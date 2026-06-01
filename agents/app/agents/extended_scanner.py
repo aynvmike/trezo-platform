@@ -1,0 +1,117 @@
+"""Extended Strategy Scanner Agent.
+
+Phase 10c. The 17th agent. Layer 4 of the Woven Basket — the multi-day
+swing layer.
+
+Sweeps the Extended watchlist mid-session (roughly 10 AM-3:30 PM ET).
+For each name it pulls daily candles, runs the four swing-setup
+detectors (EMA50 pullback, breakout hold, gap continuation, stair
+stepper), and emits a `signal` tagged strategy='extended' for the best
+qualifying setup. One signal per stock per day.
+
+Section 7C event gate: on an FOMC decision day the scanner sits out
+until 2 PM ET — no new entries before the rate announcement.
+
+Extended signals flow through the Risk Manager like any other signal.
+The Position Monitor holds them for up to ~5 trading days (it does NOT
+apply the intraday 3:45 PM force-exit that STMS / ORB positions get).
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+from app.data.candles import fetch_candles_for
+from app.data.news import fetch_company_news
+from app.strategies.extended import (
+    EXTENDED_WATCHLIST,
+    evaluate_extended,
+    fomc_blackout,
+    swing_window,
+)
+
+from .base import Agent, AgentMessage
+
+
+class ExtendedScannerAgent(Agent):
+    name = "extended_scanner"
+    tick_interval_seconds = 1800  # every 30 min — swing entries are not urgent
+
+    def __init__(self) -> None:
+        self._signalled: set[str] = set()   # symbols signalled today
+        self._day: str = ""
+
+    async def tick(self) -> list[AgentMessage]:
+        from app.runtime.settings import get_bot_settings
+        if not get_bot_settings().extended_enabled:
+            return [AgentMessage(agent=self.name, kind="info",
+                                 payload={"note": "Extended Strategy disabled in Bot Tuning."})]
+
+        if fomc_blackout():
+            return [AgentMessage(agent=self.name, kind="info",
+                                 payload={"note": "FOMC decision day - no new swing entries until 2 PM ET."})]
+
+        if not swing_window():
+            return [AgentMessage(agent=self.name, kind="info",
+                                 payload={"note": "Outside the swing scan window (8:30 AM-6:30 PM ET). Scanner idle."})]
+
+        today = date.today().isoformat()
+        if today != self._day:
+            self._signalled.clear()
+            self._day = today
+
+        out: list[AgentMessage] = []
+        scanned = 0
+        signals = 0
+
+        for symbol in EXTENDED_WATCHLIST:
+            if symbol in self._signalled:
+                continue
+            try:
+                candles = await fetch_candles_for(symbol, "stock")
+                if not candles or len(candles) < 60:
+                    continue
+                scanned += 1
+
+                # Catalyst (Section 7C): recent company news lifts the score.
+                news = await fetch_company_news(symbol, days=3)
+                has_catalyst = len(news) > 0
+
+                sig = evaluate_extended(symbol, candles, has_catalyst=has_catalyst)
+                if not sig:
+                    continue
+                self._signalled.add(symbol)
+                signals += 1
+                out.append(AgentMessage(
+                    agent=self.name,
+                    kind="signal",
+                    confidence=sig.tcs / 1000.0,
+                    payload={
+                        "ticker": sig.symbol,
+                        "tcs": sig.tcs,
+                        "direction": sig.direction,
+                        "strategy": "extended",
+                        "stop_pct": sig.stop_pct,
+                        "target_pct": sig.target_pct,
+                        "extended": {
+                            "setup": sig.setup,
+                            "entry_price": sig.entry_price,
+                            "rationale": sig.rationale,
+                            "catalyst": has_catalyst,
+                        },
+                    },
+                ))
+            except Exception as e:  # noqa: BLE001
+                out.append(AgentMessage(agent=self.name, kind="error",
+                                        payload={"ticker": symbol, "error": str(e)}))
+
+        out.append(AgentMessage(
+            agent=self.name, kind="info",
+            payload={
+                "note": "Extended scan complete",
+                "scanned": scanned,
+                "signals": signals,
+                "watchlist_size": len(EXTENDED_WATCHLIST),
+            },
+        ))
+        return out

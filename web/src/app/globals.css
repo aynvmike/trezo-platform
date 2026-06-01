@@ -1,0 +1,203 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Trezo theme tokens. Light values are the original palette exactly —
+ * light mode is pixel-identical to before. Dark values (.dark) reverse
+ * each scale's luminance: the codebase uses low indexes for surfaces
+ * and high indexes for ink, so in dark mode low = dark, high = light.
+ * Values are space-separated RGB so Tailwind's <alpha-value> works
+ * (e.g. bg-treasure-50/85).
+ */
+:root {
+  /* treasure — warm */
+  --treasure-50: 251 248 243;
+  --treasure-100: 244 236 220;
+  --treasure-200: 232 214 174;
+  --treasure-300: 216 185 122;
+  --treasure-400: 198 154 79;
+  --treasure-500: 176 125 51;
+  --treasure-600: 142 98 40;
+  --treasure-700: 107 74 32;
+  --treasure-800: 74 51 26;
+  --treasure-900: 44 31 18;
+
+  /* weave — green */
+  --weave-50: 245 247 246;
+  --weave-100: 227 234 230;
+  --weave-200: 196 211 203;
+  --weave-300: 155 179 167;
+  --weave-400: 108 142 127;
+  --weave-500: 74 112 98;
+  --weave-600: 54 88 77;
+  --weave-700: 40 67 59;
+  --weave-800: 28 47 41;
+  --weave-900: 16 33 29;
+
+  /* semantic accents — Tailwind defaults */
+  --emerald-50: 236 253 245;
+  --emerald-100: 209 250 229;
+  --emerald-200: 167 243 208;
+  --emerald-300: 110 231 183;
+  --emerald-400: 52 211 153;
+  --emerald-500: 16 185 129;
+  --emerald-600: 5 150 105;
+  --emerald-700: 4 120 87;
+  --emerald-800: 6 95 70;
+  --emerald-900: 6 78 59;
+  --red-50: 254 242 242;
+  --red-100: 254 226 226;
+  --red-200: 254 202 202;
+  --red-300: 252 165 165;
+  --red-400: 248 113 113;
+  --red-500: 239 68 68;
+  --red-600: 220 38 38;
+  --red-700: 185 28 28;
+  --red-800: 153 27 27;
+  --red-900: 127 29 29;
+  --amber-50: 255 251 235;
+  --amber-100: 254 243 199;
+  --amber-200: 253 230 138;
+  --amber-300: 252 211 77;
+  --amber-400: 251 191 36;
+  --amber-500: 245 158 11;
+  --amber-600: 217 119 6;
+  --amber-700: 180 83 9;
+  --amber-800: 146 64 14;
+  --amber-900: 120 53 15;
+
+  /* card / panel surface (was literal white) */
+  --surface: 255 255 255;
+
+  /* legacy semantic tokens used by html/body + the global border rule */
+  --background: 251 248 243;
+  --foreground: 28 47 41;
+  --muted: 245 247 246;
+  --muted-foreground: 108 142 127;
+  --primary: 74 112 98;
+  --primary-foreground: 251 248 243;
+  --accent: 198 154 79;
+  --border: 227 234 230;
+  --ring: 74 112 98;
+}
+
+.dark {
+  /*
+   * Neo Obsidian — a sleek, near-black theme. Volcanic-glass surfaces:
+   * a deep cool-charcoal page, lifted obsidian cards with a sharp thin
+   * edge, crisp light ink, the weave green kept as a luminous sage
+   * accent, and a warm-gold glint on the eyebrow labels — the old-world
+   * thread forging the path forward.
+   */
+
+  /* treasure — cool obsidian surfaces (low) into a warm-gold glint (high) */
+  --treasure-50: 12 13 14;
+  --treasure-100: 22 23 25;
+  --treasure-200: 33 35 40;
+  --treasure-300: 54 58 64;
+  --treasure-400: 92 94 92;
+  --treasure-500: 138 129 112;
+  --treasure-600: 203 181 136;
+  --treasure-700: 221 200 155;
+  --treasure-800: 235 220 192;
+  --treasure-900: 245 236 217;
+
+  /* weave — obsidian-green (low) into a luminous sage ink (high) */
+  --weave-50: 16 19 20;
+  --weave-100: 31 36 38;
+  --weave-200: 44 51 54;
+  --weave-300: 61 72 69;
+  --weave-400: 94 117 112;
+  --weave-500: 138 163 156;
+  --weave-600: 169 198 188;
+  --weave-700: 193 218 207;
+  --weave-800: 219 233 226;
+  --weave-900: 237 244 240;
+
+  /* semantic accents — dark ramp (50 = deep tint, 900 = light ink) */
+  --emerald-50: 14 31 23;
+  --emerald-100: 20 41 30;
+  --emerald-200: 30 56 42;
+  --emerald-300: 46 84 64;
+  --emerald-400: 64 116 89;
+  --emerald-500: 78 166 118;
+  --emerald-600: 110 200 150;
+  --emerald-700: 140 218 175;
+  --emerald-800: 175 232 200;
+  --emerald-900: 210 244 226;
+  --red-50: 36 20 20;
+  --red-100: 48 26 26;
+  --red-200: 64 35 35;
+  --red-300: 92 51 51;
+  --red-400: 138 77 77;
+  --red-500: 199 92 92;
+  --red-600: 222 120 120;
+  --red-700: 235 158 158;
+  --red-800: 242 184 184;
+  --red-900: 247 212 212;
+  --amber-50: 36 29 16;
+  --amber-100: 48 38 15;
+  --amber-200: 67 54 26;
+  --amber-300: 94 76 40;
+  --amber-400: 134 104 58;
+  --amber-500: 201 154 78;
+  --amber-600: 220 180 110;
+  --amber-700: 232 201 143;
+  --amber-800: 238 217 176;
+  --amber-900: 245 232 205;
+
+  /* card / panel surface — lifted obsidian, a touch above the page */
+  --surface: 22 24 26;
+
+  --background: 12 13 14;
+  --foreground: 219 233 226;
+  --muted: 16 19 20;
+  --muted-foreground: 138 163 156;
+  --primary: 169 198 188;
+  --primary-foreground: 12 13 14;
+  --accent: 203 181 136;
+  --border: 31 36 38;
+  --ring: 169 198 188;
+}
+
+html, body {
+  background: rgb(var(--background));
+  color: rgb(var(--foreground));
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  border-color: rgb(var(--border));
+}
+
+/* A gentle fade on the page backdrop when the theme flips. */
+html, body {
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Form controls — themed so native inputs are not bright white in dark
+ * mode. Explicit bg-/text- utility classes still override these. */
+@layer base {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  select,
+  textarea {
+    background-color: rgb(var(--surface));
+    color: rgb(var(--foreground));
+  }
+  ::placeholder {
+    color: rgb(var(--muted-foreground));
+    opacity: 1;
+  }
+}
+
+/* ---- Experience level (Beginner / Pro) ----------------------------------
+ * A site-wide setting, like dark mode. An inline script in the root
+ * layout sets data-experience on <html> before paint, so there is no
+ * flash. Beginner is the default.
+ *   - Mark explanatory / teaching copy `.beginner-only` — hidden for pros.
+ *   - Mark advanced-only UI `.pro-only` — hidden for beginners.
+ */
+html[data-experience="pro"] .beginner-only { display: none !important; }
+html[data-experience="beginner"] .pro-only { display: none !important; }

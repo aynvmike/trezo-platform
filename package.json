@@ -1,0 +1,24 @@
+{
+  "name": "trezo-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Trezo — Layer by Layer. Trade by Trade.",
+  "workspaces": [
+    "web",
+    "api"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace web run dev",
+    "dev:api": "npm --workspace api run dev",
+    "dev:agents": "cd agents && uvicorn app.main:app --reload --port 8001",
+    "build:web": "npm --workspace web run build",
+    "build:api": "npm --workspace api run build",
+    "lint": "npm --workspace web run lint && npm --workspace api run lint",
+    "typecheck": "npm --workspace web run typecheck && npm --workspace api run typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "author": "Trezo (Mike + Nova)",
+  "license": "UNLICENSED"
+}

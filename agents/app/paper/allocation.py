@@ -1,0 +1,166 @@
+"""Account posture & capital allocation.
+
+Phase 8a.2. Trezo reads the live account size and the AI picks a default
+*posture*:
+
+  - small account  (< $25k)        -> 'growth'   (build the account up)
+  - mid account     ($25k-$100k)   -> 'balanced'
+  - large account   (>= $100k)     -> 'income'   (generate income, preserve)
+
+The posture splits equity into per-market-type dollar budgets — how much
+may be deployed into crypto vs stocks vs options vs income strategies at
+once. The Trade Execution agent caps each new trade by the remaining
+budget for its market type.
+
+Profit-taking (the Daily Profit Lock) stays available at every account
+size and in every posture — the posture only changes WHERE capital is
+deployed and whether gains lean toward compounding or locking.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+from app.config import get_settings
+
+
+POSTURES = ("growth", "balanced", "income")
+MARKET_TYPES = ("crypto", "stocks", "options", "income")
+
+# Per-posture split of equity across market types (fractions, sum to 1.0).
+POSTURE_SPLIT: dict[str, dict[str, float]] = {
+    "growth":   {"crypto": 0.35, "stocks": 0.45, "options": 0.10, "income": 0.10},
+    "balanced": {"crypto": 0.20, "stocks": 0.35, "options": 0.20, "income": 0.25},
+    "income":   {"crypto": 0.10, "stocks": 0.20, "options": 0.20, "income": 0.50},
+}
+
+# How each posture leans on realized gains.
+POSTURE_PROFIT_MODE = {
+    "growth": "compound",       # keep gains working in the account
+    "balanced": "balanced",
+    "income": "lock_heavy",     # move gains to the vault sooner
+}
+
+POSTURE_SUMMARY = {
+    "growth": "Smaller account — growth focus: build the balance up, lean into the higher-return layers.",
+    "balanced": "Mid-size account — balanced: capital spread across growth and income.",
+    "income": "Larger account — income focus: tilt to the Wheel and Dividends layers, preserve capital.",
+}
+
+
+def default_posture(equity: float) -> str:
+    """The AI's default posture, chosen purely from account size."""
+    if equity < 25_000:
+        return "growth"
+    if equity < 100_000:
+        return "balanced"
+    return "income"
+
+
+def market_type_for(strategy: str, asset_type: str) -> str:
+    """Map a trade's strategy + asset type to one of the MARKET_TYPES buckets."""
+    s = (strategy or "").lower()
+    at = (asset_type or "").lower()
+    if at == "crypto" or s.startswith("crypto"):
+        return "crypto"
+    if s.startswith("wheel"):
+        return "income"
+    if s.startswith("options") or at == "option" or s in (
+        "long_call", "bull_call_spread", "cash_secured_put"
+    ):
+        return "options"
+    return "stocks"
+
+
+@dataclass
+class AllocationPlan:
+    posture: str
+    source: str                 # 'auto' (AI chose) or 'user'
+    account_equity: float
+    budgets: dict               # market_type -> dollar budget
+    profit_mode: str
+    summary: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def build_allocation(
+    equity: float,
+    posture_setting: str = "auto",
+    overrides: Optional[dict] = None,
+) -> AllocationPlan:
+    """Build the capital-allocation plan for an account.
+
+    posture_setting: 'auto' (let the AI choose by size) or an explicit
+    posture. overrides: optional {market_type: dollar_budget} from the user.
+    """
+    equity = max(0.0, float(equity or 0))
+    if posture_setting in POSTURES:
+        posture, source = posture_setting, "user"
+    else:
+        posture, source = default_posture(equity), "auto"
+
+    split = POSTURE_SPLIT[posture]
+    budgets = {mt: round(equity * split[mt], 2) for mt in MARKET_TYPES}
+
+    if overrides:
+        for mt, val in overrides.items():
+            if mt in MARKET_TYPES:
+                try:
+                    budgets[mt] = max(0.0, float(val))
+                except (TypeError, ValueError):
+                    pass
+
+    return AllocationPlan(
+        posture=posture,
+        source=source,
+        account_equity=round(equity, 2),
+        budgets=budgets,
+        profit_mode=POSTURE_PROFIT_MODE[posture],
+        summary=POSTURE_SUMMARY[posture],
+    )
+
+
+def _supabase():
+    s = get_settings()
+    if not s.supabase_url or not s.supabase_service_role_key:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(s.supabase_url, s.supabase_service_role_key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def deployed_capital(user_id: str) -> dict[str, float]:
+    """Sum the notional of this user's OPEN positions, grouped by market
+    type — so the Trade Execution agent knows how much budget is left."""
+    out = {mt: 0.0 for mt in MARKET_TYPES}
+    client = _supabase()
+    if not client:
+        return out
+
+    def _sync():
+        return (
+            client.table("paper_positions")
+            .select("asset_type, strategy, quantity, entry_price")
+            .eq("user_id", user_id)
+            .eq("status", "open")
+            .execute()
+        )
+
+    try:
+        res = await asyncio.to_thread(_sync)
+    except Exception:  # noqa: BLE001
+        return out
+    for r in res.data or []:
+        try:
+            notional = float(r.get("quantity") or 0) * float(r.get("entry_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        mt = market_type_for(r.get("strategy") or "", r.get("asset_type") or "")
+        out[mt] = out.get(mt, 0.0) + notional
+    return out

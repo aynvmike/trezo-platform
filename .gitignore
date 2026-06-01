@@ -1,0 +1,112 @@
+# ============================================================
+# TREZO .gitignore — guards against secret/PII leakage.
+# When in doubt, ADD it here. Removing entries should be rare.
+# ============================================================
+
+# ---- SECRETS (most important) ----
+# Every .env file at any depth. .env.example IS tracked (template only).
+.env
+.env.*
+!.env.example
+!**/.env.example
+# Explicit backstops in case a future .env lands somewhere unexpected.
+agents/.env
+api/.env
+web/.env
+web/.env.local
+web/.env.*.local
+# MCP / Claude desktop configs often embed API keys.
+claude_desktop_config*
+**/claude_desktop_config*
+# Any "secrets" or "credentials" file by convention.
+*secrets*
+*credentials*
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+gcp-key*.json
+
+# ---- Mem0 & vector store local caches ----
+.mem0/
+mem0_cache/
+.vectorstore/
+.chromadb/
+
+# ---- DEPENDENCIES ----
+node_modules/
+.pnp
+.pnp.js
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+pip-wheel-metadata/
+
+# ---- BUILDS ----
+web/.next/
+web/out/
+web/build/
+dist/
+build/
+*.tsbuildinfo
+
+# ---- LOGS & RUNTIME ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+agents/logs/
+api/logs/
+*.pid
+*.sock
+
+# ---- BACKUPS & TEMP ----
+*.bak
+*.bak.*
+*.orig
+*.rej
+*.swp
+*.swo
+*.tmp
+*.temp
+tmp/
+.cache/
+
+# ---- TESTING ----
+coverage/
+.pytest_cache/
+.coverage
+htmlcov/
+.nyc_output/
+
+# ---- EDITOR / OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.iml
+.history/
+.cursor/
+
+# ---- TREZO-SPECIFIC RUNTIME ARTIFACTS ----
+# Local cycle state, scanner caches, etc. — not source of truth.
+agents/.cache/
+agents/local_state/
+agents/scratch/
+# Old paper-trading dumps from before Supabase was source of truth.
+*.paperdump.json
+# Prebuilt migration outputs that supabase-cli regenerates.
+db/supabase/.temp/
+db/.supabase-cache/
+
+# ---- PRIVATE NOTES (optional, comment in if you want) ----
+# Uncomment these if you keep planning notes you don't want in git:
+# TREZO_PROJECT/private/
+# *.private.md
