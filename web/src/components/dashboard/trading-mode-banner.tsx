@@ -90,8 +90,8 @@ export function TradingModeBanner({
           Auto-trade: {autoTradeEnabled ? "ON" : "OFF"}
         </p>
         <p className="font-mono text-[10px] opacity-70">
-          TRADING_MODE={liveRequested ? "live" : "paper"} · executor=
-          {liveExecutorAvailable ? "available" : "off"}
+          TRADING_MODE={liveRequested ? "live" : "paper"} · paper executor=ON
+          {" · "}live executor={liveExecutorAvailable ? "ON" : "OFF (Phase 10b)"}
         </p>
         {!autoTradeEnabled ? (
           <p className="text-[11px] opacity-80 italic">

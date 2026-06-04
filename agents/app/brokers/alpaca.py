@@ -230,6 +230,70 @@ async def get_order(order_id: str) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Phase F (2026-06-04) - Alpaca crypto support, additive + removable.
+# ---------------------------------------------------------------------------
+
+# Alpaca paper crypto allowlist. Edit to add/remove the symbols you want
+# to route through Alpaca. Symbols NOT in this set fall through to the
+# internal modeled paper engine even when the feature flag is ON.
+ALPACA_CRYPTO_SYMBOLS = frozenset({
+    "BTC", "ETH", "SOL", "AVAX", "LINK", "LTC", "BCH",
+    "MATIC", "USDT", "USDC", "AAVE", "UNI", "DOGE", "SHIB",
+    "DOT", "XRP", "ADA",
+})
+
+
+def alpaca_crypto_supports(symbol: str) -> bool:
+    """True when the symbol is in the Alpaca crypto allowlist."""
+    return (symbol or "").upper().strip() in ALPACA_CRYPTO_SYMBOLS
+
+
+def _crypto_pair(symbol: str) -> str:
+    """Convert a bare ticker like 'BTC' to Alpaca's crypto pair format
+    'BTC/USD'. Already-paired inputs pass through."""
+    s = (symbol or "").upper().strip()
+    if "/" in s:
+        return s
+    return f"{s}/USD"
+
+
+async def submit_crypto_order(
+    symbol: str,
+    side: str,
+    qty: float,
+    token: Optional["UserToken"] = None,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Place a crypto MARKET order at Alpaca paper. Returns (order, error).
+
+    Alpaca crypto does NOT support bracket orders (no native stop/target
+    legs), so the stop and target prices are tracked client-side by the
+    Position Monitor agent - same shape it already uses for stocks that
+    fall back to internal mark-to-market.
+
+    Time-in-force is GTC because crypto trades 24/7; the equity-only
+    'day' value is rejected by the crypto endpoint.
+
+    Phase F follow-up: add limit orders (with 'type': 'limit' + 'limit_price')
+    once Mike wants to opt into price-protected entries.
+    """
+    pair = _crypto_pair(symbol)
+    body = {
+        "symbol": pair,
+        "side": side.lower(),
+        "type": "market",
+        "time_in_force": "gtc",
+        "qty": str(qty),
+    }
+    try:
+        order = await _post("/v2/orders", body, token=token)
+        if isinstance(order, dict) and order.get("id"):
+            return order, None
+        return None, f"unexpected_response: {str(order)[:200]}"
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)[:200]
+
+
 async def submit_bracket_order(
     symbol: str,
     qty: float,

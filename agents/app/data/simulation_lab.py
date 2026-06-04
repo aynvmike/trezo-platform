@@ -24,6 +24,14 @@ from typing import Optional
 from app.data.candles import fetch_candles_for, COIN_MAP
 from app.backtest.engine import compare_strategies
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Mem0 outcome logging is best-effort - never block a simulation if
+# the memory layer is unreachable. Imports are inside the helper to
+# defer cost when memory isn't configured.
+
 
 # Notional fraction of starting equity placed on each trade. Conservative:
 # 25% of equity goes into a position, so a 10% gain on the trade lifts
@@ -228,6 +236,11 @@ async def run_simulation(symbols: list[str], days: int,
         b.pop("tcs_sum", None)
         b.pop("tcs_n", None)
 
+    # Phase G: log every simulated trade outcome to Mem0 with
+    # metadata.source='simulation' so live agents can recall them
+    # alongside real trade history. Best-effort - never blocks.
+    _log_sim_outcomes_to_mem0(all_trades, starting_equity)
+
     return {
         "compare_all": bool(compare_all),
         "starting_equity": round(starting_equity, 2),
@@ -243,3 +256,84 @@ async def run_simulation(symbols: list[str], days: int,
         "trades": all_trades,
         "equity_curve": curve,
     }
+
+
+def _log_sim_outcomes_to_mem0(trades: list[dict], starting_equity: float) -> None:
+    """Push every simulated round-trip into Mem0 as a TradeOutcome.
+
+    Marks metadata.source='simulation' so live agents can distinguish
+    simulated history from realised trades when they recall_similar().
+    Silent on any failure - memory is a force multiplier, not a hard
+    dependency.
+    """
+    if not trades:
+        return
+    try:
+        from app.memory import get_memory, TradeOutcome
+    except Exception:  # noqa: BLE001
+        return
+    mem = get_memory()
+    if not getattr(mem, "available", False):
+        return
+
+    logged = 0
+    skipped = 0
+    for t in trades:
+        try:
+            ticker = str(t.get("symbol") or "").upper()
+            if not ticker:
+                skipped += 1
+                continue
+            entry_price = float(t.get("entry_price") or 0.0)
+            exit_price = float(t.get("exit_price") or 0.0)
+            if entry_price <= 0 or exit_price <= 0:
+                skipped += 1
+                continue
+
+            # Sim engine is long-only today; flag explicitly so the
+            # memory record is unambiguous when other strategies start
+            # emitting shorts later.
+            side = str(t.get("side") or "long").lower()
+
+            # P&L in USD = pnl_pct * 25% of starting equity per the
+            # Simulation Lab fixed-fraction sizing model.
+            pnl_pct = float(t.get("pnl_pct") or 0.0)
+            realized_pnl_usd = (pnl_pct / 100.0) * starting_equity * TRADE_FRACTION
+
+            # Holding days from entry/exit candle indices (each bar = 1d).
+            ei = int(t.get("entry_index") or 0)
+            xi = int(t.get("exit_index") or 0)
+            holding_days = max(0, xi - ei)
+
+            exit_reason = str(t.get("outcome") or "unknown")
+            strategy = str(t.get("strategy") or "default")
+
+            outcome = TradeOutcome(
+                ticker=ticker,
+                side=side,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                realized_pnl_usd=round(realized_pnl_usd, 2),
+                holding_days=holding_days,
+                exit_reason=exit_reason,
+                strategy=strategy,
+                metadata={
+                    "source": "simulation",
+                    "entry_date": t.get("entry_date") or "",
+                    "exit_date": t.get("exit_date") or "",
+                    "pnl_pct": round(pnl_pct, 2),
+                    "entry_tcs": int(t.get("entry_tcs") or 0),
+                },
+            )
+            if mem.log_outcome(outcome):
+                logged += 1
+            else:
+                skipped += 1
+        except Exception:  # noqa: BLE001
+            skipped += 1
+
+    logger.info(
+        "sim.mem0.logged trades=%d logged=%d skipped=%d",
+        len(trades), logged, skipped,
+    )
+

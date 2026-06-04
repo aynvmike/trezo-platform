@@ -120,10 +120,10 @@ export default async function PaperPage() {
   // Profit-lock + loss-limit thresholds (from profile, fallback defaults).
   const { data: profile } = await supabase
     .from("profiles")
-    .select("daily_profit_lock_usd, daily_loss_limit_usd")
+    .select("daily_profit_target_usd, daily_loss_limit_usd")
     .eq("user_id", user.id)
     .maybeSingle();
-  const profitLockTarget = Number(profile?.daily_profit_lock_usd ?? 500);
+  const profitLockTarget = Number(profile?.daily_profit_target_usd ?? 500);
   const lossLimitTarget = Number(profile?.daily_loss_limit_usd ?? 100);
 
   return (
@@ -277,7 +277,9 @@ export default async function PaperPage() {
       </Disclosure>
 
       {/* Bot settings in-force snapshot */}
-      <BotSettingsPanel userId={user.id} />
+      <Disclosure title="Bot settings — in force (click to expand)">
+        <BotSettingsPanel userId={user.id} />
+      </Disclosure>
 
       <AccountSizeSim brokerConnected={Boolean(alpaca?.configured)} />
 
@@ -371,12 +373,10 @@ export default async function PaperPage() {
       </section>
 
       {/* Recent trades */}
-      <section>
-        <h2 className="font-serif text-xl text-weave-800 mb-3">
-          Recent trades{" "}
-          <span className="text-sm text-weave-500">
-            ({closedPositions.length})
-          </span>
+      <Disclosure title={`Recent trades (${closedPositions.length}) — click to expand`}>
+        <section>
+        <h2 className="sr-only">
+          Recent trades ({closedPositions.length})
         </h2>
         {closedPositions.length === 0 ? (
           <EmptyCard>No closed trades yet today.</EmptyCard>
@@ -431,6 +431,7 @@ export default async function PaperPage() {
           </div>
         )}
       </section>
+      </Disclosure>
 
       <p className="text-[11px] text-weave-500 italic">
         Want a comprehensive view of today&apos;s activity?{" "}

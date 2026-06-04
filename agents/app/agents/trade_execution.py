@@ -79,6 +79,78 @@ class TradeExecutionAgent(Agent):
 
         return await self._execute_for_user(user_id, ticker, side, message.payload)
 
+    async def _execute_for_all_users(
+        self,
+        ticker: str,
+        side: str,
+        source_payload: dict,
+    ) -> list[AgentMessage]:
+        """Approve message did not carry a user_id (Risk Manager does not
+        currently propagate it through approve/veto payloads). Fan the
+        approval out to every active paper account so per-user execution,
+        budgets, and cost-basis all stay correct.
+
+        Aggregates messages from every per-user call. If no paper_accounts
+        exist (fresh install) we emit a single info row so the trace panel
+        records what happened instead of silently dropping the approve.
+        """
+        import asyncio
+        from app.runtime.persistence import _client
+
+        client = _client()
+        if client is None:
+            return [AgentMessage(
+                agent=self.name, kind="info", confidence=1.0,
+                payload={
+                    "ticker": ticker,
+                    "side": side,
+                    "note": "Skipped: Supabase client unavailable, cannot enumerate paper accounts",
+                },
+            )]
+
+        def _fetch():
+            return client.table("paper_accounts").select("user_id").execute()
+
+        try:
+            accts = await asyncio.to_thread(_fetch)
+        except Exception as e:  # noqa: BLE001
+            return [AgentMessage(
+                agent=self.name, kind="error", confidence=1.0,
+                payload={
+                    "ticker": ticker,
+                    "side": side,
+                    "error": f"paper_accounts lookup failed: {e}",
+                },
+            )]
+
+        users = [a.get("user_id") for a in (accts.data or []) if a.get("user_id")]
+        if not users:
+            return [AgentMessage(
+                agent=self.name, kind="info", confidence=1.0,
+                payload={
+                    "ticker": ticker,
+                    "side": side,
+                    "note": "Skipped: no paper accounts exist yet",
+                },
+            )]
+
+        out: list[AgentMessage] = []
+        for uid in users:
+            try:
+                msgs = await self._execute_for_user(uid, ticker, side, source_payload)
+                out.extend(msgs or [])
+            except Exception as e:  # noqa: BLE001
+                out.append(AgentMessage(
+                    agent=self.name, kind="error", confidence=1.0,
+                    payload={
+                        "user_id": uid,
+                        "ticker": ticker,
+                        "side": side,
+                        "error": f"execute failed for user: {e}",
+                    },
+                ))
+        return out
+
     async def _execute_for_user(
         self,
         user_id: str,
@@ -111,6 +183,28 @@ class TradeExecutionAgent(Agent):
         target_pct = source_payload.get("target_pct")
 
         from app.brokers.alpaca import alpaca_configured
+        from app.brokers.alpaca import alpaca_crypto_supports
+        from app.config import get_settings as _gs_for_routing
+        _routing_cfg = _gs_for_routing()
+
+        # Phase F (2026-06-04): Alpaca crypto routing. Feature-flagged
+        # OFF by default - flip on with ALPACA_CRYPTO_ENABLED=true in
+        # agents/.env. Symbol must also be in the allowlist; anything
+        # not supported by Alpaca crypto falls through to the modeled
+        # paper engine identical to today's behavior. To remove this
+        # branch entirely, delete the whole if block (the rest of the
+        # routing keeps working unchanged).
+        if (
+            asset_type == "crypto"
+            and getattr(_routing_cfg, "alpaca_crypto_enabled", False)
+            and alpaca_configured()
+            and alpaca_crypto_supports(ticker)
+        ):
+            return await self._execute_alpaca_crypto(
+                user_id, ticker, side, market_price,
+                stop_pct, target_pct, strategy, source_payload,
+            )
+
         if asset_type == "stock" and alpaca_configured():
             return await self._execute_alpaca(
                 user_id, ticker, side, market_price,
@@ -341,6 +435,136 @@ class TradeExecutionAgent(Agent):
                     "broker_order_id": order_id,
                     "strategy": strategy,
                     "note": f"Submitted {ticker} {side} via Alpaca, order_id={order_id}",
+                },
+            )
+        ]
+
+
+    async def _execute_alpaca_crypto(
+        self, user_id, ticker, side, market_price,
+        stop_pct, target_pct, strategy, source_payload,
+    ) -> list[AgentMessage]:
+        """Phase F: route crypto signals to Alpaca paper crypto.
+
+        Crypto at Alpaca does NOT support bracket orders, so stops and
+        targets are tracked client-side by Position Monitor via the
+        stop_price / target_price columns on paper_positions - identical
+        to how the internal modeled engine already handles them.
+
+        Market clock is NOT checked because crypto trades 24/7. The
+        order uses GTC time-in-force (the only crypto-valid TIF).
+        """
+        from app.brokers.alpaca import (
+            get_account, submit_crypto_order, broker_venue, UserToken,
+        )
+        from app.paper.sizing import plan_position
+        from app.paper.engine import record_external_position
+        from app.runtime.settings import get_bot_settings
+        from app.integrations.web_tokens import get_user_broker_token
+
+        def _err(msg: str) -> list[AgentMessage]:
+            return [AgentMessage(
+                agent=self.name, kind="error",
+                payload={"user_id": user_id, "ticker": ticker,
+                         "broker": "alpaca", "asset_type": "crypto",
+                         "error": msg},
+            )]
+
+        bt = await get_user_broker_token(user_id, "alpaca")
+        token = UserToken(
+            access_token=bt.access_token,
+            refresh_token=bt.refresh_token,
+            expires_at=bt.expires_at,
+        ) if bt else None
+        routed = "user-oauth" if token else "env-keys"
+
+        acct = await get_account(token=token)
+        if not acct:
+            return _err("Could not read the Alpaca account")
+        if acct.trading_blocked:
+            return _err("Alpaca account has trading blocked")
+
+        mt, budget, deployed, remaining, posture = await self._allocation_gate(
+            user_id, acct.equity, strategy, "crypto")
+        if remaining <= 0:
+            return self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+
+        sp = float(stop_pct) if isinstance(stop_pct, (int, float)) and stop_pct > 0 else 0.05
+        tp = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
+        if side == "long":
+            stop_price = market_price * (1 - sp)
+            target_price = market_price * (1 + tp)
+            order_side = "buy"
+        else:
+            stop_price = market_price * (1 + sp)
+            target_price = market_price * (1 - tp)
+            order_side = "sell"
+
+        risk_pct = source_payload.get("risk_pct_override")
+        if risk_pct is None:
+            risk_pct = get_bot_settings().risk_per_trade_pct
+        plan = plan_position(
+            equity=acct.equity,
+            entry_price=market_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            risk_pct=float(risk_pct),
+            asset_type="crypto",
+            buying_power=min(acct.buying_power, remaining),
+        )
+        if not plan.ok:
+            return _err(plan.reject_reason or "Sizing rejected the trade")
+
+        order, err = await submit_crypto_order(
+            symbol=ticker,
+            side=order_side,
+            qty=plan.quantity,
+            token=token,
+        )
+        if err or not order:
+            from app.paper.killswitch import record_broker_reject
+            record_broker_reject()
+            return _err(f"Alpaca rejected the crypto order: {err}")
+
+        order_id = order.get("id")
+        await record_external_position(
+            user_id=user_id,
+            ticker=ticker,
+            asset_type="crypto",
+            side=side,
+            quantity=plan.quantity,
+            entry_price=market_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            strategy=strategy,
+            broker="alpaca",
+            broker_order_id=order_id,
+            source_payload={
+                **source_payload, "broker": "alpaca",
+                "broker_order_id": order_id,
+                "alpaca_crypto": True,
+            },
+        )
+        return [
+            AgentMessage(
+                agent=self.name, kind="execute", confidence=1.0,
+                payload={
+                    "user_id": user_id,
+                    "ticker": ticker,
+                    "side": side,
+                    "asset_type": "crypto",
+                    "broker": "alpaca",
+                    "broker_order_id": order_id,
+                    "strategy": strategy,
+                    "quantity": plan.quantity,
+                    "entry_price": market_price,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                    "routed_via": routed,
+                    "note": (
+                        f"Submitted {ticker} {side} crypto via Alpaca, "
+                        f"order_id={order_id}"
+                    ),
                 },
             )
         ]

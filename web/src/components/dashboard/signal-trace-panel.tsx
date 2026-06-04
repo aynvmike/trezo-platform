@@ -32,8 +32,13 @@ export async function SignalTracePanel({ userId }: { userId: string }) {
   const supabase = createClient();
   const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
-  // Pull every relevant message from the last hour for this user (with
-  // a global fallback for messages that haven't been per-user-tagged).
+  // Pull every relevant message from the last hour. Global signals
+  // (user_id=NULL from scanners + Risk Manager vetoes that did not
+  // propagate user_id) live alongside per-user rows, so we MERGE both
+  // streams. Previously we ran user-tagged first and only fell back to
+  // NULL when zero user rows existed -- that hid the cross-stream
+  // correlation when even one user-tagged row was present, making
+  // every signal look "pending" even after Risk Manager had vetoed it.
   const fetchRows = async (forUser: boolean) => {
     let q = supabase
       .from("agent_messages")
@@ -47,8 +52,18 @@ export async function SignalTracePanel({ userId }: { userId: string }) {
     return (data ?? []) as Row[];
   };
 
-  let rows = await fetchRows(true);
-  if (rows.length === 0) rows = await fetchRows(false);
+  const [userRows, globalRows] = await Promise.all([
+    fetchRows(true),
+    fetchRows(false),
+  ]);
+  const seen = new Set<string>();
+  const rows = [...userRows, ...globalRows]
+    .filter((r) => {
+      if (seen.has(r.id)) return false;
+      seen.add(r.id);
+      return true;
+    })
+    .sort((a, b) => a.created_at.localeCompare(b.created_at));
 
   // Group by ticker → newest signal wins; then look at any veto / execute
   // / info row after that signal for the same ticker as the fate.

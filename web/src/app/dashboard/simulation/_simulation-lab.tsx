@@ -95,6 +95,50 @@ function stratLabel(s: string): string {
   )[s] ?? s;
 }
 
+// Plain-English explanations for the beginner audience. Hovers over the
+// strategy name reveal "what this strategy is hunting for" so a brand-new
+// trader can read the Simulation Lab without having to look anything up.
+function stratTooltip(s: string): string {
+  return (
+    {
+      default:
+        "Core scoring: Trezo's baseline. Scores every setup the same way live agents do — trend + volume + momentum + market regime.",
+      pattern:
+        "Pattern Engine: scans for classic chart patterns (flags, bases, breakouts) and rates setup quality. Best for swing entries.",
+      stms:
+        "Stock Bot (STMS): small-cap momentum hunter. Looks for $1–$20 stocks breaking out on 5×-average volume. Higher risk, higher reward.",
+      orb:
+        "ORB breakout: enters when price breaks the first 15-minute range after the open and exits by midday. Best for liquid stocks gapping at open.",
+      crypto:
+        "Crypto momentum: 24/7 trend follower for liquid coins. Buys strength on the higher timeframe, scales out on weakness.",
+      extended:
+        "Extended swing: multi-day pullback strategy. Buys names that have pulled back to their 50-day average inside an uptrend. Hold 3–10 days."
+    } as Record<string, string>
+  )[s] ?? "No description available yet for this strategy.";
+}
+
+// A strategy-name cell that renders the friendly label plus an ⓘ marker.
+// Hovering anywhere on the cell shows the plain-English tooltip via the
+// native title attribute — works without any tooltip library.
+function StrategyLabel({ s }: { s: string }) {
+  const label = stratLabel(s);
+  const tip = stratTooltip(s);
+  return (
+    <span
+      title={tip}
+      className="inline-flex items-center gap-1 cursor-help"
+    >
+      {label}
+      <span
+        aria-hidden
+        className="text-[10px] text-weave-400 leading-none"
+      >
+        ⓘ
+      </span>
+    </span>
+  );
+}
+
 export function SimulationLab({ watchlists }: { watchlists: Watchlist[] }) {
   const router = useRouter();
 
@@ -454,7 +498,7 @@ function StrategyBucketsTable({
       <tbody>
         {rows.map(([s, b]) => (
           <tr key={s} className="border-b border-weave-50 last:border-0">
-            <td className="py-2 text-weave-700">{stratLabel(s)}</td>
+            <td className="py-2 text-weave-700"><StrategyLabel s={s} /></td>
             <td className="py-2 text-right font-mono">{b.trades}</td>
             <td className="py-2 text-right font-mono text-weave-500">
               {b.wins} / {b.losses}
@@ -531,11 +575,11 @@ function SymbolTable({
                 {r.error ? (
                   <span className="text-amber-700">{r.error}</span>
                 ) : (r.trades ?? 0) > 0 ? (
-                  stratLabel(r.strategy ?? "")
+                  <StrategyLabel s={r.strategy ?? ""} />
                 ) : (
                   <span title="No strategy fired in this window — showing the one that came closest.">
                     <span className="text-weave-400">closest: </span>
-                    {stratLabel(r.peak_strategy ?? r.strategy ?? "")}
+                    <StrategyLabel s={r.peak_strategy ?? r.strategy ?? ""} />
                   </span>
                 )}
               </td>
@@ -610,7 +654,7 @@ function TimelineTable({ trades }: { trades: Trade[] }) {
                 {t.symbol}
               </td>
               <td className="px-4 py-2.5 text-weave-700">
-                {stratLabel(t.strategy)}
+                <StrategyLabel s={t.strategy} />
               </td>
               <td
                 className={cn(

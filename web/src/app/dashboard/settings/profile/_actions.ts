@@ -52,13 +52,21 @@ export async function saveProfileSettings(
     };
   }
 
+  // Use upsert (not update) so the save works even if no profile row
+  // exists yet for this user. The `update().eq(...)` pattern silently
+  // returns OK with zero rows touched if the row is missing - the
+  // user thinks they saved but nothing landed. Mike caught this
+  // 2026-06-04 when his $750 / $1000 settings didn't propagate.
   const { error } = await supabase
     .from("profiles")
-    .update({
-      ...parsed.data,
-      updated_at: new Date().toISOString()
-    })
-    .eq("user_id", user.id);
+    .upsert(
+      {
+        user_id: user.id,
+        ...parsed.data,
+        updated_at: new Date().toISOString()
+      },
+      { onConflict: "user_id" }
+    );
 
   if (error) {
     return { ok: false, message: error.message };

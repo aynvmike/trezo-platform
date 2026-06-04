@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     # without memory (graceful degradation, never blocks trading).
     mem0_api_key: str = ""
 
+    # Phase F (2026-06-04): route crypto signals to Alpaca paper
+    # crypto when enabled AND the symbol is in the broker allowlist.
+    # Default OFF - crypto stays on the internal modeled paper
+    # engine, identical to today. Set ALPACA_CRYPTO_ENABLED=true
+    # in agents/.env to opt in. To remove entirely, comment out
+    # this line (the routing branch in trade_execution.py treats
+    # missing flag as False).
+    alpaca_crypto_enabled: bool = False
+
     # ---- Phase C options Greek-aware filters --------------------------
     # min_dte: Options Scanner skips emit when expiration is within this
     # many days. Mike's rule 7: avoid long-call recommendations inside
