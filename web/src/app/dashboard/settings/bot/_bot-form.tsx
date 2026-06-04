@@ -30,6 +30,10 @@ type Settings = {
   expert_mode_enabled?: boolean;
   terse_format_enabled?: boolean;
   auto_trade_enabled?: boolean;
+  options_min_dte?: number;
+  options_max_premium_delta?: number;
+  options_min_iv_rank_scalp?: number;
+  options_hopeful_allocation_cap_pct?: number;
 } | null;
 
 type RiskProfile = "conservative" | "balanced" | "aggressive" | "expert";
@@ -180,6 +184,47 @@ function WeightInput({ name, label, defaultValue }: { name: string; label: strin
         className="w-full rounded-md border border-weave-200 bg-white px-3 py-2 text-sm font-mono"
       />
     </label>
+  );
+}
+
+function NumInput({
+  name, label, hint, defaultValue, step = 1, min, max, suffix,
+}: {
+  name: string;
+  label: string;
+  hint?: string;
+  defaultValue: number;
+  step?: number;
+  min?: number;
+  max?: number;
+  suffix?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <label htmlFor={name} className="text-xs font-medium text-weave-700">
+        {label}
+      </label>
+      <div className="relative">
+        <input
+          id={name}
+          name={name}
+          type="number"
+          step={step}
+          min={min}
+          max={max}
+          defaultValue={defaultValue}
+          className="w-full rounded-md border border-weave-200 bg-white px-3 py-1.5 text-sm font-mono"
+        />
+        {suffix ? (
+          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-weave-400 text-[11px]">
+            {suffix}
+          </span>
+        ) : null}
+      </div>
+      {hint ? (
+        <p className="text-[11px] text-weave-500 leading-snug">{hint}</p>
+      ) : null}
+    </div>
   );
 }
 
@@ -453,6 +498,66 @@ export function BotTuningForm({ initial, liveEquity }: { initial: Settings; live
             defaultChecked={s.terse_format_enabled ?? false}
           />
         </div>
+
+        {/* Phase C+D follow-up: options Greek filters. These let Mike
+            tune the Options Scanner's emit gates from the UI instead of
+            editing agents/.env. Only visible in Expert mode. */}
+        {expertVisible ? (
+          <div className="mt-4 rounded-xl border border-weave-100 bg-white p-4 space-y-3">
+            <div>
+              <h3 className="text-sm font-medium text-weave-800">
+                Options filters (Greek &amp; bucket caps)
+              </h3>
+              <p className="mt-1 text-xs text-weave-500 leading-relaxed">
+                Per Mike&apos;s options-trading rules. DTE protects against theta
+                burn. Delta cap keeps premium-sell setups from becoming stock
+                proxies. IV minimum requires juicy premium for scalp plays. Hopeful
+                cap limits non-Wheel directional bets to a small share of capital.
+              </p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <NumInput
+                name="options_min_dte"
+                label="Minimum DTE"
+                hint="Skip any options play within this many days of expiration. Mike's rule: avoid long calls inside 7 DTE unless setup explicitly accounts for theta. Default 7."
+                step={1}
+                min={0}
+                max={90}
+                defaultValue={s.options_min_dte ?? 7}
+                suffix="days"
+              />
+              <NumInput
+                name="options_max_premium_delta"
+                label="Max |delta| for premium-sell"
+                hint="Premium-sell setups (CSPs, spreads) whose absolute delta is above this are skipped — they're too close to short-stock proxies. Default 0.45."
+                step={0.05}
+                min={0}
+                max={1}
+                defaultValue={s.options_max_premium_delta ?? 0.45}
+              />
+              <NumInput
+                name="options_min_iv_rank_scalp"
+                label="Min IV rank for scalp"
+                hint="Scalp/short-DTE setups require IV percentile above this to be worth the theta burn. Default 30%."
+                step={1}
+                min={0}
+                max={100}
+                defaultValue={s.options_min_iv_rank_scalp ?? 30}
+                suffix="%"
+              />
+              <NumInput
+                name="options_hopeful_allocation_cap_pct"
+                label="Hopeful-holds allocation cap"
+                hint="Cap on directional long calls / debit spreads outside the Wheel, as a fraction of total options capital. Mike's rule: 3%."
+                step={0.01}
+                min={0}
+                max={1}
+                defaultValue={s.options_hopeful_allocation_cap_pct ?? 0.03}
+              />
+            </div>
+          </div>
+        ) : null}
+
         {expertVisible ? (
           <div className="mt-4">
             <ExpertOverrides />

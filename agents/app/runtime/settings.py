@@ -69,6 +69,12 @@ class BotSettings:
     # score, Risk Manager still approves, post-mortem still records the
     # would-have-done, but no open_position fires. Pure learn-only mode.
     auto_trade_enabled: bool = True
+    # Phase C+D options filters - per-user override of env defaults.
+    # Empty/None means "fall through to global Settings from .env".
+    options_min_dte: int | None = None
+    options_max_premium_delta: float | None = None
+    options_min_iv_rank_scalp: float | None = None
+    options_hopeful_allocation_cap_pct: float | None = None
 
 
 _DEFAULTS = BotSettings()
@@ -111,6 +117,10 @@ def _from_row(r: dict) -> BotSettings:
         wheel_auto_execute=bool(r.get("wheel_auto_execute", False)),
         expert_mode_enabled=bool(r.get("expert_mode_enabled", False)),
         auto_trade_enabled=bool(r.get("auto_trade_enabled", True)),
+        options_min_dte=(int(r["options_min_dte"]) if r.get("options_min_dte") is not None else None),
+        options_max_premium_delta=(float(r["options_max_premium_delta"]) if r.get("options_max_premium_delta") is not None else None),
+        options_min_iv_rank_scalp=(float(r["options_min_iv_rank_scalp"]) if r.get("options_min_iv_rank_scalp") is not None else None),
+        options_hopeful_allocation_cap_pct=(float(r["options_hopeful_allocation_cap_pct"]) if r.get("options_hopeful_allocation_cap_pct") is not None else None),
     )
 
 

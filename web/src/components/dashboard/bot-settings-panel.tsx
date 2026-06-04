@@ -1,6 +1,26 @@
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 
+// Shape of the bot_settings row matching the .select() below. Used to
+// cast the Supabase response (its type inference returns a union that
+// includes GenericStringError otherwise). 2026-06-03 cleanup.
+type BotSettingsRow = {
+  tcs_threshold: number | null;
+  max_open_positions: number | null;
+  consecutive_loss_limit: number | null;
+  risk_per_trade_pct: number | null;
+  default_stop_pct: number | null;
+  default_target_pct: number | null;
+  pattern_enabled: boolean | null;
+  stms_enabled: boolean | null;
+  extended_enabled: boolean | null;
+  crypto_enabled: boolean | null;
+  autonomy_mode: string | null;
+  account_posture: string | null;
+  pattern_weights: Record<string, number> | null;
+  updated_at: string | null;
+};
+
 /**
  * Bot settings · in force panel.
  *
@@ -13,7 +33,7 @@ import { cn } from "@/lib/utils";
  */
 export async function BotSettingsPanel({ userId }: { userId: string }) {
   const supabase = createClient();
-  const { data: s } = await supabase
+  const { data: sRaw } = await supabase
     .from("bot_settings")
     .select(
       "tcs_threshold, max_open_positions, consecutive_loss_limit, " +
@@ -23,6 +43,7 @@ export async function BotSettingsPanel({ userId }: { userId: string }) {
     )
     .eq("user_id", userId)
     .maybeSingle();
+  const s = sRaw as BotSettingsRow | null;
 
   if (!s) {
     return (

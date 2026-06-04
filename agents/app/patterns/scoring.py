@@ -192,6 +192,22 @@ _FAMILY_WEIGHTS = {
     "mean_reversion": {"bb_position": 1.8, "vwap_alignment": 1.5,
                        "momentum": 1.2, "trend": 0.5, "breakout": 0.4,
                        "macd": 0.8},
+    # ---- Phase 13a cycle families -----------------------------------
+    # iv_premium_sell: short-vol strategies (sell rich premium into the
+    # earnings IV inflation). We DON'T need a strong trend signal -
+    # the trade is range/mean-reversion adjacent. Weight bb_position,
+    # vwap, iv_environment heavily; downweight trend/breakout.
+    "iv_premium_sell": {"bb_position": 1.7, "vwap_alignment": 1.5,
+                        "iv_environment": 1.6, "momentum": 0.9,
+                        "trend": 0.6, "breakout": 0.4, "volume": 0.8,
+                        "macd": 0.7},
+    # dividend_accumulation: a stock approaching ex-div should show
+    # orderly bid coming in - reward trend + market_alignment + vwap,
+    # downweight breakout/volume spikes (those suggest news, not bid).
+    "dividend_accumulation": {"trend": 1.5, "market_alignment": 1.4,
+                              "vwap_alignment": 1.4, "macd": 1.1,
+                              "momentum": 1.0, "breakout": 0.6,
+                              "volume": 0.7, "bb_position": 0.7},
 }
 
 # Which family each Trezo strategy scores under.
@@ -202,6 +218,11 @@ STRATEGY_FAMILY = {
     "crypto_scalp": "momentum",
     "crypto_swing": "trend",
     "crypto_dca": "mean_reversion",
+    # Phase 13a cycle-aware strategies (Layer B). These only enter the
+    # scoring pool when eligible_strategies() activates them based on
+    # the symbol's cycle position (earnings window / ex-div window).
+    "iv_crush_short": "iv_premium_sell",
+    "dividend_capture_long": "dividend_accumulation",
 }
 
 
@@ -290,6 +311,21 @@ def calculate_score(
         core += 15
         breakdown["catalyst"] = 15
 
+    # ---- Phase 13a cycle-strategy bonuses ----------------------------
+    # When the eligibility gate has activated a cycle strategy, reward
+    # the contextual conditions that make the trade make sense:
+    #   iv_crush_short        : high IV rank (>= 60) means premium IS
+    #                           inflated and worth selling.
+    #   dividend_capture_long : a trending market gives confidence the
+    #                           bid will hold through ex-div.
+    if strategy == "iv_crush_short" and ctx.iv_rank is not None and ctx.iv_rank >= 60:
+        bonus = min(20.0, (ctx.iv_rank - 60.0) * 0.5 + 10.0)
+        core += bonus
+        breakdown["iv_crush_premium"] = bonus
+    elif strategy == "dividend_capture_long" and ctx.spy_trending_up is True:
+        core += 10.0
+        breakdown["dividend_market_alignment"] = 10.0
+
     score_int = max(0, min(100, int(round(core))))
     return Score(
         score=score_int,
@@ -307,12 +343,12 @@ def calculate_score(
 def scale_to_tcs(score_100: int, ctx: MarketContext) -> int:
     """Translate 0-100 pattern score into 0-1000 Trade Confidence Score.
 
-    Allocation (from TREZO_PATTERN_ENGINE.md §4):
-      - Technical (pattern):    300 max  ← from score_100
-      - Options environment:    250 max  ← from IV rank
-      - Fundamental/event:      200 max  ← catalyst signal
-      - Risk/reward:            150 max  ← placeholder until Risk Manager wired
-      - Market conditions:      100 max  ← SPY trending + confluence
+    Allocation (from TREZO_PATTERN_ENGINE.md section 4):
+      - Technical (pattern):    300 max  - from score_100
+      - Options environment:    250 max  - from IV rank
+      - Fundamental/event:      200 max  - catalyst signal
+      - Risk/reward:            150 max  - placeholder until Risk Manager wired
+      - Market conditions:      100 max  - SPY trending + confluence
     """
     technical = (score_100 / 100.0) * 300.0
 

@@ -210,7 +210,7 @@ class PatternDetectionAgent(Agent):
                 try:
                     sym = symbol.upper()
                     if sym not in candle_cache:
-                        candle_cache[sym] = await fetch_candles_for(symbol)
+                        candle_cache[sym] = await fetch_candles_for(symbol, "stock")
                     candles = candle_cache[sym]
                     if not candles:
                         continue

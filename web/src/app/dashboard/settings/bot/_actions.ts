@@ -24,7 +24,12 @@ const schema = z.object({
   wheel_auto_execute: z.coerce.boolean(),
   expert_mode_enabled: z.coerce.boolean(),
   terse_format_enabled: z.coerce.boolean(),
-  auto_trade_enabled: z.coerce.boolean()
+  auto_trade_enabled: z.coerce.boolean(),
+  // Phase C options Greek filters - per-user override of env defaults.
+  options_min_dte: z.coerce.number().int().min(0).max(90),
+  options_max_premium_delta: z.coerce.number().min(0).max(1),
+  options_min_iv_rank_scalp: z.coerce.number().min(0).max(100),
+  options_hopeful_allocation_cap_pct: z.coerce.number().min(0).max(1)
 });
 
 export type BotFormState = { ok: boolean; message?: string };
@@ -68,7 +73,11 @@ export async function saveBotSettings(
     wheel_auto_execute: formData.get("wheel_auto_execute") === "on",
     expert_mode_enabled: formData.get("expert_mode_enabled") === "on",
     terse_format_enabled: formData.get("terse_format_enabled") === "on",
-    auto_trade_enabled: formData.get("auto_trade_enabled") === "on"
+    auto_trade_enabled: formData.get("auto_trade_enabled") === "on",
+    options_min_dte: formData.get("options_min_dte") ?? 7,
+    options_max_premium_delta: formData.get("options_max_premium_delta") ?? 0.45,
+    options_min_iv_rank_scalp: formData.get("options_min_iv_rank_scalp") ?? 30,
+    options_hopeful_allocation_cap_pct: formData.get("options_hopeful_allocation_cap_pct") ?? 0.03
   };
 
   const parsed = schema.safeParse(raw);

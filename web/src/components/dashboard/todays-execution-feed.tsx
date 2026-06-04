@@ -143,6 +143,16 @@ function kindColor(kind: string): string {
   return "bg-weave-50 text-weave-500";
 }
 
+// Phase E: pull a one-line memory-driven hint from learning_context
+// when present. Risk Manager + Options Scanner attach this to every
+// approve / wheel_suggestion. Empty string when absent.
+function learningHint(p: Record<string, unknown>): string {
+  const lc = (p as { learning_context?: { available?: boolean; summary?: string } })
+    .learning_context;
+  if (!lc || lc.available === false) return "";
+  return lc.summary || "";
+}
+
 function describe(kind: string, p: Record<string, unknown>): string {
   if (kind === "signal") {
     const tcs = (p as { tcs?: number }).tcs;
@@ -157,7 +167,9 @@ function describe(kind: string, p: Record<string, unknown>): string {
       .join(" · ");
   }
   if (kind === "approve") {
-    return (p as { note?: string }).note || "approved by Risk Manager";
+    const base = (p as { note?: string }).note || "approved by Risk Manager";
+    const hint = learningHint(p);
+    return hint ? `${base} · ${hint}` : base;
   }
   if (kind === "veto") {
     return (p as { reason?: string; note?: string }).reason ||
@@ -190,6 +202,24 @@ function describe(kind: string, p: Record<string, unknown>): string {
   }
   if (kind === "error") {
     return (p as { error?: string }).error || "error";
+  }
+  // info rows — covers wheel_suggestion / options_idea / filtered emits
+  // from the Options Scanner. Surface the event + bucket + learning hint.
+  if (kind === "info") {
+    const event = (p as { event?: string }).event;
+    const bucket = (p as { bucket?: string }).bucket;
+    const note = (p as { note?: string }).note;
+    if (event) {
+      const hint = learningHint(p);
+      const parts: (string | null | undefined)[] = [
+        event.replace(/_/g, " "),
+        bucket ? `bucket=${bucket}` : null,
+        note,
+        hint || null,
+      ];
+      return parts.filter(Boolean).join(" · ");
+    }
+    return note || JSON.stringify(p).slice(0, 80);
   }
   return JSON.stringify(p).slice(0, 80);
 }

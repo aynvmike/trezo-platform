@@ -115,6 +115,47 @@ async def record_paper_close(
         log.warning("learning.record_failed",
                     position_id=position_id, error=str(e)[:200])
 
+    # Also log to Mem0 so the agents have a queryable outcome record
+    # tomorrow. Reference the risk_manager decision IDs that led to
+    # this trade so the loop closes: approval -> outcome -> next-day
+    # recall. Best-effort: a Mem0 failure here is silent.
+    try:
+        from app.memory import get_memory, TradeOutcome
+        mem = get_memory()
+        if mem.available:
+            related: list[str] = []
+            rm_id = payload.get("risk_manager_memory_id")
+            if isinstance(rm_id, str) and rm_id:
+                related.append(rm_id)
+            # Future agents can append their own memory IDs here too.
+            holding_days = 0
+            if hold_minutes is not None:
+                holding_days = int(hold_minutes // (60 * 24))
+            outcome_meta = {
+                "position_id": position_id,
+                "user_id": user_id,
+                "tcs_at_entry": payload.get("tcs"),
+                "iv_environment_at_entry": cycle.get("iv_environment"),
+                "regime_at_entry": scope.get("regime"),
+                "asset_type": asset_type,
+                "status": status,
+            }
+            mem.log_outcome(TradeOutcome(
+                ticker=ticker,
+                side=side or "long",
+                entry_price=float(entry_price),
+                exit_price=float(exit_price),
+                realized_pnl_usd=float(realized_pnl_usd),
+                holding_days=holding_days,
+                exit_reason=exit_reason,
+                strategy=strategy or "unknown",
+                related_decisions=related,
+                metadata=outcome_meta,
+            ))
+    except Exception as e:  # noqa: BLE001
+        log.warning("learning.mem0_log_failed",
+                    position_id=position_id, error=str(e)[:200])
+
 
 # ----------------------------------------------------------------------
 # Stats helpers
@@ -215,47 +256,45 @@ async def get_strategy_stats(
     }
 
 
-def suggest_tuning(strategy_stats: dict[str, Any]) -> list[dict[str, Any]]:
-    """Turn per-strategy stats into plain-English suggestions. Returns
-    a list of dicts that the UI can render with a "Apply" button.
 
-    The rules are intentionally simple — a tiny knob-tuner, not an
-    optimizer. Auto-apply is OFF; suggestions live in a sidebar.
+def suggest_tuning(strategy_stats: dict[str, Any]) -> list[dict[str, Any]]:
+    """Turn per-strategy stats into plain-English suggestions.
+
+    Reads the by_strategy bucket from `get_strategy_stats()` and
+    returns a small list of actionable tuning notes the Bot Tuning
+    page can render in an amber callout. Each suggestion is a dict
+    with keys: strategy, message, severity.
     """
-    out: list[dict[str, Any]] = []
-    for strat, s in (strategy_stats.get("by_strategy") or {}).items():
-        if s["n"] < 6 or s["wins"] == 0 or s["losses"] == 0:
+    suggestions: list[dict[str, Any]] = []
+    by_strat = (strategy_stats or {}).get("by_strategy") or {}
+    for strat, stats in by_strat.items():
+        n = stats.get("n") or 0
+        if n < 5:
             continue
-        wt = s.get("median_tcs_winners")
-        lt = s.get("median_tcs_losers")
-        if wt is None or lt is None:
-            continue
-        gap = wt - lt
-        # Winners need to be noticeably higher-TCS than losers to be a
-        # real signal. >= 60 TCS is the cutoff we use as a sanity gate.
-        if gap >= 60:
-            target = int(round((wt - 50) / 25) * 25)
-            out.append({
+        wr = stats.get("win_rate")
+        med_winner_tcs = stats.get("median_winner_tcs")
+        med_loser_tcs = stats.get("median_loser_tcs")
+        # Heuristic 1: winners have a clearly higher TCS than losers -
+        # raise the floor toward the winners' median.
+        if (med_winner_tcs is not None and med_loser_tcs is not None
+                and med_winner_tcs - med_loser_tcs >= 80):
+            suggestions.append({
                 "strategy": strat,
-                "kind": "raise_tcs_floor",
-                "current_median_winners": int(wt),
-                "current_median_losers": int(lt),
-                "suggested_tcs_floor": target,
-                "note": (
-                    f"{strat.upper()} winners had median TCS {int(wt)} vs "
-                    f"losers at {int(lt)} ({gap:.0f} point gap). "
-                    f"Consider raising the TCS floor toward {target}."
+                "severity": "info",
+                "message": (
+                    f"{strat} winners had median TCS {med_winner_tcs} vs "
+                    f"losers {med_loser_tcs} - consider raising the floor "
+                    f"toward {med_winner_tcs}."
                 ),
             })
-        elif (s.get("win_rate") or 0) < 0.35 and s["n"] >= 10:
-            out.append({
+        # Heuristic 2: poor win rate over a meaningful sample.
+        if wr is not None and n >= 10 and wr < 0.40:
+            suggestions.append({
                 "strategy": strat,
-                "kind": "pause_strategy",
-                "win_rate": s["win_rate"],
-                "note": (
-                    f"{strat.upper()} is at {s['win_rate']*100:.0f}% win rate "
-                    f"over {s['n']} trades. Consider pausing in Bot Tuning "
-                    "while you investigate."
+                "severity": "warn",
+                "message": (
+                    f"{strat} is at {wr*100:.0f}% win rate over {n} trades. "
+                    "Consider pausing or tightening filters."
                 ),
             })
-    return out
+    return suggestions

@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
 import { TrimDialog } from "./trim-dialog";
+import { OptionsTrimButton } from "./options-trim-button";
 
 type Alert = {
   id: string;
@@ -16,6 +17,7 @@ type Alert = {
 };
 
 const KIND_LABEL: Record<string, string> = {
+  // Stock-side (existing Exit Advisor)
   peak_giveback: "Peak giveback",
   stop_approaching: "Stop approaching",
   time_in_trade: "Capital parked",
@@ -23,7 +25,28 @@ const KIND_LABEL: Record<string, string> = {
   target_hit: "Target hit",
   held_too_long: "Held too long",
   decayed_thesis: "Thesis decayed",
+  // Options-side (Phase B / D — ExitAdvisorOptionsAgent)
+  drawdown_tolerance_hit: "Drawdown ceiling hit",
+  save_profit_before_negative: "Save profit",
+  defensive_trim: "Defensive trim",
+  trim_for_capital_recovery: "Capital recovery",
+  profit_target_low_tier: "Profit target (low contracts)",
+  emotion_cap_take_gain: "Emotion cap (high contracts)",
+  hopeful_near_cap: "Hopeful bucket near cap",
 };
+
+// Options-specific alert kinds — used to swap UI affordances (no
+// stock TrimDialog for options, show an "Options" badge, use the
+// OptionsTrimButton instead).
+const OPTIONS_KINDS = new Set([
+  "drawdown_tolerance_hit",
+  "save_profit_before_negative",
+  "defensive_trim",
+  "trim_for_capital_recovery",
+  "profit_target_low_tier",
+  "emotion_cap_take_gain",
+  "hopeful_near_cap",
+]);
 
 /**
  * ExitAdvisorAlerts — surfaces the Exit Advisor's open (unacknowledged)
@@ -85,14 +108,26 @@ export async function ExitAdvisorAlerts() {
                   <span className="text-[10px] uppercase tracking-widest opacity-80">
                     {KIND_LABEL[a.alert_kind] ?? a.alert_kind}
                   </span>
+                  {OPTIONS_KINDS.has(a.alert_kind) ? (
+                    <span className="text-[9px] uppercase tracking-widest rounded-full bg-treasure-100 text-treasure-700 px-1.5 py-0.5 font-medium">
+                      Options
+                    </span>
+                  ) : null}
                 </div>
                 <div className="flex items-baseline gap-3">
-                  {/* Trim button only on decayed_thesis alerts with a
-                      position to act on. Posts to the trim API which
-                      sells 50% of the position at market and frees
-                      the capital. Mike 2026-06-01. */}
-                  {a.alert_kind === "decayed_thesis" && a.position_id ? (
+                  {/* Stock trim - decayed_thesis only. */}
+                  {a.alert_kind === "decayed_thesis"
+                    && a.position_id
+                    && !OPTIONS_KINDS.has(a.alert_kind) ? (
                     <TrimDialog positionId={a.position_id} />
+                  ) : null}
+                  {/* Options trim - on any options alert kind with a
+                      specific position. hopeful_near_cap is bucket-level
+                      so excluded. Task #29. */}
+                  {OPTIONS_KINDS.has(a.alert_kind)
+                    && a.alert_kind !== "hopeful_near_cap"
+                    && a.position_id ? (
+                    <OptionsTrimButton positionId={a.position_id} />
                   ) : null}
                   <form action="/api/exit-advisor/ack" method="post">
                     <input type="hidden" name="alert_id" value={a.id} />
@@ -108,13 +143,19 @@ export async function ExitAdvisorAlerts() {
               <p className="text-sm leading-relaxed">{a.message}</p>
               <div className="flex items-baseline gap-4 text-[11px] font-mono opacity-80 flex-wrap">
                 {a.current_price !== null ? (
-                  <span>Now ${a.current_price.toFixed(2)}</span>
+                  <span>
+                    {OPTIONS_KINDS.has(a.alert_kind) ? "Mark" : "Now"} $
+                    {a.current_price.toFixed(2)}
+                  </span>
                 ) : null}
                 {a.peak_price !== null ? (
                   <span>Peak ${a.peak_price.toFixed(2)}</span>
                 ) : null}
                 {a.giveback_pct !== null ? (
-                  <span>Giveback {(a.giveback_pct * 100).toFixed(0)}%</span>
+                  <span>
+                    {OPTIONS_KINDS.has(a.alert_kind) ? "Drawback" : "Giveback"}{" "}
+                    {(a.giveback_pct * 100).toFixed(0)}%
+                  </span>
                 ) : null}
                 {a.unrealized_pnl_usd !== null ? (
                   <span>Unrealized ${a.unrealized_pnl_usd.toFixed(0)}</span>

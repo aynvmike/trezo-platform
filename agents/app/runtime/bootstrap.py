@@ -11,6 +11,8 @@ from app.agents.adaptive_scope import AdaptiveScopeAgent
 from app.agents.crypto_scanner import CryptoScannerAgent
 from app.agents.cycle_awareness import CycleAwarenessAgent
 from app.agents.exit_advisor import ExitAdvisorAgent
+from app.agents.exit_advisor_options import ExitAdvisorOptionsAgent
+from app.agents.ops_watchdog import OpsWatchdogAgent
 from app.agents.dividend_manager import DividendManagerAgent
 from app.agents.extended_scanner import ExtendedScannerAgent
 from app.agents.kindrip_agent import KindripAgent
@@ -59,6 +61,8 @@ def bootstrap_agents() -> None:
     horizon   = MarketHorizonAgent()
     cycles    = CycleAwarenessAgent()
     exit_adv  = ExitAdvisorAgent()
+    exit_opts = ExitAdvisorOptionsAgent()
+    watchdog  = OpsWatchdogAgent()
 
     registry.register(pattern,   "Detects candlestick patterns and scores trade confidence (0-1000).",                  role="observer")
     registry.register(stms,      "Small-cap momentum scanner. Active 7-11 AM ET. Looks for $1-$20 stocks up 10%+ on 5x volume with TCS 750+.", role="observer")
@@ -80,6 +84,8 @@ def bootstrap_agents() -> None:
     registry.register(horizon,   "Market Horizon. Every 15 min reads the whole landscape - stocks, crypto, gold, USD, bonds, income ETFs - and notes who leads and whether the classic cross-asset relationships still hold.", role="observer")
     registry.register(cycles,    "Cycle Awareness (Phase 13). Every 6h reads upcoming earnings + ex-dividend dates per watchlist ticker; tags signals with cycle context so the bot picks strategies around the rhythm pros watch (IV crush, dividend capture).", role="observer")
     registry.register(exit_adv,  "Exit Advisor (Phase 13d). Every 5 min watches every open position for the held-too-long pattern - tracks the running peak unrealized P&L and raises a dashboard alert when the position gives back 30%+ of its peak gain. Never closes a trade; surfaces suggestions for the user to act on.", role="observer")
+    registry.register(exit_opts, "Exit Advisor - Options edition (Phase B). Every 5 min watches open option positions and applies Mike's rules: contract-count drives target (1-10 -> 30-50%, >10 -> 15%), drawback ladder (39/30/25%), catalyst-aware urgency bump. Never closes; surfaces alerts.", role="observer")
+    registry.register(watchdog,  "Operations Watchdog (Task #31, 21st agent). Every 5 min checks the runtime registry vs the expected-agent list and the last-tick time of every registered agent. Raises ops_health_alerts when an agent is missing or has gone silent during market hours.", role="observer")
 
     # Wire on_message handlers - agents react to each other's messages.
     async def _route(message):

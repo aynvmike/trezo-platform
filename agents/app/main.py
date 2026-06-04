@@ -4,6 +4,7 @@ import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Loud debug marker so we can confirm THIS file is the one uvicorn loaded.
 print(f"[trezo-agents] main.py LOADED build=PHASE5-D2 file={__file__}", file=sys.stderr, flush=True)
@@ -650,226 +651,11 @@ async def wheel_reconcile():
 
 @app.post("/stocks/reconcile", tags=["paper"])
 async def stocks_reconcile():
-    """Force a stock-side reconciliation: bring Trezo's open paper_positions
-    rows for stocks in line with what Alpaca actually holds.
-
-    Why this exists (Mike 2026-05-29): a user opened a SOFI position in
-    two fills (3 shares + 4 shares) but Trezo's local DB only captured
-    one fill (qty=3). Alpaca was the truth at qty=7, $18.23 avg entry,
-    but Trezo's dashboard showed qty=3 at $16.98. That mismatch matters
-    because (a) sizing math uses Trezo's view, (b) the user gets
-    confused which is the truth.
-
-    Behavior:
-      - For each open Trezo paper_position with broker='alpaca':
-          * If Alpaca holds nothing in that symbol -> close the row
-            with status='closed_manual' and a reconcile note.
-          * If Alpaca's qty / avg_entry differs from Trezo's -> patch
-            the Trezo row to match Alpaca (broker truth wins).
-      - For each Alpaca position not present in Trezo (was missed at
-        fill time) -> insert a tracking row via record_external_position.
-
-    The agent-side `/wheel/reconcile` is the options-side equivalent.
-    """
-    from app.brokers.alpaca import (
-        alpaca_configured, get_positions, get_account, UserToken,
-    )
-    from app.paper.engine import record_external_position
-    from app.integrations.web_tokens import get_user_broker_token
-    from app.config import get_settings as _gs
-
-    s = _gs()
-    if not (s.supabase_url and s.supabase_service_role_key):
-        return {"ok": False, "error": "Supabase not configured."}
-
-    try:
-        from supabase import create_client
-        client = create_client(s.supabase_url, s.supabase_service_role_key)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"Supabase client error: {e}"}
-
-    if not alpaca_configured():
-        return {"ok": False, "error": "Alpaca env keys not configured."}
-
-    import asyncio
-
-    def _users():
-        return client.table("paper_accounts").select("user_id").execute()
-    user_rows = (await asyncio.to_thread(_users)).data or []
-
-    total_updated = 0
-    total_inserted = 0
-    total_closed = 0
-    per_user: list[dict] = []
-
-    for u in user_rows:
-        user_id = u.get("user_id")
-        if not user_id:
-            continue
-
-        # Per-user token if OAuth-wired, else env keys.
-        bt = await get_user_broker_token(user_id, "alpaca")
-        token = UserToken(
-            access_token=bt.access_token,
-            refresh_token=bt.refresh_token,
-            expires_at=bt.expires_at,
-        ) if bt else None
-
-        try:
-            alpaca_positions = await get_positions(token=token)
-        except Exception:
-            alpaca_positions = []
-
-        # Index Alpaca positions by symbol (uppercase).
-        alpaca_by_sym: dict[str, dict] = {}
-        for p in alpaca_positions:
-            sym = str(p.get("symbol", "")).upper()
-            if sym:
-                alpaca_by_sym[sym] = p
-
-        # Trezo's open stock positions for this user.
-        def _trezo_open(uid=user_id):
-            return (
-                client.table("paper_positions")
-                .select("id, ticker, side, quantity, entry_price, stop_price, target_price, strategy")
-                .eq("user_id", uid)
-                .eq("status", "open")
-                .eq("asset_type", "stock")
-                .execute()
-            )
-        trezo_rows = (await asyncio.to_thread(_trezo_open)).data or []
-        trezo_syms = {str(r["ticker"]).upper() for r in trezo_rows}
-
-        updated = 0
-        closed = 0
-        inserted = 0
-        notes_list: list[str] = []
-
-        # 1) Update or close existing Trezo rows.
-        for r in trezo_rows:
-            sym = str(r["ticker"]).upper()
-            ap = alpaca_by_sym.get(sym)
-            if ap is None:
-                # Alpaca has nothing in this symbol - close as reconciled.
-                def _close(rid=r["id"]):
-                    return (
-                        client.table("paper_positions")
-                        .update({
-                            "status": "closed_manual",
-                            "closed_at": "now()",
-                            "exit_at": "now()",
-                            "realized_pnl_usd": 0.0,
-                        })
-                        .eq("id", rid)
-                        .execute()
-                    )
-                await asyncio.to_thread(_close)
-                closed += 1
-                notes_list.append(f"{sym} closed (not at broker)")
-                continue
-
-            # Alpaca has this symbol. Compare qty + avg_entry. If
-            # they differ, patch Trezo to match (broker truth wins).
-            try:
-                ap_qty = float(ap.get("qty") or 0)
-                ap_entry = float(ap.get("avg_entry_price") or 0)
-            except (TypeError, ValueError):
-                ap_qty = 0
-                ap_entry = 0
-            ap_side = "long" if ap_qty > 0 else "short"
-            ap_qty_abs = abs(ap_qty)
-
-            cur_qty = float(r.get("quantity") or 0)
-            cur_entry = float(r.get("entry_price") or 0)
-
-            if (abs(cur_qty - ap_qty_abs) > 1e-6
-                or abs(cur_entry - ap_entry) > 0.005
-                or r.get("side") != ap_side):
-                def _patch(rid=r["id"]):
-                    return (
-                        client.table("paper_positions")
-                        .update({
-                            "quantity": ap_qty_abs,
-                            "entry_price": ap_entry,
-                            "side": ap_side,
-                        })
-                        .eq("id", rid)
-                        .execute()
-                    )
-                await asyncio.to_thread(_patch)
-                updated += 1
-                notes_list.append(
-                    f"{sym} patched qty {cur_qty}->{ap_qty_abs}, entry "
-                    f"${cur_entry:.2f}->${ap_entry:.2f}"
-                )
-
-        # 2) Insert Alpaca positions that Trezo doesn't have.
-        for sym, ap in alpaca_by_sym.items():
-            if sym in trezo_syms:
-                continue
-            try:
-                ap_qty = float(ap.get("qty") or 0)
-                ap_entry = float(ap.get("avg_entry_price") or 0)
-            except (TypeError, ValueError):
-                continue
-            if ap_qty == 0 or ap_entry <= 0:
-                continue
-            side = "long" if ap_qty > 0 else "short"
-            qty_abs = abs(ap_qty)
-
-            # Use bot-settings default stop/target so the row carries
-            # reasonable exits. Fine adjustments stay with the broker.
-            from app.runtime.settings import get_bot_settings
-            cfg = get_bot_settings(user_id)
-            sp = float(cfg.default_stop_pct or 0.05)
-            tp = float(cfg.default_target_pct or 0.10)
-            if side == "long":
-                stop_price = ap_entry * (1 - sp)
-                target_price = ap_entry * (1 + tp)
-            else:
-                stop_price = ap_entry * (1 + sp)
-                target_price = ap_entry * (1 - tp)
-
-            try:
-                await record_external_position(
-                    user_id=str(user_id),
-                    ticker=sym,
-                    asset_type="stock",
-                    side=side,
-                    quantity=qty_abs,
-                    entry_price=ap_entry,
-                    stop_price=stop_price,
-                    target_price=target_price,
-                    strategy="reconciled",
-                    broker="alpaca",
-                    broker_order_id=None,
-                    source_payload={"reconcile": True, "alpaca_avg_entry": ap_entry},
-                )
-                inserted += 1
-                notes_list.append(f"{sym} inserted from broker (qty {qty_abs})")
-            except Exception:
-                continue
-
-        total_updated += updated
-        total_inserted += inserted
-        total_closed += closed
-        per_user.append({
-            "user_id": str(user_id),
-            "updated": updated,
-            "inserted": inserted,
-            "closed": closed,
-            "notes": notes_list,
-        })
-
-    return {
-        "ok": True,
-        "users_touched": len(per_user),
-        "updated": total_updated,
-        "inserted": total_inserted,
-        "closed": total_closed,
-        "details": per_user,
-    }
-
+    """Force a stock-side reconciliation. Real work lives in
+    app/paper/stocks_reconcile.py so PositionMonitor can call the same
+    code on a 30-min schedule (Task #32, 2026-06-03)."""
+    from app.paper.stocks_reconcile import reconcile_stocks_all_users
+    return await reconcile_stocks_all_users()
 
 @app.post("/admin/manual-trade", tags=["admin"])
 async def admin_manual_trade(user_id: str, ticker: str, side: str = "long",
@@ -1205,6 +991,22 @@ async def admin_settings_audit():
         "switching_mode": cfg.switching_mode,
         "switching_advantage_pct": cfg.switching_advantage_pct,
         "wheel_auto_execute": cfg.wheel_auto_execute,
+        # Phase C+D options filters (Path α): show per-user override when
+        # set, else what the agent will actually use (env default).
+        "options_min_dte": (cfg.options_min_dte
+                            if cfg.options_min_dte is not None
+                            else int(s.options_min_dte)),
+        "options_max_premium_delta": (cfg.options_max_premium_delta
+                                      if cfg.options_max_premium_delta is not None
+                                      else float(s.options_max_premium_delta)),
+        "options_min_iv_rank_scalp": (cfg.options_min_iv_rank_scalp
+                                      if cfg.options_min_iv_rank_scalp is not None
+                                      else float(s.options_min_iv_rank_scalp)),
+        "options_hopeful_allocation_cap_pct": (
+            cfg.options_hopeful_allocation_cap_pct
+            if cfg.options_hopeful_allocation_cap_pct is not None
+            else float(s.options_hopeful_allocation_cap_pct)
+        ),
     }
     out["live_in_agents"] = live
 
@@ -1552,6 +1354,127 @@ async def learning_insights(user_id: str, lookback_days: int = 30):
     stats = await get_strategy_stats(user_id, lookback_days=lookback_days)
     stats["suggestions"] = suggest_tuning(stats)
     return stats
+
+
+# ----------------------------------------------------------------------
+# Trim endpoints - stocks (capital recycling, shipped 2026-06-01) and
+# options (task #29 v1, modeled close, 2026-06-02). Both proxy to a
+# specialized async primitive in app/paper/.
+# ----------------------------------------------------------------------
+
+class _StockTrimReq(BaseModel):
+    user_id: str
+    position_id: str
+    ticker: str | None = None
+    asset_type: str | None = None
+    fraction: float
+    reason: str = "user_trim"
+
+
+@app.post("/paper/positions/trim", tags=["paper"])
+async def paper_positions_trim(req: _StockTrimReq) -> dict:
+    """Sell a fraction of an open paper position. Backs the stock
+    Trim button on Exit Advisor alerts. The slice's P&L lands in
+    today_realized_pnl_usd; the remaining position keeps trading."""
+    from app.paper.engine import close_partial_position
+    # We need a market price for the slice. Fetch from candles.
+    market_price = 0.0
+    try:
+        from app.data.candles import fetch_candles_for
+        candles = await fetch_candles_for(
+            req.ticker or "", req.asset_type or "stock"
+        )
+        if candles:
+            market_price = float(candles[-1].close)
+    except Exception:
+        pass
+    if market_price <= 0:
+        return {"ok": False, "error": "no_market_price"}
+    result = await close_partial_position(
+        user_id=req.user_id,
+        position_id=req.position_id,
+        fraction=req.fraction,
+        market_price=market_price,
+        reason=req.reason,
+    )
+    return {
+        "ok": getattr(result, "ok", False),
+        "error": getattr(result, "error", None),
+        "realized_pnl_usd": getattr(result, "realized_pnl_usd", None),
+        "filled_qty": getattr(result, "filled_qty", None),
+        "fill_price": getattr(result, "fill_price", None),
+    }
+
+
+class _OptionsTrimReq(BaseModel):
+    user_id: str
+    position_id: str
+    contracts_to_close: int
+    reason: str = "user_trim"
+
+
+@app.post("/paper/options/trim", tags=["paper"])
+async def paper_options_trim(req: _OptionsTrimReq) -> dict:
+    """Close N contracts of an open options_positions row. Backs the
+    Trim button on options Exit Advisor alerts. Task #29 v1: modeled
+    close only - the user is expected to mirror live broker orders
+    manually until v2 ships."""
+    from app.paper.options_trim import close_partial_options_position
+    return await close_partial_options_position(
+        user_id=req.user_id,
+        position_id=req.position_id,
+        contracts_to_close=req.contracts_to_close,
+        reason=req.reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI lifecycle hooks - load the agents and start the scheduler.
+# Mike 2026-06-03: this was MISSING for days, which is why bootstrap
+# never ran, the registry was empty, no scanners ticked, and the bot
+# went silent. Adding the startup hook is the single fix that brings
+# the platform back online.
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    """Bootstrap every agent into the registry, then start the
+    APScheduler tick loop. Both calls are idempotent so re-runs
+    (uvicorn reload) won't double-register."""
+    try:
+        bootstrap_agents()
+        log.info(
+            "agents.bootstrap.complete",
+            count=len(registry.all()),
+        )
+    except Exception as e:
+        log.error("agents.bootstrap.FAILED", error=str(e))
+        # Don't swallow - if bootstrap fails, scanners won't tick.
+        # Re-raise so uvicorn logs the traceback.
+        raise
+
+    try:
+        start_scheduler(app=app, registry=registry)
+        log.info("agents.scheduler.started")
+    except TypeError:
+        # Older signature with no kwargs
+        try:
+            start_scheduler()
+            log.info("agents.scheduler.started.fallback")
+        except Exception as e:
+            log.error("agents.scheduler.FAILED", error=str(e))
+    except Exception as e:
+        log.error("agents.scheduler.FAILED", error=str(e))
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    """Stop the APScheduler tick loop cleanly so uvicorn reload doesn't
+    leak the prior scheduler instance."""
+    try:
+        stop_scheduler()
+    except Exception:
+        pass
 
 
 @app.get("/health")

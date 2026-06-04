@@ -7,6 +7,8 @@ import { WheelLiveQuotes } from "@/components/dashboard/wheel-live-quotes";
 import { WheelLivePositions } from "@/components/dashboard/wheel-live-positions";
 import { WheelReconcileButton } from "@/components/dashboard/wheel-reconcile-button";
 import { WheelUniversePanel } from "@/components/dashboard/wheel-universe-panel";
+import { OpenOptionsTable } from "@/components/dashboard/open-options-table";
+import { WheelAcquisitionQueue } from "@/components/dashboard/wheel-acquisition-queue";
 import { OptionsApprovalBadge } from "@/components/dashboard/options-approval-badge";
 import { fetchAlpacaSnapshot } from "@/lib/alpaca-snapshot";
 import {
@@ -448,36 +450,42 @@ export default async function WheelPage() {
 
       <WheelLivePositions userId={user.id} />
 
+      {/* Task #28: complete options book with bucket badges (wheel /
+          income / hopeful) and DTE color-coding. Bucket-aware view -
+          shows hopeful holds and other non-Wheel options alongside the
+          Wheel. */}
+      <OpenOptionsTable />
+
       <WheelLiveQuotes underlyings={WHEEL_WATCHLIST} />
 
-      {/* Per-underlying cycle state — the bot's view of where each name is */}
-      <section className="space-y-3">
-        <div className="flex items-baseline justify-between gap-3 flex-wrap">
-          <div>
-            <h2 className="font-serif text-xl text-weave-800">
-              Modeled wheel planner — where each name would be
-            </h2>
-            <p className="beginner-only mt-1 text-sm text-weave-500">
-              This is the bot&apos;s <span className="font-medium">modeled
-              plan</span>, not your real broker positions. It shows where
-              each name <span className="italic">would</span> be on the
-              wheel if the bot ran the cycle on its own. Your actual
-              broker legs live in the <span className="font-medium">Live
-              Wheel positions</span> card above. The two will only match
-              when you&apos;ve placed real CSPs / CCs via the Place
-              buttons.
-            </p>
+      {/* Task #35: Acquisition Queue replaces the example-grid as the
+          primary signal of what the bot is actually queueing. The full
+          17-name example planner moves into a collapsed disclosure
+          below for those who still want the reference. */}
+      <WheelAcquisitionQueue />
+
+      <Disclosure title="Show full example planner (all watchlist names)">
+        <section className="space-y-3">
+          <div className="flex items-baseline justify-between gap-3 flex-wrap">
+            <div>
+              <p className="text-sm text-weave-500 leading-relaxed">
+                This is the bot&apos;s <span className="font-medium">modeled
+                plan</span> for every watchlist name, not your real broker
+                positions. Use this as a reference for how the wheel cycle
+                LOOKS — for active picks, see the Acquisition Queue above.
+              </p>
+            </div>
+            <span className="text-[10px] uppercase tracking-widest rounded-full bg-weave-100 text-weave-600 px-2 py-0.5 shrink-0">
+              Modeled · not broker
+            </span>
           </div>
-          <span className="text-[10px] uppercase tracking-widest rounded-full bg-weave-100 text-weave-600 px-2 py-0.5 shrink-0">
-            Modeled · not broker
-          </span>
-        </div>
-        <div className="grid gap-3 lg:grid-cols-2">
-          {cycles.map((c) => (
-            <CycleCard key={c.underlying} cycle={c} />
-          ))}
-        </div>
-      </section>
+          <div className="grid gap-3 lg:grid-cols-2">
+            {cycles.map((c) => (
+              <CycleCard key={c.underlying} cycle={c} />
+            ))}
+          </div>
+        </section>
+      </Disclosure>
 
       {/* Income breakdown — premium + dividends + FPSL */}
       <section className="space-y-3">

@@ -33,6 +33,52 @@ MAX_ATR_STRETCH = 4.0          # ATRs from the 20-day mean before "overextended"
 MAX_SPREAD_PCT = 0.005         # widest bid/ask spread before a name is "illiquid"
 _CACHE_TTL = 120.0
 
+# Per-strategy liquidity floors. Each strategy has its own thesis on
+# what "tradeable" means - STMS hunts small-caps where 1M shares/day is
+# WAY too restrictive; the curated Wheel watchlist is pre-filtered so
+# the floor only catches mistakes. The constants above remain the
+# fallback for any strategy not listed here.
+#
+# Mike 2026-06-03: the platform-wide 1M floor was filtering everything
+# out of STMS for days. Per-strategy floors fix the structural mismatch.
+STRATEGY_LIQUIDITY_FLOORS: dict[str, dict[str, float]] = {
+    # STMS - small-cap momentum, $1-$20 stocks, 5x-volume breakouts.
+    # Low floors are the whole point of the strategy.
+    "stms": {"min_price": 1.0, "min_avg_volume": 100_000},
+    # ORB - opening range breakout. Needs decent participation but
+    # doesn't require mega-cap liquidity.
+    "orb": {"min_price": 3.0, "min_avg_volume": 500_000},
+    # Extended - multi-day swing on EMA50 pullbacks. Wants the full
+    # liquidity story so fills are clean across days.
+    "extended": {"min_price": 5.0, "min_avg_volume": 1_000_000},
+    # Pattern detection - flexible, runs on the watchlist + market pool.
+    # Default 1M floor is appropriate for the names it most often hits.
+    "pattern": {"min_price": 5.0, "min_avg_volume": 1_000_000},
+    # Wheel CSP / CC - the universe is curated (WHEEL_WATCHLIST) so the
+    # floor is just a sanity check. Medium-high floor is fine because
+    # the curated list already screens above this.
+    "wheel_csp": {"min_price": 5.0, "min_avg_volume": 500_000},
+    "wheel_cc": {"min_price": 5.0, "min_avg_volume": 500_000},
+    # Cycle-aware strategies (Layer B). Inherit pattern's defaults until
+    # we have outcome data to tune them.
+    "iv_crush_short": {"min_price": 5.0, "min_avg_volume": 1_000_000},
+    "dividend_capture_long": {"min_price": 5.0, "min_avg_volume": 500_000},
+}
+
+
+def _floors_for(strategy: str | None) -> tuple[float, float]:
+    """Return (min_price, min_avg_volume) for the given strategy.
+    Unmapped or empty strategy -> the global defaults."""
+    if not strategy:
+        return MIN_PRICE, MIN_AVG_VOLUME
+    floors = STRATEGY_LIQUIDITY_FLOORS.get(str(strategy).lower())
+    if not floors:
+        return MIN_PRICE, MIN_AVG_VOLUME
+    return (
+        float(floors.get("min_price", MIN_PRICE)),
+        float(floors.get("min_avg_volume", MIN_AVG_VOLUME)),
+    )
+
 
 @dataclass
 class MarketBias:
@@ -99,18 +145,25 @@ def direction_blocked(bias: MarketBias, side: str) -> Optional[str]:
     return None
 
 
-def liquidity_check(candles) -> Optional[str]:
-    """Return a veto reason if the symbol fails the liquidity floor."""
+def liquidity_check(candles, strategy: str | None = None) -> Optional[str]:
+    """Return a veto reason if the symbol fails the liquidity floor.
+
+    Per-strategy floors per Mike's 2026-06-03 ask. The global constants
+    MIN_PRICE / MIN_AVG_VOLUME stay as the fallback for any strategy
+    not in STRATEGY_LIQUIDITY_FLOORS.
+    """
     if not candles:
         return "No price data for the liquidity check"
+    min_price, min_volume = _floors_for(strategy)
     price = float(candles[-1].close)
-    if price < MIN_PRICE:
-        return (f"Liquidity filter: price ${price:.2f} is below the "
-                f"${MIN_PRICE:.0f} minimum")
+    if price < min_price:
+        return (f"Liquidity filter [{strategy or 'default'}]: price "
+                f"${price:.2f} is below the ${min_price:.0f} minimum")
     av = avg_volume(candles, 20)
-    if av < MIN_AVG_VOLUME:
-        return (f"Liquidity filter: average volume {av:,.0f} is below the "
-                f"{MIN_AVG_VOLUME:,.0f}-share minimum")
+    if av < min_volume:
+        return (f"Liquidity filter [{strategy or 'default'}]: average "
+                f"volume {av:,.0f} is below the {min_volume:,.0f}-share "
+                f"minimum")
     return None
 
 

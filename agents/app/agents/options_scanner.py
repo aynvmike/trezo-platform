@@ -33,6 +33,8 @@ from datetime import date
 
 from app.config import get_settings
 from app.data.candles import fetch_candles_for
+from app.memory import get_memory, AgentDecision
+from app.learning.recall_helpers import recall_decision_context
 from app.strategies.wheel import (
     WHEEL_WATCHLIST, evaluate_csp, evaluate_cc, refine_csp_live,
 )
@@ -145,6 +147,163 @@ def _occ_match(occ: str, underlying: str, opt_type: str, strike: float,
 class OptionsScannerAgent(Agent):
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
+
+    def _greek_filter(self, *, expiration: str,
+                      net_delta: float | None = None,
+                      is_premium_sell: bool = False,
+                      modeled_iv: float | None = None,
+                      is_scalp_play: bool = False,
+                      user_id: str | None = None,
+                      ) -> tuple[bool, str]:
+        """Return (passes, reason). False reason is non-empty when the
+        play was filtered out so the caller can log + surface why.
+
+        Rules read from settings (Bot Tuning controls these):
+          1. options_min_dte: any play within N DTE is skipped unless
+             explicitly tagged as a scalp setup.
+          2. options_max_premium_delta: premium-sell setups whose
+             |net_delta| exceeds this are skipped (they are too
+             stock-proxy-like for the Wheel income model).
+          3. options_min_iv_rank_scalp: scalp setups require elevated
+             IV (modeled_iv is the proxy when we lack a true rank).
+
+        Per Mike's options-trading rules (project memory).
+        """
+        s = get_settings()
+        # Phase C UI follow-up: when a user_id is provided, prefer their
+        # per-user bot_settings override; fall through to env defaults.
+        user_min_dte: int | None = None
+        user_max_delta: float | None = None
+        user_min_iv: float | None = None
+        if user_id:
+            try:
+                from app.runtime.settings import get_bot_settings
+                bs = get_bot_settings(user_id)
+                user_min_dte = bs.options_min_dte
+                user_max_delta = bs.options_max_premium_delta
+                user_min_iv = bs.options_min_iv_rank_scalp
+            except Exception:
+                pass
+        eff_min_dte = int(user_min_dte if user_min_dte is not None else s.options_min_dte)
+        eff_max_delta = float(user_max_delta if user_max_delta is not None else s.options_max_premium_delta)
+        eff_min_iv = float(user_min_iv if user_min_iv is not None else s.options_min_iv_rank_scalp)
+        try:
+            from datetime import date as _date
+            exp = _date.fromisoformat(expiration[:10])
+            today = _date.today()
+            dte = (exp - today).days
+        except Exception:
+            dte = 999
+
+        if dte < eff_min_dte and not is_scalp_play:
+            return False, (
+                f"DTE {dte} below min {eff_min_dte} - theta burn "
+                f"risk too high without explicit scalp framing."
+            )
+
+        if is_premium_sell and net_delta is not None:
+            if abs(float(net_delta)) > eff_max_delta:
+                return False, (
+                    f"|delta| {abs(net_delta):.2f} exceeds max "
+                    f"{eff_max_delta} for premium-sell - "
+                    f"too close to short-stock proxy."
+                )
+
+        if is_scalp_play and modeled_iv is not None:
+            iv_pct = float(modeled_iv) * 100.0
+            if iv_pct < eff_min_iv:
+                return False, (
+                    f"IV {iv_pct:.0f}% below scalp minimum "
+                    f"{eff_min_iv}% - premium not "
+                    f"juicy enough for short-DTE play."
+                )
+
+        return True, ""
+
+    def _log_to_mem0(self, *, action: str, ticker: str, reasoning: str,
+                     metadata: dict | None = None) -> str | None:
+        """Persist an options-side decision to Mem0. Returns memory_id on
+        success or None on any failure. NEVER raises - options trading
+        cannot break because the memory layer hiccuped.
+        """
+        try:
+            mem = get_memory()
+            if not mem.available:
+                return None
+            return mem.log_decision(AgentDecision(
+                agent="options_scanner",
+                action=action,
+                ticker=ticker,
+                reasoning=reasoning,
+                metadata=metadata or {},
+            ))
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Phase D: hopeful-holds bucket classification + 3% cap enforcement.
+    # Wheel = wheel_csp / wheel_cc. Income = income-style premium plays
+    # (CSPs, spreads). Hopeful = directional long calls / debit spreads
+    # outside the Wheel - Mike's "3% of the time" bucket.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _strategy_bucket(strategy: str) -> str:
+        """Map a strategy name to its bucket. Used to enforce Mike's
+        3% allocation cap on hopeful holds."""
+        s = (strategy or "").lower()
+        if s in ("wheel_csp", "wheel_cc"):
+            return "wheel"
+        if s in ("cash_secured_put", "bull_put_spread", "iron_condor",
+                 "bear_call_spread"):
+            return "income"
+        if s in ("long_call", "long_put", "bull_call_spread"):
+            return "hopeful"
+        return "income"  # safe default
+
+    async def _hopeful_allocation_pct(self, client, user_id: str) -> float:
+        """Return the current open hopeful allocation as a fraction of
+        total options capital. 0.0 when no open positions or query
+        fails - fail OPEN so a quiet DB doesn't lock the user out."""
+        def _sync():
+            return (
+                client.table("options_positions")
+                .select("strategy, contracts, strike, net_premium_usd")
+                .eq("user_id", user_id)
+                .eq("status", "open")
+                .execute()
+            )
+        try:
+            res = await asyncio.to_thread(_sync)
+            rows = res.data or []
+        except Exception:
+            return 0.0
+
+        total_capital = 0.0
+        hopeful_capital = 0.0
+        for r in rows:
+            strat = str(r.get("strategy") or "")
+            bucket = self._strategy_bucket(strat)
+            contracts = int(r.get("contracts") or 1)
+            strike = float(r.get("strike") or 0.0)
+            premium = float(r.get("net_premium_usd") or 0.0)
+            # Capital at risk per row:
+            #   wheel CSP -> strike * 100 * contracts (cash-secured)
+            #   wheel CC  -> 0 (no cash at risk; underlying held separately)
+            #   long debit play -> abs(premium) (debit paid)
+            if bucket == "wheel" and "csp" in strat:
+                cap = strike * 100.0 * contracts
+            elif premium < 0:  # debit position
+                cap = abs(premium)
+            else:
+                cap = strike * 100.0 * contracts * 0.1  # rough proxy for credit risk
+            total_capital += cap
+            if bucket == "hopeful":
+                hopeful_capital += cap
+
+        if total_capital <= 0:
+            return 0.0
+        return hopeful_capital / total_capital
 
     async def tick(self) -> list[AgentMessage]:
         client = _supabase()
@@ -508,6 +667,23 @@ class OptionsScannerAgent(Agent):
                 },
             )
 
+        mem_id = self._log_to_mem0(
+            action="wheel_auto_placed",
+            ticker=underlying,
+            reasoning=note,
+            metadata={
+                "user_id": user_id,
+                "strategy": strategy,
+                "occ": pick.occ,
+                "strike": pick.strike,
+                "expiration": pick.expiration,
+                "contracts": int(leg.contracts or 1),
+                "premium_per_share": pick.premium,
+                "credit_usd": float(pick.premium or 0) * 100 * int(leg.contracts or 1),
+                "alpaca_order_id": order_id,
+                "routed_via": routed,
+            },
+        )
         return AgentMessage(
             agent=self.name, kind="execute", confidence=1.0,
             payload={
@@ -525,6 +701,7 @@ class OptionsScannerAgent(Agent):
                 "alpaca_order_status": order.get("status"),
                 "routed_via": routed,
                 "note": note,
+                "options_scanner_memory_id": mem_id,
             },
         )
 
@@ -665,6 +842,46 @@ class OptionsScannerAgent(Agent):
                             "Use the Place button on the Wheel page "
                             "if you want to fire it."
                         )
+                    # Phase C: DTE gate on wheel legs (delta is not
+                    # computed for the WheelLeg; only DTE applies).
+                    passed_wheel, reason_wheel = self._greek_filter(
+                        expiration=leg.expiration,
+                        is_premium_sell=True,
+                        modeled_iv=getattr(leg, "modeled_iv", None),
+                        user_id=user_id,
+                    )
+                    if not passed_wheel:
+                        self._log_to_mem0(
+                            action="wheel_suggestion_filtered",
+                            ticker=leg.underlying,
+                            reasoning=f"Filtered: {reason_wheel}",
+                            metadata={"strategy": strategy,
+                                      "expiration": leg.expiration},
+                        )
+                        continue
+
+                    # Phase E: include similar-past-setups summary
+                    try:
+                        recall = recall_decision_context(
+                            ticker=leg.underlying, strategy=strategy,
+                            extra_query="wheel",
+                        )
+                    except Exception:
+                        recall = {"available": False}
+
+                    mem_id = self._log_to_mem0(
+                        action="wheel_suggestion",
+                        ticker=leg.underlying,
+                        reasoning=suggestion_note,
+                        metadata={
+                            "user_id": user_id,
+                            "strategy": strategy,
+                            "credit_usd": leg.credit_usd,
+                            "strike": leg.strike,
+                            "expiration": leg.expiration,
+                            "live_chain": getattr(leg, "live", False),
+                        },
+                    )
                     out.append(AgentMessage(
                         agent=self.name, kind="info",
                         payload={
@@ -677,6 +894,8 @@ class OptionsScannerAgent(Agent):
                             "expiration": leg.expiration,
                             "modeled": not getattr(leg, "live", False),
                             "note": suggestion_note,
+                            "options_scanner_memory_id": mem_id,
+                            "learning_context": recall,
                         },
                     ))
                     continue
@@ -712,6 +931,19 @@ class OptionsScannerAgent(Agent):
                     )
 
                 await asyncio.to_thread(_sync_insert)
+                mem_id_modeled = self._log_to_mem0(
+                    action="wheel_modeled_open",
+                    ticker=leg.underlying,
+                    reasoning=nt,
+                    metadata={
+                        "user_id": user_id,
+                        "strategy": strategy,
+                        "credit_usd": leg.credit_usd,
+                        "strike": leg.strike,
+                        "expiration": leg.expiration,
+                        "modeled": True,
+                    },
+                )
                 out.append(AgentMessage(
                     agent=self.name, kind="execute",
                     payload={
@@ -721,6 +953,7 @@ class OptionsScannerAgent(Agent):
                         "credit_usd": leg.credit_usd,
                         "strike": leg.strike,
                         "modeled": not getattr(leg, "live", False),
+                        "options_scanner_memory_id": mem_id_modeled,
                     },
                 ))
         return out
@@ -739,6 +972,58 @@ class OptionsScannerAgent(Agent):
                 if not play:
                     continue
                     continue
+                # Phase D: tag the bucket. Ideas are broadcast (no
+                # user_id), so per-user cap enforcement happens
+                # downstream in Risk Manager / UI. We still surface
+                # the bucket so the rendering can warn.
+                bucket = self._strategy_bucket(play.strategy)
+
+                # Phase C Greek filter - skip plays that violate user's
+                # Greek thresholds, but log the skip so the user can see
+                # what was suppressed and adjust thresholds.
+                is_premium_sell = play.direction == "income" or play.strategy in (
+                    "cash_secured_put", "bull_put_spread", "iron_condor",
+                )
+                is_scalp = play.strategy in ("iron_condor",) or (
+                    play.direction == "income" and play.contracts <= 3
+                )
+                passed, reason = self._greek_filter(
+                    expiration=play.expiration,
+                    net_delta=play.net_delta,
+                    is_premium_sell=is_premium_sell,
+                    modeled_iv=play.modeled_iv,
+                    is_scalp_play=is_scalp,
+                )
+                if not passed:
+                    self._log_to_mem0(
+                        action="options_idea_filtered",
+                        ticker=play.underlying,
+                        reasoning=f"Filtered: {reason}",
+                        metadata={
+                            "strategy": play.strategy,
+                            "expiration": play.expiration,
+                            "net_delta": play.net_delta,
+                            "modeled_iv": play.modeled_iv,
+                        },
+                    )
+                    continue
+
+                mem_id_idea = self._log_to_mem0(
+                    action="options_idea",
+                    ticker=play.underlying,
+                    reasoning=str(play.notes or play.strategy),
+                    metadata={
+                        "strategy": play.strategy,
+                        "direction": play.direction,
+                        "expiration": play.expiration,
+                        "contracts": play.contracts,
+                        "net_premium_usd": play.net_premium_usd,
+                        "max_loss_usd": play.max_loss_usd,
+                        "max_gain_usd": play.max_gain_usd,
+                        "net_delta": play.net_delta,
+                        "net_theta": play.net_theta,
+                    },
+                )
                 out.append(AgentMessage(
                     agent=self.name, kind="info",
                     payload={
@@ -758,6 +1043,8 @@ class OptionsScannerAgent(Agent):
                         "net_vega": play.net_vega,
                         "legs": play.legs,
                         "notes": play.notes,
+                        "options_scanner_memory_id": mem_id_idea,
+                        "bucket": bucket,
                     },
                 ))
         return out

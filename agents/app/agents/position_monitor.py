@@ -66,7 +66,40 @@ class PositionMonitorAgent(Agent):
     name = "position_monitor"
     tick_interval_seconds = 30
 
+    # Task #32: auto-reconcile stocks every 30 min (60 ticks * 30s).
+    # Counter is class-level - ticks are sequential so no race risk.
+    _recon_tick_counter: int = 0
+    _RECON_EVERY_N_TICKS: int = 60
+
     async def tick(self) -> list[AgentMessage]:
+        # Task #32: every 30 min, sync Trezo's open stock positions against
+        # Alpaca truth. Catches manual closes / phantoms within 30 min.
+        type(self)._recon_tick_counter += 1
+        if type(self)._recon_tick_counter % type(self)._RECON_EVERY_N_TICKS == 0:
+            try:
+                from app.paper.stocks_reconcile import reconcile_stocks_all_users
+                result = await reconcile_stocks_all_users()
+                if result.get("ok") and (
+                    result.get("closed", 0)
+                    or result.get("updated", 0)
+                    or result.get("inserted", 0)
+                ):
+                    return [AgentMessage(
+                        agent=self.name, kind="info",
+                        payload={
+                            "event": "stocks_auto_reconcile",
+                            "closed": result.get("closed", 0),
+                            "updated": result.get("updated", 0),
+                            "inserted": result.get("inserted", 0),
+                            "users_touched": result.get("users_touched", 0),
+                        },
+                    )]
+            except Exception as e:  # noqa: BLE001
+                # Never let reconcile failure block the rest of the tick.
+                logger_msg = f"auto reconcile failed: {str(e)[:160]}"
+                return [AgentMessage(agent=self.name, kind="error",
+                                     payload={"error": logger_msg})]
+
         client = _supabase()
         if not client:
             return [AgentMessage(agent=self.name, kind="error",

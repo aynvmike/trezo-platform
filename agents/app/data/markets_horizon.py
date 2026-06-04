@@ -104,7 +104,7 @@ async def compute_snapshot(corr_window: int = 30) -> dict:
 
     for key, (ticker, label) in UNIVERSE.items():
         try:
-            candles = await fetch_candles_for(ticker)
+            candles = await fetch_candles_for(ticker, "stock")
         except Exception:
             continue
         if not candles or len(candles) < 6:

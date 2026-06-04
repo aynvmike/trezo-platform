@@ -40,9 +40,37 @@ from .base import Agent, AgentMessage
 
 # Pattern thresholds — kept tunable inline so we can move them into
 # bot_settings later if Mike wants per-user control.
-PEAK_GIVEBACK_PCT = 0.30      # alert when 30%+ of peak gain handed back
+PEAK_GIVEBACK_PCT = 0.30      # default 30% giveback (used as the fallback)
 TIME_IN_TRADE_DAYS = 5        # alert when >=5 days in a flat winner
 STOP_APPROACH_PCT = 0.01      # alert when within 1% of stop
+
+
+# ---------------------------------------------------------------------------
+# Mike 2026-06-03 ask: scale the giveback tolerance to the absolute peak
+# gain. Small wins (up <=15%) need TIGHTER protection because one bad
+# move flips them losing. Big wins (up >30%) can absorb more drawback
+# without panicking the user out of a great trade.
+#
+# Returns (warn_threshold, urgent_threshold) in fraction units.
+# ---------------------------------------------------------------------------
+def _giveback_thresholds_for_peak(peak_pct: float) -> tuple[float, float]:
+    """Tier giveback alerts by absolute peak gain.
+
+      peak gain  | warn  | urgent
+      ---------- | ----- | ------
+      <=5%       | 0.15  | 0.30
+      <=15%      | 0.20  | 0.40     <- Mike's 10% case lives here
+      <=30%      | 0.30  | 0.50     <- old default range
+      >30%       | 0.40  | 0.60     <- big winners get room
+    """
+    p = abs(float(peak_pct or 0.0))
+    if p <= 0.05:
+        return (0.15, 0.30)
+    if p <= 0.15:
+        return (0.20, 0.40)
+    if p <= 0.30:
+        return (0.30, 0.50)
+    return (0.40, 0.60)
 
 
 def _supabase():
@@ -191,20 +219,38 @@ class ExitAdvisorAgent(Agent):
         stop = float(pos.get("stop_price") or 0)
         opened_at = pos.get("entry_at")
 
+        # Derive entry cost (quantity * entry_price) so we can
+        # scale the giveback tiers per Mike's 2026-06-03 ask.
+        try:
+            entry_value = abs(float(pos.get("entry_price") or 0)
+                              * float(pos.get("quantity") or 0))
+        except Exception:  # noqa: BLE001
+            entry_value = 0.0
+
         # --- Rule 1: peak giveback (the main held-too-long signal).
         # Active only when we ever had a positive peak AND current pnl
         # is positive too (no point alerting on a stop-bound trade).
         if peak > 0 and pnl > 0:
             giveback = (peak - pnl) / peak
-            if giveback >= PEAK_GIVEBACK_PCT:
+            # Use entry cost to derive peak gain percentage so the
+            # tier picker can scale appropriately.
+            peak_pct = (peak / entry_value) if entry_value > 0 else 0.0
+            warn_th, urgent_th = _giveback_thresholds_for_peak(peak_pct)
+            if giveback >= warn_th:
                 if not await self._has_open_alert(client, pid, "peak_giveback"):
-                    severity = "urgent" if giveback >= 0.50 else "warn"
+                    severity = "urgent" if giveback >= urgent_th else "warn"
+                    tier_label = (
+                        "small-win (tight)" if peak_pct <= 0.15
+                        else "medium-win" if peak_pct <= 0.30
+                        else "big-win (room)"
+                    )
                     msg = (
                         f"{ticker} hit peak unrealized P&L of "
-                        f"${peak:.0f} and has given back "
-                        f"{giveback*100:.0f}% of that gain. The setup "
-                        "may be exhausted - consider trimming or "
-                        "trailing the stop to lock in what's left."
+                        f"${peak:.0f} ({peak_pct*100:.1f}% of cost) and "
+                        f"has given back {giveback*100:.0f}% of that "
+                        f"gain. Tier: {tier_label}. The setup may be "
+                        f"exhausted - consider trimming or trailing the "
+                        f"stop to lock in what's left."
                     )
                     await self._raise_alert(
                         client, user_id=user_id, position_id=pid,

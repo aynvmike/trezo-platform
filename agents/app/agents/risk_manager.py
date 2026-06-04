@@ -22,6 +22,11 @@ import asyncio
 from collections import deque
 
 from app.config import get_settings
+from app.memory import get_memory, AgentDecision
+from app.learning.recall_helpers import recall_decision_context
+from app.learning.bucket_helpers import (
+    is_hopeful, hopeful_allocation_pct, hopeful_cap_for_user,
+)
 
 from .base import Agent, AgentMessage
 
@@ -308,7 +313,7 @@ class RiskManagerAgent(Agent):
             if blocked:
                 return [self._veto(ticker, tcs, blocked)]
             stock_candles = await fetch_candles_for(ticker, "stock")
-            liq = liquidity_check(stock_candles)
+            liq = liquidity_check(stock_candles, strategy=strategy)
             if liq:
                 return [self._veto(ticker, tcs, liq)]
             ext = overextension_check(stock_candles)
@@ -344,6 +349,69 @@ class RiskManagerAgent(Agent):
         if target_pct is not None:
             approve_payload["target_pct"] = target_pct
 
+        # Path beta: hopeful-bucket cap enforcement. If this signal is
+        # a hopeful-bucket strategy and the user is already at or above
+        # their cap, veto - we don't want to push their hopeful
+        # allocation past the limit. Best-effort: any failure passes
+        # through (we'd rather approve than freeze).
+        if is_hopeful(strategy):
+            try:
+                client = _supabase()
+                user_id_str = message.payload.get("user_id")
+                if client and user_id_str:
+                    cap = hopeful_cap_for_user(user_id_str)
+                    current = await hopeful_allocation_pct(client, user_id_str)
+                    if cap > 0 and current >= cap:
+                        return [self._veto(
+                            ticker, tcs,
+                            f"Hopeful bucket cap hit "
+                            f"({current*100:.1f}% >= {cap*100:.1f}%) - "
+                            f"skip until existing hopeful positions close.",
+                            strategy=strategy, user_id=user_id_str,
+                        )]
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Phase E: surface a tiny summary of similar past
+        # situations so downstream (UI, TradeExecution) can render
+        # "11 similar setups; 7 won, 4 lost" context. Best-effort.
+        try:
+            recall = recall_decision_context(
+                ticker=ticker, strategy=strategy,
+                extra_query=f"tcs {tcs} {direction}",
+            )
+            if recall.get("available"):
+                approve_payload["learning_context"] = recall
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Log the approval to Mem0. The TradeOutcomeLogger will later
+        # reference this memory_id when the trade closes, closing the
+        # loop: approval -> outcome -> next-day query. Best-effort:
+        # never block a trade on memory failure.
+        approval_memory_id = None
+        try:
+            mem = get_memory()
+            if mem.available:
+                approval_memory_id = mem.log_decision(AgentDecision(
+                    agent="risk_manager",
+                    action="approve",
+                    ticker=ticker,
+                    reasoning=approve_payload["reason"],
+                    metadata={
+                        "tcs": int(tcs),
+                        "strategy": strategy,
+                        "direction": direction,
+                        "user_id": message.payload.get("user_id") or "global",
+                        "stop_pct": approve_payload.get("stop_pct"),
+                        "target_pct": approve_payload.get("target_pct"),
+                    },
+                ))
+        except Exception:
+            pass
+        if approval_memory_id:
+            approve_payload["risk_manager_memory_id"] = approval_memory_id
+
         return [
             AgentMessage(
                 agent=self.name,
@@ -353,7 +421,28 @@ class RiskManagerAgent(Agent):
             )
         ]
 
-    def _veto(self, ticker: str, tcs: int, reason: str) -> AgentMessage:
+    def _veto(self, ticker: str, tcs: int, reason: str,
+              strategy: str | None = None,
+              user_id: str | None = None) -> AgentMessage:
+        # Log the veto to Mem0 so future-self can query "did I veto this
+        # kind of setup before, and was I right?". Best-effort: failure
+        # in the memory layer must NEVER break the trading decision.
+        try:
+            mem = get_memory()
+            if mem.available:
+                mem.log_decision(AgentDecision(
+                    agent="risk_manager",
+                    action="veto",
+                    ticker=ticker,
+                    reasoning=reason,
+                    metadata={
+                        "tcs": int(tcs),
+                        "strategy": strategy or "unknown",
+                        "user_id": user_id or "global",
+                    },
+                ))
+        except Exception:
+            pass  # memory failure cannot block a veto
         return AgentMessage(
             agent=self.name,
             kind="veto",

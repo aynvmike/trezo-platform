@@ -580,12 +580,12 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
 
       {/* Single-symbol, single-strategy result */}
       {mode === "single" && !compareAll && result && (
-        <SingleResult result={result} />
+        <SingleResult result={result} startingCapital={startingCapital} />
       )}
 
       {/* Single-symbol, all-strategy comparison */}
       {mode === "single" && compareAll && compareSingle && (
-        <CompareView data={compareSingle} />
+        <CompareView data={compareSingle} startingCapital={startingCapital} />
       )}
 
       {/* Whole-watchlist result */}
@@ -605,7 +605,7 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
 
 /* ---------- single-symbol, single-strategy ---------- */
 
-function SingleResult({ result }: { result: Result }) {
+function SingleResult({ result, startingCapital }: { result: Result; startingCapital: number }) {
   return (
     <>
       <div>
@@ -645,7 +645,7 @@ function SingleResult({ result }: { result: Result }) {
 
 /* ---------- single-symbol, all strategies compared ---------- */
 
-function CompareView({ data }: { data: CompareResult }) {
+function CompareView({ data, startingCapital }: { data: CompareResult; startingCapital: number }) {
   const best = pickBest(data);
   const [selected, setSelected] = useState(best.strategy);
   const shown =

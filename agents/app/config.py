@@ -59,6 +59,29 @@ class Settings(BaseSettings):
     trezo_web_base_url: str = ""
     cron_secret: str = ""
 
+    # Mem0 hosted memory layer - the shared brain across agents.
+    # See agents/app/memory/ for the wrapper. Empty -> agents run
+    # without memory (graceful degradation, never blocks trading).
+    mem0_api_key: str = ""
+
+    # ---- Phase C options Greek-aware filters --------------------------
+    # min_dte: Options Scanner skips emit when expiration is within this
+    # many days. Mike's rule 7: avoid long-call recommendations inside
+    # 7 DTE unless setup explicitly accounts for theta burn. Default 7.
+    options_min_dte: int = 7
+    # max_premium_delta: skip premium-sell setups whose |net_delta| is
+    # above this. High |delta| premium sells are basically short-stock
+    # proxies; not what the Wheel is for. Default 0.45.
+    options_max_premium_delta: float = 0.45
+    # min_iv_rank_scalp: scalp/short-DTE setups need elevated IV to be
+    # worth the theta. Default 30.0 (percentile). 0 disables this filter.
+    options_min_iv_rank_scalp: float = 30.0
+    # Phase D - hopeful-holds allocation cap. Mike's rule 5: holds a
+    # call outside the Wheel maybe 3% of the time. Default 3% (0.03).
+    # The cap is applied against total open option capital (sum of
+    # cash_secured + premium-at-risk across open positions). 0 disables.
+    options_hopeful_allocation_cap_pct: float = 0.03
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

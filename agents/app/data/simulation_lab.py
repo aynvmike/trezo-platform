@@ -60,7 +60,7 @@ async def run_simulation(symbols: list[str], days: int,
         if not sym_u:
             continue
         try:
-            candles = await fetch_candles_for(sym_u)
+            candles = await fetch_candles_for(sym_u, "stock")
         except Exception as e:  # noqa: BLE001
             per_symbol.append({"symbol": sym_u,
                                 "error": f"Could not fetch history: {e}"})

@@ -100,7 +100,7 @@ function PatternsTab({ listName, symbols }: { listName: string; symbols: string[
   );
 }
 
-function BacktestTab({ watchlists }: { watchlists: { id: string; name: string; tickers: string[] }[] }) {
+function BacktestTab({ watchlists }: { watchlists: { id: string; name: string; is_default: boolean; tickers: { ticker: string; asset_type: string }[] }[] }) {
   return (
     <section className="space-y-6">
       <p className="beginner-only text-sm text-weave-600 leading-relaxed">
@@ -115,7 +115,7 @@ function BacktestTab({ watchlists }: { watchlists: { id: string; name: string; t
   );
 }
 
-function SimulationTab({ watchlists }: { watchlists: { id: string; name: string; tickers: string[] }[] }) {
+function SimulationTab({ watchlists }: { watchlists: { id: string; name: string; is_default: boolean; tickers: { ticker: string; asset_type: string }[] }[] }) {
   return (
     <section className="space-y-6">
       <p className="beginner-only text-sm text-weave-600 leading-relaxed">
