@@ -1,6 +1,6 @@
 # Trezo — Project Status Handoff
 
-**Last updated:** 2026-06-12 (seventh pass: day-TIF bracket bug fixed — AAPL incident root cause; Mem0 budget re-tuned to 10k adds/week ACTIVE in .env. RESTART pending — Position Monitor still crash-looping on old code until agents restart.)
+**Last updated:** 2026-06-12 ~10:30 PM ET (final pass: RESTART CONFIRMED — new build is live and every formerly-dark agent is emitting. options_scanner produced its first messages EVER (74 tonight); crypto, watchdog, market_horizon, market_sentiment all alive; Position Monitor clean. Full-codebase audits green; git snapshot 720b941. NOTE: clear stale git locks before next git use — see section 6.A1.)
 **Maintained by:** Mike (founder/architect) + Nova (Claude collaborator)
 **Repo root:** `C:\Trezo\trezo-platform`
 
@@ -284,7 +284,10 @@ AAPL is a legitimate bot trade (Pattern Detection bullish signal, TCS 604, 6/11 
 ```
 Until you do one of these, nothing will stop AAPL out if it gaps down at Friday's open. (The new naked-position alert will also nag you about it hourly once agents restart.)
 
-### A. Restart agents to load today's 4 file changes
+### A1. Git locks — cleared ✅ (nothing to do)
+Nova cleared the stale lock files directly on 6/12 night after Mike granted folder delete permission. Git is fully usable.
+
+### A. Restart agents — DONE 6/12 evening ✅ (kept for reference)
 ```
 [Trezo - Agents window]   Ctrl+C  →  Y  →  Enter
 [PowerShell]              cd C:\Trezo\trezo-platform
