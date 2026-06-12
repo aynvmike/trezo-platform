@@ -43,7 +43,7 @@ export async function SignalTracePanel({ userId }: { userId: string }) {
     let q = supabase
       .from("agent_messages")
       .select("id, agent_name, kind, payload, created_at")
-      .in("kind", ["signal", "approve", "veto", "execute", "error", "info"])
+      .in("kind", ["signal", "scanner_pulse", "approve", "veto", "execute", "error", "info"])
       .gte("created_at", hourAgo)
       .order("created_at", { ascending: true })
       .limit(500);
@@ -138,8 +138,23 @@ export async function SignalTracePanel({ userId }: { userId: string }) {
   // Newest signals on top.
   traces.sort((a, b) => new Date(b.signal_at).getTime() - new Date(a.signal_at).getTime());
 
+  // Task #60 (2026-06-05): scanner_pulse aggregation.
+  // When skip_signal_persist=true (default), individual signal rows
+  // do NOT land in agent_messages -- only scanner_pulse summaries do.
+  // Sum the "fired" counts across all scanner_pulse rows in the window
+  // so the SIGNAL counter still shows real activity.
+  let firedFromPulses = 0;
+  let scannedFromPulses = 0;
+  for (const r of rows) {
+    if (r.kind !== "scanner_pulse") continue;
+    const p = r.payload as { fired?: number; scanned?: number };
+    if (typeof p?.fired === "number") firedFromPulses += p.fired;
+    if (typeof p?.scanned === "number") scannedFromPulses += p.scanned;
+  }
+
   const counts = {
-    total: traces.length,
+    total: Math.max(traces.length, firedFromPulses),
+    scanned: scannedFromPulses,
     executed: traces.filter((t) => t.outcome === "executed").length,
     vetoed: traces.filter((t) => t.outcome === "vetoed").length,
     skipped: traces.filter((t) => t.outcome === "skipped").length,

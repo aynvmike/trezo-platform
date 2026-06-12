@@ -23,13 +23,27 @@ from .base import Agent, AgentMessage
 
 class ORBScannerAgent(Agent):
     name = "orb_scanner"
-    tick_interval_seconds = 60
+    tick_interval_seconds = 120  # Throttled 2026-06-05 (was 60) to cut API load
 
     def __init__(self) -> None:
         self._alerted: set[str] = set()   # symbols alerted today
         self._day: str = ""
+        # Patched 2026-06-10 (WMT-stacking class of bug): seed _alerted
+        # from today's signal history so restarts don't re-alert.
+        self._seeded_alerted: bool = False
+
+    async def _maybe_seed_alerted(self) -> None:
+        if self._seeded_alerted:
+            return
+        self._seeded_alerted = True
+        try:
+            from app.runtime.restart_state import seed_today_signal_tickers
+            self._alerted = await seed_today_signal_tickers("orb_scanner")
+        except Exception:
+            pass
 
     async def tick(self) -> list[AgentMessage]:
+        await self._maybe_seed_alerted()
         from app.runtime.settings import get_bot_settings
         if not get_bot_settings().stms_enabled:
             # ORB shares the stock day-trade toggle with STMS.
@@ -100,4 +114,37 @@ class ORBScannerAgent(Agent):
                 "watchlist_size": len(ORB_WATCHLIST),
             },
         ))
+        # Task #60 (2026-06-05): scanner_pulse summary emission.
+        try:
+            _signals = [m for m in out if getattr(m, "kind", None) == "signal"]
+            if _signals:
+                _tcss = []
+                for s in _signals:
+                    t = (s.payload or {}).get("tcs")
+                    if isinstance(t, (int, float)):
+                        _tcss.append(int(t))
+                _top_tcs = max(_tcss) if _tcss else 0
+                _by_strategy = {}
+                for s in _signals:
+                    st = (s.payload or {}).get("strategy") or "default"
+                    _by_strategy[st] = _by_strategy.get(st, 0) + 1
+                _scanned = 0
+                try:
+                    _scanned = len(symbols)  # type: ignore[name-defined]
+                except Exception:
+                    _scanned = len(_signals)
+                out.append(AgentMessage(
+                    agent=self.name,
+                    kind="scanner_pulse",
+                    confidence=1.0,
+                    payload={
+                        "scanned": _scanned,
+                        "fired": len(_signals),
+                        "top_tcs": _top_tcs,
+                        "by_strategy": _by_strategy,
+                    },
+                ))
+        except Exception:
+            pass
+
         return out

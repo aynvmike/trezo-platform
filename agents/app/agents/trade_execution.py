@@ -393,7 +393,15 @@ class TradeExecutionAgent(Agent):
         if not plan.ok:
             return _err(plan.reject_reason or "Sizing rejected the trade")
 
-        tif = "gtc" if strategy == "extended" else "day"
+        # Fixed 2026-06-12 (the AAPL incident): bracket exit legs with
+        # tif="day" DIE at the 4 PM close while the position lives on --
+        # so any multi-day trade went naked overnight (AAPL "default"
+        # strategy targets +10%, a multi-day journey, but its stop/target
+        # expired same-day). Only true intraday strategies (STMS/ORB,
+        # which also have hard time stops) keep day legs; everything
+        # else gets GTC legs that survive until filled or cancelled.
+        _s = (strategy or "").lower()
+        tif = "day" if (_s.startswith("stms") or _s.startswith("orb")) else "gtc"
         order, err = await submit_bracket_order(
             symbol=ticker,
             qty=plan.quantity,

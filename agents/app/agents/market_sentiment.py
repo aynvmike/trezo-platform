@@ -40,9 +40,46 @@ LLM_BUDGET_PER_TICK = 30
 
 class MarketSentimentAgent(Agent):
     name = "market_sentiment"
-    tick_interval_seconds = 300  # every 5 minutes
+    tick_interval_seconds = 1800  # Throttled 2026-06-05 (was 300/5min)
+    # News doesn't move minute-to-minute. 30-min cadence is plenty for
+    # intraday context. TODO: add time-of-day burst at 8:00 ET so we
+    # catch pre-market news without polling 24/7.
+    # Future: see Task #74 (Alpaca WebSocket streaming - eventual real-time).
+
+
+    @staticmethod
+    def _in_news_window() -> tuple[bool, str]:
+        """Return (in_window, label). Mike's Task #76:
+          08:00-09:30 ET burst window (pre-market)
+          09:30-16:00 ET regular window
+          else: skip - news isn't actionable outside market hours.
+        """
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo("America/New_York"))
+            mins = now.hour * 60 + now.minute
+            # Weekend skip
+            if now.weekday() >= 5:
+                return (False, "weekend")
+            if 8 * 60 <= mins < 9 * 60 + 30:
+                return (True, "pre-market")
+            if 9 * 60 + 30 <= mins < 16 * 60:
+                return (True, "regular")
+            return (False, "off-hours")
+        except Exception:
+            return (True, "fallback-always-on")
 
     async def tick(self) -> list[AgentMessage]:
+        # Task #76 (2026-06-05): only scan news during actionable
+        # windows (pre-market + trading). Saves ~50% Finnhub calls.
+        in_window, label = self._in_news_window()
+        if not in_window:
+            return [AgentMessage(
+                agent=self.name, kind="info",
+                payload={"note": f"news window skipped ({label})"},
+            )]
+
         out: list[AgentMessage] = []
         scanned = 0
         headlines = 0

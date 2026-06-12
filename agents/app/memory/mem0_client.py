@@ -37,6 +37,171 @@ Wired by Nova for Mike on 2026-06-01.
 from __future__ import annotations
 
 import logging
+import time as _time
+
+# 2026-06-11: Mem0 ADD quota hit 10000/10000 (resets 2026-07-01) because
+# every routine veto was logged. When the API answers 429/quota, pause
+# WRITES for a while instead of hammering + spamming warnings. Reads
+# (search) are unaffected by the ADD quota and keep working.
+_WRITE_PAUSE_SECONDS = 6 * 3600.0
+_writes_paused_until: float = 0.0
+
+# ---------------------------------------------------------------------------
+# Usage budget (2026-06-12). Mike upgraded the Mem0 plan after the first
+# 10k ADD quota burned in <2 weeks -- almost entirely routine-veto noise,
+# while only ~6 recalls had ever run. Policy: adds are budgeted per DAY
+# and per ISO WEEK; retrievals get a high daily ceiling so the agents can
+# ALWAYS consult memory before decisions. Counters persist to a JSON file
+# next to this module so the daily restarts don't reset spend. Limits are
+# tunable in agents/.env (mem0_max_adds_per_day, mem0_max_adds_per_week,
+# mem0_max_searches_per_day -- read via Settings, NOT os.getenv, because
+# pydantic-settings does not export .env values to the process env).
+# ---------------------------------------------------------------------------
+import json as _json
+import os as _os
+import threading as _threading
+from datetime import datetime as _dt, timezone as _tz
+
+_BUDGET_FILE = _os.path.join(_os.path.dirname(__file__), ".usage_budget.json")
+_BUDGET_LOCK = _threading.Lock()
+_throttle_logged_at: dict[str, float] = {}
+
+
+def _budget_limits() -> tuple[int, int, int]:
+    try:
+        from app.config import get_settings
+        s = get_settings()
+        return (int(s.mem0_max_adds_per_day),
+                int(s.mem0_max_adds_per_week),
+                int(s.mem0_max_searches_per_day))
+    except Exception:  # noqa: BLE001
+        return (400, 2500, 2000)
+
+
+def _budget_load() -> dict:
+    try:
+        with open(_BUDGET_FILE, encoding="utf-8") as f:
+            b = _json.load(f)
+        if isinstance(b, dict):
+            return b
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _budget_save(b: dict) -> None:
+    try:
+        tmp = _BUDGET_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(b, f)
+        _os.replace(tmp, _BUDGET_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _budget_roll(b: dict) -> dict:
+    now = _dt.now(_tz.utc)
+    day = now.strftime("%Y-%m-%d")
+    iso = now.isocalendar()
+    week = f"{iso.year}-W{iso.week:02d}"
+    if b.get("day") != day:
+        b["day"] = day
+        b["adds_today"] = 0
+        b["searches_today"] = 0
+    if b.get("week") != week:
+        b["week"] = week
+        b["adds_week"] = 0
+    return b
+
+
+def _budget_try_spend(kind: str) -> bool:
+    """Atomically check + spend one unit of 'add' or 'search' budget.
+    False = cap exhausted, caller must skip the API call. Never raises;
+    bookkeeping failure must never block the memory layer."""
+    max_day, max_week, max_search = _budget_limits()
+    try:
+        with _BUDGET_LOCK:
+            b = _budget_roll(_budget_load())
+            if kind == "add":
+                if (b.get("adds_today", 0) >= max_day
+                        or b.get("adds_week", 0) >= max_week):
+                    return False
+                b["adds_today"] = b.get("adds_today", 0) + 1
+                b["adds_week"] = b.get("adds_week", 0) + 1
+            else:
+                if b.get("searches_today", 0) >= max_search:
+                    return False
+                b["searches_today"] = b.get("searches_today", 0) + 1
+            _budget_save(b)
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _budget_throttle_log(kind: str) -> None:
+    """Warn about an exhausted budget at most once per hour per kind."""
+    now = _time.time()
+    if now - _throttle_logged_at.get(kind, 0.0) >= 3600.0:
+        _throttle_logged_at[kind] = now
+        max_day, max_week, max_search = _budget_limits()
+        logger.warning(
+            "Mem0 %s budget exhausted (limits: %d adds/day, %d adds/week, "
+            "%d searches/day) - skipping until the window rolls. Tune in "
+            "agents/.env.", kind, max_day, max_week, max_search,
+        )
+
+
+def normalize_tags(metadata: dict) -> dict:
+    """Tagging standard (Mike 2026-06-12: 'some of the memory tags are
+    blank and we can benefit from having a system'). Every memory gets:
+      - the four required keys filled (kind/agent/action/ticker;
+        missing -> 'unknown', never blank),
+      - strategy defaulted to 'unknown',
+      - a flat lowercase `tags` list built from the above so dashboard
+        filtering and future recall have ONE consistent vocabulary.
+    Never raises; returns the enriched dict."""
+    try:
+        md = dict(metadata or {})
+        for k in ("kind", "agent", "action", "ticker"):
+            v = str(md.get(k) or "").strip()
+            md[k] = v if v else "unknown"
+        if not str(md.get("strategy") or "").strip():
+            md["strategy"] = "unknown"
+        tags = []
+        for k in ("kind", "agent", "action", "ticker", "strategy"):
+            v = str(md.get(k, "")).strip().lower()
+            if v and v != "unknown" and v not in tags:
+                tags.append(v)
+        md["tags"] = tags
+        return md
+    except Exception:  # noqa: BLE001
+        return dict(metadata or {})
+
+
+def budget_status() -> dict:
+    """Current spend vs limits. Surfaced via TrezoMemory.health()."""
+    max_day, max_week, max_search = _budget_limits()
+    with _BUDGET_LOCK:
+        b = _budget_roll(_budget_load())
+    return {
+        "adds_today": b.get("adds_today", 0),
+        "adds_per_day_limit": max_day,
+        "adds_week": b.get("adds_week", 0),
+        "adds_per_week_limit": max_week,
+        "searches_today": b.get("searches_today", 0),
+        "searches_per_day_limit": max_search,
+    }
+
+
+def _writes_paused() -> bool:
+    return _time.time() < _writes_paused_until
+
+
+def _maybe_pause_writes(err: Exception) -> None:
+    global _writes_paused_until
+    s = str(err)
+    if "429" in s or "quota" in s.lower():
+        _writes_paused_until = _time.time() + _WRITE_PAUSE_SECONDS
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -155,7 +320,10 @@ class TrezoMemory:
         Persist an agent decision to Mem0. Returns the memory ID on
         success, None on failure. Never raises.
         """
-        if not self._available:
+        if not self._available or _writes_paused():
+            return None
+        if not _budget_try_spend("add"):
+            _budget_throttle_log("add")
             return None
         try:
             content = self._format_decision(decision)
@@ -170,10 +338,18 @@ class TrezoMemory:
             result = self._client.add(
                 messages=[{"role": "assistant", "content": content}],
                 user_id=self.user_id,
-                metadata=metadata,
+                metadata=normalize_tags(metadata),
             )
-            return self._extract_id(result)
+            # Mem0 v3 processes adds ASYNCHRONOUSLY: the response is
+            # {"event_id": ..., "status": "PENDING"} with no memory id.
+            # Callers correlate decisions->outcomes via the client-side
+            # decision_key in metadata instead (Task #47, 2026-06-12).
+            rid = self._extract_id(result)
+            if rid is None and isinstance(result, dict) and result.get("event_id"):
+                rid = str(metadata.get("decision_key") or result["event_id"])
+            return rid
         except Exception as e:  # noqa: BLE001
+            _maybe_pause_writes(e)
             logger.warning(
                 "Mem0 log_decision failed for %s/%s: %s",
                 decision.agent, decision.ticker, e,
@@ -185,7 +361,10 @@ class TrezoMemory:
         Persist a closed-trade outcome. Reference the decisions that
         led to it via outcome.related_decisions so the loop closes.
         """
-        if not self._available:
+        if not self._available or _writes_paused():
+            return None
+        if not _budget_try_spend("add"):
+            _budget_throttle_log("add")
             return None
         try:
             content = self._format_outcome(outcome)
@@ -205,10 +384,14 @@ class TrezoMemory:
             result = self._client.add(
                 messages=[{"role": "assistant", "content": content}],
                 user_id=self.user_id,
-                metadata=metadata,
+                metadata=normalize_tags(metadata),
             )
-            return self._extract_id(result)
+            rid = self._extract_id(result)
+            if rid is None and isinstance(result, dict) and result.get("event_id"):
+                rid = str(result["event_id"])
+            return rid
         except Exception as e:  # noqa: BLE001
+            _maybe_pause_writes(e)
             logger.warning(
                 "Mem0 log_outcome failed for %s: %s", outcome.ticker, e,
             )
@@ -237,21 +420,36 @@ class TrezoMemory:
         """
         if not self._available:
             return []
+        if not _budget_try_spend("search"):
+            _budget_throttle_log("search")
+            return []
         try:
-            filters: dict[str, Any] = {}
-            if agent:
-                filters["agent"] = agent
-            if ticker:
-                filters["ticker"] = ticker
-            if kind:
-                filters["kind"] = kind
+            # Fixed 2026-06-11: mem0ai 2.x rejects top-level user_id in
+            # search() ("Top-level entity parameters ... not supported.
+            # Use filters={'user_id': ...}"). Every recall_similar call
+            # had been failing silently since the 2.0.4 install -- agents
+            # could WRITE memories but never READ them back. user_id now
+            # rides in filters; agent/ticker/kind are filtered client-side
+            # so we don't depend on Mem0's metadata-filter schema.
             results = self._client.search(
                 query=query,
-                user_id=self.user_id,
-                limit=limit,
-                filters=filters or None,
+                filters={"user_id": self.user_id},
+                limit=max(int(limit) * 3, int(limit)),
             )
-            return results.get("results", []) if isinstance(results, dict) else list(results)
+            rows = (results.get("results", [])
+                    if isinstance(results, dict) else list(results))
+
+            def _meta(r: Any) -> dict:
+                return (r.get("metadata") or {}) if isinstance(r, dict) else {}
+
+            if agent:
+                rows = [r for r in rows if _meta(r).get("agent") == agent]
+            if ticker:
+                rows = [r for r in rows
+                        if str(_meta(r).get("ticker", "")).upper() == ticker.upper()]
+            if kind:
+                rows = [r for r in rows if _meta(r).get("kind") == kind]
+            return rows[:int(limit)]
         except Exception as e:  # noqa: BLE001
             logger.warning("Mem0 recall_similar failed for %r: %s", query, e)
             return []
@@ -269,6 +467,8 @@ class TrezoMemory:
             "available": self._available,
             "user_id": self.user_id,
             "api_key_set": bool(self._api_key),
+            "writes_paused": _writes_paused(),
+            "budget": budget_status(),
         }
 
     # ------------------------------------------------------------------

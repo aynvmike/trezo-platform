@@ -2,7 +2,7 @@ const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
 
 type Candidate = {
   ticker: string;
-  source: "seed" | "watchlist" | "position" | string;
+  source: "seed" | "watchlist" | "position" | "market_wide" | string;
   yield_pct: number;
 };
 
@@ -16,12 +16,14 @@ const SOURCE_LABEL: Record<string, string> = {
   seed: "Seed",
   watchlist: "Watchlist",
   position: "Held",
+  market_wide: "Market",
 };
 
 const SOURCE_TONE: Record<string, string> = {
   seed: "bg-weave-100 text-weave-700",
   watchlist: "bg-treasure-100 text-treasure-800",
   position: "bg-emerald-100 text-emerald-800",
+  market_wide: "bg-sky-100 text-sky-800",
 };
 
 /**
@@ -60,10 +62,11 @@ export async function WheelUniversePanel({ userId }: { userId: string }) {
           </h2>
           <p className="text-xs text-weave-500 leading-relaxed mt-0.5">
             Every name the Wheel is allowed to consider this tick.
-            Seed = curated baseline. Watchlist = added via a
-            dividend-tagged watchlist. Held = active option position
-            the bot keeps cycling. The bot picks within this set;
-            quality gate applies to additions.
+            Seed = curated baseline. Watchlist = added via your
+            dividend-tagged watchlists. Held = active option position
+            the bot keeps cycling. Market = cross-sector liquid
+            dividend payers (the bot is not locked to your watchlist).
+            Quality gate (yield ≥ 1.5%) applies to all additions.
           </p>
         </div>
         <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest">
@@ -89,6 +92,8 @@ export async function WheelUniversePanel({ userId }: { userId: string }) {
                 ? "bg-emerald-50/50"
                 : c.source === "watchlist"
                 ? "bg-treasure-50/40"
+                : c.source === "market_wide"
+                ? "bg-sky-50/40"
                 : "bg-weave-50/30"
             }`}
           >

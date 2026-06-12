@@ -28,7 +28,7 @@ EARNINGS_ALERT_WITHIN = 5  # days — closer than this counts as material
 
 class ResearchAgent(Agent):
     name = "research"
-    tick_interval_seconds = 600  # every 10 minutes
+    tick_interval_seconds = 1800  # Throttled 2026-06-05 (was 600/10min) - news cadence aligned with Market Sentiment
 
     async def tick(self) -> list[AgentMessage]:
         out: list[AgentMessage] = []

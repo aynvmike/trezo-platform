@@ -150,7 +150,13 @@ async def fetch_stock_candles(
             pass
 
     # Fallback to yfinance for any miss or non-daily interval.
-    return _yfinance_candles(symbol, period, interval)
+    # Fixed 2026-06-11: yf.Ticker().history() is a BLOCKING network
+    # call. Calling it inline froze the entire event loop (every agent
+    # + the API server) for the duration of each Yahoo request -- and
+    # Yahoo rate-limit stalls could freeze the whole bot. to_thread
+    # matches the docstring's promise ("caller runs it in a thread").
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(_yfinance_candles, symbol, period, interval)
 
 
 async def fetch_candles_for(

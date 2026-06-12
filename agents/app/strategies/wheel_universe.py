@@ -7,7 +7,9 @@ the single source of truth for "what symbols can the Wheel work on
 right now" - the Options Scanner imports `get_wheel_universe(user)`
 instead of iterating the static list.
 
-Composition (in priority order):
+Composition (in priority order; #5 added 2026-06-11, Task #6 --
+the Wheel's candidate ceiling is the same market-wide pool the stock
+agents scan, gated by dividend quality, never a curated whitelist):
   1. Curated seed (`WHEEL_WATCHLIST`) - always included. The 17 names
      we picked for their tier-balanced economics. Source = strategy.
   2. User watchlists - every stock-type ticker in any of the user's
@@ -64,6 +66,91 @@ DIVIDEND_YIELDS: dict[str, float] = {
 }
 
 MIN_QUALIFYING_YIELD = 0.015   # 1.5%. Names below this are not wheel-y enough.
+
+
+# Task #5 (2026-06-10, Mike's ask: "options be more open to the markets
+# and different industries like the stock agents"). Market-wide pool
+# of liquid dividend payers across sectors. Same role as
+# expanded_scan_pool() does for Pattern Detection - it gives the Wheel
+# a broader candidate set without forcing Mike to add each name to a
+# watchlist. Names here still go through the same yield-quality gate.
+MARKET_WIDE_DIVIDEND_POOL = [
+    # Mega-cap consumer staples
+    "PG", "KO", "PEP", "MDLZ", "CL", "KMB", "GIS", "K",
+    # Healthcare blue-chip yielders
+    "JNJ", "ABBV", "PFE", "MRK", "BMY", "AMGN", "GILD", "LLY",
+    # Banks + REITs
+    "JPM", "BAC", "C", "WFC", "USB", "PNC", "TFC",
+    "SPG", "O", "AMT", "PLD", "WELL", "VTR",
+    # Energy + utilities
+    "XOM", "CVX", "COP", "PSX", "VLO", "MPC",
+    "NEE", "DUK", "SO", "AEP", "EXC", "D",
+    # Industrials + materials
+    "MMM", "CAT", "DE", "HON", "GE", "DOW",
+    # Tech yielders + telcos
+    "IBM", "CSCO", "INTC", "ORCL", "QCOM", "TXN",
+    "T", "VZ", "TMUS",
+    # ETF dividend baskets (Wheel-friendly liquidity)
+    "SCHD", "VYM", "DVY", "HDV", "NOBL", "JEPI", "JEPQ", "DGRO",
+]
+
+
+async def market_wide_dividend_candidates() -> list[str]:
+    """Return the market-wide dividend pool. Static for now; future
+    versions can pull from S&P Dividend Aristocrats live or scrape
+    high-yield ETF constituents. Returns deduplicated upper-case
+    tickers."""
+    return [t.strip().upper() for t in MARKET_WIDE_DIVIDEND_POOL if t.strip()]
+
+
+# Task #49 (2026-06-05): live yield lookup for names not in DIVIDEND_YIELDS.
+# Uses Alpha Vantage COMPANY_OVERVIEW when an AV key is configured;
+# results cached for 24h to stay under the 25/day free tier. Falls back
+# to None on any failure -> consumer treats as ineligible.
+import time
+_yield_cache: dict[str, tuple[float, float]] = {}  # ticker -> (yield_pct, fetched_at)
+_YIELD_CACHE_TTL = 86400  # 24h
+
+
+async def _yield_live_lookup(ticker: str) -> Optional[float]:
+    t = ticker.upper().strip()
+    now = time.time()
+    hit = _yield_cache.get(t)
+    if hit and (now - hit[1]) < _YIELD_CACHE_TTL:
+        return hit[0]
+    try:
+        from app.config import get_settings as _gs_yield
+        key = (getattr(_gs_yield(), "alpha_vantage_api_key", "") or "").strip()
+        if not key:
+            return None
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://www.alphavantage.co/query",
+                params={"function": "COMPANY_OVERVIEW", "symbol": t, "apikey": key},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            div_yield = data.get("DividendYield")
+            if div_yield in (None, "", "None"):
+                _yield_cache[t] = (0.0, now)
+                return 0.0
+            v = float(div_yield)
+            _yield_cache[t] = (v, now)
+            return v
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def yield_for(ticker: str) -> Optional[float]:
+    """Get the dividend yield for a ticker. Prefers the static dict
+    (fast, known-good). Falls back to live lookup. Returns None when
+    we genuinely can't say."""
+    t = ticker.upper().strip()
+    if t in DIVIDEND_YIELDS:
+        return DIVIDEND_YIELDS[t]
+    return await _yield_live_lookup(t)
 _CACHE_TTL_SECONDS = 30
 
 
@@ -72,7 +159,7 @@ class WheelCandidate:
     """A single ticker the Wheel is allowed to consider, with the
     reason it qualified. The UI can use `source` to render reason chips."""
     ticker: str
-    source: str        # 'seed' | 'watchlist' | 'position'
+    source: str        # 'seed' | 'watchlist' | 'position' | 'market_wide'
     yield_pct: float
 
 
@@ -164,6 +251,58 @@ async def get_wheel_universe(user_id: Optional[str]) -> list[WheelCandidate]:
         except Exception as e:  # noqa: BLE001
             log.warning("wheel_universe.position_fetch_failed",
                         user_id=user_id, error=str(e)[:200])
+
+    # 4) Market-wide dividend pool (Task #5, Mike 2026-06-10:
+    #    "options be more open to the markets and different
+    #    industries like the stock agents"). Same yield gate as
+    #    watchlist additions - we don't auto-include names whose
+    #    yield we genuinely don't know.
+    try:
+        for sym in await market_wide_dividend_candidates():
+            if sym in seen:
+                continue
+            y = DIVIDEND_YIELDS.get(sym)
+            if y is None:
+                # Try live lookup - if still no yield, skip.
+                y = await yield_for(sym)
+            if y is None or y < MIN_QUALIFYING_YIELD:
+                continue
+            seen[sym] = WheelCandidate(
+                ticker=sym, source="market_wide", yield_pct=y,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("wheel_universe.market_wide_failed", error=str(e)[:200])
+
+    # 5) Full stock-side market pool (Task #6, Mike 2026-06-10: "they
+    #    should all be able to see all the stocks not a limited few").
+    #    This is the SAME dynamic universe Pattern Detection scans
+    #    (Alpaca movers, gainers + losers, padded with sector leaders),
+    #    so the Wheel's ceiling now tracks the stock side automatically
+    #    instead of stopping at the curated 64-name pool. Every name
+    #    still passes the same dividend-yield quality gate -- the gate
+    #    decides wheel-worthiness, the pool is no longer the cage.
+    #    Live AV yield lookups are budgeted per build to protect the
+    #    25/day free tier; unknown names simply wait for a later tick.
+    try:
+        from app.data.market_universe import market_wide_candidates as _stock_pool
+        live_budget = 5
+        for sym in await _stock_pool(limit=50):
+            sym = sym.upper().strip()
+            if not sym or sym in seen:
+                continue
+            y = DIVIDEND_YIELDS.get(sym)
+            if y is None:
+                if live_budget <= 0:
+                    continue
+                live_budget -= 1
+                y = await yield_for(sym)
+            if y is None or y < MIN_QUALIFYING_YIELD:
+                continue
+            seen[sym] = WheelCandidate(
+                ticker=sym, source="market_wide", yield_pct=y,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("wheel_universe.stock_pool_failed", error=str(e)[:200])
 
     universe = sorted(seen.values(), key=lambda c: (c.source != "position",
                                                     c.source != "seed",

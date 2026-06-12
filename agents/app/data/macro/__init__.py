@@ -19,13 +19,31 @@ from app.config import get_settings
 from .base import MacroReading, MacroSource, classify_macro_regime
 from .manual import ManualMacroSource
 from .nasdaq import NasdaqMacroSource
+from .twelve_data import TwelveDataMacroSource
+from .alpha_vantage import AlphaVantageMacroSource
+from .massive import MassiveMacroSource
 
 
 def pick_active_source() -> Optional[MacroSource]:
     """Return the active source for this process, or None when no
     source is configured. Reads from `Settings` (loaded from
-    agents/.env at startup) - not os.environ directly."""
+    agents/.env at startup) - not os.environ directly.
+
+    Priority order (first match wins):
+      1. Twelve Data  - clean free tier, no redistribution issues
+      2. Nasdaq Data Link - legacy backend; their API changed 2026-06
+         and existing free keys are getting 403. Keep for accounts
+         that still work.
+      3. Manual env vars - user types VIX/yield_spread/fed_funds in .env
+      4. None - regime classifier returns 'neutral'
+    """
     settings = get_settings()
+    if (getattr(settings, "massive_api_key", "") or "").strip():
+        return MassiveMacroSource()
+    if (getattr(settings, "twelve_data_api_key", "") or "").strip():
+        return TwelveDataMacroSource()
+    if (getattr(settings, "alpha_vantage_api_key", "") or "").strip():
+        return AlphaVantageMacroSource()
     if (settings.nasdaq_data_link_api_key or "").strip():
         return NasdaqMacroSource()
     if any(
@@ -44,10 +62,11 @@ async def get_macro_reading() -> MacroReading:
         return MacroReading(
             source="unavailable",
             note=(
-                "No macro source configured. Set "
-                "NASDAQ_DATA_LINK_API_KEY (Nasdaq backend) or "
-                "TREZO_MACRO_VIX / TREZO_MACRO_YIELD_SPREAD / "
-                "TREZO_MACRO_FED_FUNDS (manual backend) in agents/.env."
+                "No macro source configured. Easiest fix: sign up at "
+                "twelvedata.com (free, no card, 800 req/day) and set "
+                "TWELVE_DATA_API_KEY in agents/.env. Or set the manual "
+                "env vars TREZO_MACRO_VIX / TREZO_MACRO_YIELD_SPREAD / "
+                "TREZO_MACRO_FED_FUNDS for instant zero-key fallback."
             ),
         )
     return await src.get_reading()

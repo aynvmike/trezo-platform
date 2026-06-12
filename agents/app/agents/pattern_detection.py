@@ -56,7 +56,7 @@ def _supabase():
 
 class PatternDetectionAgent(Agent):
     name = "pattern_detection"
-    tick_interval_seconds = 60
+    tick_interval_seconds = 180  # Throttled 2026-06-05 (was 60) to cut API load
 
     # TCS at/above this triggers a signal.
     signal_threshold: int = 700
@@ -83,6 +83,10 @@ class PatternDetectionAgent(Agent):
         # `app/runtime/settings.py` for the four modes.
         # Keyed by f"{user_id or 'global'}:{SYM}". Value: (strategy, tcs).
         self._prev_strategy: dict[str, tuple[str, int]] = {}
+        # Patched 2026-06-10 (same class as WMT stacking): seed
+        # _prev_strategy from today's emitted signals so restart
+        # doesn't blow away strategy-switching friction state.
+        self._seeded_prev_strategy: bool = False
 
     async def _scan_targets(self) -> list[tuple]:
         """[(user_id, [tickers])] to scan - each user's default watchlist.
@@ -164,7 +168,22 @@ class PatternDetectionAgent(Agent):
         self._bt_at = now
         return self._bt_history
 
+    async def _maybe_seed_prev_strategy(self) -> None:
+        if self._seeded_prev_strategy:
+            return
+        self._seeded_prev_strategy = True
+        try:
+            from app.runtime.restart_state import seed_today_ticker_strategy_map
+            mp = await seed_today_ticker_strategy_map("pattern_detection")
+            # Reconstruct (strategy, tcs=0) tuples - TCS isn't tracked
+            # in this map and 0 is a safe default for friction comparison.
+            for ticker, strategy in mp.items():
+                self._prev_strategy[ticker] = (strategy, 0)
+        except Exception:
+            pass
+
     async def tick(self) -> list[AgentMessage]:
+        await self._maybe_seed_prev_strategy()
         from app.runtime.settings import (
             get_bot_settings, required_switch_advantage,
         )
@@ -388,6 +407,19 @@ class PatternDetectionAgent(Agent):
                         }
                         if user_id:
                             payload["user_id"] = user_id
+                        # Task #91 (2026-06-05): tag urgency for tiered
+                        # staleness in Risk Manager. Mike: TCS alone is
+                        # misleading; agents should learn what's actually
+                        # time-sensitive. Initial rule: high TCS = urgent,
+                        # mid-band = mixed, else low. Pattern.is_fresh
+                        # would refine this once we plumb a freshness
+                        # signal through (TODO).
+                        if pick.tcs >= 700:
+                            payload["urgency"] = "urgent"
+                        elif pick.tcs >= 500:
+                            payload["urgency"] = "mixed"
+                        else:
+                            payload["urgency"] = "low"
                         out.append(AgentMessage(
                             agent=self.name, kind="signal",
                             confidence=pick.tcs / 1000.0, payload=payload,
@@ -447,5 +479,36 @@ class PatternDetectionAgent(Agent):
                 payload["user_id"] = summary["user_id"]
             out.append(AgentMessage(
                 agent=self.name, kind="info", payload=payload))
+
+        # Task #60 (2026-06-05): emit a single scanner_pulse summary.
+        # Replaces N signal rows in agent_messages with 1 summary row -
+        # trace panel reads this for the "X SIGNAL" counter without
+        # paying for per-signal storage.
+        try:
+            _signals = [m for m in out if getattr(m, "kind", None) == "signal"]
+            if _signals:
+                _tcss = []
+                for s in _signals:
+                    t = (s.payload or {}).get("tcs")
+                    if isinstance(t, (int, float)):
+                        _tcss.append(int(t))
+                _top_tcs = max(_tcss) if _tcss else 0
+                _by_strategy = {}
+                for s in _signals:
+                    st = (s.payload or {}).get("strategy") or "default"
+                    _by_strategy[st] = _by_strategy.get(st, 0) + 1
+                out.append(AgentMessage(
+                    agent=self.name,
+                    kind="scanner_pulse",
+                    confidence=1.0,
+                    payload={
+                        "scanned": len(symbols) if 'symbols' in dir() else 0,
+                        "fired": len(_signals),
+                        "top_tcs": _top_tcs,
+                        "by_strategy": _by_strategy,
+                    },
+                ))
+        except Exception:
+            pass
 
         return out

@@ -105,6 +105,9 @@ def _supabase():
         return None
 
 
+_BOOT_AT = datetime.now(timezone.utc)
+
+
 class OpsWatchdogAgent(Agent):
     """The 21st agent. Supervisor / health monitor."""
 
@@ -122,8 +125,13 @@ class OpsWatchdogAgent(Agent):
     async def tick(self) -> list[AgentMessage]:
         out: list[AgentMessage] = []
         try:
+            # Fixed 2026-06-11: this used to import _last_tick_at from
+            # app.runtime.scheduler -- a name that NEVER existed. The
+            # ImportError fired on every tick, so the watchdog (built
+            # after the 6/3 silence incident!) was itself dead from the
+            # day it shipped. Tick times live on the registry's
+            # AgentState (state.last_tick_at, set by mark_ticked()).
             from app.runtime.registry import registry
-            from app.runtime.scheduler import _last_tick_at  # may be {} on cold start
         except Exception as e:  # noqa: BLE001
             return [AgentMessage(
                 agent=self.name, kind="error",
@@ -174,15 +182,45 @@ class OpsWatchdogAgent(Agent):
                 # Outside market hours, only alert on REALLY long silence.
                 tolerance_min = max(tolerance_min, 1440)
 
-            last_str = _last_tick_at.get(name) if isinstance(_last_tick_at, dict) else None
-            if not last_str:
-                # No tick yet this run - normal on cold start. Tolerate
-                # for the first 2x tick interval after process boot.
+            _st = registered.get(name)
+            last_dt = getattr(_st, "last_tick_at", None) if _st else None
+            if last_dt is None:
+                # Registered but has NEVER ticked. On a fresh boot that's
+                # normal briefly; past 2x the agent's own interval it is
+                # exactly the silent-failure case this watchdog exists
+                # for (e.g. a tick that hangs or raises before returning).
+                interval_s = getattr(getattr(_st, "impl", None),
+                                     "tick_interval_seconds", 300) or 300
+                boot_grace_min = max((2 * interval_s) / 60.0, 10.0)
+                uptime_min = (now - _BOOT_AT).total_seconds() / 60.0
+                if uptime_min < boot_grace_min:
+                    continue
+                key = ("never_ticked", name)
+                if key in self._open_alerts:
+                    continue
+                self._open_alerts.add(key)
+                await self._persist_alert(
+                    kind="stuck_agent",
+                    target=name,
+                    severity="urgent",
+                    message=(
+                        f"Agent '{name}' is registered but has NEVER "
+                        f"ticked ({uptime_min:.0f} min since boot, "
+                        f"interval {interval_s}s). Its tick is likely "
+                        f"raising or hanging before completing. Check "
+                        f"the agents console for 'agent.tick.failed' "
+                        f"lines, or GET /agents for last_error."
+                    ),
+                )
+                out.append(AgentMessage(
+                    agent=self.name, kind="error",
+                    payload={"event": "never_ticked", "target": name,
+                             "uptime_min": round(uptime_min, 1)},
+                ))
                 continue
-            try:
-                last_dt = datetime.fromisoformat(str(last_str).replace("Z", "+00:00"))
-            except Exception:
-                continue
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            last_str = last_dt.isoformat()
             silence_min = (now - last_dt).total_seconds() / 60.0
             if silence_min < tolerance_min:
                 # Healthy - clear any prior stuck alert for this agent

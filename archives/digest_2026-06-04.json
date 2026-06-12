@@ -1,0 +1,2045 @@
+﻿[
+    {
+        "content":  "[DAILY BRIEF 2026-06-04] 72041 decisions: 71533 vetoes, 431 approves, 57 executes, 20 closes. Realized P\u0026L: $-24.17.",
+        "metadata":  {
+                         "executes":  57,
+                         "vetoes":  71533,
+                         "realized_pnl_usd":  -24.17,
+                         "date":  "2026-06-04",
+                         "kind":  "daily_brief",
+                         "approves":  431,
+                         "closes":  20
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] LGHL had 50 vetoes. Top reasons: 32x Liquidity filter price  is below the  minimum; 18x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "LGHL",
+                         "count":  50,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TJGC had 642 vetoes. Top reasons: 642x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TJGC",
+                         "count":  642,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MLAAW had 767 vetoes. Top reasons: 764x Liquidity filter price  is below the  minimum; 3x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MLAAW",
+                         "count":  767,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] VCIG had 895 vetoes. Top reasons: 860x Neutral direction  no actionable bias; 35x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "VCIG",
+                         "count":  895,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMDY had 1156 vetoes. Top reasons: 683x Neutral direction  no actionable bias; 338x Killswitch session   broker order rejects this session; 135x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMDY",
+                         "count":  1156,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] BAC had 3 vetoes. Top reasons: 2x Killswitch session   broker order rejects this session; 1x BAC bidask spread  is too wide limit   illiquid skipped",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "BAC",
+                         "count":  3,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SSACW had 607 vetoes. Top reasons: 607x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SSACW",
+                         "count":  607,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TURB had 31 vetoes. Top reasons: 31x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TURB",
+                         "count":  31,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MNTS had 804 vetoes. Top reasons: 783x Neutral direction  no actionable bias; 12x Liquidity filter default average volume  is below the share ; 9x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MNTS",
+                         "count":  804,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ANY had 643 vetoes. Top reasons: 635x Daily loss limit hit for  users  pausing signals; 8x Liquidity filter default average volume  is below the share ",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ANY",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AVXX had 82 vetoes. Top reasons: 82x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AVXX",
+                         "count":  82,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AIIO had 43 vetoes. Top reasons: 31x Liquidity filter price  is below the  minimum; 11x Neutral direction  no actionable bias; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AIIO",
+                         "count":  43,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PRZO had 536 vetoes. Top reasons: 532x Neutral direction  no actionable bias; 4x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PRZO",
+                         "count":  536,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NCT had 567 vetoes. Top reasons: 554x Neutral direction  no actionable bias; 13x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NCT",
+                         "count":  567,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NEXR had 619 vetoes. Top reasons: 356x Neutral direction  no actionable bias; 223x Killswitch session   broker order rejects this session; 30x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NEXR",
+                         "count":  619,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SDOT had 651 vetoes. Top reasons: 635x Daily loss limit hit for  users  pausing signals; 8x Liquidity filter default average volume  is below the share ; 8x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SDOT",
+                         "count":  651,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NVDY had 122 vetoes. Top reasons: 65x Killswitch session   broker order rejects this session; 33x Liquidity filter average volume  is below the share minimum; 14x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NVDY",
+                         "count":  122,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] WCT had 643 vetoes. Top reasons: 635x Daily loss limit hit for  users  pausing signals; 8x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "WCT",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ONDG had 553 vetoes. Top reasons: 553x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ONDG",
+                         "count":  553,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CISO had 6 vetoes. Top reasons: 6x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CISO",
+                         "count":  6,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TSSI had 23 vetoes. Top reasons: 20x Neutral direction  no actionable bias; 2x Killswitch session   broker order rejects this session; 1x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TSSI",
+                         "count":  23,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TWAV had 31 vetoes. Top reasons: 22x Neutral direction  no actionable bias; 9x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TWAV",
+                         "count":  31,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DXST had 17 vetoes. Top reasons: 17x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DXST",
+                         "count":  17,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] HOTH had 30 vetoes. Top reasons: 30x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "HOTH",
+                         "count":  30,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NTCL had 619 vetoes. Top reasons: 619x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NTCL",
+                         "count":  619,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CMND had 902 vetoes. Top reasons: 555x Neutral direction  no actionable bias; 345x Killswitch session   broker order rejects this session; 2x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CMND",
+                         "count":  902,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ONDL had 562 vetoes. Top reasons: 562x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ONDL",
+                         "count":  562,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SNOW had 143 vetoes. Top reasons: 94x Killswitch session   broker order rejects this session; 49x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SNOW",
+                         "count":  143,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NVDA had 3 vetoes. Top reasons: 2x Killswitch session   broker order rejects this session; 1x NVDA bidask spread  is too wide limit   illiquid skipped",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NVDA",
+                         "count":  3,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] WXM had 35 vetoes. Top reasons: 24x Liquidity filter default average volume  is below the share ; 8x Neutral direction  no actionable bias; 3x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "WXM",
+                         "count":  35,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] BKSY.WS had 740 vetoes. Top reasons: 740x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "BKSY.WS",
+                         "count":  740,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RBLX had 393 vetoes. Top reasons: 250x Liquidity filter average volume  is below the share minimum; 129x Killswitch session   broker order rejects this session; 10x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RBLX",
+                         "count":  393,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] REPL had 234 vetoes. Top reasons: 161x Neutral direction  no actionable bias; 69x Killswitch session   broker order rejects this session; 4x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "REPL",
+                         "count":  234,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CPSH had 772 vetoes. Top reasons: 769x Neutral direction  no actionable bias; 3x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CPSH",
+                         "count":  772,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RCT had 24 vetoes. Top reasons: 15x Neutral direction  no actionable bias; 9x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RCT",
+                         "count":  24,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] JEPQ had 1929 vetoes. Top reasons: 1334x Neutral direction  no actionable bias; 385x Killswitch session   broker order rejects this session; 210x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "JEPQ",
+                         "count":  1929,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] IBM had 918 vetoes. Top reasons: 867x Neutral direction  no actionable bias; 21x Liquidity filter average volume  is below the share minimum; 18x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "IBM",
+                         "count":  918,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NXTS had 80 vetoes. Top reasons: 80x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NXTS",
+                         "count":  80,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DY had 62 vetoes. Top reasons: 36x Neutral direction  no actionable bias; 26x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DY",
+                         "count":  62,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] HSPTU had 7 vetoes. Top reasons: 7x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "HSPTU",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CPOP had 11 vetoes. Top reasons: 11x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CPOP",
+                         "count":  11,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CZR had 2193 vetoes. Top reasons: 1174x Neutral direction  no actionable bias; 635x Daily loss limit hit for  users  pausing signals; 343x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CZR",
+                         "count":  2193,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PD had 359 vetoes. Top reasons: 262x Neutral direction  no actionable bias; 95x Killswitch session   broker order rejects this session; 2x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PD",
+                         "count":  359,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RUMBW had 4 vetoes. Top reasons: 4x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RUMBW",
+                         "count":  4,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] GM had 1371 vetoes. Top reasons: 743x Killswitch session   broker order rejects this session; 559x Neutral direction  no actionable bias; 62x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "GM",
+                         "count":  1371,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DEVS had 525 vetoes. Top reasons: 338x Neutral direction  no actionable bias; 183x Killswitch session   broker order rejects this session; 4x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DEVS",
+                         "count":  525,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] XOS had 643 vetoes. Top reasons: 643x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "XOS",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TE.WS had 834 vetoes. Top reasons: 805x Neutral direction  no actionable bias; 29x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TE.WS",
+                         "count":  834,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] IMCC had 21 vetoes. Top reasons: 17x Neutral direction  no actionable bias; 4x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "IMCC",
+                         "count":  21,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TDTH had 7 vetoes. Top reasons: 7x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TDTH",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MRK had 2239 vetoes. Top reasons: 1150x Liquidity filter average volume  is below the share minimum; 635x Daily loss limit hit for  users  pausing signals; 334x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MRK",
+                         "count":  2239,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RYOJ had 4 vetoes. Top reasons: 3x Liquidity filter price  is below the  minimum; 1x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RYOJ",
+                         "count":  4,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DGNX had 50 vetoes. Top reasons: 50x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DGNX",
+                         "count":  50,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] STAK had 643 vetoes. Top reasons: 643x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "STAK",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MX had 355 vetoes. Top reasons: 331x Neutral direction  no actionable bias; 24x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MX",
+                         "count":  355,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SBEV had 20 vetoes. Top reasons: 20x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SBEV",
+                         "count":  20,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] LSE had 4 vetoes. Top reasons: 4x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "LSE",
+                         "count":  4,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RDWU had 797 vetoes. Top reasons: 797x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RDWU",
+                         "count":  797,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMSC had 467 vetoes. Top reasons: 258x Killswitch session   broker order rejects this session; 159x Liquidity filter average volume  is below the share minimum; 33x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMSC",
+                         "count":  467,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] YMAT had 1714 vetoes. Top reasons: 760x Neutral direction  no actionable bias; 635x Daily loss limit hit for  users  pausing signals; 302x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "YMAT",
+                         "count":  1714,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] WNW had 70 vetoes. Top reasons: 60x Killswitch session   broker order rejects this session; 10x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "WNW",
+                         "count":  70,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] OLOX had 903 vetoes. Top reasons: 838x Neutral direction  no actionable bias; 57x Killswitch session   broker order rejects this session; 8x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "OLOX",
+                         "count":  903,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CNEY had 14 vetoes. Top reasons: 14x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CNEY",
+                         "count":  14,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AXINR had 769 vetoes. Top reasons: 742x Neutral direction  no actionable bias; 27x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AXINR",
+                         "count":  769,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CXAIW had 23 vetoes. Top reasons: 23x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CXAIW",
+                         "count":  23,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ASTC had 1588 vetoes. Top reasons: 1515x Neutral direction  no actionable bias; 67x Killswitch session   broker order rejects this session; 6x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ASTC",
+                         "count":  1588,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TOPP had 731 vetoes. Top reasons: 583x Neutral direction  no actionable bias; 147x Killswitch session   broker order rejects this session; 1x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TOPP",
+                         "count":  731,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] GNTA had 78 vetoes. Top reasons: 66x Neutral direction  no actionable bias; 12x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "GNTA",
+                         "count":  78,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] QFIN had 62 vetoes. Top reasons: 62x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "QFIN",
+                         "count":  62,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] QTTB had 251 vetoes. Top reasons: 249x Neutral direction  no actionable bias; 2x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "QTTB",
+                         "count":  251,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] IOTR had 736 vetoes. Top reasons: 655x Neutral direction  no actionable bias; 81x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "IOTR",
+                         "count":  736,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DLLL had 902 vetoes. Top reasons: 655x Neutral direction  no actionable bias; 182x Killswitch session   broker order rejects this session; 65x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DLLL",
+                         "count":  902,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] OSCX had 18 vetoes. Top reasons: 18x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "OSCX",
+                         "count":  18,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MOBX had 4 vetoes. Top reasons: 4x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MOBX",
+                         "count":  4,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] STI had 37 vetoes. Top reasons: 27x Neutral direction  no actionable bias; 9x Liquidity filter default average volume  is below the share ; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "STI",
+                         "count":  37,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] QTEXW had 552 vetoes. Top reasons: 502x Neutral direction  no actionable bias; 50x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "QTEXW",
+                         "count":  552,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CSCO had 1011 vetoes. Top reasons: 730x CSCO bidask spread  is too wide limit   illiquid skipped; 208x Killswitch session   broker order rejects this session; 46x Opensignal cap reached ",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CSCO",
+                         "count":  1011,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] LUNL had 83 vetoes. Top reasons: 83x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "LUNL",
+                         "count":  83,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SPRC had 582 vetoes. Top reasons: 519x Neutral direction  no actionable bias; 63x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SPRC",
+                         "count":  582,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AIMD had 733 vetoes. Top reasons: 728x Neutral direction  no actionable bias; 5x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AIMD",
+                         "count":  733,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] FOXXW had 35 vetoes. Top reasons: 35x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "FOXXW",
+                         "count":  35,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TDACW had 272 vetoes. Top reasons: 272x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TDACW",
+                         "count":  272,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] BRR had 58 vetoes. Top reasons: 58x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "BRR",
+                         "count":  58,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] VTIX had 36 vetoes. Top reasons: 36x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "VTIX",
+                         "count":  36,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMSS had 4 vetoes. Top reasons: 4x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMSS",
+                         "count":  4,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DIS had 5 vetoes. Top reasons: 4x Liquidity filter average volume  is below the share minimum; 1x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DIS",
+                         "count":  5,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MSFT had 8 vetoes. Top reasons: 6x Liquidity filter average volume  is below the share minimum; 2x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MSFT",
+                         "count":  8,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ASAN had 5 vetoes. Top reasons: 3x Neutral direction  no actionable bias; 2x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ASAN",
+                         "count":  5,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PYPL had 1822 vetoes. Top reasons: 744x Neutral direction  no actionable bias; 635x Daily loss limit hit for  users  pausing signals; 327x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PYPL",
+                         "count":  1822,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] LMT had 1662 vetoes. Top reasons: 738x Liquidity filter average volume  is below the share minimum; 635x Daily loss limit hit for  users  pausing signals; 160x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "LMT",
+                         "count":  1662,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SNOY had 6 vetoes. Top reasons: 6x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SNOY",
+                         "count":  6,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] HUBC had 446 vetoes. Top reasons: 298x Neutral direction  no actionable bias; 142x Killswitch session   broker order rejects this session; 6x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "HUBC",
+                         "count":  446,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SNGX had 248 vetoes. Top reasons: 202x Neutral direction  no actionable bias; 46x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SNGX",
+                         "count":  248,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] EDIT had 13 vetoes. Top reasons: 13x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "EDIT",
+                         "count":  13,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] FGL had 249 vetoes. Top reasons: 205x Liquidity filter price  is below the  minimum; 44x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "FGL",
+                         "count":  249,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NCPL had 215 vetoes. Top reasons: 168x Neutral direction  no actionable bias; 47x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NCPL",
+                         "count":  215,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CXAI had 56 vetoes. Top reasons: 36x Neutral direction  no actionable bias; 20x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CXAI",
+                         "count":  56,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] WLDSW had 402 vetoes. Top reasons: 402x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "WLDSW",
+                         "count":  402,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] EEIQ had 147 vetoes. Top reasons: 76x Neutral direction  no actionable bias; 71x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "EEIQ",
+                         "count":  147,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NOWL had 15 vetoes. Top reasons: 15x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NOWL",
+                         "count":  15,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AIM had 240 vetoes. Top reasons: 240x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AIM",
+                         "count":  240,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TYG.RT had 5 vetoes. Top reasons: 5x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TYG.RT",
+                         "count":  5,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NVTX had 643 vetoes. Top reasons: 643x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NVTX",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] XLP had 3 vetoes. Top reasons: 2x Liquidity filter average volume  is below the share minimum; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "XLP",
+                         "count":  3,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] OKTA had 54 vetoes. Top reasons: 54x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "OKTA",
+                         "count":  54,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] XLF had 3 vetoes. Top reasons: 2x XLF bidask spread  is too wide limit   illiquid skipped; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "XLF",
+                         "count":  3,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ONDU had 563 vetoes. Top reasons: 563x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ONDU",
+                         "count":  563,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] UMAC had 573 vetoes. Top reasons: 572x Neutral direction  no actionable bias; 1x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "UMAC",
+                         "count":  573,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PCLA had 718 vetoes. Top reasons: 718x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PCLA",
+                         "count":  718,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] APPX had 7 vetoes. Top reasons: 7x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "APPX",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] OTLK had 103 vetoes. Top reasons: 102x Neutral direction  no actionable bias; 1x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "OTLK",
+                         "count":  103,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TSLY had 503 vetoes. Top reasons: 325x Killswitch session   broker order rejects this session; 96x Neutral direction  no actionable bias; 63x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TSLY",
+                         "count":  503,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SNOU had 573 vetoes. Top reasons: 507x Neutral direction  no actionable bias; 66x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SNOU",
+                         "count":  573,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NHICW had 181 vetoes. Top reasons: 181x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NHICW",
+                         "count":  181,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CGTL had 359 vetoes. Top reasons: 249x Killswitch session   broker order rejects this session; 110x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CGTL",
+                         "count":  359,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CRSR had 20 vetoes. Top reasons: 20x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CRSR",
+                         "count":  20,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] YYGH had 7 vetoes. Top reasons: 7x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "YYGH",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMPGZ had 3 vetoes. Top reasons: 3x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMPGZ",
+                         "count":  3,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] UZX had 768 vetoes. Top reasons: 766x Liquidity filter price  is below the  minimum; 1x Neutral direction  no actionable bias; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "UZX",
+                         "count":  768,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MYND had 371 vetoes. Top reasons: 314x Killswitch session   broker order rejects this session; 57x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MYND",
+                         "count":  371,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] FATN had 573 vetoes. Top reasons: 566x Neutral direction  no actionable bias; 7x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "FATN",
+                         "count":  573,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PHGE had 768 vetoes. Top reasons: 742x Neutral direction  no actionable bias; 26x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PHGE",
+                         "count":  768,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MKLYR had 29 vetoes. Top reasons: 29x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MKLYR",
+                         "count":  29,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] TNMG had 93 vetoes. Top reasons: 46x Neutral direction  no actionable bias; 34x Killswitch session   broker order rejects this session; 13x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "TNMG",
+                         "count":  93,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CUPR had 319 vetoes. Top reasons: 210x Killswitch session   broker order rejects this session; 109x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CUPR",
+                         "count":  319,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MSC had 23 vetoes. Top reasons: 23x Liquidity filter stms average volume  is below the share min",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MSC",
+                         "count":  23,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] GNS had 140 vetoes. Top reasons: 139x Killswitch session   broker order rejects this session; 1x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "GNS",
+                         "count":  140,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SMCL had 151 vetoes. Top reasons: 151x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SMCL",
+                         "count":  151,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] QTEX had 1299 vetoes. Top reasons: 856x Liquidity filter price  is below the  minimum; 442x Neutral direction  no actionable bias; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "QTEX",
+                         "count":  1299,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PRFX had 475 vetoes. Top reasons: 287x Killswitch session   broker order rejects this session; 184x Neutral direction  no actionable bias; 4x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PRFX",
+                         "count":  475,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CODX had 1031 vetoes. Top reasons: 1031x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CODX",
+                         "count":  1031,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] QH had 903 vetoes. Top reasons: 650x Neutral direction  no actionable bias; 195x Killswitch session   broker order rejects this session; 58x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "QH",
+                         "count":  903,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] VS had 106 vetoes. Top reasons: 106x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "VS",
+                         "count":  106,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SMCX had 151 vetoes. Top reasons: 151x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SMCX",
+                         "count":  151,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] HCAT had 33 vetoes. Top reasons: 27x Neutral direction  no actionable bias; 6x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "HCAT",
+                         "count":  33,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SPPL had 200 vetoes. Top reasons: 200x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SPPL",
+                         "count":  200,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] STG had 470 vetoes. Top reasons: 390x Neutral direction  no actionable bias; 80x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "STG",
+                         "count":  470,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ACCL had 20 vetoes. Top reasons: 12x Neutral direction  no actionable bias; 8x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ACCL",
+                         "count":  20,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ASTN had 212 vetoes. Top reasons: 188x Killswitch session   broker order rejects this session; 24x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ASTN",
+                         "count":  212,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] F had 6 vetoes. Top reasons: 3x Overextended price is  ATR from its day average  too stretch; 2x Killswitch session   broker order rejects this session; 1x F no live bidask quote  possibly halted signal skipped",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "F",
+                         "count":  6,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SPCE had 352 vetoes. Top reasons: 352x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SPCE",
+                         "count":  352,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] NTAP had 182 vetoes. Top reasons: 170x Neutral direction  no actionable bias; 12x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "NTAP",
+                         "count":  182,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RCAX had 573 vetoes. Top reasons: 573x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RCAX",
+                         "count":  573,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AAPL had 918 vetoes. Top reasons: 521x Killswitch session   broker order rejects this session; 340x Neutral direction  no actionable bias; 47x Opensignal cap reached ",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AAPL",
+                         "count":  918,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] GITS had 61 vetoes. Top reasons: 61x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "GITS",
+                         "count":  61,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ATPC had 1216 vetoes. Top reasons: 801x Neutral direction  no actionable bias; 306x Killswitch session   broker order rejects this session; 109x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ATPC",
+                         "count":  1216,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] OSCG had 15 vetoes. Top reasons: 15x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "OSCG",
+                         "count":  15,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] VERU had 17 vetoes. Top reasons: 16x Liquidity filter default price  is below the  minimum; 1x Liquidity filter default average volume  is below the share ",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "VERU",
+                         "count":  17,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMPGR had 11 vetoes. Top reasons: 11x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMPGR",
+                         "count":  11,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] BRAI had 737 vetoes. Top reasons: 704x Liquidity filter average volume  is below the share minimum; 32x Neutral direction  no actionable bias; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "BRAI",
+                         "count":  737,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] BRUNW had 7 vetoes. Top reasons: 7x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "BRUNW",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CDT had 141 vetoes. Top reasons: 91x Neutral direction  no actionable bias; 49x Killswitch session   broker order rejects this session; 1x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CDT",
+                         "count":  141,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CDTG had 9 vetoes. Top reasons: 9x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CDTG",
+                         "count":  9,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] WMT had 1513 vetoes. Top reasons: 1192x Killswitch session   broker order rejects this session; 301x Liquidity filter average volume  is below the share minimum; 17x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "WMT",
+                         "count":  1513,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SCLX had 8 vetoes. Top reasons: 8x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SCLX",
+                         "count":  8,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DELL had 348 vetoes. Top reasons: 256x Neutral direction  no actionable bias; 90x Killswitch session   broker order rejects this session; 2x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DELL",
+                         "count":  348,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] BRTX had 150 vetoes. Top reasons: 116x Liquidity filter price  is below the  minimum; 34x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "BRTX",
+                         "count":  150,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] IPWR had 7 vetoes. Top reasons: 6x Neutral direction  no actionable bias; 1x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "IPWR",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SNYR had 48 vetoes. Top reasons: 35x Killswitch session   broker order rejects this session; 13x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SNYR",
+                         "count":  48,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RPGL had 5 vetoes. Top reasons: 4x Neutral direction  no actionable bias; 1x Liquidity filter stms average volume  is below the share min",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RPGL",
+                         "count":  5,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] DRNL had 11 vetoes. Top reasons: 11x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "DRNL",
+                         "count":  11,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MNTSW had 180 vetoes. Top reasons: 180x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MNTSW",
+                         "count":  180,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AKTX had 266 vetoes. Top reasons: 266x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AKTX",
+                         "count":  266,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SOFI had 1266 vetoes. Top reasons: 834x Killswitch session   broker order rejects this session; 332x Neutral direction  no actionable bias; 100x SOFI bidask spread  is too wide limit   illiquid skipped",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SOFI",
+                         "count":  1266,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ZS had 14 vetoes. Top reasons: 14x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ZS",
+                         "count":  14,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SELX had 643 vetoes. Top reasons: 635x Daily loss limit hit for  users  pausing signals; 8x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SELX",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] EDHL had 37 vetoes. Top reasons: 29x Neutral direction  no actionable bias; 8x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "EDHL",
+                         "count":  37,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ASTI had 11 vetoes. Top reasons: 11x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ASTI",
+                         "count":  11,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RFAMR had 10 vetoes. Top reasons: 10x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RFAMR",
+                         "count":  10,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CREG had 57 vetoes. Top reasons: 42x Killswitch session   broker order rejects this session; 11x Neutral direction  no actionable bias; 4x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CREG",
+                         "count":  57,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMD had 1445 vetoes. Top reasons: 1158x Neutral direction  no actionable bias; 205x Killswitch session   broker order rejects this session; 75x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMD",
+                         "count":  1445,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CUBWW had 642 vetoes. Top reasons: 642x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CUBWW",
+                         "count":  642,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MULL had 761 vetoes. Top reasons: 760x Liquidity filter average volume  is below the share minimum; 1x No price data for the liquidity check",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MULL",
+                         "count":  761,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ROLR had 5 vetoes. Top reasons: 5x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ROLR",
+                         "count":  5,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] PLCE had 8 vetoes. Top reasons: 7x Neutral direction  no actionable bias; 1x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "PLCE",
+                         "count":  8,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] AMST had 5 vetoes. Top reasons: 5x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "AMST",
+                         "count":  5,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] INDP had 16 vetoes. Top reasons: 16x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "INDP",
+                         "count":  16,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] MASK had 576 vetoes. Top reasons: 463x Killswitch session   broker order rejects this session; 111x Liquidity filter price  is below the  minimum; 2x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "MASK",
+                         "count":  576,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ADVB had 25 vetoes. Top reasons: 25x Killswitch session   broker order rejects this session",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ADVB",
+                         "count":  25,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] CHA had 21 vetoes. Top reasons: 21x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "CHA",
+                         "count":  21,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] INTC had 592 vetoes. Top reasons: 254x Killswitch session   broker order rejects this session; 253x INTC bidask spread  is too wide limit   illiquid skipped; 54x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "INTC",
+                         "count":  592,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] FOXX had 37 vetoes. Top reasons: 28x Neutral direction  no actionable bias; 9x Liquidity filter default average volume  is below the share ",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "FOXX",
+                         "count":  37,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] SOAR had 643 vetoes. Top reasons: 635x Daily loss limit hit for  users  pausing signals; 8x Liquidity filter default price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "SOAR",
+                         "count":  643,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RDGT had 19 vetoes. Top reasons: 19x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RDGT",
+                         "count":  19,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] OKTG had 886 vetoes. Top reasons: 886x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "OKTG",
+                         "count":  886,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] APPS had 251 vetoes. Top reasons: 245x Neutral direction  no actionable bias; 6x Liquidity filter average volume  is below the share minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "APPS",
+                         "count":  251,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] ARTL had 12 vetoes. Top reasons: 12x Liquidity filter price  is below the  minimum",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "ARTL",
+                         "count":  12,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] RUM had 4 vetoes. Top reasons: 3x Liquidity filter default average volume  is below the share ; 1x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "RUM",
+                         "count":  4,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[VETO ROLLUP 2026-06-04] FOFO had 7 vetoes. Top reasons: 7x Neutral direction  no actionable bias",
+        "metadata":  {
+                         "date":  "2026-06-04",
+                         "ticker":  "FOFO",
+                         "count":  7,
+                         "kind":  "veto_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] GM via  approved 9 time(s). TCS range: 670-670.",
+        "metadata":  {
+                         "count":  9,
+                         "ticker":  "GM",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] AAPL via  approved 4 time(s). TCS range: 750-770.",
+        "metadata":  {
+                         "count":  4,
+                         "ticker":  "AAPL",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] CSCO via  approved 75 time(s). TCS range: 652-670.",
+        "metadata":  {
+                         "count":  75,
+                         "ticker":  "CSCO",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] F via  approved 5 time(s). TCS range: 710-760.",
+        "metadata":  {
+                         "count":  5,
+                         "ticker":  "F",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] NVDA via  approved 3 time(s). TCS range: 760-760.",
+        "metadata":  {
+                         "count":  3,
+                         "ticker":  "NVDA",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] XRP via  approved 10 time(s). TCS range: 482-482.",
+        "metadata":  {
+                         "count":  10,
+                         "ticker":  "XRP",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] AAPL via  approved 45 time(s). TCS range: 670-670.",
+        "metadata":  {
+                         "count":  45,
+                         "ticker":  "AAPL",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] JEPQ via  approved 3 time(s). TCS range: 652-652.",
+        "metadata":  {
+                         "count":  3,
+                         "ticker":  "JEPQ",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] BAC via  approved 2 time(s). TCS range: 760-760.",
+        "metadata":  {
+                         "count":  2,
+                         "ticker":  "BAC",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] INTC via  approved 152 time(s). TCS range: 634-670.",
+        "metadata":  {
+                         "count":  152,
+                         "ticker":  "INTC",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] SOFI via  approved 113 time(s). TCS range: 616-670.",
+        "metadata":  {
+                         "count":  113,
+                         "ticker":  "SOFI",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] RBLX via  approved 1 time(s). TCS range: 616-616.",
+        "metadata":  {
+                         "count":  1,
+                         "ticker":  "RBLX",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[APPROVE 2026-06-04] INTC via  approved 9 time(s). TCS range: 652-652.",
+        "metadata":  {
+                         "count":  9,
+                         "ticker":  "INTC",
+                         "date":  "2026-06-04",
+                         "strategy":  "",
+                         "kind":  "approve_rollup"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $83.008475. Realized: $-1.5.",
+        "metadata":  {
+                         "realized_pnl_usd":  -1.5,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $83.008475. Realized: $-1.5.",
+        "metadata":  {
+                         "realized_pnl_usd":  -1.5,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $83.11842. Realized: $-0.03.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.03,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $83.11842. Realized: $-0.03.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.03,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $83.01847000000001. Realized: $-0.87.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.87,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $83.01847000000001. Realized: $-0.87.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.87,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $82.71862000000002. Realized: $-2.44.",
+        "metadata":  {
+                         "realized_pnl_usd":  -2.44,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] GM closed stms_11am_stop @ $82.71862000000002. Realized: $-2.44.",
+        "metadata":  {
+                         "realized_pnl_usd":  -2.44,
+                         "ticker":  "GM",
+                         "exit_reason":  "stms_11am_stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] XRP closed stop @ $1.1994. Realized: $-112.",
+        "metadata":  {
+                         "realized_pnl_usd":  -112,
+                         "ticker":  "XRP",
+                         "exit_reason":  "stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] XRP closed stop @ $1.1994. Realized: $-112.",
+        "metadata":  {
+                         "realized_pnl_usd":  -112,
+                         "ticker":  "XRP",
+                         "exit_reason":  "stop",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] SOFI closed alpaca_bracket @ $16.69. Realized: $-0.2.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.2,
+                         "ticker":  "SOFI",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] SOFI closed alpaca_bracket @ $16.69. Realized: $-0.2.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.2,
+                         "ticker":  "SOFI",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] INTC closed alpaca_bracket @ $112.74. Realized: $94.74.",
+        "metadata":  {
+                         "realized_pnl_usd":  94.74,
+                         "ticker":  "INTC",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] INTC closed alpaca_bracket @ $112.74. Realized: $94.74.",
+        "metadata":  {
+                         "realized_pnl_usd":  94.74,
+                         "ticker":  "INTC",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] SOFI closed alpaca_bracket @ $15.93. Realized: $-0.96.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.96,
+                         "ticker":  "SOFI",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] SOFI closed alpaca_bracket @ $15.93. Realized: $-0.96.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.96,
+                         "ticker":  "SOFI",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] F closed alpaca_bracket @ $15.935. Realized: $-0.16.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.16,
+                         "ticker":  "F",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] F closed alpaca_bracket @ $15.935. Realized: $-0.16.",
+        "metadata":  {
+                         "realized_pnl_usd":  -0.16,
+                         "ticker":  "F",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] INTC closed alpaca_bracket @ $119.43. Realized: $11.34.",
+        "metadata":  {
+                         "realized_pnl_usd":  11.34,
+                         "ticker":  "INTC",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    },
+    {
+        "content":  "[CLOSE 2026-06-04] INTC closed alpaca_bracket @ $119.43. Realized: $11.34.",
+        "metadata":  {
+                         "realized_pnl_usd":  11.34,
+                         "ticker":  "INTC",
+                         "exit_reason":  "alpaca_bracket",
+                         "date":  "2026-06-04",
+                         "kind":  "close_outcome"
+                     }
+    }
+]

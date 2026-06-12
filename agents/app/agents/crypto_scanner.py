@@ -21,7 +21,7 @@ from .base import Agent, AgentMessage
 
 class CryptoScannerAgent(Agent):
     name = "crypto_scanner"
-    tick_interval_seconds = 60  # 24/7, every minute
+    tick_interval_seconds = 180  # Throttled 2026-06-05 (was 60) to cut API load
 
     # Crypto signals can be acted on with a slightly lower TCS bar than
     # stocks — the per-coin stops are tighter. Still gated by Risk Manager.
@@ -36,9 +36,16 @@ class CryptoScannerAgent(Agent):
         _cfg = get_bot_settings()
         tcs_floor = int(_cfg.tcs_threshold or self.MIN_TCS)
         if not _cfg.crypto_enabled:
+            # Patched 2026-06-05: surface clearly so Mike can spot it
+            # in the trace panel. If Bot Tuning has crypto_enabled=False
+            # (default for new users), this is why no crypto signals
+            # ever fire even though the scanner is alive and ticking.
             return [AgentMessage(
                 agent=self.name, kind="info",
-                payload={"note": "Crypto strategy disabled in Bot Tuning settings."},
+                payload={
+                    "note": "Crypto strategy DISABLED in Bot Tuning. Toggle 'crypto_enabled' ON in /dashboard/settings/bot to enable XRP/ETH/SOL scanning.",
+                    "fix": "Bot Tuning settings -> Strategies -> Crypto: ON",
+                },
             )]
 
         out: list[AgentMessage] = []
@@ -95,4 +102,37 @@ class CryptoScannerAgent(Agent):
                 "modes_triggered": triggered,
             },
         ))
+        # Task #60 (2026-06-05): scanner_pulse summary emission.
+        try:
+            _signals = [m for m in out if getattr(m, "kind", None) == "signal"]
+            if _signals:
+                _tcss = []
+                for s in _signals:
+                    t = (s.payload or {}).get("tcs")
+                    if isinstance(t, (int, float)):
+                        _tcss.append(int(t))
+                _top_tcs = max(_tcss) if _tcss else 0
+                _by_strategy = {}
+                for s in _signals:
+                    st = (s.payload or {}).get("strategy") or "default"
+                    _by_strategy[st] = _by_strategy.get(st, 0) + 1
+                _scanned = 0
+                try:
+                    _scanned = len(symbols)  # type: ignore[name-defined]
+                except Exception:
+                    _scanned = len(_signals)
+                out.append(AgentMessage(
+                    agent=self.name,
+                    kind="scanner_pulse",
+                    confidence=1.0,
+                    payload={
+                        "scanned": _scanned,
+                        "fired": len(_signals),
+                        "top_tcs": _top_tcs,
+                        "by_strategy": _by_strategy,
+                    },
+                ))
+        except Exception:
+            pass
+
         return out

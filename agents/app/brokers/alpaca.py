@@ -249,6 +249,23 @@ def alpaca_crypto_supports(symbol: str) -> bool:
     return (symbol or "").upper().strip() in ALPACA_CRYPTO_SYMBOLS
 
 
+def crypto_symbol_variants(symbol: str) -> frozenset:
+    """Every spelling Alpaca may use for a crypto ticker, uppercased:
+    'BTC' -> {'BTC', 'BTC/USD', 'BTCUSD'}.
+
+    Needed because get_open_symbols() returns crypto in pair format
+    ('BTCUSD' or 'BTC/USD') while Trezo paper_positions rows store the
+    bare ticker ('BTC'). Membership checks that ignore this mismatch
+    phantom-close crypto rows while Alpaca still holds the coins
+    (Task #10 audit, 2026-06-11)."""
+    s = (symbol or "").upper().strip()
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    elif s.endswith("USD") and len(s) > 4:
+        s = s[:-3]
+    return frozenset({s, f"{s}/USD", f"{s}USD"})
+
+
 def _crypto_pair(symbol: str) -> str:
     """Convert a bare ticker like 'BTC' to Alpaca's crypto pair format
     'BTC/USD'. Already-paired inputs pass through."""
@@ -375,8 +392,29 @@ async def get_open_symbols() -> Optional[set]:
     return {str(p.get("symbol", "")).upper() for p in data if p.get("symbol")}
 
 
-async def liquidate_position(symbol: str) -> tuple[Optional[dict], Optional[str]]:
+async def get_open_orders_for(symbol: str) -> Optional[list]:
+    """Open orders for one symbol (list, possibly empty) or None when the
+    call failed. Added 2026-06-11 PM for the naked-position alert: a
+    day-TIF bracket's exit legs DIE at the close, so a stock row held
+    overnight at Alpaca can sit with no stop and no target (found live
+    with AAPL). Callers must treat None as 'could not check'."""
+    data = await _get(f"/v2/orders?status=open&symbols={symbol.upper()}")
+    return data if isinstance(data, list) else None
+
+
+async def liquidate_position(
+    symbol: str, asset_type: str = "stock",
+) -> tuple[Optional[dict], Optional[str]]:
     """Close an open Alpaca position at market (DELETE /v2/positions/{sym}).
-    Used by the Position Monitor's swing time stop (Phase 10c). Best-effort:
-    returns (json, None) on success or (None, error_message)."""
-    return await _delete(f"/v2/positions/{symbol.upper()}")
+    Used by the Position Monitor's swing time stop (Phase 10c) and the
+    crypto client-side exits (Task #10, 2026-06-11). Best-effort:
+    returns (json, None) on success or (None, error_message).
+
+    Crypto rows store the bare ticker ('BTC') but Alpaca's positions
+    endpoint addresses crypto by pair without the slash ('BTCUSD'), so
+    pass asset_type='crypto' to translate; bare stock symbols are
+    passed through unchanged."""
+    sym = symbol.upper().strip()
+    if asset_type == "crypto":
+        sym = _crypto_pair(sym).replace("/", "")
+    return await _delete(f"/v2/positions/{sym}")

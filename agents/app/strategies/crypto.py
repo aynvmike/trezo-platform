@@ -55,6 +55,37 @@ for _sym in ISO20022_SYMBOLS:
 CRYPTO_WATCHLIST: list[str] = ["ETH", "SOL"] + ISO20022_SYMBOLS
 
 
+def get_crypto_universe(user_id=None) -> list[str]:
+    """Task #50 (2026-06-05): expandable crypto universe.
+
+    Seed = CRYPTO_WATCHLIST (curated by spec) union any tickers in
+    user watchlists with asset_type='crypto'. Falls back to the static
+    seed on DB error. Mike's rule: watchlist is personalization, not
+    cap; the bot should consider any crypto Mike adds.
+    """
+    try:
+        from app.runtime.persistence import _client
+        client = _client()
+        if not client:
+            return list(CRYPTO_WATCHLIST)
+        q = client.table("watchlist_tickers").select("ticker").eq("asset_type", "crypto")
+        if user_id:
+            q = q.eq("user_id", user_id)
+        res = q.execute()
+        extras = []
+        for row in (res.data or []):
+            t = (row.get("ticker") or "").strip().upper()
+            if t and t not in extras:
+                extras.append(t)
+        seed = list(CRYPTO_WATCHLIST)
+        for e in extras:
+            if e not in seed:
+                seed.append(e)
+        return seed
+    except Exception:  # noqa: BLE001
+        return list(CRYPTO_WATCHLIST)
+
+
 @dataclass
 class CryptoSignal:
     ticker: str

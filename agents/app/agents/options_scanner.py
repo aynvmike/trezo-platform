@@ -148,12 +148,33 @@ class OptionsScannerAgent(Agent):
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
+    @staticmethod
+    def leg_delta_of(net_delta: float | None, contracts: int | None) -> float | None:
+        """Translate a POSITION-level, share-equivalent net delta into the
+        per-leg delta fraction Mike's settings speak in (2026-06-12).
+        Example: net_delta 24.18 with 1 contract -> 0.2418. Values already
+        in fraction form (|d| <= 1.5) pass through unchanged. Returns None
+        when the input can't be interpreted."""
+        if net_delta is None:
+            return None
+        try:
+            d = float(net_delta)
+        except (TypeError, ValueError):
+            return None
+        if abs(d) > 1.5:
+            d = d / (100.0 * max(int(contracts or 1), 1))
+        if abs(d) > 1.5:
+            return None
+        return round(d, 4)
+
     def _greek_filter(self, *, expiration: str,
                       net_delta: float | None = None,
                       is_premium_sell: bool = False,
                       modeled_iv: float | None = None,
                       is_scalp_play: bool = False,
                       user_id: str | None = None,
+                      contracts: int = 1,
+                      n_legs: int = 1,
                       ) -> tuple[bool, str]:
         """Return (passes, reason). False reason is non-empty when the
         play was filtered out so the caller can log + surface why.
@@ -202,12 +223,69 @@ class OptionsScannerAgent(Agent):
             )
 
         if is_premium_sell and net_delta is not None:
-            if abs(float(net_delta)) > eff_max_delta:
+            # ---- Delta semantics fix (Mike, 2026-06-12) --------------
+            # Two bugs lived here:
+            # 1) UNITS: OptionPlay.net_delta is POSITION-level and
+            #    share-equivalent (per-share delta x 100 x contracts).
+            #    Comparing it against the 0.45 PER-LEG cap rejected
+            #    essentially every premium sell (e.g. STAG bull put
+            #    spread: "net delta 14.13 > 0.45" -- mem0 afa5668c).
+            #    Normalize back to a per-leg fraction first.
+            # 2) SEMANTICS: options_max_premium_delta is Mike's cap on
+            #    the LEG delta for normal-cycle premium sells -- NOT a
+            #    flat cap for every timeframe. LEAPs legitimately carry
+            #    high delta (stock replacement) and same-day contracts
+            #    swing delta too fast for it to gate risk; the cap must
+            #    follow the timeframe. Ladder (Mike's bands: 0.05 floor,
+            #    0.30 / 0.45 / 0.75 / 1.00):
+            #      <=1 DTE    -> no delta cap (IV gate governs scalps)
+            #      <=45 DTE   -> user's options_max_premium_delta (0.45)
+            #      <=180 DTE  -> 0.75
+            #      >180 LEAPs -> 1.00 (effectively uncapped)
+            d = abs(float(net_delta))
+            if d > 1.5:
+                # Share-equivalent units -> per-leg fraction.
+                d = d / (100.0 * max(int(contracts or 1), 1))
+            if d > 1.5:
+                # Still impossible as a per-share delta: bad upstream
+                # data. Don't trade on numbers we can't interpret.
                 return False, (
-                    f"|delta| {abs(net_delta):.2f} exceeds max "
-                    f"{eff_max_delta} for premium-sell - "
-                    f"too close to short-stock proxy."
+                    f"delta {net_delta} uninterpretable even after "
+                    f"unit normalization - skipping on bad data."
                 )
+            # Structure awareness (Mike 2026-06-12, mem0 7c991cc1: an
+            # iron condor on O was vetoed for its delta -- but a condor
+            # is delta-neutral BY DESIGN; near-zero net delta is the
+            # goal, not a defect). For multi-leg defined-risk spreads
+            # the net delta measures the position's directional TILT:
+            # small is good, so the 0.05 floor must not apply, and the
+            # band cap only guards against a spread so lopsided it has
+            # become a directional bet in disguise. The floor only
+            # makes sense for SINGLE-leg shorts (CSP / covered call),
+            # where a 0.03-delta strike truly is lottery-dust premium.
+            is_spread = int(n_legs or 1) >= 2
+            if dte <= 1:
+                pass  # same-day: gamma rules; IV gate below governs
+            else:
+                if dte <= 45:
+                    band_cap, band = eff_max_delta, f"<=45 DTE (user cap {eff_max_delta})"
+                elif dte <= 180:
+                    band_cap, band = max(0.75, eff_max_delta), "<=180 DTE (0.75)"
+                else:
+                    band_cap, band = 1.0, "LEAP >180 DTE (1.00)"
+                if d > band_cap:
+                    kind_txt = ("net directional tilt" if is_spread
+                                else "per-leg |delta|")
+                    return False, (
+                        f"{kind_txt} {d:.2f} exceeds the {band} "
+                        f"band cap for premium-sell."
+                    )
+                if d < 0.05 and not is_spread:
+                    return False, (
+                        f"per-leg |delta| {d:.2f} below the 0.05 floor - "
+                        f"premium too thin to be worth fees on a "
+                        f"single-leg short."
+                    )
 
         if is_scalp_play and modeled_iv is not None:
             iv_pct = float(modeled_iv) * 100.0
@@ -993,6 +1071,8 @@ class OptionsScannerAgent(Agent):
                     is_premium_sell=is_premium_sell,
                     modeled_iv=play.modeled_iv,
                     is_scalp_play=is_scalp,
+                    contracts=int(getattr(play, "contracts", 1) or 1),
+                    n_legs=len(getattr(play, "legs", None) or []) or 1,
                 )
                 if not passed:
                     self._log_to_mem0(
@@ -1003,6 +1083,11 @@ class OptionsScannerAgent(Agent):
                             "strategy": play.strategy,
                             "expiration": play.expiration,
                             "net_delta": play.net_delta,
+                            "net_delta_units": "share_equivalent",
+                            "leg_delta": self.leg_delta_of(
+                                play.net_delta, play.contracts),
+                            "n_legs": len(getattr(play, "legs", None) or []) or 1,
+                            "filter_rule": reason[:120],
                             "modeled_iv": play.modeled_iv,
                         },
                     )
@@ -1021,6 +1106,9 @@ class OptionsScannerAgent(Agent):
                         "max_loss_usd": play.max_loss_usd,
                         "max_gain_usd": play.max_gain_usd,
                         "net_delta": play.net_delta,
+                        "net_delta_units": "share_equivalent",
+                        "leg_delta": self.leg_delta_of(
+                            play.net_delta, play.contracts),
                         "net_theta": play.net_theta,
                     },
                 )
@@ -1038,6 +1126,9 @@ class OptionsScannerAgent(Agent):
                         "max_gain_usd": play.max_gain_usd,
                         "modeled_iv": play.modeled_iv,
                         "net_delta": play.net_delta,
+                        "net_delta_units": "share_equivalent",
+                        "leg_delta": self.leg_delta_of(
+                            play.net_delta, play.contracts),
                         "net_gamma": play.net_gamma,
                         "net_theta": play.net_theta,
                         "net_vega": play.net_vega,

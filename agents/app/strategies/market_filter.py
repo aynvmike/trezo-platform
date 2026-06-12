@@ -167,6 +167,27 @@ def liquidity_check(candles, strategy: str | None = None) -> Optional[str]:
     return None
 
 
+def profiles_accepting(candles) -> list[str]:
+    """Which strategy liquidity profiles WOULD accept this symbol.
+
+    Mike 2026-06-12 (mem0 72c35e29: YMAT, TCS 670, $1.23, vetoed by the
+    $5 default floor while strategy='unknown'): a high-TCS signal that
+    fails its OWN profile's floor may fit a different strategy's lane --
+    YMAT is a textbook STMS candidate ($1-$20 small-cap momentum). This
+    helper names the lanes that fit so the veto can carry reattribution
+    candidates instead of throwing the information away."""
+    if not candles:
+        return []
+    price = float(candles[-1].close)
+    av = avg_volume(candles, 20)
+    out: list[str] = []
+    for name, floors in STRATEGY_LIQUIDITY_FLOORS.items():
+        if (price >= float(floors.get("min_price", MIN_PRICE))
+                and av >= float(floors.get("min_avg_volume", MIN_AVG_VOLUME))):
+            out.append(name)
+    return out
+
+
 def atr(candles, period: int = 14) -> float:
     """Average True Range over the last `period` bars."""
     if len(candles) < period + 1:

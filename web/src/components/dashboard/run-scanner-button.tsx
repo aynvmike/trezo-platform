@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 
@@ -35,6 +35,17 @@ export function RunScannerButton({
   const router = useRouter();
   const [stage, setStage] = useState<"idle" | "running" | "done" | "error">("idle");
   const [resp, setResp] = useState<Resp | null>(null);
+
+  // Auto-clear stale error/done UI after 8 seconds so the dashboard
+  // doesn't show "stocks cannot be force-ticked" forever (Task #68).
+  useEffect(() => {
+    if (stage !== "error" && stage !== "done") return;
+    const t = setTimeout(() => {
+      setStage("idle");
+      setResp(null);
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [stage]);
 
   async function send() {
     setStage("running");

@@ -31,6 +31,15 @@ class AgentBus:
         self._subscribers.append((handler, kind_set))
 
     async def publish(self, message: AgentMessage) -> None:
+        # Stamp emitted_at_epoch on signal messages (Task #89, 2026-06-05).
+        # Risk Manager reads this to compute signal age for tiered
+        # staleness vetoes. We stamp on publish so EVERY scanner gets
+        # it for free - no per-scanner change required.
+        if message.kind == "signal" and isinstance(message.payload, dict):
+            if "emitted_at_epoch" not in message.payload:
+                import time
+                message.payload["emitted_at_epoch"] = time.time()
+
         # Snapshot subscribers under lock to avoid concurrent-modification surprises
         async with self._lock:
             subs = list(self._subscribers)

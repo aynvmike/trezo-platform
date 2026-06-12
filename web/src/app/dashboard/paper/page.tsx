@@ -254,22 +254,31 @@ export default async function PaperPage() {
 
       <StrategyWindows />
 
-      {/* Scanner + diagnostic controls */}
-      <section className="grid gap-3 sm:grid-cols-3">
-        <RunScannerButton
-          name="stocks"
-          label="Run stock scan now"
-          hint="Runs the active stock strategy on your watchlist immediately."
-        />
-        <DiagnoseNowButton />
-        <StocksReconcileButton />
-      </section>
+      {/* Task #72 (2026-06-05): Diagnostics + manual scans collapsed.
+          Mike: "these take a lot of space and aren't used every minute". */}
+      <Disclosure title="Diagnostics + manual scans (click to expand)">
+        <section className="grid gap-3 sm:grid-cols-3">
+          <RunScannerButton
+            name="pattern_detection"
+            label="Run stock scan now"
+            hint="Runs the Pattern Detection scanner immediately (scans your watchlist + market-wide pool)."
+          />
+          <DiagnoseNowButton />
+          <StocksReconcileButton />
+        </section>
+      </Disclosure>
 
       <ManualTradeButton />
 
-      <ScannerPulse userId={user.id} />
-      <VetoReasonsPanel userId={user.id} />
-      <SignalTracePanel userId={user.id} />
+      {/* Task #71 (2026-06-05): scanner + risk side-by-side strip.
+          Was two stacked panels, now one 2-col row to save vertical space. */}
+      <section className="grid gap-3 md:grid-cols-2">
+        <ScannerPulse userId={user.id} />
+        <VetoReasonsPanel userId={user.id} />
+      </section>
+      <Disclosure title="Signal trace - last hour (click to expand)">
+        <SignalTracePanel userId={user.id} />
+      </Disclosure>
 
       {/* Today's execution feed */}
       <Disclosure title="Today's execution feed (diagnostic - click to expand)">

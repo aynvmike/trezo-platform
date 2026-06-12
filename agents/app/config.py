@@ -30,6 +30,46 @@ class Settings(BaseSettings):
     # backends can fill in via TREZO_MACRO_* fields below.
     nasdaq_data_link_api_key: str = ""
 
+    # Twelve Data macro backend - free 800 req/day at twelvedata.com.
+    # Provides VIX + treasury yields without FRED's redistribution issues.
+    # See agents/app/data/macro/twelve_data.py for setup.
+    twelve_data_api_key: str = ""
+
+    # Alpha Vantage macro backend - free 25 req/day at alphavantage.co.
+    # Has VIX + treasury yields + Fed Funds directly. Slightly more
+    # complete than Twelve Data but tighter rate limit.
+    alpha_vantage_api_key: str = ""
+
+    # Capital safety knobs (Task #87, Mike's 2026-06-05 rule):
+    # bot must defer to platform settings, never use code constants
+    # for trading decisions. These are surfaced as defaults in
+    # bot_settings - the user can override via Bot Tuning UI.
+    #
+    # max_position_pct: per-position concentration cap (% of equity).
+    #   Default 0.25 = 25% of equity per trade. Replaces hardcoded
+    #   NOTIONAL_CAP_PCT. Low-vol ETFs no longer eat 58% (XLF fix).
+    max_position_pct: float = 0.25
+    # min_reward_risk_floor: refuse trades below this R:R. Default 1.5.
+    # User can tighten or loosen via Bot Tuning.
+    min_reward_risk_floor: float = 1.5
+    # max_open_signals: max concurrent open approved signals across
+    # all strategies. Replaces the Risk Manager class constant.
+    max_open_signals: int = 20
+
+    # Task #77 (2026-06-05): forex_enabled toggle. Default off because
+    # data source for FX isn't wired yet (scaffold only).
+    forex_enabled: bool = False
+
+    # Task #92 (2026-06-10, Mike's rule): Exit Advisor auto-action.
+    # Off = surface alerts only (legacy spec). On = bot acts on its own
+    # giveback rules: urgent -> close, warn -> trim 50%.
+    auto_exit_advisor: bool = False
+
+    # Massive (massive.com) - free tier. Used today as macro backend
+    # (stub - Task #84 finishes). Eventual: full data spine for stocks
+    # + options + forex + crypto + news + WebSocket (Task #80).
+    massive_api_key: str = ""
+
     # Manual macro backend - Mike types the current values directly.
     # Empty string means "not set" -> picker falls through to next
     # backend (or "unavailable" when nothing is set).
@@ -63,6 +103,13 @@ class Settings(BaseSettings):
     # See agents/app/memory/ for the wrapper. Empty -> agents run
     # without memory (graceful degradation, never blocks trading).
     mem0_api_key: str = ""
+    # Mem0 usage budget (2026-06-12, after the 10k ADD quota burned in
+    # under 2 weeks on veto noise). Tunable in agents/.env. Adds are the
+    # scarce resource; retrievals get a generous ceiling so the agents
+    # can ALWAYS consult their memory before decisions.
+    mem0_max_adds_per_day: int = 400      # ~2,800/week
+    mem0_max_adds_per_week: int = 2500    # hard weekly stop
+    mem0_max_searches_per_day: int = 2000
 
     # Phase F (2026-06-04): route crypto signals to Alpaca paper
     # crypto when enabled AND the symbol is in the broker allowlist.
@@ -72,6 +119,14 @@ class Settings(BaseSettings):
     # this line (the routing branch in trade_execution.py treats
     # missing flag as False).
     alpaca_crypto_enabled: bool = False
+
+    # Task #59 (2026-06-05): skip persistence of 'signal' kind messages.
+    # Default True - cuts agent_messages writes by ~90%. Signals still
+    # flow on the in-process bus to Risk Manager / Trade Execution; they
+    # just don't land in Supabase. Scanners emit a single scanner_pulse
+    # summary row per tick (Task #60) so the trace panel still shows
+    # what was scanned + how many fired.
+    skip_signal_persist: bool = True
 
     # ---- Phase C options Greek-aware filters --------------------------
     # min_dte: Options Scanner skips emit when expiration is within this

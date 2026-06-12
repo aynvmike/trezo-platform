@@ -20,6 +20,49 @@ const ALLOWED = new Set([
   "strategy_discovery"
 ]);
 
+// Task #69 (2026-06-05): friendly aliases so the UI can call agents
+// by intent ("stocks", "crypto") instead of by internal agent_id.
+// Add new aliases here when a button/widget needs a new shorthand -
+// keeps the language consistent across the platform.
+const ALIAS_MAP: Record<string, string> = {
+  // Stocks
+  "stocks":       "pattern_detection",
+  "stock":        "pattern_detection",
+  "stock_bot":    "pattern_detection",
+  "patterns":     "pattern_detection",
+  // Small-caps
+  "small_caps":   "stms_scanner",
+  "smallcaps":    "stms_scanner",
+  "stms":         "stms_scanner",
+  // ORB
+  "orb":          "orb_scanner",
+  "breakout":     "orb_scanner",
+  "opening":      "orb_scanner",
+  // Extended swing
+  "swing":        "extended_scanner",
+  "extended":     "extended_scanner",
+  // Crypto
+  "crypto":       "crypto_scanner",
+  "coins":        "crypto_scanner",
+  // Options / Wheel
+  "options":      "options_scanner",
+  "wheel":        "options_scanner",
+  // Macro
+  "macro":        "market_horizon",
+  "horizons":     "market_horizon",
+  // News
+  "news":         "market_sentiment",
+  "sentiment":    "market_sentiment",
+  // Dividends
+  "dividends":    "dividend_manager",
+  "yieldmax":     "dividend_manager"
+};
+
+function resolveName(raw: string): string {
+  const lc = raw.toLowerCase().trim();
+  return ALIAS_MAP[lc] ?? raw;
+}
+
 /**
  * POST /api/agents/run-now/:name
  *
@@ -39,7 +82,8 @@ export async function POST(
   if (!user) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
-  const name = String(params.name ?? "").trim();
+  const rawName = String(params.name ?? "").trim();
+  const name = resolveName(rawName);
   if (!ALLOWED.has(name)) {
     return NextResponse.json(
       { ok: false, error: `Agent "${name}" cannot be force-ticked from the UI.` },

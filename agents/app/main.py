@@ -1466,11 +1466,30 @@ async def _on_startup() -> None:
     except Exception as e:
         log.error("agents.scheduler.FAILED", error=str(e))
 
+    # Patched 2026-06-05 (Task #61): start the batched-persistence
+    # flush loop. Every persist_message() call queues into an
+    # in-memory deque; the flush loop drains it via bulk-insert
+    # every second. Cuts Supabase round-trips ~50x.
+    try:
+        from app.runtime.persistence import start_flush_loop
+        start_flush_loop()
+        log.info("persistence.flush_loop.started")
+    except Exception as e:
+        log.error("persistence.flush_loop.FAILED", error=str(e))
+
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
     """Stop the APScheduler tick loop cleanly so uvicorn reload doesn't
-    leak the prior scheduler instance."""
+    leak the prior scheduler instance. Also drain the persistence
+    buffer so we never lose pending messages on a clean shutdown."""
+    # Drain the batched-persistence buffer FIRST so any messages
+    # produced during the last tick still land in Supabase.
+    try:
+        from app.runtime.persistence import stop_flush_loop
+        await stop_flush_loop()
+    except Exception:
+        pass
     try:
         stop_scheduler()
     except Exception:

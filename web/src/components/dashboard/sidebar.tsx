@@ -35,16 +35,20 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
       <SectionHeader>What&apos;s happening</SectionHeader>
       <NavGroup items={monitor} path={path} onNavigate={onNavigate} />
 
+      {/* Task #73 (2026-06-05): Wealth Layers compacted - dropped the
+          2-line description and tightened the connector line padding.
+          Same 7 layers, less vertical footprint. The description was
+          useful onboarding but every returning user knows what they
+          are now. */}
       <div>
         <SectionHeader>Wealth layers</SectionHeader>
-        <p className="px-3 mb-2 text-[10px] text-weave-400 leading-tight">
-          Outer ring = most volatile.<br />
-          Inner ring = most protected.
+        <p className="px-3 mb-1 text-[9px] text-weave-400/80 leading-tight italic">
+          Outer = volatile - Inner = protected
         </p>
         <ol className="relative">
           <span
             aria-hidden="true"
-            className="absolute left-[22px] top-3 bottom-3 w-px bg-gradient-to-b from-weave-200 via-weave-300 to-treasure-300"
+            className="absolute left-[22px] top-2 bottom-2 w-px bg-gradient-to-b from-weave-200 via-weave-300 to-treasure-300"
           />
           {layers.map((item) => (
             <LayerRow key={item.label} item={item} path={path} onNavigate={onNavigate} />

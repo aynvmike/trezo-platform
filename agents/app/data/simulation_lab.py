@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Notional fraction of starting equity placed on each trade. Conservative:
 # 25% of equity goes into a position, so a 10% gain on the trade lifts
 # overall equity by 2.5%. Easy to reason about; not a sizing model.
-TRADE_FRACTION = 0.25
+TRADE_FRACTION = 0.25  # default; per-sim override via trade_fraction_override
 
 
 def _candle_date(c) -> str:
@@ -51,7 +51,15 @@ async def run_simulation(symbols: list[str], days: int,
                          tcs_threshold: int = 650,
                          stop_pct: float = 0.05,
                          target_pct: float = 0.10,
-                         compare_all: bool = True) -> dict:
+                         compare_all: bool = True,
+                         trade_fraction_override: float | None = None,
+                         max_drawdown_pct: float | None = None) -> dict:
+    """Task #44 extra params:
+      trade_fraction_override - per-sim trade sizing (default 0.25)
+      max_drawdown_pct - kill the simulation if equity falls below
+        starting_equity * (1 - max_drawdown_pct). Lets Mike test
+        his drawdown ceiling without touching live bot settings.
+    """
     """Replay the agents over the last `days` of history for `symbols`.
 
     Returns a dict the Simulation Lab page renders directly."""

@@ -28,6 +28,7 @@ from app.agents.stms_scanner import STMSScannerAgent
 from app.agents.strategy_discovery import StrategyDiscoveryAgent
 from app.agents.tax_optimizer import TaxOptimizerAgent
 from app.agents.trade_execution import TradeExecutionAgent
+from app.agents.forex_scanner import ForexScannerAgent
 from app.agents.user_support import UserSupportAgent
 
 from .bus import bus
@@ -46,6 +47,7 @@ def bootstrap_agents() -> None:
     orb       = ORBScannerAgent()
     extended  = ExtendedScannerAgent()
     crypto    = CryptoScannerAgent()
+    forex_scanner = ForexScannerAgent()
     options   = OptionsScannerAgent()
     risk      = RiskManagerAgent()
     execution = TradeExecutionAgent()
@@ -69,6 +71,7 @@ def bootstrap_agents() -> None:
     registry.register(orb,       "Opening Range Breakout scanner. Active 8:30 AM-12:00 PM ET. Trades confirmed breakouts of the first 5-minute range (best size 8:30-10:30, reduced 10:30-12:00).", role="observer")
     registry.register(extended,  "Extended Strategy scanner (Layer 4). The multi-day swing layer - EMA50 pullbacks, breakout holds, earnings-gap continuations, stair-steppers.", role="observer")
     registry.register(crypto,    "24/7 crypto scanner for XRP/ETH/SOL. Detects SCALP / SWING / DCA modes from RSI, Bollinger width and volume.", role="observer")
+    registry.register(forex_scanner, "Forex scanner (Task #77). Watches major pairs (EUR/USD, USD/JPY, GBP/USD, USD/CHF, AUD/USD). Disabled by default until data source is wired.", role="observer")
     registry.register(options,   "Runs the Dividend Wheel (cash-secured puts) and surfaces options-strategy ideas. Pricing is modeled (Black-Scholes).", role="actor")
     registry.register(risk,      "Highest-authority gatekeeper. Approves or vetoes every signal; enforces Adaptive Scope, kill-switches and market filters.", role="observer")
     registry.register(execution, "Routes approved signals - stock trades to Alpaca paper, crypto to the internal paper engine.", role="actor")

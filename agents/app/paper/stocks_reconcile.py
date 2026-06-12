@@ -19,6 +19,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 async def reconcile_stocks_all_users() -> dict[str, Any]:
     """Reconcile every user's open paper_positions stocks against the
     Alpaca broker truth. Idempotent + safe to call from a tick loop.
@@ -76,6 +81,13 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
 
         alpaca_by_sym: dict[str, dict] = {}
         for p in alpaca_positions:
+            # Task #10 (2026-06-11): this reconciler is stocks-only.
+            # Without this filter, an Alpaca crypto position ('BTCUSD',
+            # asset_class='crypto') gets re-inserted below as a phantom
+            # asset_type='stock' row that nothing can ever exit.
+            ac = str(p.get("asset_class") or "us_equity").lower()
+            if ac != "us_equity":
+                continue
             sym = str(p.get("symbol", "")).upper()
             if sym:
                 alpaca_by_sym[sym] = p
@@ -110,14 +122,16 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     return (
                         client.table("paper_positions")
                         .update({
+                            # paper_positions has NO notes column; the old
+                            # "notes" key here made PostgREST reject the
+                            # ENTIRE update, so phantom closes silently
+                            # never happened (found 2026-06-11). The
+                            # reconcile reason now lives in the summary
+                            # message + agent log only.
                             "status": "closed_manual",
                             "exit_price": None,
                             "realized_pnl_usd": 0,
-                            "notes": (
-                                "Auto-reconciled - not present at broker. "
-                                "Phantom position closed by 30-min stocks "
-                                "reconciliation tick."
-                            ),
+                            "exit_at": _now_iso(),
                         })
                         .eq("id", rid)
                         .execute()

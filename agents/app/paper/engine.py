@@ -655,6 +655,16 @@ async def record_external_position(
                 "target_price": target_price,
                 "status": "open",
                 "strategy": strategy,
+                # Fixed 2026-06-11 PM: broker/broker_order_id were ONLY
+                # stored inside source_payload, never in their real
+                # columns -- so every Alpaca-routed row landed as
+                # broker="paper" and the Position Monitor's entire
+                # Alpaca branch (bracket reconcile, time stops, crypto
+                # exits, broker-aware close) skipped it. AAPL was held
+                # live at Alpaca while Trezo managed it as internal
+                # paper because of this.
+                "broker": broker,
+                "broker_order_id": broker_order_id,
                 "source_payload": {
                     **(source_payload or {}),
                     "broker": broker,
@@ -761,3 +771,213 @@ async def record_external_close(
         )
     except Exception as e:  # noqa: BLE001
         return FillResult(ok=False, error=str(e))
+
+
+
+async def trim_position(
+    user_id: str,
+    position_id: str,
+    fraction: float = 0.5,
+    price: float = 0.0,
+    reason: str = "trim",
+) -> FillResult:
+    """Sell a fraction of an open INTERNAL paper position, leaving the
+    remainder open (the "runner"). Implemented 2026-06-11 -- the Exit
+    Advisor's warn-tier auto-trim (Task #92) imported this function but
+    it did not exist, and because it shared an import statement with
+    close_position_broker_aware inside a try/except-pass, the missing
+    name silently disabled the ENTIRE auto-exit path, urgent closes
+    included.
+
+    Mirrors close_position() economics on the trimmed slice: slippage,
+    commission, realized P&L into account today/ytd/week totals, and
+    proceeds back to cash. The row stays status="open" with reduced
+    quantity; the trim is recorded in the notes column (the
+    realized_pnl_usd column is only written at final close, which
+    covers the remaining quantity -- account totals carry the trim).
+
+    Internal-paper rows ONLY. Alpaca-routed rows need the bracket
+    cancel -> partial sell -> re-submit pattern (deferred); callers
+    already gate on broker != "alpaca".
+    """
+    client = _supabase()
+    if not client:
+        return FillResult(ok=False, error="Supabase not configured")
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError):
+        return FillResult(ok=False, error="Bad fraction")
+    if not (0.0 < fraction < 1.0):
+        return FillResult(ok=False, error="Fraction must be between 0 and 1")
+
+    def _sync_get():
+        return (
+            client.table("paper_positions")
+            .select("*")
+            .eq("id", position_id)
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+
+    res = await asyncio.to_thread(_sync_get)
+    pos = res.data if res else None
+    if not pos or pos.get("status") != "open":
+        return FillResult(ok=False, error="Position not open")
+    if (pos.get("broker") or "").lower().strip() == "alpaca":
+        # Defense in depth -- callers gate this too.
+        return FillResult(ok=False, error="Trim on Alpaca-routed rows not supported yet")
+
+    side = pos["side"]
+    qty = float(pos["quantity"])
+    entry = float(pos["entry_price"])
+    asset_type = pos["asset_type"]
+    trim_qty = qty * fraction
+    remain_qty = qty - trim_qty
+    if trim_qty <= 0 or remain_qty <= 0:
+        return FillResult(ok=False, error="Trim quantity rounds to zero")
+
+    fill_price = apply_slippage(price, side, "close")
+    notional = trim_qty * fill_price
+    fee = commission(asset_type, notional)
+    if side == "long":
+        gross_pnl = trim_qty * (fill_price - entry)
+    else:
+        gross_pnl = trim_qty * (entry - fill_price)
+    pnl = gross_pnl - fee
+
+    # paper_positions has NO notes column (verified 2026-06-11) --
+    # record the trim inside the source_payload jsonb instead.
+    sp = pos.get("source_payload")
+    sp = dict(sp) if isinstance(sp, dict) else {}
+    trims = list(sp.get("trims") or [])
+    trims.append({
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "sold_qty": trim_qty,
+        "of_qty": qty,
+        "fill_price": fill_price,
+        "realized_pnl_usd": round(pnl, 4),
+        "reason": reason,
+    })
+    sp["trims"] = trims
+
+    def _sync_trim():
+        return (
+            client.table("paper_positions")
+            .update({
+                "quantity": remain_qty,
+                "fees_usd": float(pos.get("fees_usd", 0)) + fee,
+                "source_payload": sp,
+            })
+            .eq("id", position_id)
+            .execute()
+        )
+
+    await asyncio.to_thread(_sync_trim)
+
+    account = await get_account(user_id)
+    if account:
+        new_cash = float(account["current_cash_usd"]) + notional - fee
+        new_today = float(account["today_realized_pnl_usd"]) + pnl
+        new_ytd = float(account["ytd_realized_pnl_usd"]) + pnl
+        new_week = float(account.get("week_realized_pnl_usd") or 0) + pnl
+
+        def _sync_update_account():
+            return (
+                client.table("paper_accounts")
+                .update({
+                    "current_cash_usd": new_cash,
+                    "today_realized_pnl_usd": new_today,
+                    "ytd_realized_pnl_usd": new_ytd,
+                    "week_realized_pnl_usd": new_week,
+                })
+                .eq("user_id", user_id)
+                .execute()
+            )
+
+        await asyncio.to_thread(_sync_update_account)
+
+    return FillResult(ok=True, fill_price=fill_price, realized_pnl_usd=pnl)
+
+
+async def close_position_broker_aware(
+    user_id: str,
+    position_id: str,
+    market_price: float,
+    reason: str = "manual",
+) -> FillResult:
+    """Broker-aware wrapper around close_position().
+
+    For rows where broker == "alpaca", first calls Alpaca's
+    DELETE /v2/positions/{ticker} (liquidate_position) which
+    automatically cancels any open bracket legs and submits a market
+    close at Alpaca. Only after Alpaca returns success do we update the
+    Trezo row via close_position(). On Alpaca failure the Trezo row
+    stays open so the next reconcile tick can retry; we DO NOT
+    optimistically close the Trezo row and leave Alpaca holding the bag
+    (that was the Gap 2 bug from 2026-06-11).
+
+    For non-Alpaca rows, falls through to plain close_position().
+    """
+    import structlog
+    _log = structlog.get_logger("trezo.engine")
+    client = _supabase()
+    if not client:
+        return FillResult(ok=False, error="Supabase not configured")
+
+    # Read the row to find out broker + ticker
+    def _sync_get():
+        return (
+            client.table("paper_positions")
+            .select("ticker, broker, status, asset_type")
+            .eq("id", position_id)
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+    res = await asyncio.to_thread(_sync_get)
+    pos = res.data if res else None
+    if not pos:
+        return FillResult(ok=False, error="Position not found")
+    if pos.get("status") != "open":
+        return FillResult(ok=False, error="Position not open")
+
+    broker = (pos.get("broker") or "").lower().strip()
+    ticker = (pos.get("ticker") or "").upper().strip()
+    # Task #10 (2026-06-11): pass asset_type so crypto liquidations hit
+    # Alpaca with the pair symbol ('BTCUSD'), not the bare ticker ('BTC')
+    # which 404s and would leave the row stuck open forever.
+    a_type = (pos.get("asset_type") or "stock").lower().strip()
+
+    if broker == "alpaca" and ticker:
+        # 1) Liquidate at Alpaca (cancels bracket legs + closes the position).
+        try:
+            from app.brokers.alpaca import liquidate_position
+            liq, liq_err = await liquidate_position(ticker, asset_type=a_type)
+            if liq_err:
+                _log.warning(
+                    "engine.broker_aware_close.alpaca_liquidate_failed",
+                    ticker=ticker, position_id=position_id, error=liq_err,
+                )
+                # Leave the Trezo row open - next Position Monitor tick will
+                # reconcile naturally if Alpaca did actually close.
+                return FillResult(
+                    ok=False,
+                    error=f"alpaca liquidate failed: {liq_err}",
+                )
+            _log.info(
+                "engine.broker_aware_close.alpaca_liquidate_ok",
+                ticker=ticker, position_id=position_id, reason=reason,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log.warning(
+                "engine.broker_aware_close.alpaca_liquidate_raised",
+                ticker=ticker, position_id=position_id, error=str(e)[:200],
+            )
+            return FillResult(
+                ok=False,
+                error=f"alpaca liquidate raised: {str(e)[:200]}",
+            )
+
+    # 2) Mark the Trezo row closed (always, whether Alpaca-routed or not).
+    return await close_position(user_id, position_id, market_price, reason=reason)

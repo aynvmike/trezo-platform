@@ -24,10 +24,15 @@ DEFAULT_RISK_PCT = 0.01    # 1% per trade — the document's testing target
 DOC_RISK_CEILING = 0.02    # 2% — the document's hard ceiling (a default)
 SLIDER_RISK_MAX = 0.25     # the Bot Tuning slider's own maximum
 SLIDER_RISK_MIN = 0.0005   # floor so a zero slider can't divide trades to nothing
-# A single position may use up to 100% of equity — i.e. it is bounded by
-# buying power, not by an artificial concentration cap. The risk slider
-# is what controls risk; this stays at 1.0 so the slider truly governs.
-NOTIONAL_CAP_PCT = 1.0
+# Per-position concentration cap. Patched 2026-06-05 (Task #83):
+# was 1.0 (100% of equity in one trade) which let low-volatility ETFs
+# like XLF take ~58% of capital - the dollar-risk slider doesn't
+# protect against concentration because low-vol names have tiny stop
+# distances that produce large share counts. The risk-per-trade slider
+# still governs DOLLAR LOSS; this cap governs DOLLAR EXPOSURE.
+# At 0.25 (25%), Mike can hold 4 positions of full size before being
+# forced to share equity across them.
+NOTIONAL_CAP_PCT = 0.25
 MIN_REWARD_RISK = 1.5      # SEED — overridden per-user by bot_settings.min_reward_risk.
                             # The user's risk profile (conservative / balanced / aggressive /
                             # expert) drives this. Range enforced 0.3-3.0 in the form layer.
@@ -107,8 +112,21 @@ def plan_position(
     risk_usd = equity * eff_risk
     risk_qty = risk_usd / stop_distance
 
-    # The only ceiling above the risk slider is buying power.
-    notional_cap = equity * NOTIONAL_CAP_PCT
+    # User-tunable concentration cap (Task #87, Mike's capital safety rule):
+    # Defer to bot_settings.max_position_pct if the user has set it;
+    # otherwise use the platform default (NOTIONAL_CAP_PCT). Either way
+    # the hard cap is buying_power - we can never trade more cash than
+    # the broker accepts.
+    cap_pct = NOTIONAL_CAP_PCT
+    try:
+        from app.runtime.settings import get_bot_settings as _gbs2
+        _bs = _gbs2()
+        _user_cap = getattr(_bs, "max_position_pct", None)
+        if _user_cap is not None and 0.01 <= float(_user_cap) <= 1.0:
+            cap_pct = float(_user_cap)
+    except Exception:  # noqa: BLE001
+        pass
+    notional_cap = equity * cap_pct
     if buying_power is not None and buying_power > 0:
         notional_cap = min(notional_cap, buying_power)
 

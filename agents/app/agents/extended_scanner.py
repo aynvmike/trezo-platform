@@ -40,8 +40,23 @@ class ExtendedScannerAgent(Agent):
     def __init__(self) -> None:
         self._signalled: set[str] = set()   # symbols signalled today
         self._day: str = ""
+        # Patched 2026-06-10 (same class of bug as WMT stacking): seed
+        # _signalled from today's signal history so restarts don't
+        # re-emit signals for tickers already handled today.
+        self._seeded_signalled: bool = False
+
+    async def _maybe_seed_signalled(self) -> None:
+        if self._seeded_signalled:
+            return
+        self._seeded_signalled = True
+        try:
+            from app.runtime.restart_state import seed_today_signal_tickers
+            self._signalled = await seed_today_signal_tickers("extended_scanner")
+        except Exception:
+            pass
 
     async def tick(self) -> list[AgentMessage]:
+        await self._maybe_seed_signalled()
         from app.runtime.settings import get_bot_settings
         if not get_bot_settings().extended_enabled:
             return [AgentMessage(agent=self.name, kind="info",
@@ -114,4 +129,37 @@ class ExtendedScannerAgent(Agent):
                 "watchlist_size": len(EXTENDED_WATCHLIST),
             },
         ))
+        # Task #60 (2026-06-05): scanner_pulse summary emission.
+        try:
+            _signals = [m for m in out if getattr(m, "kind", None) == "signal"]
+            if _signals:
+                _tcss = []
+                for s in _signals:
+                    t = (s.payload or {}).get("tcs")
+                    if isinstance(t, (int, float)):
+                        _tcss.append(int(t))
+                _top_tcs = max(_tcss) if _tcss else 0
+                _by_strategy = {}
+                for s in _signals:
+                    st = (s.payload or {}).get("strategy") or "default"
+                    _by_strategy[st] = _by_strategy.get(st, 0) + 1
+                _scanned = 0
+                try:
+                    _scanned = len(symbols)  # type: ignore[name-defined]
+                except Exception:
+                    _scanned = len(_signals)
+                out.append(AgentMessage(
+                    agent=self.name,
+                    kind="scanner_pulse",
+                    confidence=1.0,
+                    payload={
+                        "scanned": _scanned,
+                        "fired": len(_signals),
+                        "top_tcs": _top_tcs,
+                        "by_strategy": _by_strategy,
+                    },
+                ))
+        except Exception:
+            pass
+
         return out

@@ -163,12 +163,153 @@ class RiskManagerAgent(Agent):
     DEFAULT_PCT_OF_ACCOUNT = 0.02
 
     def __init__(self) -> None:
-        self._recent_approvals: deque[str] = deque(maxlen=8)
+        # Patched 2026-06-04 stacking fix: set, not deque(maxlen=8).
+        # Old deque rotated entries silently so the cap check
+        # (len() >= max_open_positions) was effectively dead, AND it
+        # allowed the same ticker to appear multiple times. Result: GM
+        # got approved 3x in one morning -> 84 shares on $5K equity.
+        # Now a set dedupes naturally; Position Monitor calls
+        # forget_ticker(t) when a position closes so re-buys ARE
+        # allowed after the existing trade exits.
+        self._recent_approvals: set[str] = set()
+        # Patched 2026-06-10 (Mike's WMT 52-share incident): seed
+        # open positions into the dedup set on first message so a
+        # restart-while-positions-open doesn't re-stack.
+        self._seeded_open_positions: bool = False
+
+    async def _seed_open_positions(self) -> None:
+        """Load currently-open position tickers into _recent_approvals
+        so dedup survives agent restarts. Best-effort - any failure
+        leaves the set empty and we fall back to the runtime behavior
+        (concentration cap still gates oversizing). Idempotent: only
+        runs the seed query once per process lifetime."""
+        if self._seeded_open_positions:
+            return
+        self._seeded_open_positions = True
+        try:
+            from app.runtime.persistence import _client
+            client = _client()
+            if client is None:
+                return
+            import asyncio
+            def _fetch():
+                return client.table("paper_positions").select(
+                    "ticker"
+                ).eq("status", "open").execute()
+            res = await asyncio.to_thread(_fetch)
+            for row in (res.data or []):
+                t = (row.get("ticker") or "").strip().upper()
+                if t:
+                    self._recent_approvals.add(t)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def forget_ticker(self, ticker: str) -> None:
+        """Position Monitor calls this when a position closes, allowing
+        a fresh approval on the same ticker. If the ticker was never in
+        the set, the discard is a silent no-op."""
+        self._recent_approvals.discard(ticker.upper())
 
     async def tick(self) -> list[AgentMessage]:
         return []
 
+    # Tiered staleness deadlines by TCS (Task #89, 2026-06-05).
+    # Mike's design: urgent signals get fast processing, low-priority
+    # signals can wait, and anything older than its tier gets vetoed
+    # with timeout. Prevents queue buildup when APIs lag.
+    STALE_TIMEOUTS = (
+        (700, 60),    # TCS >= 700 -> 60-second deadline (urgent)
+        (500, 180),   # TCS 500-699 -> 180-second deadline (MIXED priority - Mike 2026-06-05: TCS in this band is misleading on urgency, will be refined by agent-tagged urgency over time)
+        (0,   300),   # TCS <  500 -> 300-second deadline (low priority)
+    )
+
+    # Agent-tagged urgency override mapping. Mike 2026-06-05: TCS alone
+    # is misleading for urgency. Agents (eventually informed by Mem0
+    # outcomes) tag signals with payload["urgency"] - we honor that
+    # tag over the score-based tier. This is the seam for the
+    # "agent-recommended priority" upgrade Mike asked for.
+    URGENCY_TAGS = {
+        "urgent": 60,
+        "mixed":  180,
+        "medium": 180,  # alias for mixed
+        "low":    300,
+    }
+
+    @classmethod
+    def _stale_deadline_for(cls, tcs: int, urgency_tag: str | None = None) -> int:
+        # 1. If the emitting agent tagged urgency directly, use that.
+        if urgency_tag:
+            t = str(urgency_tag).strip().lower()
+            if t in cls.URGENCY_TAGS:
+                return cls.URGENCY_TAGS[t]
+        # 2. Otherwise fall back to TCS-band tier.
+        for floor, secs in cls.STALE_TIMEOUTS:
+            if tcs >= floor:
+                return secs
+        return 300
+
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
+        # Patched 2026-06-10 (Mike's WMT 52-share incident): seed open
+        # positions into the dedup set on first message so a restart
+        # while positions are already open doesn't re-stack the ticker
+        # via fresh signals.
+        await self._seed_open_positions()
+
+        # Approve-without-fill release (2026-06-11). Found live: SOFI was
+        # approved at 9:16/9:29 ET pre-open, Trade Execution skipped it
+        # ("Market closed"), but the ticker stayed in _recent_approvals --
+        # so every fresh SOFI signal for the REST OF THE DAY was vetoed
+        # as "already approved" with no position behind it. Any
+        # trade_execution info/error about a ticker that is NOT a fill
+        # means the approve died (market closed, budget skip, sizing
+        # reject, broker reject); free the ticker so the next signal can
+        # be considered on its own merits. Safe because fills emit
+        # kind="execute" only, and trade_execution has no info/error
+        # emission after a successful submit (verified 2026-06-11) --
+        # so info/error + ticker always means "no position was opened".
+        if message.agent == "trade_execution" and message.kind in ("info", "error"):
+            _p = message.payload if isinstance(message.payload, dict) else {}
+            _tk = str(_p.get("ticker") or "").upper().strip()
+            if _tk:
+                self.forget_ticker(_tk)
+            return []
+
+        # Tiered staleness veto (Task #89, 2026-06-05). Mike: signals
+        # waiting past their priority deadline get auto-cleared so they
+        # don't sit in a hung queue forever. Cheap check, runs BEFORE
+        # all expensive Supabase / Mem0 work so stale signals also
+        # relieve load.
+        if message.kind == "signal":
+            import time
+            ts_val = message.payload.get("emitted_at_epoch") or message.payload.get("ts")
+            if ts_val is not None:
+                try:
+                    age = time.time() - float(ts_val)
+                    tcs_for_age = int(message.payload.get("tcs", 0))
+                    urgency_tag = message.payload.get("urgency")
+                    deadline = self._stale_deadline_for(tcs_for_age, urgency_tag)
+                    if age > deadline:
+                        return [self._veto(
+                            message.payload.get("ticker", "?"),
+                            tcs_for_age,
+                            f"Stale signal: {int(age)}s old, tier deadline {deadline}s "
+                            f"(TCS {tcs_for_age}) - auto-cleared by timeout",
+                            strategy=message.payload.get("strategy"),
+                            user_id=message.payload.get("user_id"),
+                        )]
+                except (TypeError, ValueError):
+                    pass  # bad timestamp - don't block, just process normally
+
+        # Listen for close messages to forget the ticker so a fresh
+        # approval is allowed (Patched 2026-06-04 stacking fix - paired
+        # with the dedup veto above). Position Monitor emits kind="close"
+        # whenever a position exits via stop/target/manual/alpaca.
+        if message.kind == "close":
+            tk = (message.payload or {}).get("ticker")
+            if tk:
+                self.forget_ticker(str(tk))
+            return []
+
         if message.kind != "signal":
             return []
 
@@ -265,6 +406,19 @@ class RiskManagerAgent(Agent):
                 ticker, tcs,
                 f"TCS {tcs} below threshold {effective_min_tcs}{extra}")]
 
+        # Patched 2026-06-04: same-ticker stacking veto. If this ticker
+        # already has a recent approval (and Position Monitor hasn't
+        # told us the position closed yet), veto rather than re-buy.
+        if ticker.upper() in self._recent_approvals:
+            return [self._veto(
+                ticker, tcs,
+                f"Already approved {ticker} in this session - skip to "
+                f"avoid stacking. The open position must close (or be "
+                f"trimmed) before a fresh approval is allowed.",
+                strategy=strategy,
+                user_id=message.payload.get("user_id"),
+            )]
+
         if len(self._recent_approvals) >= max_open:
             # Mike 2026-06-01 capital recycling: the veto stands BUT we
             # attach a rotation hint so the user/UI can see which
@@ -315,7 +469,61 @@ class RiskManagerAgent(Agent):
             stock_candles = await fetch_candles_for(ticker, "stock")
             liq = liquidity_check(stock_candles, strategy=strategy)
             if liq:
-                return [self._veto(ticker, tcs, liq)]
+                # Strategy reattribution (Mike 2026-06-12, mem0 72c35e29:
+                # YMAT TCS 670 died on the $5 DEFAULT floor because its
+                # strategy tag was 'unknown' -- but STMS's $1 lane fits a
+                # $1.23 small-cap momentum name perfectly). When a high-
+                # TCS signal fails ITS floor, name the lanes that WOULD
+                # take it, carry them in the veto payload, and preserve
+                # the case in Mem0 (kind=decision, action=
+                # veto_reattribution_candidate -- deliberately NOT
+                # filtered as routine noise) so pattern recognition can
+                # learn which mislabeled setups keep recurring. The veto
+                # itself stands: per Mike's capital-safety directive,
+                # out-of-parameter trades prove themselves in the lab
+                # first, not with live capital.
+                fits = []
+                try:
+                    from app.strategies.market_filter import profiles_accepting
+                    fits = [s for s in profiles_accepting(stock_candles)
+                            if s != (strategy or "").lower()]
+                except Exception:  # noqa: BLE001
+                    fits = []
+                if fits and tcs >= 600:
+                    try:
+                        mem = get_memory()
+                        if mem.available:
+                            asyncio.create_task(asyncio.to_thread(
+                                mem.log_decision,
+                                AgentDecision(
+                                    agent="risk_manager",
+                                    action="veto_reattribution_candidate",
+                                    ticker=ticker,
+                                    reasoning=(
+                                        f"{liq} -- but profiles "
+                                        f"{fits} would accept this "
+                                        f"symbol. High TCS ({tcs}) with a "
+                                        f"'{strategy}' label suggests the "
+                                        f"signal belongs in another lane; "
+                                        f"candidate for relabeling or a "
+                                        f"new strategy definition."
+                                    ),
+                                    metadata={
+                                        "tcs": int(tcs),
+                                        "strategy": strategy or "unknown",
+                                        "reattribution_candidates": fits,
+                                        "price": float(stock_candles[-1].close) if stock_candles else None,
+                                        "user_id": message.payload.get("user_id") or "global",
+                                    },
+                                ),
+                            ))
+                    except Exception:  # noqa: BLE001
+                        pass
+                v = self._veto(ticker, tcs, liq, strategy=strategy,
+                               user_id=message.payload.get("user_id"))
+                if fits:
+                    v.payload["reattribution_candidates"] = fits
+                return [v]
             ext = overextension_check(stock_candles)
             if ext:
                 return [self._veto(ticker, tcs, ext)]
@@ -330,8 +538,12 @@ class RiskManagerAgent(Agent):
             if coin_veto:
                 return [self._veto(ticker, tcs, coin_veto)]
 
-        self._recent_approvals.append(ticker)
+        self._recent_approvals.add(ticker.upper())
+        # Patched 2026-06-05 (Task #47): propagate user_id into the
+        # approve payload so persistence + trace panel can attribute
+        # per-user instead of falling through to NULL.
         approve_payload: dict = {
+            "user_id": message.payload.get("user_id"),
             "ticker": ticker,
             "direction": direction,
             "tcs": tcs,
@@ -375,42 +587,61 @@ class RiskManagerAgent(Agent):
         # Phase E: surface a tiny summary of similar past
         # situations so downstream (UI, TradeExecution) can render
         # "11 similar setups; 7 won, 4 lost" context. Best-effort.
+        # Patched 2026-06-04 for async Mem0 calls - the sync version
+        # of this call was blocking the event loop when Mem0 was slow.
+        # Now runs on a worker thread; we await it so we keep the
+        # return value but other handlers can run during the wait.
         try:
-            recall = recall_decision_context(
-                ticker=ticker, strategy=strategy,
-                extra_query=f"tcs {tcs} {direction}",
+            recall = await asyncio.to_thread(
+                lambda: recall_decision_context(
+                    ticker=ticker, strategy=strategy,
+                    extra_query=f"tcs {tcs} {direction}",
+                ),
             )
             if recall.get("available"):
                 approve_payload["learning_context"] = recall
         except Exception:  # noqa: BLE001
             pass
 
-        # Log the approval to Mem0. The TradeOutcomeLogger will later
-        # reference this memory_id when the trade closes, closing the
-        # loop: approval -> outcome -> next-day query. Best-effort:
-        # never block a trade on memory failure.
-        approval_memory_id = None
+        # Log the approval to Mem0. Patched 2026-06-04 for async safety:
+        # the Mem0 SDK's .add() is sync; calling it from on_message blocked
+        # the FastAPI event loop when Mem0 was slow, killing the whole bot.
+        # Now fire-and-forget on a worker thread. We lose the immediate
+        # memory_id linkage (Task #47 will rework that tomorrow), but the
+        # log record still lands and the bot keeps trading.
         try:
             mem = get_memory()
             if mem.available:
-                approval_memory_id = mem.log_decision(AgentDecision(
-                    agent="risk_manager",
-                    action="approve",
-                    ticker=ticker,
-                    reasoning=approve_payload["reason"],
-                    metadata={
-                        "tcs": int(tcs),
-                        "strategy": strategy,
-                        "direction": direction,
-                        "user_id": message.payload.get("user_id") or "global",
-                        "stop_pct": approve_payload.get("stop_pct"),
-                        "target_pct": approve_payload.get("target_pct"),
-                    },
+                # Task #47 fix (2026-06-12): Mem0 v3 adds are async (no
+                # memory id in the response), so generate OUR OWN
+                # correlation key BEFORE the fire-and-forget write and
+                # carry it through approve_payload -> source_payload ->
+                # TradeOutcome.related_decisions. The decision and its
+                # outcome share the key in metadata; recall correlates
+                # on it without needing Mem0's internal ids.
+                import uuid as _uuid
+                _decision_key = _uuid.uuid4().hex
+                approve_payload["risk_manager_memory_id"] = _decision_key
+                asyncio.create_task(asyncio.to_thread(
+                    mem.log_decision,
+                    AgentDecision(
+                        agent="risk_manager",
+                        action="approve",
+                        ticker=ticker,
+                        reasoning=approve_payload["reason"],
+                        metadata={
+                            "decision_key": _decision_key,
+                            "tcs": int(tcs),
+                            "strategy": strategy,
+                            "direction": direction,
+                            "user_id": message.payload.get("user_id") or "global",
+                            "stop_pct": approve_payload.get("stop_pct"),
+                            "target_pct": approve_payload.get("target_pct"),
+                        },
+                    ),
                 ))
         except Exception:
             pass
-        if approval_memory_id:
-            approve_payload["risk_manager_memory_id"] = approval_memory_id
 
         return [
             AgentMessage(
@@ -427,25 +658,52 @@ class RiskManagerAgent(Agent):
         # Log the veto to Mem0 so future-self can query "did I veto this
         # kind of setup before, and was I right?". Best-effort: failure
         # in the memory layer must NEVER break the trading decision.
+        #
+        # 2026-06-11 quota guard: routine filter vetoes (neutral bias,
+        # liquidity, staleness, dedup, wide spread) fired ~120x/day and
+        # burned the ENTIRE 10k/month Mem0 ADD quota on noise -- writes
+        # 429'd from mid-June. Only decision-quality vetoes are worth
+        # remembering; the routine ones carry no learning signal.
+        _ROUTINE_VETO_MARKERS = (
+            "Neutral direction",
+            "Liquidity filter",
+            "Stale signal",
+            "Already approved",
+            "bid/ask spread",
+        )
+        _is_routine = any(k in reason for k in _ROUTINE_VETO_MARKERS)
         try:
             mem = get_memory()
-            if mem.available:
-                mem.log_decision(AgentDecision(
-                    agent="risk_manager",
-                    action="veto",
-                    ticker=ticker,
-                    reasoning=reason,
-                    metadata={
-                        "tcs": int(tcs),
-                        "strategy": strategy or "unknown",
-                        "user_id": user_id or "global",
-                    },
+            if mem.available and not _is_routine:
+                # Patched 2026-06-04: fire-and-forget on worker thread.
+                # Sync Mem0 calls block the event loop when Mem0 is slow.
+                asyncio.create_task(asyncio.to_thread(
+                    mem.log_decision,
+                    AgentDecision(
+                        agent="risk_manager",
+                        action="veto",
+                        ticker=ticker,
+                        reasoning=reason,
+                        metadata={
+                            "tcs": int(tcs),
+                            "strategy": strategy or "unknown",
+                            "user_id": user_id or "global",
+                        },
+                    ),
                 ))
         except Exception:
             pass  # memory failure cannot block a veto
+        # Patched 2026-06-05 (Task #47): include user_id so vetoes are
+        # per-user attributable in the audit trail.
         return AgentMessage(
             agent=self.name,
             kind="veto",
             confidence=1.0,
-            payload={"ticker": ticker, "tcs": tcs, "reason": reason},
+            payload={
+                "ticker": ticker,
+                "tcs": tcs,
+                "reason": reason,
+                "user_id": user_id,
+                "strategy": strategy or "unknown",
+            },
         )
