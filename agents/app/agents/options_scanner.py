@@ -660,6 +660,44 @@ class OptionsScannerAgent(Agent):
                 },
             )
 
+        # Pre-gates (2026-06-12): yesterday produced 120x "options market
+        # orders are only allowed during market hours" (fired at night)
+        # and 190x "insufficient options buying power" (retried every
+        # tick) -- both knowable BEFORE submitting. Check the clock and
+        # the collateral requirement first; skip QUIETLY when closed
+        # (the suggestion row already exists for the Wheel page) and
+        # once-per-tick loudly when underfunded.
+        try:
+            from app.brokers.alpaca import get_clock
+            clock = await get_clock(token=token)
+            if not clock or not clock.get("is_open"):
+                return None  # market closed - try again next tick
+        except Exception:  # noqa: BLE001
+            pass  # clock unavailable -> let Alpaca decide
+        if strategy == "wheel_csp":
+            try:
+                collateral = float(pick.strike) * 100.0 * int(leg.contracts or 1)
+                opt_bp = float(getattr(acct, "options_buying_power", 0) or
+                               getattr(acct, "buying_power", 0) or 0)
+                if opt_bp and collateral > opt_bp:
+                    return AgentMessage(
+                        agent=self.name, kind="info",
+                        payload={
+                            "user_id": user_id,
+                            "event": "wheel_auto_blocked",
+                            "underlying": underlying,
+                            "strategy": strategy,
+                            "reason": (
+                                f"CSP needs ${collateral:,.0f} collateral; "
+                                f"options buying power ${opt_bp:,.0f}. "
+                                f"Skipped without hitting Alpaca."
+                            ),
+                            "routed_via": routed,
+                        },
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
         # SELL-TO-OPEN the put (CSP) or call (CC). Same call shape the
         # manual button uses - day time-in-force, no limit price (market).
         order, err = await submit_option_order(
@@ -712,13 +750,15 @@ class OptionsScannerAgent(Agent):
                         "strike": pick.strike,
                         "premium": pick.premium,
                     }],
-                    "notes": note + " · Placed via Alpaca · auto-fired",
-                    "broker_order_id": order_id,
-                    "source_payload": {
-                        "auto_fired": True,
-                        "routed_via": routed,
-                        "occ": pick.occ,
-                    },
+                    # Fixed 2026-06-12: broker_order_id and source_payload
+                    # are NOT columns on options_positions -- their
+                    # presence made PostgREST reject the whole insert, so
+                    # the ARCC put fired at Alpaca but was never tracked
+                    # (wheel_auto_tracking_failed). Fold them into notes.
+                    "notes": (note + " · Placed via Alpaca · auto-fired"
+                              + f" · occ={pick.occ}"
+                              + f" · order_id={order_id}"
+                              + f" · routed={routed}"),
                 }).execute()
             )
 

@@ -417,4 +417,20 @@ async def liquidate_position(
     sym = symbol.upper().strip()
     if asset_type == "crypto":
         sym = _crypto_pair(sym).replace("/", "")
+    # Fixed 2026-06-12 evening (the GM incident): DELETE /v2/positions
+    # returns 403 "available: 0" when ALL shares are reserved by open
+    # orders -- e.g. the position's own bracket sell legs. GM's stms
+    # time stop fired 429 times today and every liquidate was rejected,
+    # so the position rode all day. Cancel the symbol's open orders
+    # FIRST, then liquidate. Cancelling exit legs is always correct
+    # here: every caller is a forced exit that replaces them.
+    try:
+        orders = await _get(f"/v2/orders?status=open&symbols={sym}")
+        if isinstance(orders, list):
+            for o in orders:
+                oid = o.get("id")
+                if oid:
+                    await _delete(f"/v2/orders/{oid}")
+    except Exception:  # noqa: BLE001
+        pass  # best effort; the liquidate below surfaces any real error
     return await _delete(f"/v2/positions/{sym}")

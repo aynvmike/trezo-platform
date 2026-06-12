@@ -190,7 +190,14 @@ class OpsWatchdogAgent(Agent):
                 # exactly the silent-failure case this watchdog exists
                 # for (e.g. a tick that hangs or raises before returning).
                 interval_s = getattr(getattr(_st, "impl", None),
-                                     "tick_interval_seconds", 300) or 300
+                                     "tick_interval_seconds", 300)
+                if interval_s is not None and interval_s <= 0:
+                    # Event-driven agents (risk_manager, trade_execution,
+                    # user_support) have interval 0 and NEVER tick by
+                    # design -- they react on the bus. 2026-06-12: these
+                    # false-alarmed as never_ticked all morning.
+                    continue
+                interval_s = interval_s or 300
                 boot_grace_min = max((2 * interval_s) / 60.0, 10.0)
                 uptime_min = (now - _BOOT_AT).total_seconds() / 60.0
                 if uptime_min < boot_grace_min:

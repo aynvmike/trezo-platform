@@ -190,6 +190,36 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             side = "long" if ap_qty > 0 else "short"
             qty_abs = abs(ap_qty)
 
+            # Inheritance first (2026-06-12: the open-bell phantom-close
+            # race closed fresh stms rows, and this re-import path gave
+            # them strategy="reconciled" + default stops -- so CSCO/SOFI
+            # lost their time stops and rode all day). If THIS ticker has
+            # a row closed within the last 24h, inherit its strategy,
+            # stop and target: the re-imported position is almost
+            # certainly the same trade the books lost.
+            inherited = None
+            try:
+                def _last_closed(uid=user_id, s=sym):
+                    return (
+                        client.table("paper_positions")
+                        .select("strategy, stop_price, target_price, side, entry_at")
+                        .eq("user_id", uid).eq("ticker", s)
+                        .neq("status", "open")
+                        .order("entry_at", desc=True)
+                        .limit(1)
+                        .execute()
+                    )
+                prev_rows = (await asyncio.to_thread(_last_closed)).data or []
+                if prev_rows:
+                    from datetime import datetime, timezone, timedelta
+                    prev = prev_rows[0]
+                    ts = str(prev.get("entry_at") or "")
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+                    if dt and (datetime.now(timezone.utc) - dt) < timedelta(hours=24)                             and (prev.get("side") or side) == side:
+                        inherited = prev
+            except Exception:  # noqa: BLE001
+                inherited = None
+
             # Best-effort stop/target from per-user defaults.
             try:
                 from app.runtime.settings import get_bot_settings
@@ -204,6 +234,13 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             else:
                 stop_price = ap_entry * (1 + sp)
                 target_price = ap_entry * (1 - tp)
+            strategy_label = "reconciled"
+            if inherited:
+                strategy_label = inherited.get("strategy") or "reconciled"
+                if inherited.get("stop_price"):
+                    stop_price = float(inherited["stop_price"])
+                if inherited.get("target_price"):
+                    target_price = float(inherited["target_price"])
 
             try:
                 await record_external_position(
@@ -215,7 +252,7 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     entry_price=ap_entry,
                     stop_price=stop_price,
                     target_price=target_price,
-                    strategy="reconciled",
+                    strategy=strategy_label,
                     broker="alpaca",
                     broker_order_id=None,
                     source_payload={

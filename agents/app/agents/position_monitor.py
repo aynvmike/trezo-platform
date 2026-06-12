@@ -343,6 +343,18 @@ class PositionMonitorAgent(Agent):
                             }))
                     continue
                 if alpaca_held is not None and tk.upper() not in alpaca_held:
+                    # Fresh-row grace (2026-06-12: at the open, WMT/GM/
+                    # CSCO/SOFI were "closed" 6-60s after submission --
+                    # the order had not FILLED yet, so the positions API
+                    # did not list the symbol and this branch phantom-
+                    # closed the row; the fill then landed and the shares
+                    # sat orphaned until the 30-min reconcile re-imported
+                    # them WITHOUT their strategy tags). A just-submitted
+                    # order needs time to appear: skip reconcile-close
+                    # for rows younger than 5 minutes.
+                    if _minutes_since(r.get("entry_at")) < 5.0:
+                        alpaca_managed += 1
+                        continue
                     # Alpaca's bracket order closed it - reconcile our books.
                     price = await _price(tk, at)
                     if price is not None:

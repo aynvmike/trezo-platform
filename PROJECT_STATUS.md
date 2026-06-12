@@ -112,6 +112,36 @@ Trezo is an **autonomous layered trading platform** for a single operator (Mike)
 
 ---
 
+## 2a. Friday 6/12 POST-MORTEM (6 PM) — what the day taught us
+
+**The day in trades:** AAPL sold at open (+$10.30 banked) then bot SHORTED AAPL (default, GTC bracket, +$2.88). STMS fired GM/CSCO/SOFI at the bell; WMT shorted. **Open-bell phantom-close race** (rows "closed" 6-60s after submit because unfilled orders aren't in the positions API yet) mangled the books; the 30-min reconcile re-imported CSCO/SOFI/WMT as strategy="reconciled" (losing stms tags + time stops). GM re-entered at 9:39 keeping its stms tag — and then **its time stop fired 429 times all day, every one rejected by Alpaca 403 "available: 0"**: the bracket's own sell legs reserved all 30 shares; DELETE /v2/positions does NOT auto-cancel them. The Wheel sold its FIRST REAL option (ARCC 7/17 $18 CSP, premium $20) but the tracking insert failed on nonexistent columns; 190x buying-power + 120x market-closed blocked retries spammed the log. Delta translation verified live (net 39.47 → leg 0.3947 on today's ideas). auto_exit_advisor could never arm: the bot_settings COLUMN never existed.
+
+**Fixed tonight (rows 33-38, load at next restart):**
+| 33 | liquidate_position cancels the symbol's open orders BEFORE DELETE /v2/positions (GM 403 root cause) | ✅ |
+| 34 | 5-min fresh-row grace in the monitor's reconcile-close (open-bell phantom race) | ✅ |
+| 35 | Re-imported rows inherit strategy/stop/target from their <24h closed predecessor (no more lost stms tags) | ✅ |
+| 36 | Watchdog exempts event-driven agents (interval<=0) from never_ticked | ✅ |
+| 37 | Wheel auto-fire pre-gates: market clock + CSP collateral vs options buying power (no more 422/403 spam) | ✅ |
+| 38 | options_positions tracking insert: dropped nonexistent broker_order_id/source_payload columns (folded into notes); ARCC row repaired by hand (id e6812fed) | ✅ |
+
+**Needs ONE Supabase paste (Mike):** migration 0039 — the auto-exit toggle column. All-in-one, run in the Supabase SQL editor:
+```
+[Supabase SQL]  ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_exit_advisor boolean NOT NULL DEFAULT false;
+```
+Then flip it ON in /dashboard/settings/bot when you want auto-exits live.
+
+**Monday open watch:** GM/CSCO/SOFI/WMT exits will finally fire (time stops + brackets now cancellable); confirm closes log Mem0 outcomes with related_decisions.
+
+## 2b. Live watch — Friday 6/12 pre-market sweep (8:30-8:45 AM ET, observation only)
+
+**Confirmed working:** full build live (service records carry decision_key + tags); screener firing 26 signals/tick across 4 lanes (top TCS 670); STMS scanning 15 names/tick; crypto 7-9 coins/tick 24/7; Risk Manager 136 vetoes + 5 approves pre-market; Position Monitor clean (AAPL broker-aware, INTC auto-reconciled closed); dedup-release cycling SOFI pre-open as designed; **the Wheel attempted its first REAL Alpaca option orders overnight** (wheel_csp, e.g. ARCC260717P00018000) — blocked only by "options market orders only during market hours"; it retries every 30 min, first in-hours attempt ~10:00 AM.
+
+**After-close fix queue (DO NOT touch during market hours):**
+1. Watchdog `never_ticked` false-alarms on event-driven agents (risk_manager, trade_execution, user_support have tick_interval=0) — exempt interval<=0 agents.
+2. Wheel auto-execute should check the market clock before submitting options orders (avoid 422 churn; stocks already do this).
+3. `scanner_pulse.scanned` reports 0 while `fired`=26 — counter bug, cosmetic.
+4. Verify first TODAY close logs a Mem0 outcome with `related_decisions=[decision_key]` (old INTC outcomes predate the key). If empty, trace `record_paper_close` -> source_payload chain.
+
 ## 3. Architecture
 
 ### Repo layout
