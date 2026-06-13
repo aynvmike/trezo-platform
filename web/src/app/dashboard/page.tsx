@@ -23,21 +23,12 @@ export default async function DashboardPage() {
     supabase.from("paper_accounts").select("crypto_balance_usd").eq("user_id", user.id).maybeSingle()
   ]);
 
-  // Mike feedback 2026-05-29: the KPIs were reading hardcoded profile
-  // fields ($15k stock capital, $10k crypto), which mismatched the real
-  // Alpaca account (~$8.5k equity). That mismatch is dangerous - the
-  // account-size-aware posture logic was sizing trades for a phantom
-  // $25k portfolio. Source of truth is now: Alpaca equity when
-  // connected, profile fallback otherwise. Multiple brokerage accounts
-  // will be summed below as soon as Trezo wires a second broker.
+  // Source of truth: Alpaca equity when connected, profile fallback otherwise
+  // (Mike 2026-05-29 — avoid the phantom-portfolio sizing bug).
   const alpacaActive = !!(alpaca?.configured && alpaca?.account);
   const liveEquity = alpacaActive ? Number(alpaca!.account!.equity) : null;
   const liveCash = alpacaActive ? Number(alpaca!.account!.cash) : null;
 
-  // Alpaca paper trading is stock-only, so all live equity counts toward
-  // stocks. Crypto holdings come from the internal paper account (the
-  // crypto SCALP/SWING/DCA engine runs on the internal ledger, not
-  // Alpaca). Falls back to the profile defaults when neither is wired.
   const stockCapital = liveEquity ?? Number(profile?.stock_capital_usd ?? 0);
   const cryptoHoldings = paperAcct?.crypto_balance_usd
     ? Number(paperAcct.crypto_balance_usd)
@@ -45,112 +36,144 @@ export default async function DashboardPage() {
   const dailyTarget = Number(profile?.daily_profit_target_usd ?? 0);
 
   return (
-    <div className="px-4 sm:px-6 py-8 space-y-10 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
+    <div className="px-4 sm:px-8 py-8 sm:py-10 space-y-10 max-w-6xl">
+      {/* ---- Hero ------------------------------------------------------- */}
+      <header className="relative">
+        <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-treasure-600">
           Overview
         </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
+        <h1 className="mt-2 font-serif text-3xl sm:text-4xl tracking-tight text-weave-800">
           Welcome back, {profile?.display_name ?? "friend"}.
         </h1>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
+        <p className="beginner-only mt-3 max-w-2xl text-sm text-weave-600 leading-relaxed">
           Live data below. Bots and strategies come online layer by layer.
         </p>
+        <div className="mt-6 h-px w-full bg-gradient-to-r from-treasure-500/50 via-weave-200 to-transparent" />
       </header>
 
-      <section className="space-y-1">
+      {/* ---- KPI band -------------------------------------------------- */}
+      <section className="space-y-2">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <KPI
-            label={alpacaActive ? "Stock capital - Alpaca live" : "Stock capital"}
+            label={alpacaActive ? "Stock capital · Alpaca live" : "Stock capital"}
             value={stockCapital}
             live={alpacaActive}
           />
-          <KPI label="Crypto holdings" value={cryptoHoldings} />
-          <KPI label="Daily target" value={dailyTarget} />
+          <KPI label="Crypto holdings" value={cryptoHoldings} accent="treasure" />
+          <KPI label="Daily target" value={dailyTarget} accent="weave" />
         </div>
         {alpacaActive ? (
           <p className="text-[11px] text-weave-500 leading-relaxed">
             Stock capital reads from your Alpaca account equity
-            (<span className="font-mono">${liveEquity?.toLocaleString()}</span>{" "}
-            · cash <span className="font-mono">${liveCash?.toLocaleString()}</span>).
-            When multiple brokerages are wired, the values sum across all
-            connected accounts.
+            (<span className="font-mono tabular-nums">${liveEquity?.toLocaleString()}</span>{" "}
+            · cash <span className="font-mono tabular-nums">${liveCash?.toLocaleString()}</span>).
+            Values sum across brokerages as more are wired.
           </p>
         ) : (
           <p className="text-[11px] text-weave-500 leading-relaxed">
             Showing onboarding values. Connect Alpaca on{" "}
-            <Link href="/dashboard/settings/connections" className="underline">
+            <Link href="/dashboard/settings/connections" className="text-treasure-600 underline underline-offset-2">
               Connections
             </Link>{" "}
-            and these tiles will reflect your real account.
+            and these tiles reflect your real account.
           </p>
         )}
       </section>
 
       <PerformanceSnapshot userId={user.id} />
 
+      {/* ---- Layers + activity ---------------------------------------- */}
       <section className="grid gap-8 lg:grid-cols-[1.4fr_1fr]">
         <div className="space-y-10 min-w-0">
           <div>
-            <div className="flex items-baseline justify-between mb-3">
-              <h2 className="font-serif text-xl text-weave-800">Live crypto</h2>
-              <Link href="/dashboard/crypto" className="text-sm text-weave-600 hover:underline">
-                Open Layer 1 -&gt;
-              </Link>
-            </div>
+            <SectionHead eyebrow="Layer 1" title="Live crypto" href="/dashboard/crypto" cta="Open" />
             <CryptoCards />
           </div>
-
           <div>
-            <div className="flex items-baseline justify-between mb-3">
-              <h2 className="font-serif text-xl text-weave-800">Watchlist preview</h2>
-              <Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">
-                Open Layer 2 -&gt;
-              </Link>
-            </div>
+            <SectionHead eyebrow="Layer 2" title="Watchlist preview" href="/dashboard/stocks" cta="Open" />
             <StockQuotes symbols={["AMD", "INTC", "CZR", "WMT", "AMSC"]} />
           </div>
         </div>
 
-        <aside>
-          <div className="flex items-baseline justify-between mb-3">
-            <h2 className="font-serif text-xl text-weave-800">Activity</h2>
-            <Link href="/dashboard/agents" className="text-sm text-weave-600 hover:underline">
-              Manage agents -&gt;
-            </Link>
+        <aside className="min-w-0">
+          <SectionHead eyebrow="Live feed" title="Activity" href="/dashboard/agents" cta="Manage agents" />
+          <div className="rounded-2xl border bg-white/40 p-1.5 shadow-sm">
+            <ActivityFeed limit={30} refreshSec={5} maxHeight="620px" />
           </div>
-          <ActivityFeed limit={30} refreshSec={5} maxHeight="640px" />
         </aside>
       </section>
     </div>
   );
 }
 
+/* ---- section header: gold eyebrow + serif title + hairline rule ------ */
+function SectionHead({
+  eyebrow,
+  title,
+  href,
+  cta
+}: {
+  eyebrow: string;
+  title: string;
+  href: string;
+  cta: string;
+}) {
+  return (
+    <div className="mb-4 flex items-end justify-between gap-3 border-b border-weave-200/70 pb-2.5">
+      <div>
+        <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-treasure-600">
+          {eyebrow}
+        </p>
+        <h2 className="mt-0.5 font-serif text-xl text-weave-800 tracking-tight">{title}</h2>
+      </div>
+      <Link
+        href={href}
+        className="shrink-0 text-xs font-medium text-weave-500 transition-colors hover:text-weave-800"
+      >
+        {cta} →
+      </Link>
+    </div>
+  );
+}
+
+/* ---- KPI tile: lifted obsidian card, sharp top accent, serif value --- */
 function KPI({
   label,
   value,
-  live
+  live,
+  accent = "treasure"
 }: {
   label: string;
   value: number;
   live?: boolean;
+  accent?: "treasure" | "weave" | "emerald";
 }) {
+  const bar = live
+    ? "via-emerald-500/70"
+    : accent === "weave"
+      ? "via-weave-500/60"
+      : "via-treasure-500/60";
+  const dot = live ? "bg-emerald-500" : accent === "weave" ? "bg-weave-500" : "bg-treasure-500";
   return (
     <div
       className={cn(
-        "rounded-xl border p-5",
-        live ? "border-emerald-200 bg-emerald-50/40" : "border-weave-100 bg-white"
+        "group relative overflow-hidden rounded-2xl border p-5 shadow-sm transition-shadow hover:shadow-md",
+        "bg-gradient-to-b from-white to-weave-50/40",
+        live ? "border-emerald-300/60" : "border-weave-200/70"
       )}
     >
-      <div className="flex items-baseline gap-2">
-        <p className="text-xs uppercase tracking-widest text-weave-500">{label}</p>
+      {/* sharp top hairline — the obsidian edge */}
+      <span className={cn("absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent to-transparent", bar)} />
+      <div className="flex items-center gap-2">
+        <span className={cn("h-1.5 w-1.5 rounded-full", dot, live && "animate-pulse")} />
+        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-weave-500">{label}</p>
         {live && (
-          <span className="text-[9px] uppercase tracking-widest rounded-full px-1.5 py-0.5 bg-emerald-100 text-emerald-800">
-            LIVE
+          <span className="ml-auto rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-emerald-800">
+            Live
           </span>
         )}
       </div>
-      <p className="mt-2 font-serif text-2xl text-weave-800">
+      <p className="mt-3 font-serif text-[1.7rem] leading-none text-weave-800 tabular-nums">
         ${Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 })}
       </p>
     </div>
