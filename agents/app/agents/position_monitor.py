@@ -126,6 +126,51 @@ async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
     return new_stop
 
 
+async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
+    """Step-ladder profit lock (crypto Part 2b, 2026-06-13). For a long
+    position, as unrealized gain (return on capital) climbs through the
+    ladder's tiers, ratchet the stop UP to that tier's locked floor --
+    locking gains in stages while the trade still rides to its target.
+    ``ladder`` = ((gain_trigger, locked_floor), ...) as fractions of entry.
+    Returns the new stop if it ratcheted up (and persists it), else None.
+    Never lowers a stop. Long-only."""
+    try:
+        entry = float(r.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or price <= 0:
+        return None
+    gain = (price - entry) / entry
+    locked = None
+    for trigger, floor in ladder:
+        if gain >= trigger:
+            locked = floor
+    if locked is None:
+        return None  # below the first rung -> keep the original stop
+    new_stop = round(entry * (1.0 + locked), 8)
+    try:
+        cur = float(r["stop_price"]) if r.get("stop_price") else None
+    except (TypeError, ValueError):
+        cur = None
+    if cur is not None and new_stop <= cur:
+        return None  # only ever ratchet UP
+    client = _supabase()
+    if client is None:
+        return None
+    rid = r.get("id")
+
+    def _upd():
+        return (client.table("paper_positions")
+                .update({"stop_price": new_stop}).eq("id", rid).execute())
+
+    try:
+        await asyncio.to_thread(_upd)
+    except Exception:  # noqa: BLE001
+        return None
+    r["stop_price"] = new_stop
+    return new_stop
+
+
 async def _latest_price(ticker: str, asset_type: str) -> float | None:
     """Best-effort latest price from candle data. Returns the most recent close."""
     candles = await fetch_candles_for(ticker, asset_type if asset_type != "option" else "stock")
@@ -333,13 +378,20 @@ class PositionMonitorAgent(Agent):
                               if r.get("stop_price") else None)
                     target_c = (float(r["target_price"])
                                 if r.get("target_price") else None)
-                    # HODL trail-to-lock for an Alpaca-routed crypto HODL
-                    # (crypto Part 2). Ratchets the client-side stop up; no
-                    # target, so the position keeps holding.
-                    if "hodl" in (r.get("strategy") or "").lower() and r["side"] == "long":
+                    # Crypto trail-to-lock for Alpaca-routed rows (Part 2/2b):
+                    # HODL ratchets a trailing stop up (no target, keeps
+                    # holding); SWING keeps its target but step-ladders the
+                    # stop up to lock return-on-capital on the way there.
+                    _strat_a = (r.get("strategy") or "").lower()
+                    if r["side"] == "long" and "hodl" in _strat_a:
                         _t = await _maybe_trail_hodl(r, price_c)
                         if _t is not None:
                             stop_c = _t
+                    elif r["side"] == "long" and "swing" in _strat_a:
+                        from app.strategies.crypto import SWING_PROFIT_LADDER
+                        _tl = await _maybe_ladder_stop(r, price_c, SWING_PROFIT_LADDER)
+                        if _tl is not None:
+                            stop_c = _tl
                     reason_c: str | None = None
                     if r.get("close_requested"):
                         reason_c = "manual"
@@ -502,14 +554,23 @@ class PositionMonitorAgent(Agent):
             # last_error="name 'strat' is not defined").
             strat  = (r.get("strategy") or "").lower()
 
-            # HODL trail-to-lock (crypto Part 2, 2026-06-13): once a long
-            # HODL has run far enough in profit, ratchet its stop UP to
-            # lock gains. No profit target is ever set, so it still holds;
-            # only the trailed stop (or a manual close) can exit it.
-            if at == "crypto" and "hodl" in strat and side == "long":
-                _trail = await _maybe_trail_hodl(r, price)
-                if _trail is not None:
-                    stop = _trail
+            # Crypto trail-to-lock (crypto Part 2 / 2b, 2026-06-13):
+            #  - HODL: ratchet a trailing stop UP after a big run; no target,
+            #    so it keeps holding -- only the trailed stop or a manual
+            #    close exits.
+            #  - SWING: a defined trade, so it keeps its fixed target but
+            #    step-ladders the stop up to lock return-on-capital in stages,
+            #    so a reversal before the target still banks most of the gain.
+            if at == "crypto" and side == "long":
+                if "hodl" in strat:
+                    _trail = await _maybe_trail_hodl(r, price)
+                    if _trail is not None:
+                        stop = _trail
+                elif "swing" in strat:
+                    from app.strategies.crypto import SWING_PROFIT_LADDER
+                    _lad = await _maybe_ladder_stop(r, price, SWING_PROFIT_LADDER)
+                    if _lad is not None:
+                        stop = _lad
 
             close_reason: str | None = None
             close_detail = ""

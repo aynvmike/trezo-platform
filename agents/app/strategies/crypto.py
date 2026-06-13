@@ -11,7 +11,8 @@ Three adaptive modes:
   SCALP — RSI 40-68, normal volatility, volume >= 1.2x avg.
           Holding 1-6 candles. Target ~3%, tight stop.
   SWING — strong trend + volume + Bollinger width > 2.5%.
-          Holding hours-days. Target 10-15%, 5% stop, trail after 5%.
+          Holding hours-days. Target 10-15%, 5% stop, then a step-ladder
+          profit lock (SWING_PROFIT_LADDER) ratchets the stop up.
   DCA   — RSI < 35 (accumulate). Slow buying back toward the mean.
 
 Runs 24/7 — crypto has no market-hours window.
@@ -76,6 +77,21 @@ HODL_RSI_MAX = 25              # only accumulate when genuinely deep-value
 # sentinel target still never triggers). "Hold, but protect a big run."
 HODL_TRAIL_TRIGGER = 0.40      # +40% unrealized before trailing engages
 HODL_TRAIL_GIVEBACK = 0.20     # then trail 20% below price (lock ~80% of high)
+
+# SWING step-ladder profit lock (crypto Part 2b, 2026-06-13). A SWING is a
+# DEFINED trade (it still exits at its fixed +12% target), but on the way up
+# we ratchet a step-ladder stop to lock RETURN ON CAPITAL in stages, so a
+# reversal before the target still banks most of the gain. Each tuple is
+# (gain_trigger, locked_floor) as fractions of entry: once unrealized gain
+# >= trigger, raise the stop to entry*(1+floor). Ratchets up only. The rungs
+# climb toward the target, tightening the give-back as profit grows -- the
+# same "tighter the more you are up" discipline as Mike's options drawback
+# ladder. Tune the rungs here.
+SWING_PROFIT_LADDER = (
+    (0.05, 0.00),   # +5% gain  -> lock breakeven (the spec's "trail after 5%")
+    (0.08, 0.03),   # +8% gain  -> lock +3%
+    (0.10, 0.05),   # +10% gain -> lock +5% (target at +12% takes the rest)
+)
 
 # Modes allowed to SCALE IN across days (accumulate on dips). One-shot
 # modes (swing/scalp) still trade one position at a time. Risk Manager

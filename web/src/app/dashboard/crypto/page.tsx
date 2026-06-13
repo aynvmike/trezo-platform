@@ -174,7 +174,7 @@ export default async function CryptoPage() {
         <p>
           <span className="font-medium text-weave-800">Modes:</span>{" "}
           SCALP = RSI 40-68 with volume (tight 1.5% stop, 3% target) ·{" "}
-          SWING = Bollinger width &gt; 2.5% in an uptrend (5% stop, 12% target) ·{" "}
+          SWING = Bollinger width &gt; 2.5% in an uptrend (5% stop, 12% target; step-ladder profit lock ratchets the stop up as it climbs) ·{" "}
           DCA = RSI below 35, oversold accumulation (wider stop, per-coin target) ·{" "}
           HODL = RSI below 25, deep-value long-horizon hold (-35% catastrophe stop, no profit target; trails up to lock gains after a big run, never force-sells).
         </p>
