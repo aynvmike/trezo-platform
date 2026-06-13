@@ -6,6 +6,8 @@
 
 This document is the single source of truth for "where are we, what just shipped, what's next." Read this first when picking up the project.
 
+> 🍍 **Pineapple continuity check — 2026-06-13 (Nova):** Cross-session memory is live and honored this session — the auto-memory index and `project_pineapple_test.md` loaded, and the full status below was reviewed and is current as of 2026-06-13. Note: the Mem0 **MCP server** is NOT connected in this Cowork session (no `mcp__mem0__*` tools surfaced); the Trezo agent-side Mem0 brain (status rows 22–28) is a separate Python integration and is unaffected. Pineapple acknowledged. 🍍
+
 ---
 
 ## 1. Goal
@@ -136,11 +138,11 @@ Mike's direction: take full control of crypto like stocks; cover the whole ISO 2
 | 37 | Wheel auto-fire pre-gates: market clock + CSP collateral vs options buying power (no more 422/403 spam) | ✅ |
 | 38 | options_positions tracking insert: dropped nonexistent broker_order_id/source_payload columns (folded into notes); ARCC row repaired by hand (id e6812fed) | ✅ |
 
-**Needs ONE Supabase paste (Mike):** migration 0039 — the auto-exit toggle column. All-in-one, run in the Supabase SQL editor:
+**Migration 0039 — DONE ✅ (no paste needed).** The auto-exit toggle column was renumbered 0039→0043 (0039 collided with `0039_options_user_filters`) and is already applied in the DB (commit 85ab86c, verified 6/13). The SQL below is kept for history only:
 ```
 [Supabase SQL]  ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_exit_advisor boolean NOT NULL DEFAULT false;
 ```
-Then flip it ON in /dashboard/settings/bot when you want auto-exits live.
+Just flip auto_exit_advisor ON in /dashboard/settings/bot when you want auto-exits live — the column already exists.
 
 **Monday open watch:** GM/CSCO/SOFI/WMT exits will finally fire (time stops + brackets now cancellable); confirm closes log Mem0 outcomes with related_decisions.
 
