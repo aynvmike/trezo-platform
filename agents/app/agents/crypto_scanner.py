@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from app.data.candles import fetch_candles_for
 from app.patterns.scoring import calculate_score, MarketContext
-from app.strategies.crypto import CRYPTO_WATCHLIST, detect_mode
+from app.strategies.crypto import CRYPTO_WATCHLIST, detect_mode, indicators
 
 from .base import Agent, AgentMessage
 
@@ -51,23 +51,32 @@ class CryptoScannerAgent(Agent):
         out: list[AgentMessage] = []
         scanned = 0
         triggered = 0
+        detail: list[dict] = []  # per-coin why-it-did/didn't-fire (observability)
 
         for coin in CRYPTO_WATCHLIST:
             try:
                 candles = await fetch_candles_for(coin, "crypto")
                 if not candles:
+                    detail.append({"ticker": coin, "result": "no_data"})
                     continue
                 scanned += 1
 
+                ind = indicators(candles)
                 sig = detect_mode(coin, candles)
                 if not sig:
+                    detail.append({"ticker": coin, "result": "no_setup", **ind})
                     continue
 
                 score = calculate_score(candles, MarketContext(), strategy=f"crypto_{sig.mode}")
                 if score.tcs < tcs_floor:
+                    detail.append({"ticker": coin, "result": "low_tcs",
+                                   "mode": sig.mode, "tcs": score.tcs,
+                                   "tcs_floor": tcs_floor, **ind})
                     continue
 
                 triggered += 1
+                detail.append({"ticker": coin, "result": "FIRED",
+                               "mode": sig.mode, "tcs": score.tcs, **ind})
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="signal",
@@ -89,6 +98,7 @@ class CryptoScannerAgent(Agent):
                     },
                 ))
             except Exception as e:  # noqa: BLE001
+                detail.append({"ticker": coin, "result": "error", "error": str(e)[:120]})
                 out.append(AgentMessage(
                     agent=self.name, kind="error",
                     payload={"ticker": coin, "error": str(e)},
@@ -100,6 +110,7 @@ class CryptoScannerAgent(Agent):
                 "note": "Crypto scan complete",
                 "coins_scanned": scanned,
                 "modes_triggered": triggered,
+                "detail": detail,
             },
         ))
         # Task #60 (2026-06-05): scanner_pulse summary emission.

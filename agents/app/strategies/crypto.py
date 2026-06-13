@@ -181,6 +181,45 @@ def _bb_width_pct(values: list[float]) -> float:
     return width / bb["mid"][-1] * 100.0
 
 
+# --- Mode tuning (crypto Part 4, 2026-06-13) -------------------------------
+# Tuned for ACTIVITY and per Mike's strategy character:
+#   SCALP = fast, loose, FLEXIBLE quick trade; volume-OPTIONAL so it still
+#           fires when a coin's feed reports no volume (the old SCALP needed a
+#           volume surge and was mathematically DEAD on no-volume feeds -- the
+#           #1 reason crypto sat silent for hours).
+#   DCA   = oversold accumulation, a touch looser to catch more dips.
+#   SWING = trend expansion, slightly looser bands.
+#   HODL  = stays TIGHT + selective -- deepest value only (RSI < HODL_RSI_MAX),
+#           hold and never chase; the catastrophe stop is the only exit.
+# All edges live here so they are easy to retune in one place.
+SCALP_RSI_LO, SCALP_RSI_HI = 40, 68
+SCALP_BB_MAX = 2.2
+SCALP_VOL_MIN = 1.1
+SWING_RSI_LO, SWING_RSI_HI = 48, 72
+SWING_BB_MIN = 2.0
+SWING_VOL_MIN = 1.1
+DCA_RSI_MAX = 40
+
+
+def indicators(candles: list[Candle]) -> dict:
+    """The raw read each mode is judged on -- RSI, Bollinger width %, last-bar
+    volume ratio -- so the scanner can SHOW why a coin did or did not fire."""
+    if len(candles) < 25:
+        return {"insufficient": True, "bars": len(candles)}
+    cl = closes(candles)
+    rsi_now = rsi(cl, 14)[-1]
+    bb_w = _bb_width_pct(cl)
+    last_vol = candles[-1].volume
+    avg_vol = avg_volume(candles[:-1], 20)
+    vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
+    return {
+        "rsi": round(rsi_now, 1),
+        "bb_width_pct": round(bb_w, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "has_volume": avg_vol > 0,
+    }
+
+
 def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
     """Evaluate a coin and return a CryptoSignal if a mode triggers, else None.
 
@@ -204,18 +243,24 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
 
     base = COIN_PARAMS[sym]
 
-    # --- SWING: strong expansion. Wide bands + healthy RSI + volume. ---
-    if bb_w > 2.5 and 50 <= rsi_now <= 70 and (vol_ratio >= 1.2 or avg_vol == 0):
+    # Volume is OPTIONAL when the feed reports none (avg_vol == 0): a coin
+    # without volume data should still trade on price/RSI/range, not be frozen
+    # out. This is what revives SCALP/SWING on no-volume feeds.
+    has_vol = avg_vol > 0
+
+    # --- SWING: trend expansion. Wide bands + healthy RSI. ---
+    if (bb_w > SWING_BB_MIN and SWING_RSI_LO <= rsi_now <= SWING_RSI_HI
+            and (vol_ratio >= SWING_VOL_MIN or not has_vol)):
         return CryptoSignal(
             ticker=sym, mode="swing", direction="bullish",
             stop_pct=0.05, target_pct=0.12,   # swing geometry overrides per-coin
             rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
-            reason=f"SWING — BB width {bb_w:.1f}% > 2.5, RSI {rsi_now:.0f}",
+            reason=f"SWING — BB width {bb_w:.1f}% > {SWING_BB_MIN}, RSI {rsi_now:.0f}",
         )
 
-    # --- HODL: long-horizon accumulate-and-hold. Deepest value tier. ---
-    # Fires only when genuinely deep-value (RSI < 25). Catastrophe stop,
-    # sentinel target (hold, don't sell), small size by construction.
+    # --- HODL: deep-value hold. TIGHT + selective by design (Mike): only the
+    # deepest value (RSI < HODL_RSI_MAX) triggers; the catastrophe stop is the
+    # only exit (hold, never chase). Kept strict on purpose. ---
     if rsi_now < HODL_RSI_MAX:
         return CryptoSignal(
             ticker=sym, mode="hodl", direction="bullish",
@@ -226,8 +271,8 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
                     f"hold (no profit target)."),
         )
 
-    # --- DCA: deep value accumulation. RSI oversold. ---
-    if rsi_now < 35:
+    # --- DCA: oversold accumulation. ---
+    if rsi_now < DCA_RSI_MAX:
         return CryptoSignal(
             ticker=sym, mode="dca", direction="bullish",
             stop_pct=base["stop_pct"], target_pct=base["target_pct"],
@@ -235,14 +280,16 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
             reason=f"DCA - RSI {rsi_now:.0f} oversold, accumulating.",
         )
 
-    # --- SCALP: tight range + volume pop. ---
-    if bb_w < 1.5 and vol_ratio >= 1.5 and 45 <= rsi_now <= 60:
+    # --- SCALP: fast, flexible default for calm/range coins. Loose bands,
+    # volume-OPTIONAL so it is not frozen out on no-volume feeds. ---
+    if (bb_w < SCALP_BB_MAX and SCALP_RSI_LO <= rsi_now <= SCALP_RSI_HI
+            and (vol_ratio >= SCALP_VOL_MIN or not has_vol)):
         return CryptoSignal(
             ticker=sym, mode="scalp", direction="bullish",
             stop_pct=max(base["stop_pct"] * 0.6, 0.01),
             target_pct=max(base["target_pct"] * 0.5, 0.02),
             rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
-            reason=f"SCALP - BB width {bb_w:.1f}% tight, volume {vol_ratio:.1f}x.",
+            reason=f"SCALP - BB {bb_w:.1f}% range, RSI {rsi_now:.0f}, vol {vol_ratio:.1f}x.",
         )
 
     return None
