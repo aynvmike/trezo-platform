@@ -47,8 +47,61 @@ def _period_to_days(period: str) -> int:
     return _PERIOD_DAYS.get(period, 120)
 
 
+async def fetch_kraken_ohlc(symbol: str, interval_minutes: int = 1440) -> list[Candle]:
+    """LIVE daily OHLC from Kraken's PUBLIC OHLC endpoint (no auth, no funds).
+    Returns Candles WITH real volume (CoinGecko OHLC carries none, which left
+    the SCALP/SWING volume checks blind). Empty list if the coin is not on
+    Kraken or the call fails, so the caller falls back to CoinGecko.
+    Crypto Part 3 (2026-06-13)."""
+    try:
+        from app.brokers.crypto_exchange import kraken_pair
+        pair = kraken_pair(symbol)
+    except Exception:  # noqa: BLE001
+        pair = None
+    if not pair:
+        return []
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {"pair": pair, "interval": str(interval_minutes)}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(url, params=params)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+    except Exception:  # noqa: BLE001
+        return []
+    if data.get("error"):
+        return []
+    result = data.get("result") or {}
+    rows = None
+    for k, v in result.items():
+        if k != "last" and isinstance(v, list):
+            rows = v
+            break
+    if not rows:
+        return []
+    out: list[Candle] = []
+    for row in rows:
+        try:
+            ts = datetime.fromtimestamp(int(row[0]), tz=timezone.utc)
+            out.append(Candle(
+                timestamp=ts,
+                open=float(row[1]), high=float(row[2]),
+                low=float(row[3]), close=float(row[4]),
+                volume=float(row[6]),
+            ))
+        except (KeyError, ValueError, TypeError, IndexError):
+            continue
+    return out
+
+
 async def fetch_crypto_ohlc(symbol: str, days: int = 30) -> list[Candle]:
-    """Daily OHLC candles for a crypto symbol via CoinGecko."""
+    """Daily OHLC candles for a crypto symbol. Prefers LIVE Kraken public OHLC
+    (real exchange prices + volume) for coins Kraken lists; falls back to
+    CoinGecko for the rest (crypto Part 3, 2026-06-13)."""
+    kr = await fetch_kraken_ohlc(symbol)
+    if kr:
+        return kr
     coin_id = COIN_MAP.get(symbol.upper())
     if not coin_id:
         return []

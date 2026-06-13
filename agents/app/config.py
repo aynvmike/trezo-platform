@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     crypto_exchange: str = "coinbase"   # 'coinbase' | 'kraken'
     crypto_exchange_api_key: str = ""
     crypto_exchange_api_secret: str = ""
+    # Kraken-specific creds. Mike set Kraken_API_KEY / Kraken_Private_Key in
+    # agents/.env; pydantic-settings is case-insensitive so these map to them.
+    # The connector prefers the generic crypto_exchange_* pair if set, else
+    # falls back to these.
+    kraken_api_key: str = ""
+    kraken_private_key: str = ""
 
     # Task #59 (2026-06-05): skip persistence of 'signal' kind messages.
     # Default True - cuts agent_messages writes by ~90%. Signals still

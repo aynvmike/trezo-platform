@@ -133,7 +133,12 @@ Mike's direction: take full control of crypto like stocks; cover the whole ISO 2
 - **Exchange connector SCAFFOLD** — `brokers/crypto_exchange.py` (Coinbase/Kraken) wired into trade_execution routing but FEATURE-FLAGGED OFF: `is_configured()` is False until `crypto_exchange_enabled=true` AND keys are set in `agents/.env`, so it can never fire by accident; always falls back to the modeled engine. Long-only (crypto short side deliberately deferred).
 - **Migration 0044** (optional, non-blocking) adds `hodl_per_coin_cap_pct` + `crypto_accumulate_cooldown_hours` to `bot_settings`; the code already enforces both via graceful defaults, so no paste is required to get the behavior.
 
-**Part 3 queue (NOT yet built):** fill in the real Coinbase/Kraken REST calls in `crypto_exchange.submit_order` (needs Mike's exchange API keys), optional crypto short side, and a per-coin HODL cap slider in the Bot Tuning UI.
+**Part 3 shipped (2026-06-13; loads at next restart):**
+- **Kraken connector (validate-first)** — `brokers/crypto_exchange.py` does real Kraken auth (HMAC-SHA512, verified offline vs Kraken's official test vector), private `Balance` (`self_test`), and `AddOrder` with `validate=true` (checks orders against the live book, NO funds move). Reads Mike's `Kraken_API_KEY` / `Kraken_Private_Key` from agents/.env via config aliases. `is_configured()` stays OFF until `CRYPTO_EXCHANGE_ENABLED=true`, so adding keys alone never changes routing. Real placement + fill reconciliation is Part 4 (real money — needs explicit go-ahead).
+- **Live Kraken market data** — `data/candles.py` `fetch_kraken_ohlc()` pulls Kraken PUBLIC OHLC (no auth, real prices + real volume) for listed coins, CoinGecko fallback otherwise. Fixes the CoinGecko volume=0 blind spot for SCALP/SWING.
+- **Step-ladder extended to DCA + Extended** — crypto DCA (`DCA_PROFIT_LADDER`) and the STOCK swing Extended (`EXTENDED_PROFIT_LADDER`) now lock gains on the same return-on-capital ladder. Extended is Alpaca-routed, so the monitor ratchets the DB stop and liquidates client-side (cancel legs + market) when the locked stop is hit — same pattern as the time stops.
+
+**Part 4 queue (real money — needs Mike's explicit go-ahead):** real Kraken order placement (`validate=false`) + live fill recording + Kraken-side exit/reconciliation; optional crypto short side; per-coin cap slider in Bot Tuning UI. NOTE: Kraken Spot has NO paper API (only Kraken Futures demo, a different leveraged product), so paper crypto stays on the modeled engine priced off live Kraken data.
 
 ## 2a. Friday 6/12 POST-MORTEM (6 PM) — what the day taught us
 

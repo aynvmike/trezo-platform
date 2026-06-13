@@ -93,6 +93,22 @@ SWING_PROFIT_LADDER = (
     (0.10, 0.05),   # +10% gain -> lock +5% (target at +12% takes the rest)
 )
 
+# DCA accumulation profit lock (crypto). DCA targets are smaller (per-coin
+# ~6%), so the rungs are tighter: protect capital early, lock a little after.
+DCA_PROFIT_LADDER = (
+    (0.03, 0.00),   # +3% gain -> lock breakeven
+    (0.05, 0.02),   # +5% gain -> lock +2%
+)
+
+# Extended (STOCK multi-day swing) profit lock. Bigger moves than crypto DCA,
+# so wider rungs. Kept here with the other ladders as one tunable home; the
+# Position Monitor applies it to Alpaca-routed Extended rows.
+EXTENDED_PROFIT_LADDER = (
+    (0.04, 0.00),   # +4% gain  -> lock breakeven
+    (0.07, 0.03),   # +7% gain  -> lock +3%
+    (0.10, 0.06),   # +10% gain -> lock +6%
+)
+
 # Modes allowed to SCALE IN across days (accumulate on dips). One-shot
 # modes (swing/scalp) still trade one position at a time. Risk Manager
 # consults this to decide whether to relax its same-ticker stacking veto.

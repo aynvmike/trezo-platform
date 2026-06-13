@@ -392,6 +392,11 @@ class PositionMonitorAgent(Agent):
                         _tl = await _maybe_ladder_stop(r, price_c, SWING_PROFIT_LADDER)
                         if _tl is not None:
                             stop_c = _tl
+                    elif r["side"] == "long" and "dca" in _strat_a:
+                        from app.strategies.crypto import DCA_PROFIT_LADDER
+                        _td = await _maybe_ladder_stop(r, price_c, DCA_PROFIT_LADDER)
+                        if _td is not None:
+                            stop_c = _td
                     reason_c: str | None = None
                     if r.get("close_requested"):
                         reason_c = "manual"
@@ -512,6 +517,34 @@ class PositionMonitorAgent(Agent):
                                 # drops it from open positions.
                                 continue
 
+                    # Extended trailing step-ladder (crypto Part 2b ext,
+                    # 2026-06-13): lock return-on-capital as a stock swing
+                    # runs. Ratchet the stop up by the ladder; if price has
+                    # fallen back to the locked stop, close at market (cancel
+                    # legs first) -- the same client-side liquidation pattern
+                    # the time stops use, so it works on Alpaca-routed rows
+                    # whose real stop lives in the broker bracket.
+                    if strat_a.startswith("extended"):
+                        price_x = await _price(tk, at)
+                        if price_x is not None:
+                            from app.strategies.crypto import EXTENDED_PROFIT_LADDER
+                            await _maybe_ladder_stop(r, price_x, EXTENDED_PROFIT_LADDER)
+                            _xstop = float(r["stop_price"]) if r.get("stop_price") else None
+                            if _xstop is not None and price_x <= _xstop:
+                                from app.brokers.alpaca import liquidate_position
+                                _xliq, _xerr = await liquidate_position(tk)
+                                out.append(AgentMessage(
+                                    agent=self.name, kind="info",
+                                    payload={
+                                        "user_id": r["user_id"], "ticker": tk,
+                                        "note": ("Extended trailing-lock stop hit - "
+                                                 "Alpaca position closed at market"
+                                                 + (f" (error: {_xerr})" if _xerr else "")),
+                                        "position_id": r["id"], "broker": "alpaca",
+                                        "reason": "trail_lock",
+                                    }))
+                                continue
+
                     if strat_a.startswith("extended") and held_days >= SWING_MAX_HOLD_DAYS:
                         from app.brokers.alpaca import liquidate_position
                         _liq, liq_err = await liquidate_position(tk)
@@ -571,6 +604,11 @@ class PositionMonitorAgent(Agent):
                     _lad = await _maybe_ladder_stop(r, price, SWING_PROFIT_LADDER)
                     if _lad is not None:
                         stop = _lad
+                elif "dca" in strat:
+                    from app.strategies.crypto import DCA_PROFIT_LADDER
+                    _ld = await _maybe_ladder_stop(r, price, DCA_PROFIT_LADDER)
+                    if _ld is not None:
+                        stop = _ld
 
             close_reason: str | None = None
             close_detail = ""
