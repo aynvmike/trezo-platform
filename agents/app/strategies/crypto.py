@@ -55,6 +55,22 @@ for _sym in ISO20022_SYMBOLS:
 CRYPTO_WATCHLIST: list[str] = ["ETH", "SOL"] + ISO20022_SYMBOLS
 
 
+# HODL — long-horizon accumulate-and-hold (Mike 2026-06-13). The
+# thesis: hold quality names (XRP, SOL, ISO 20022 cluster) through the
+# long climb, not flip them. Discipline that keeps it from becoming an
+# EMOTIONAL bag-hold:
+#   * Catastrophe stop only (no target, no time stop) — a HODL exits
+#     ONLY if the thesis is broken by a deep drawdown.
+#   * The wide stop makes the sized position SMALL (risk $ / big stop
+#     distance = few coins), so a HODL can never dominate the book.
+#   * Per-coin allocation cap enforced by the normal allocation gate.
+# "Hold and do not sell" = the target is set so high it effectively
+# never triggers; only the catastrophe stop or a manual close exits.
+HODL_CATASTROPHE_STOP = 0.35   # -35%: thesis-broken line, not a trade stop
+HODL_TARGET_SENTINEL = 5.0     # +500%: effectively "never auto-sell"
+HODL_RSI_MAX = 25              # only accumulate when genuinely deep-value
+
+
 def get_crypto_universe(user_id=None) -> list[str]:
     """Task #50 (2026-06-05): expandable crypto universe.
 
@@ -89,7 +105,7 @@ def get_crypto_universe(user_id=None) -> list[str]:
 @dataclass
 class CryptoSignal:
     ticker: str
-    mode: str            # 'scalp' | 'swing' | 'dca'
+    mode: str            # 'scalp' | 'swing' | 'dca' | 'hodl'
     direction: str       # 'bullish' (long) — Phase 6c is long-only for crypto
     stop_pct: float
     target_pct: float
@@ -111,7 +127,8 @@ def _bb_width_pct(values: list[float]) -> float:
 def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
     """Evaluate a coin and return a CryptoSignal if a mode triggers, else None.
 
-    Mode priority: SWING (strongest) > DCA (deep value) > SCALP (default).
+    Mode priority: SWING (strongest) > HODL (deepest value, RSI<25) >
+    DCA (oversold, RSI<35) > SCALP (default).
     Long-only for Phase 6c — short crypto comes later.
     """
     sym = ticker.upper()
@@ -137,6 +154,19 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
             stop_pct=0.05, target_pct=0.12,   # swing geometry overrides per-coin
             rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
             reason=f"SWING — BB width {bb_w:.1f}% > 2.5, RSI {rsi_now:.0f}",
+        )
+
+    # --- HODL: long-horizon accumulate-and-hold. Deepest value tier. ---
+    # Fires only when genuinely deep-value (RSI < 25). Catastrophe stop,
+    # sentinel target (hold, don't sell), small size by construction.
+    if rsi_now < HODL_RSI_MAX:
+        return CryptoSignal(
+            ticker=sym, mode="hodl", direction="bullish",
+            stop_pct=HODL_CATASTROPHE_STOP, target_pct=HODL_TARGET_SENTINEL,
+            rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
+            reason=(f"HODL - RSI {rsi_now:.0f} deep-value; long-horizon "
+                    f"accumulate, catastrophe stop -{int(HODL_CATASTROPHE_STOP*100)}%, "
+                    f"hold (no profit target)."),
         )
 
     # --- DCA: deep value accumulation. RSI oversold. ---

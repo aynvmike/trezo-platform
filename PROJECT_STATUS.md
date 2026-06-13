@@ -112,6 +112,18 @@ Trezo is an **autonomous layered trading platform** for a single operator (Mike)
 
 ---
 
+## 2c. Crypto expansion — Part 1 of N (2026-06-13, weekend build)
+
+Mike's direction: take full control of crypto like stocks; cover the whole ISO 20022 ecosystem (XRP/XLM/ALGO/HBAR/QNT/XDC/IOTA/XYO + SOL); add a HODL accumulate-and-hold mode; make untradeable coins doable in code; HODL can "hold and not sell" but must NOT be emotional.
+
+**Part 1 shipped (loads at next restart):**
+- **Crypto classification fixed** — `CRYPTO_SYMBOLS` was a hardcoded 4-set (XRP/ETH/SOL/BTC), so the ISO coins were misclassified as STOCKS and routed to Alpaca's stock path. Now derived from `COIN_MAP` (majors + full ISO cluster). Untradeable coins (XLM/HBAR/ALGO/IOTA/QNT/XDC/XYO) now correctly route to the modeled-paper engine on live CoinGecko prices = "doable in code" as Mike asked.
+- **HODL mode** added to crypto strategy (deepest-value tier, RSI<25): catastrophe stop -35%, sentinel target +500% (= hold, never auto-sell), small size by construction (wide stop → few coins → can't dominate the book = the anti-emotional discipline). Priority: SWING > HODL > DCA > SCALP.
+- **HODL exempt from Exit Advisor** — with auto_exit_advisor now ON, peak-giveback would have force-closed HODLs; exit_advisor now skips any `*hodl*` strategy. Only the catastrophe stop or a manual close exits a HODL.
+- Verified: XRP deep-decline → HODL (stop 0.35, target 5.0); HBAR in COIN_PARAMS (modeled); import audit clean.
+
+**Part 2+ queue (NOT yet built):** accumulate-on-dip across days (re-buy after dedup clears / scale-in), trail-to-lock after a big HODL run, per-coin HODL allocation cap as an explicit bot_setting, real crypto-exchange connector (Coinbase/Kraken) so the ISO coins can trade with real paper not just modeled, crypto short side, HODL surfaced on the dashboard.
+
 ## 2a. Friday 6/12 POST-MORTEM (6 PM) — what the day taught us
 
 **The day in trades:** AAPL sold at open (+$10.30 banked) then bot SHORTED AAPL (default, GTC bracket, +$2.88). STMS fired GM/CSCO/SOFI at the bell; WMT shorted. **Open-bell phantom-close race** (rows "closed" 6-60s after submit because unfilled orders aren't in the positions API yet) mangled the books; the 30-min reconcile re-imported CSCO/SOFI/WMT as strategy="reconciled" (losing stms tags + time stops). GM re-entered at 9:39 keeping its stms tag — and then **its time stop fired 429 times all day, every one rejected by Alpaca 403 "available: 0"**: the bracket's own sell legs reserved all 30 shares; DELETE /v2/positions does NOT auto-cancel them. The Wheel sold its FIRST REAL option (ARCC 7/17 $18 CSP, premium $20) but the tracking insert failed on nonexistent columns; 190x buying-power + 120x market-closed blocked retries spammed the log. Delta translation verified live (net 39.47 → leg 0.3947 on today's ideas). auto_exit_advisor could never arm: the bot_settings COLUMN never existed.

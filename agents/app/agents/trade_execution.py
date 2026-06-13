@@ -23,7 +23,20 @@ from app.runtime.trading_mode import get_trading_mode
 
 from .base import Agent, AgentMessage
 
-CRYPTO_SYMBOLS = {"XRP", "ETH", "SOL", "BTC"}
+# Single source of truth for "is this ticker a crypto?" 2026-06-13:
+# was a hardcoded 4-symbol set, which misclassified the ISO 20022
+# coins (XLM/HBAR/ALGO/IOTA/QNT/XDC/XYO) as STOCKS -> they were routed
+# to Alpaca's stock path instead of the modeled crypto engine, so the
+# agents could never take a position in them. Derive from COIN_MAP
+# (every symbol we have crypto price data for: majors + ISO cluster).
+def _all_crypto_symbols() -> set:
+    try:
+        from app.data.candles import COIN_MAP
+        return {s.upper() for s in COIN_MAP.keys()}
+    except Exception:  # noqa: BLE001
+        return {"XRP", "ETH", "SOL", "BTC"}
+
+CRYPTO_SYMBOLS = _all_crypto_symbols()
 
 
 class TradeExecutionAgent(Agent):

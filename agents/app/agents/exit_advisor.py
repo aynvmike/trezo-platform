@@ -124,7 +124,7 @@ class ExitAdvisorAgent(Agent):
                 .select("id, user_id, ticker, side, asset_type, "
                         "quantity, entry_price, stop_price, target_price, "
                         "peak_unrealized_pnl_usd, peak_price, peak_at, "
-                        "entry_at")
+                        "entry_at, strategy")
                 .eq("status", "open")
                 .execute()
             )
@@ -147,6 +147,14 @@ class ExitAdvisorAgent(Agent):
                 qty = float(pos.get("quantity") or 0)
                 entry = float(pos.get("entry_price") or 0)
                 if not ticker or qty <= 0 or entry <= 0:
+                    continue
+
+                # HODL exemption (2026-06-13): a long-horizon HODL is
+                # "hold and do not sell" by design. The peak-giveback
+                # rule (and its auto-close when auto_exit_advisor is ON)
+                # must NEVER fire on a HODL -- only its catastrophe stop
+                # or a manual close exits one. Skip entirely.
+                if "hodl" in (pos.get("strategy") or "").lower():
                     continue
 
                 # Latest price from the standard candle path.
