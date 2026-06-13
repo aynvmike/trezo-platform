@@ -140,6 +140,19 @@ Mike's direction: take full control of crypto like stocks; cover the whole ISO 2
 
 **Part 4 queue (real money — needs Mike's explicit go-ahead):** real Kraken order placement (`validate=false`) + live fill recording + Kraken-side exit/reconciliation; optional crypto short side; per-coin cap slider in Bot Tuning UI. NOTE: Kraken Spot has NO paper API (only Kraken Futures demo, a different leveraged product), so paper crypto stays on the modeled engine priced off live Kraken data.
 
+## 2d. Kraken Futures (demo) — Phase 1 shipped (2026-06-13; loads at restart)
+
+Kraken Futures has a REAL demo/paper sandbox (demo-futures.kraken.com, same API as production, only the base URL differs), so the agents can learn futures + build strategies with NO real money. This is the leveraged-futures path, separate from long-only spot.
+
+- `brokers/kraken_futures.py` — public `instruments`/`tickers`, `tradable_symbols()` (widest available, incl. any ISO-cluster futures), private `accounts` `self_test`, Kraken-Futures Authent signing, and `leverage_cap()`/`clamp_leverage()`.
+- `strategies/futures.py` — scaffold + a baseline momentum example (long/short, demo) for the agents to iterate on.
+- `data/candles.py` `fetch_futures_ohlc()` — public Kraken Futures charts (no auth).
+- `config.py` — `kraken_futures_*` (demo default ON), `futures_max_leverage` default 2x.
+- **Leverage is CONSERVATIVE (Mike 2026-06-13):** hard-capped at 3x in code (`LEVERAGE_HARD_CAP`) regardless of the setting; default 2x. Verified: clamp(10x)→2x.
+- Needs a SEPARATE demo API key (demo-futures.kraken.com/settings/api); the spot key won't work.
+
+**Futures Phase 2 (NOT built):** live `futures_scanner` agent + demo order placement (`sendorder`) + futures exit/position management + `strategy_discovery` on futures data. Futures auth is pending live demo self-test verification (no offline vector like spot). SECURITY: the spot API key had Withdraw/Deposit/Earn enabled — minimize to query + order perms.
+
 ## 2a. Friday 6/12 POST-MORTEM (6 PM) — what the day taught us
 
 **The day in trades:** AAPL sold at open (+$10.30 banked) then bot SHORTED AAPL (default, GTC bracket, +$2.88). STMS fired GM/CSCO/SOFI at the bell; WMT shorted. **Open-bell phantom-close race** (rows "closed" 6-60s after submit because unfilled orders aren't in the positions API yet) mangled the books; the 30-min reconcile re-imported CSCO/SOFI/WMT as strategy="reconciled" (losing stms tags + time stops). GM re-entered at 9:39 keeping its stms tag — and then **its time stop fired 429 times all day, every one rejected by Alpaca 403 "available: 0"**: the bracket's own sell legs reserved all 30 shares; DELETE /v2/positions does NOT auto-cancel them. The Wheel sold its FIRST REAL option (ARCC 7/17 $18 CSP, premium $20) but the tracking insert failed on nonexistent columns; 190x buying-power + 120x market-closed blocked retries spammed the log. Delta translation verified live (net 39.47 → leg 0.3947 on today's ideas). auto_exit_advisor could never arm: the bot_settings COLUMN never existed.

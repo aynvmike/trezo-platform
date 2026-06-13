@@ -132,6 +132,42 @@ async def fetch_crypto_ohlc(symbol: str, days: int = 30) -> list[Candle]:
     return out
 
 
+async def fetch_futures_ohlc(symbol: str, resolution: str = "1d",
+                             lookback_days: int = 200) -> list[Candle]:
+    """Public Kraken Futures OHLC via the charts API (no auth, no money).
+    `symbol` is a Kraken Futures contract, e.g. 'PF_XBTUSD'. Empty on failure.
+    Futures Phase 1 (2026-06-13)."""
+    import time as _t
+    to = int(_t.time())
+    frm = to - lookback_days * 86400
+    url = f"https://futures.kraken.com/api/charts/v1/trade/{symbol}/{resolution}"
+    params = {"from": str(frm), "to": str(to)}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(url, params=params)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+    except Exception:  # noqa: BLE001
+        return []
+    raw = data.get("candles") or []
+    out: list[Candle] = []
+    for c in raw:
+        try:
+            t = int(c["time"])
+            ts = datetime.fromtimestamp(
+                t / 1000.0 if t > 1_000_000_000_000 else t, tz=timezone.utc)
+            out.append(Candle(
+                timestamp=ts,
+                open=float(c["open"]), high=float(c["high"]),
+                low=float(c["low"]), close=float(c["close"]),
+                volume=float(c.get("volume", 0) or 0),
+            ))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
 def _bars_to_candles(bars: list) -> list[Candle]:
     """Convert Alpaca bar dicts ({t,o,h,l,c,v}) to Candle objects."""
     out: list[Candle] = []
