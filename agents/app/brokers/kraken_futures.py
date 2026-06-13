@@ -8,9 +8,10 @@ leveraged-futures path, distinct from the long-only spot connector.
 SAFETY:
   * Default base = DEMO. Live futures requires kraken_futures_demo=false AND is
     a separate, explicit step (real money).
-  * Conservative leverage: leverage_cap() HARD-clamps to <= 3x (Mike's
-    2026-06-13 'conservative 2-3x' posture); default 2x. The hard cap is in
-    code and cannot be overridden by a setting.
+  * Leverage range 1x-10x (Mike 2026-06-13): agents choose leverage per
+    strategy so the learning / strategy-strengthening process is NOT
+    artificially limited. leverage_cap() clamps only at the 10x safety
+    ceiling (the stated max); default setting is 10x.
   * Phase 1 is DATA + ACCOUNT READ only. Order placement (even on demo) is
     Phase 2, once strategies exist.
   * Needs a SEPARATE demo API key (demo-futures.kraken.com/settings/api); the
@@ -35,7 +36,7 @@ DATA_BASE = "https://futures.kraken.com"        # public market data
 DEMO_BASE = "https://demo-futures.kraken.com"   # paper account / trading
 LIVE_BASE = "https://futures.kraken.com"        # real account (much later)
 
-LEVERAGE_HARD_CAP = 3.0   # never exceed, whatever the setting says
+LEVERAGE_HARD_CAP = 10.0  # safety ceiling (stated max 10x); agents range 1x-10x freely
 
 
 @dataclass
@@ -77,7 +78,7 @@ def is_configured() -> bool:
 
 
 def leverage_cap() -> float:
-    """Effective max leverage: the user's setting, HARD-capped at 3x."""
+    """Effective max leverage: the user's setting, capped at the 10x ceiling."""
     return max(1.0, min(LEVERAGE_HARD_CAP, _config().max_leverage))
 
 

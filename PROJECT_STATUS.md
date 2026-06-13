@@ -148,7 +148,7 @@ Kraken Futures has a REAL demo/paper sandbox (demo-futures.kraken.com, same API 
 - `strategies/futures.py` — scaffold + a baseline momentum example (long/short, demo) for the agents to iterate on.
 - `data/candles.py` `fetch_futures_ohlc()` — public Kraken Futures charts (no auth).
 - `config.py` — `kraken_futures_*` (demo default ON), `futures_max_leverage` default 2x.
-- **Leverage is CONSERVATIVE (Mike 2026-06-13):** hard-capped at 3x in code (`LEVERAGE_HARD_CAP`) regardless of the setting; default 2x. Verified: clamp(10x)→2x.
+- **Leverage range 1x–10x (Mike 2026-06-13, revised):** agents choose leverage per strategy from 1x up to 10x so the learning/strategy-strengthening process is not artificially limited; `LEVERAGE_HARD_CAP` is a 10x safety ceiling (his stated max), default setting 10x. (Supersedes the earlier 2–3x posture.)
 - Needs a SEPARATE demo API key (demo-futures.kraken.com/settings/api); the spot key won't work.
 
 **Futures Phase 2 (NOT built):** live `futures_scanner` agent + demo order placement (`sendorder`) + futures exit/position management + `strategy_discovery` on futures data. Futures auth is pending live demo self-test verification (no offline vector like spot). SECURITY: the spot API key had Withdraw/Deposit/Earn enabled — minimize to query + order perms.

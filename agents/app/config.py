@@ -139,12 +139,13 @@ class Settings(BaseSettings):
     # Kraken FUTURES (demo/paper first) - Futures Phase 1 (2026-06-13).
     # SEPARATE demo API key from demo-futures.kraken.com/settings/api (the spot
     # key won't work). Demo by default; live futures is a separate explicit
-    # step. Leverage is conservative: default 2x, HARD-capped 3x in code.
+    # step. Leverage range 1x-10x: default 10x so agent learning is not limited;
+    # absolute 10x safety ceiling in code (kraken_futures.LEVERAGE_HARD_CAP).
     kraken_futures_enabled: bool = False
     kraken_futures_demo: bool = True
     kraken_futures_api_key: str = ""
     kraken_futures_api_secret: str = ""
-    futures_max_leverage: float = 2.0
+    futures_max_leverage: float = 10.0
 
     # Task #59 (2026-06-05): skip persistence of 'signal' kind messages.
     # Default True - cuts agent_messages writes by ~90%. Signals still
