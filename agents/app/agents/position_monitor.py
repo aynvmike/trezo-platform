@@ -87,6 +87,45 @@ def _supabase():
         return None
 
 
+async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
+    """HODL trail-to-lock (crypto Part 2, 2026-06-13). For a long HODL row
+    that has run >= HODL_TRAIL_TRIGGER in profit, RAISE (never lower) its
+    stop to lock gains -- without ever setting a profit target, so the
+    position still holds. Returns the new stop if it ratcheted up (and
+    persists it to the row), else None. Long-only."""
+    from app.strategies.crypto import HODL_TRAIL_TRIGGER, HODL_TRAIL_GIVEBACK
+    try:
+        entry = float(r.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or price <= 0:
+        return None
+    if price < entry * (1.0 + HODL_TRAIL_TRIGGER):
+        return None  # not far enough in profit -> keep the catastrophe stop
+    new_stop = round(price * (1.0 - HODL_TRAIL_GIVEBACK), 8)
+    try:
+        cur = float(r["stop_price"]) if r.get("stop_price") else None
+    except (TypeError, ValueError):
+        cur = None
+    if cur is not None and new_stop <= cur:
+        return None  # only ever ratchet UP
+    client = _supabase()
+    if client is None:
+        return None
+    rid = r.get("id")
+
+    def _upd():
+        return (client.table("paper_positions")
+                .update({"stop_price": new_stop}).eq("id", rid).execute())
+
+    try:
+        await asyncio.to_thread(_upd)
+    except Exception:  # noqa: BLE001
+        return None
+    r["stop_price"] = new_stop
+    return new_stop
+
+
 async def _latest_price(ticker: str, asset_type: str) -> float | None:
     """Best-effort latest price from candle data. Returns the most recent close."""
     candles = await fetch_candles_for(ticker, asset_type if asset_type != "option" else "stock")
@@ -294,6 +333,13 @@ class PositionMonitorAgent(Agent):
                               if r.get("stop_price") else None)
                     target_c = (float(r["target_price"])
                                 if r.get("target_price") else None)
+                    # HODL trail-to-lock for an Alpaca-routed crypto HODL
+                    # (crypto Part 2). Ratchets the client-side stop up; no
+                    # target, so the position keeps holding.
+                    if "hodl" in (r.get("strategy") or "").lower() and r["side"] == "long":
+                        _t = await _maybe_trail_hodl(r, price_c)
+                        if _t is not None:
+                            stop_c = _t
                     reason_c: str | None = None
                     if r.get("close_requested"):
                         reason_c = "manual"
@@ -455,6 +501,15 @@ class PositionMonitorAgent(Agent):
             # crash-looped from 10:33 AM ET (found via GET /agents
             # last_error="name 'strat' is not defined").
             strat  = (r.get("strategy") or "").lower()
+
+            # HODL trail-to-lock (crypto Part 2, 2026-06-13): once a long
+            # HODL has run far enough in profit, ratchet its stop UP to
+            # lock gains. No profit target is ever set, so it still holds;
+            # only the trailed stop (or a manual close) can exit it.
+            if at == "crypto" and "hodl" in strat and side == "long":
+                _trail = await _maybe_trail_hodl(r, price)
+                if _trail is not None:
+                    stop = _trail
 
             close_reason: str | None = None
             close_detail = ""

@@ -15,7 +15,8 @@ function fmtUsd(n: number | null | undefined): string {
 const MODE_COLOR: Record<string, string> = {
   scalp: "bg-weave-100 text-weave-800",
   swing: "bg-treasure-200 text-treasure-800",
-  dca:   "bg-amber-100 text-amber-800"
+  dca:   "bg-amber-100 text-amber-800",
+  hodl:  "bg-indigo-100 text-indigo-800"
 };
 
 export default async function CryptoPage() {
@@ -54,11 +55,11 @@ export default async function CryptoPage() {
         <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
           Crypto Bot
         </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Layer 1 — 24/7 crypto scanner. Detects SCALP / SWING / DCA modes from RSI, Bollinger width, and volume.</p>
+        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Layer 1 — 24/7 crypto scanner. Detects SCALP / SWING / DCA / HODL modes from RSI, Bollinger width, and volume.</p>
         <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          24/7 scanning of XRP, ETH, and SOL. The bot picks one of three modes
-          per coin — SCALP (quick moves), SWING (trend rides), or DCA (oversold
-          accumulation) — and trades it on the paper account. Live spot prices
+          24/7 scanning of ETH, SOL, and the ISO 20022 cluster (XRP, XLM, HBAR, ALGO, QNT, XDC, IOTA, XYO). The bot picks one of four modes
+          per coin — SCALP (quick moves), SWING (trend rides), DCA (oversold
+          accumulation), or HODL (deep-value buy-and-hold) — and trades it on the paper account. Live spot prices
           below; bot activity underneath.
         </p>
       </header>
@@ -174,11 +175,15 @@ export default async function CryptoPage() {
           <span className="font-medium text-weave-800">Modes:</span>{" "}
           SCALP = RSI 40-68 with volume (tight 1.5% stop, 3% target) ·{" "}
           SWING = Bollinger width &gt; 2.5% in an uptrend (5% stop, 12% target) ·{" "}
-          DCA = RSI below 35, oversold accumulation (wider stop, per-coin target).
+          DCA = RSI below 35, oversold accumulation (wider stop, per-coin target) ·{" "}
+          HODL = RSI below 25, deep-value long-horizon hold (-35% catastrophe stop, no profit target; trails up to lock gains after a big run, never force-sells).
         </p>
         <p className="mt-2">
-          Real Coinbase execution is a later phase — for now every crypto
-          trade runs on the paper account.
+          The ISO 20022 coins Alpaca cannot trade (XLM, HBAR, ALGO, IOTA,
+          QNT, XDC, XYO) run on the modeled paper engine using live prices.
+          A real Coinbase/Kraken connector is scaffolded and stays off
+          until API keys are added — for now every crypto trade runs on
+          the paper account.
         </p>
       </Disclosure>
     </div>

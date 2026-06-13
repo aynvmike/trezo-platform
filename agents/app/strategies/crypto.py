@@ -70,6 +70,31 @@ HODL_CATASTROPHE_STOP = 0.35   # -35%: thesis-broken line, not a trade stop
 HODL_TARGET_SENTINEL = 5.0     # +500%: effectively "never auto-sell"
 HODL_RSI_MAX = 25              # only accumulate when genuinely deep-value
 
+# Trail-to-lock (crypto Part 2, 2026-06-13). Once a long HODL has run far
+# enough in profit, the Position Monitor ratchets a trailing stop UP to
+# lock gains -- WITHOUT ever forcing a sale at a profit target (the
+# sentinel target still never triggers). "Hold, but protect a big run."
+HODL_TRAIL_TRIGGER = 0.40      # +40% unrealized before trailing engages
+HODL_TRAIL_GIVEBACK = 0.20     # then trail 20% below price (lock ~80% of high)
+
+# Modes allowed to SCALE IN across days (accumulate on dips). One-shot
+# modes (swing/scalp) still trade one position at a time. Risk Manager
+# consults this to decide whether to relax its same-ticker stacking veto.
+ACCUMULATION_MODES = frozenset({"hodl", "dca"})
+
+
+def is_accumulation_strategy(strategy: str | None) -> bool:
+    """True if a strategy tag is an accumulate-across-days crypto mode
+    (crypto_hodl / crypto_dca). Tolerant of tag shape: matches
+    'crypto_hodl', 'hodl', or any '*_hodl' variant."""
+    s = (strategy or "").strip().lower()
+    if not s:
+        return False
+    for m in ACCUMULATION_MODES:
+        if s == m or s == f"crypto_{m}" or s.endswith(f"_{m}"):
+            return True
+    return False
+
 
 def get_crypto_universe(user_id=None) -> list[str]:
     """Task #50 (2026-06-05): expandable crypto universe.

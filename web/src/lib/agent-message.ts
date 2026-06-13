@@ -45,7 +45,11 @@ const STRATEGY_LABEL: Record<string, string> = {
   stms: "Stock Bot",
   orb: "ORB breakout",
   crypto: "Crypto momentum",
-  extended: "Extended swing"
+  extended: "Extended swing",
+  crypto_hodl: "Crypto HODL (hold)",
+  crypto_swing: "Crypto swing",
+  crypto_dca: "Crypto DCA",
+  crypto_scalp: "Crypto scalp"
 };
 
 export function strategyLabel(s: string): string {

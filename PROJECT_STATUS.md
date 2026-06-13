@@ -124,7 +124,15 @@ Mike's direction: take full control of crypto like stocks; cover the whole ISO 2
 - **HODL exempt from Exit Advisor** — with auto_exit_advisor now ON, peak-giveback would have force-closed HODLs; exit_advisor now skips any `*hodl*` strategy. Only the catastrophe stop or a manual close exits a HODL.
 - Verified: XRP deep-decline → HODL (stop 0.35, target 5.0); HBAR in COIN_PARAMS (modeled); import audit clean.
 
-**Part 2+ queue (NOT yet built):** accumulate-on-dip across days (re-buy after dedup clears / scale-in), trail-to-lock after a big HODL run, per-coin HODL allocation cap as an explicit bot_setting, real crypto-exchange connector (Coinbase/Kraken) so the ISO coins can trade with real paper not just modeled, crypto short side, HODL surfaced on the dashboard.
+**Part 2 shipped (2026-06-13; loads at next restart):**
+- **Per-coin HODL cap** — Risk Manager caps TOTAL open exposure to any one coin at `hodl_per_coin_cap_pct` (default 10% of equity, summed across all open rows); no approval once a coin reaches the cap. Guards first buys and accumulation alike.
+- **Cross-day accumulation** — HODL/DCA may scale in on dips across days: the same-ticker stacking veto is relaxed for those two modes only, gated by a restart-safe cooldown (`crypto_accumulate_cooldown_hours`, default 18h) and the per-coin cap. Each add is its own small row; swing/scalp/stocks stay one-shot.
+- **Trail-to-lock** — once a long HODL runs +40%, Position Monitor ratchets its stop UP to lock ~80% of the high (never lowers it, never sets a profit target). Protects a big run without force-selling.
+- **Dashboard** — HODL mode badge + four-mode copy + ISO cluster + plain-language HODL explainer on `/dashboard/crypto`.
+- **Exchange connector SCAFFOLD** — `brokers/crypto_exchange.py` (Coinbase/Kraken) wired into trade_execution routing but FEATURE-FLAGGED OFF: `is_configured()` is False until `crypto_exchange_enabled=true` AND keys are set in `agents/.env`, so it can never fire by accident; always falls back to the modeled engine. Long-only (crypto short side deliberately deferred).
+- **Migration 0044** (optional, non-blocking) adds `hodl_per_coin_cap_pct` + `crypto_accumulate_cooldown_hours` to `bot_settings`; the code already enforces both via graceful defaults, so no paste is required to get the behavior.
+
+**Part 3 queue (NOT yet built):** fill in the real Coinbase/Kraken REST calls in `crypto_exchange.submit_order` (needs Mike's exchange API keys), optional crypto short side, and a per-coin HODL cap slider in the Bot Tuning UI.
 
 ## 2a. Friday 6/12 POST-MORTEM (6 PM) — what the day taught us
 

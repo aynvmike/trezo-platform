@@ -210,6 +210,74 @@ class RiskManagerAgent(Agent):
         the set, the discard is a silent no-op."""
         self._recent_approvals.discard(ticker.upper())
 
+    async def _account_equity(self, user_id) -> float:
+        """Best-effort account equity (cash + vault) for per-coin cap
+        math. Returns 0.0 on any miss (the cap then disengages and the
+        normal single-row dedup still protects the book)."""
+        try:
+            from app.paper.engine import get_account
+            acct = await get_account(user_id)
+            if not acct:
+                return 0.0
+            return (float(acct.get("current_cash_usd") or 0)
+                    + float(acct.get("vault_balance_usd") or 0))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    async def _crypto_coin_state(self, user_id, coin: str) -> dict:
+        """Summed open exposure + hours since the most recent add for a
+        single coin, across every open row and pair-symbol variant
+        (BTC / BTCUSD / BTC/USD). Powers the per-coin HODL cap and the
+        accumulation cooldown. Best-effort: any failure returns an empty
+        state so the caller falls back to plain single-row dedup."""
+        empty = {"exposure_usd": 0.0, "rows": 0, "hours_since_last": 1e9}
+        try:
+            from datetime import datetime, timezone
+            from app.runtime.persistence import _client
+            client = _client()
+            if client is None:
+                return empty
+            try:
+                from app.brokers.alpaca import crypto_symbol_variants
+                variants = sorted(crypto_symbol_variants(coin))
+            except Exception:  # noqa: BLE001
+                variants = [coin.upper()]
+            def _fetch():
+                q = (client.table("paper_positions")
+                     .select("quantity, entry_price, entry_at")
+                     .eq("status", "open").in_("ticker", variants))
+                if user_id:
+                    q = q.eq("user_id", user_id)
+                return q.execute()
+            res = await asyncio.to_thread(_fetch)
+            rows = res.data or []
+            exposure = 0.0
+            latest = None
+            for row in rows:
+                try:
+                    exposure += (float(row.get("quantity") or 0)
+                                 * float(row.get("entry_price") or 0))
+                except (TypeError, ValueError):
+                    pass
+                ts = row.get("entry_at")
+                if ts:
+                    try:
+                        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if latest is None or dt > latest:
+                            latest = dt
+                    except Exception:  # noqa: BLE001
+                        pass
+            hours_since = 1e9
+            if latest is not None:
+                now = datetime.now(timezone.utc)
+                hours_since = (now - latest).total_seconds() / 3600.0
+            return {"exposure_usd": exposure, "rows": len(rows),
+                    "hours_since_last": hours_since}
+        except Exception:  # noqa: BLE001
+            return empty
+
     async def tick(self) -> list[AgentMessage]:
         return []
 
@@ -406,20 +474,69 @@ class RiskManagerAgent(Agent):
                 ticker, tcs,
                 f"TCS {tcs} below threshold {effective_min_tcs}{extra}")]
 
-        # Patched 2026-06-04: same-ticker stacking veto. If this ticker
-        # already has a recent approval (and Position Monitor hasn't
-        # told us the position closed yet), veto rather than re-buy.
-        if ticker.upper() in self._recent_approvals:
-            return [self._veto(
-                ticker, tcs,
-                f"Already approved {ticker} in this session - skip to "
-                f"avoid stacking. The open position must close (or be "
-                f"trimmed) before a fresh approval is allowed.",
-                strategy=strategy,
-                user_id=message.payload.get("user_id"),
-            )]
+        # --- Crypto accumulation + per-coin cap (Mike 2026-06-13, Part 2) ---
+        # Crypto HODL/DCA may SCALE IN on dips across days, unlike one-shot
+        # stock/swing trades. Three guards keep it disciplined: a per-coin
+        # exposure cap (summed across rows), a cooldown so adds land across
+        # days (not every tick), and the normal max-open cap for brand-new
+        # coins (below). Each add is its own small row, so the catastrophe
+        # stop applies per add and the cap sums them.
+        from app.data.candles import COIN_MAP as _COIN_MAP_ACC
+        from app.strategies.crypto import is_accumulation_strategy
+        _coin_u = ticker.upper()
+        _is_crypto = _coin_u in _COIN_MAP_ACC
+        _accumulate_mode = is_accumulation_strategy(strategy)
+        accumulation_add = False
+        if _is_crypto:
+            _equity = await self._account_equity(message.payload.get("user_id"))
+            _coin_state = await self._crypto_coin_state(
+                message.payload.get("user_id"), _coin_u)
+            _cap_pct = float(getattr(cfg, "hodl_per_coin_cap_pct", 0.10) or 0.10)
+            _cap_usd = _equity * _cap_pct if _equity > 0 else 0.0
+            # Hard per-coin ceiling: never approve more of a coin once its
+            # summed open exposure has reached the cap. Guards first buys
+            # and accumulation adds alike.
+            if _cap_usd > 0 and _coin_state["exposure_usd"] >= _cap_usd:
+                return [self._veto(
+                    ticker, tcs,
+                    f"Per-coin cap reached for {ticker}: "
+                    f"${_coin_state['exposure_usd']:.0f} open is at/above "
+                    f"{_cap_pct * 100:.0f}% of equity (${_cap_usd:.0f}). "
+                    f"HODL holds; no more accumulation until it trims or "
+                    f"equity grows.",
+                    strategy=strategy,
+                    user_id=message.payload.get("user_id"),
+                )]
 
-        if len(self._recent_approvals) >= max_open:
+        # Patched 2026-06-04: same-ticker stacking veto. If this ticker
+        # already has a recent approval (and Position Monitor hasn't told
+        # us the position closed yet), veto rather than re-buy -- EXCEPT
+        # crypto HODL/DCA, which may add once the cooldown clears.
+        if _coin_u in self._recent_approvals:
+            if _is_crypto and _accumulate_mode:
+                _cool = float(getattr(cfg, "crypto_accumulate_cooldown_hours", 18.0) or 18.0)
+                _hrs = _coin_state["hours_since_last"]
+                if _hrs < _cool:
+                    return [self._veto(
+                        ticker, tcs,
+                        f"{ticker} {strategy} accumulation on cooldown: last "
+                        f"add {_hrs:.1f}h ago, need {_cool:.0f}h between adds. "
+                        f"Holding the existing position.",
+                        strategy=strategy,
+                        user_id=message.payload.get("user_id"),
+                    )]
+                accumulation_add = True
+            else:
+                return [self._veto(
+                    ticker, tcs,
+                    f"Already approved {ticker} in this session - skip to "
+                    f"avoid stacking. The open position must close (or be "
+                    f"trimmed) before a fresh approval is allowed.",
+                    strategy=strategy,
+                    user_id=message.payload.get("user_id"),
+                )]
+
+        if _coin_u not in self._recent_approvals and len(self._recent_approvals) >= max_open:
             # Mike 2026-06-01 capital recycling: the veto stands BUT we
             # attach a rotation hint so the user/UI can see which
             # weakest open position would free up the slot. Pure
@@ -550,6 +667,7 @@ class RiskManagerAgent(Agent):
             "position_pct": self.DEFAULT_PCT_OF_ACCOUNT,
             "strategy": strategy,
             "reason": f"TCS {tcs} clears threshold; {direction} bias [{strategy}]",
+            "accumulation": accumulation_add,
         }
         # Adaptive Scope can tighten stops in rougher regimes.
         if stop_pct is not None:

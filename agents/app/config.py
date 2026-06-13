@@ -120,6 +120,17 @@ class Settings(BaseSettings):
     # missing flag as False).
     alpaca_crypto_enabled: bool = False
 
+    # Crypto Part 2 (2026-06-13): real crypto-exchange connector
+    # (Coinbase / Kraken) for the ISO 20022 coins Alpaca cannot trade.
+    # SCAFFOLD + OFF by default. Wired into routing but reports "not
+    # configured" until BOTH the flag is on AND a key/secret are set, so
+    # nothing can fire by accident. Set in agents/.env once you have an
+    # exchange account; Part 3 fills in the REST calls.
+    crypto_exchange_enabled: bool = False
+    crypto_exchange: str = "coinbase"   # 'coinbase' | 'kraken'
+    crypto_exchange_api_key: str = ""
+    crypto_exchange_api_secret: str = ""
+
     # Task #59 (2026-06-05): skip persistence of 'signal' kind messages.
     # Default True - cuts agent_messages writes by ~90%. Signals still
     # flow on the in-process bus to Risk Manager / Trade Execution; they

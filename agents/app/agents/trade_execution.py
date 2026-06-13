@@ -218,6 +218,26 @@ class TradeExecutionAgent(Agent):
                 stop_pct, target_pct, strategy, source_payload,
             )
 
+        # Crypto Part 2 (2026-06-13): real exchange connector (Coinbase/
+        # Kraken) for the ISO coins Alpaca cannot trade. SCAFFOLD + OFF:
+        # is_configured() is False until keys are added, so this never
+        # fires today and crypto stays on the modeled engine. Part 3 fills
+        # in crypto_exchange.submit_order and routes the full ISO list to a
+        # live venue. Long-only.
+        if asset_type == "crypto":
+            try:
+                from app.brokers.crypto_exchange import (
+                    is_configured as _cx_ready,
+                    exchange_supports as _cx_supports,
+                )
+                if _cx_ready() and _cx_supports(ticker):
+                    return await self._execute_crypto_exchange(
+                        user_id, ticker, side, market_price,
+                        stop_pct, target_pct, strategy, source_payload,
+                    )
+            except Exception:  # noqa: BLE001
+                pass  # connector error -> fall through to the modeled engine
+
         if asset_type == "stock" and alpaca_configured():
             return await self._execute_alpaca(
                 user_id, ticker, side, market_price,
@@ -226,6 +246,36 @@ class TradeExecutionAgent(Agent):
 
         return await self._execute_internal(
             user_id, ticker, asset_type, side, market_price,
+            stop_pct, target_pct, strategy, source_payload,
+        )
+
+    async def _execute_crypto_exchange(
+        self, user_id, ticker, side, market_price,
+        stop_pct, target_pct, strategy, source_payload,
+    ) -> list[AgentMessage]:
+        # Scaffold path (crypto Part 2). The connector's submit_order
+        # raises NotImplementedError today; we catch it and fall back to
+        # the modeled engine so flipping the flag early can never strand a
+        # signal. Part 3 replaces this body with real fill handling.
+        try:
+            from app.brokers import crypto_exchange as _cx
+            await _cx.submit_order(
+                user_id=user_id, ticker=ticker, side=side,
+                price=market_price, stop_pct=stop_pct, target_pct=target_pct,
+            )
+        except NotImplementedError:
+            return await self._execute_internal(
+                user_id, ticker, "crypto", side, market_price,
+                stop_pct, target_pct, strategy, source_payload,
+            )
+        except Exception as e:  # noqa: BLE001
+            return [AgentMessage(
+                agent=self.name, kind="error",
+                payload={"user_id": user_id, "ticker": ticker,
+                         "error": f"crypto_exchange submit failed: {e}"},
+            )]
+        return await self._execute_internal(
+            user_id, ticker, "crypto", side, market_price,
             stop_pct, target_pct, strategy, source_payload,
         )
 

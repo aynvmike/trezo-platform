@@ -75,6 +75,17 @@ class BotSettings:
     options_max_premium_delta: float | None = None
     options_min_iv_rank_scalp: float | None = None
     options_hopeful_allocation_cap_pct: float | None = None
+    # Crypto HODL per-coin allocation cap (Mike 2026-06-13, crypto Part 2).
+    # Hard ceiling on TOTAL open exposure to a single coin as a share of
+    # account equity, summed across every open row for that coin. Keeps
+    # cross-day HODL accumulation from quietly concentrating the book in
+    # one name. Default 10%. Tunable from Bot Tuning once migration 0044
+    # adds the column; the code default already enforces it.
+    hodl_per_coin_cap_pct: float = 0.10
+    # Hours between HODL/DCA accumulation adds on the same coin -- turns
+    # "buy the dip" into "across days" instead of every scanner tick.
+    # Default 18h, derived restart-safe from the coin's most recent row.
+    crypto_accumulate_cooldown_hours: float = 18.0
 
 
 _DEFAULTS = BotSettings()
@@ -121,6 +132,8 @@ def _from_row(r: dict) -> BotSettings:
         options_max_premium_delta=(float(r["options_max_premium_delta"]) if r.get("options_max_premium_delta") is not None else None),
         options_min_iv_rank_scalp=(float(r["options_min_iv_rank_scalp"]) if r.get("options_min_iv_rank_scalp") is not None else None),
         options_hopeful_allocation_cap_pct=(float(r["options_hopeful_allocation_cap_pct"]) if r.get("options_hopeful_allocation_cap_pct") is not None else None),
+        hodl_per_coin_cap_pct=float(r.get("hodl_per_coin_cap_pct", 0.10) or 0.10),
+        crypto_accumulate_cooldown_hours=float(r.get("crypto_accumulate_cooldown_hours", 18.0) or 18.0),
     )
 
 
