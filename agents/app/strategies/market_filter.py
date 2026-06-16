@@ -27,8 +27,8 @@ from typing import Optional
 
 from app.patterns.indicators import vwap, avg_volume
 
-MIN_PRICE = 5.0
-MIN_AVG_VOLUME = 1_000_000
+MIN_PRICE = 0.0
+MIN_AVG_VOLUME = 250_000  # fallback only; live default = settings.min_avg_volume (TREZO_MIN_AVG_VOLUME)
 MAX_ATR_STRETCH = 4.0          # ATRs from the 20-day mean before "overextended"
 MAX_SPREAD_PCT = 0.005         # widest bid/ask spread before a name is "illiquid"
 _CACHE_TTL = 120.0
@@ -44,39 +44,55 @@ _CACHE_TTL = 120.0
 STRATEGY_LIQUIDITY_FLOORS: dict[str, dict[str, float]] = {
     # STMS - small-cap momentum, $1-$20 stocks, 5x-volume breakouts.
     # Low floors are the whole point of the strategy.
-    "stms": {"min_price": 1.0, "min_avg_volume": 100_000},
+    "stms": {"min_price": 0.0, "min_avg_volume": 100_000},
     # ORB - opening range breakout. Needs decent participation but
     # doesn't require mega-cap liquidity.
-    "orb": {"min_price": 3.0, "min_avg_volume": 500_000},
+    "orb": {"min_price": 0.0, "min_avg_volume": 500_000},
     # Extended - multi-day swing on EMA50 pullbacks. Wants the full
     # liquidity story so fills are clean across days.
-    "extended": {"min_price": 5.0, "min_avg_volume": 1_000_000},
+    "extended": {"min_price": 0.0, "min_avg_volume": 500_000},
     # Pattern detection - flexible, runs on the watchlist + market pool.
-    # Default 1M floor is appropriate for the names it most often hits.
-    "pattern": {"min_price": 5.0, "min_avg_volume": 1_000_000},
+    # 2026-06-16: dropped the hardcoded 1M floor (it vetoed ~all
+    # market-wide names, leaving AAPL the only one trading). Now follows
+    # the global tunable (settings.min_avg_volume, default 250k).
+    "pattern": {"min_price": 0.0},
     # Wheel CSP / CC - the universe is curated (WHEEL_WATCHLIST) so the
     # floor is just a sanity check. Medium-high floor is fine because
     # the curated list already screens above this.
-    "wheel_csp": {"min_price": 5.0, "min_avg_volume": 500_000},
-    "wheel_cc": {"min_price": 5.0, "min_avg_volume": 500_000},
+    "wheel_csp": {"min_price": 0.0, "min_avg_volume": 500_000},
+    "wheel_cc": {"min_price": 0.0, "min_avg_volume": 500_000},
     # Cycle-aware strategies (Layer B). Inherit pattern's defaults until
     # we have outcome data to tune them.
-    "iv_crush_short": {"min_price": 5.0, "min_avg_volume": 1_000_000},
-    "dividend_capture_long": {"min_price": 5.0, "min_avg_volume": 500_000},
+    "iv_crush_short": {"min_price": 0.0, "min_avg_volume": 500_000},
+    "dividend_capture_long": {"min_price": 0.0, "min_avg_volume": 500_000},
 }
+
+
+def _global_min_volume() -> float:
+    """Tunable global liquidity floor. Reads settings.min_avg_volume
+    (env TREZO_MIN_AVG_VOLUME); falls back to MIN_AVG_VOLUME if settings
+    are unavailable. Added 2026-06-16 so the floor is no longer a static
+    code constant (Mike's experience-driven-vetoes direction)."""
+    try:
+        from app.config import get_settings
+        v = float(get_settings().min_avg_volume or 0)
+        return v if v > 0 else float(MIN_AVG_VOLUME)
+    except Exception:  # noqa: BLE001
+        return float(MIN_AVG_VOLUME)
 
 
 def _floors_for(strategy: str | None) -> tuple[float, float]:
     """Return (min_price, min_avg_volume) for the given strategy.
-    Unmapped or empty strategy -> the global defaults."""
+    Unmapped or empty strategy -> the global (tunable) defaults."""
+    gmin = _global_min_volume()
     if not strategy:
-        return MIN_PRICE, MIN_AVG_VOLUME
+        return MIN_PRICE, gmin
     floors = STRATEGY_LIQUIDITY_FLOORS.get(str(strategy).lower())
     if not floors:
-        return MIN_PRICE, MIN_AVG_VOLUME
+        return MIN_PRICE, gmin
     return (
         float(floors.get("min_price", MIN_PRICE)),
-        float(floors.get("min_avg_volume", MIN_AVG_VOLUME)),
+        float(floors.get("min_avg_volume", gmin)),
     )
 
 
@@ -183,7 +199,7 @@ def profiles_accepting(candles) -> list[str]:
     out: list[str] = []
     for name, floors in STRATEGY_LIQUIDITY_FLOORS.items():
         if (price >= float(floors.get("min_price", MIN_PRICE))
-                and av >= float(floors.get("min_avg_volume", MIN_AVG_VOLUME))):
+                and av >= float(floors.get("min_avg_volume", _global_min_volume()))):
             out.append(name)
     return out
 

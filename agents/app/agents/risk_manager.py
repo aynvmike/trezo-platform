@@ -488,6 +488,32 @@ class RiskManagerAgent(Agent):
         _accumulate_mode = is_accumulation_strategy(strategy)
         accumulation_add = False
         if _is_crypto:
+            # Fee-aware net-edge gate (Mike 2026-06-15): a crypto entry must
+            # be able to net a profit after round-trip fees + slippage + a
+            # 0.01% cushion. NEVER gate on the coin's price/cost -- only on net
+            # profitability. Fails OPEN (allows) on any error.
+            try:
+                from app.strategies.crypto import (
+                    COIN_PARAMS as _CP, clears_fee_edge as _cfe,
+                    net_edge_pct as _nep,
+                )
+                from app.paper.engine import (
+                    CRYPTO_COMMISSION_BPS as _FEE, SLIPPAGE_BPS as _SLIP,
+                )
+                _p = _CP.get(_coin_u)
+                _tgt = float(_p["target_pct"]) if _p and _p.get("target_pct") else None
+                if _tgt is not None and not _cfe(_tgt, _FEE, _SLIP):
+                    _net = _nep(_tgt, _FEE, _SLIP)
+                    return [self._veto(
+                        ticker, tcs,
+                        f"Net-edge filter: {_coin_u} target {_tgt * 100:.2f}% "
+                        f"nets {_net * 100:+.2f}% after fees + slippage - "
+                        f"below the +0.01% floor",
+                        strategy=strategy,
+                        user_id=message.payload.get("user_id"),
+                    )]
+            except Exception:
+                pass
             _equity = await self._account_equity(message.payload.get("user_id"))
             _coin_state = await self._crypto_coin_state(
                 message.payload.get("user_id"), _coin_u)

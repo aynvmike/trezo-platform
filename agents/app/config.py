@@ -85,6 +85,18 @@ class Settings(BaseSettings):
     # used only when the live executor is enabled and TRADING_MODE=live.
     alpaca_live_api_key: str = ""
     alpaca_live_secret_key: str = ""
+    # Account-identity guard (2026-06-16). When set, the startup self-check
+    # asserts the live Alpaca account_number matches this value and raises a
+    # loud ops alert on mismatch so the bot never silently trades the wrong
+    # account. Empty = no pin (just logs whichever account it bound to).
+    alpaca_expected_account: str = ""
+
+    # Liquidity floor (2026-06-16). Minimum 20-day average share volume a
+    # symbol must clear to be tradable. Tunable via env TREZO_MIN_AVG_VOLUME
+    # so Mike can adjust without a code change. Lowered from the old
+    # hardcoded 1,000,000 (which vetoed ~all market-wide candidates) to
+    # 250,000. Per-strategy lanes in market_filter.py still apply floors.
+    min_avg_volume: int = 250_000
 
     # Cache
     upstash_redis_rest_url: str = ""

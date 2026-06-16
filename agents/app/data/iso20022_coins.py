@@ -163,3 +163,27 @@ def default_params_for(symbol: str) -> Optional[dict[str, float]]:
 
 def is_iso20022_aligned(symbol: str) -> bool:
     return symbol.upper() in ISO20022_COIN_MAP
+
+
+# Kraken executability (live-verified 2026-06-15 vs api.kraken.com AssetPairs).
+# Mike 2026-06-15: the agents should look at any ISO 20022 coin actually
+# tradable on the exchange. All eight are SCANNED (modeled on live Kraken
+# data); these seven also have live Kraken pairs and can be routed for REAL
+# orders once crypto live-trading is enabled. IOTA has NO Kraken pair -> it
+# stays MODELED-ONLY (no live order attempts). Re-verify if the list shifts.
+KRAKEN_TRADABLE: frozenset = frozenset(
+    {"XRP", "XLM", "ALGO", "HBAR", "QNT", "XDC", "XYO"}
+)
+
+
+def is_kraken_tradable(symbol: str) -> bool:
+    """True if the ISO 20022 coin has a live Kraken pair (real-order capable).
+    False for modeled-only names like IOTA."""
+    return symbol.upper() in KRAKEN_TRADABLE
+
+
+def tradable_iso20022_symbols() -> list:
+    """ISO 20022 symbols actually executable on Kraken, in registry order.
+    Scope LIVE crypto routing with this; ISO20022_SYMBOLS stays the full
+    modeled-scan/awareness list."""
+    return [s for s in ISO20022_SYMBOLS if s in KRAKEN_TRADABLE]

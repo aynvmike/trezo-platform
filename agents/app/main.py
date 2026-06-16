@@ -1436,6 +1436,71 @@ async def paper_options_trim(req: _OptionsTrimReq) -> dict:
 # the platform back online.
 # ---------------------------------------------------------------------------
 
+async def _startup_auto_repair() -> None:
+    """Self-healing data + account integrity pass, run once at startup.
+    Never raises - every step is independently guarded so one failure can
+    neither block the others nor the boot. Added 2026-06-16 (Mike's ask:
+    always point at the right Alpaca account; no stale data on refresh)."""
+    # (1) Account-identity guard: prove WHICH Alpaca account we are bound to
+    # and flag the wrong-account / blocked / not-options-approved cases.
+    try:
+        from app.brokers.alpaca import account_self_check
+        chk = await account_self_check()
+        problem = (not chk.get("ok")) or chk.get("mismatch") or chk.get("trading_blocked")
+        if problem:
+            log.error("alpaca.account_check.PROBLEM",
+                      account=chk.get("account_number"),
+                      mismatch=chk.get("mismatch"),
+                      blocked=chk.get("trading_blocked"),
+                      note=chk.get("note"))
+        else:
+            log.info("alpaca.account_check.ok",
+                     account=chk.get("account_number"),
+                     buying_power=chk.get("buying_power"),
+                     options_level=chk.get("options_approved_level"),
+                     note=chk.get("note"))
+        # Surface it in the UI feed/ticker (best-effort, never blocks boot).
+        try:
+            from app.runtime.persistence import persist_message
+            from app.agents.base import AgentMessage
+            await persist_message(AgentMessage(
+                agent="ops_watchdog",
+                kind="error" if problem else "info",
+                payload={**chk, "event": "account_guard"},
+            ))
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        log.error("alpaca.account_check.FAILED", error=str(e))
+
+    # (2) Purge stale in-memory caches so a refresh can't serve data from
+    # before the restart (defensive; a fresh process also starts empty).
+    try:
+        import app.strategies.market_filter as _mf
+        _mf._cache = None
+        _mf._cache_at = 0.0
+    except Exception:  # noqa: BLE001
+        pass
+
+    # (3) Full integrity sweep vs broker truth so cash, stock positions and
+    # option drift are all correct the moment the service returns (not at
+    # tick 2 / the hourly sweep). Aligns the internal ledger to the broker.
+    try:
+        from app.paper.stocks_reconcile import run_integrity_sweep
+        res = await run_integrity_sweep()
+        if isinstance(res, dict):
+            bal = res.get("balances") or {}
+            stk = res.get("stocks") or {}
+            opt = res.get("options") or {}
+            log.info("agents.startup_integrity_sweep.done",
+                     cash_synced=bal.get("synced"),
+                     stocks_closed=stk.get("closed"),
+                     stocks_updated=stk.get("updated"),
+                     option_mismatches=opt.get("mismatches"))
+    except Exception as e:  # noqa: BLE001
+        log.error("agents.startup_integrity_sweep.FAILED", error=str(e))
+
+
 @app.on_event("startup")
 async def _on_startup() -> None:
     """Bootstrap every agent into the registry, then start the
@@ -1477,6 +1542,13 @@ async def _on_startup() -> None:
     except Exception as e:
         log.error("persistence.flush_loop.FAILED", error=str(e))
 
+    # 2026-06-16: self-healing startup repair (account guard + cache purge
+    # + immediate reconcile). Best-effort; never blocks the boot.
+    try:
+        await _startup_auto_repair()
+    except Exception as e:  # noqa: BLE001
+        log.error("agents.auto_repair.FAILED", error=str(e))
+
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
@@ -1494,6 +1566,24 @@ async def _on_shutdown() -> None:
         stop_scheduler()
     except Exception:
         pass
+
+
+@app.get("/account-check")
+async def account_check() -> dict:
+    """On-demand account-identity guard: which Alpaca account the bot is
+    bound to, buying power, options approval, and any expected-account
+    mismatch. Read-only."""
+    from app.brokers.alpaca import account_self_check
+    return await account_self_check()
+
+
+@app.get("/integrity-check", tags=["ops"])
+async def integrity_check() -> dict:
+    """Run the full self-healing sweep on demand: sync the cash ledger to the
+    broker, reconcile stock positions, and report option-position drift.
+    Idempotent and safe to call repeatedly."""
+    from app.paper.stocks_reconcile import run_integrity_sweep
+    return await run_integrity_sweep()
 
 
 @app.get("/health")

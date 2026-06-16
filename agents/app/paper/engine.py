@@ -25,7 +25,7 @@ from app.config import get_settings
 
 SLIPPAGE_BPS = 5            # 0.05% on every fill (entry + exit)
 STOCK_COMMISSION = 0.0      # Robinhood-style free
-CRYPTO_COMMISSION_BPS = 0   # paper-trading approximation
+CRYPTO_COMMISSION_BPS = 26  # Kraken taker ~0.26%/side (Mike 2026-06-15: real modeled fee, tunable here)
 
 
 # ---- Supabase client (lazy) -----------------------------------------------

@@ -74,10 +74,12 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             expires_at=bt.expires_at,
         ) if bt else None
 
+        fetch_ok = True
         try:
             alpaca_positions = await get_positions(token=token)
         except Exception:
             alpaca_positions = []
+            fetch_ok = False
 
         alpaca_by_sym: dict[str, dict] = {}
         for p in alpaca_positions:
@@ -91,6 +93,12 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             sym = str(p.get("symbol", "")).upper()
             if sym:
                 alpaca_by_sym[sym] = p
+
+        # Trust a "broker doesn't list this symbol" signal as a real
+        # close ONLY when the fetch succeeded AND returned >=1 stock
+        # position. An empty list or a swallowed error must not
+        # phantom-close real rows at the open bell (2026-06-15 fix).
+        trust_close = fetch_ok and bool(alpaca_by_sym)
 
         def _trezo_open(uid=user_id):
             return (
@@ -116,6 +124,10 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             sym = str(r["ticker"]).upper()
             ap = alpaca_by_sym.get(sym)
             if ap is None:
+                # An empty or errored broker read must never be treated
+                # as a close (open-bell phantom-close race, 2026-06-15).
+                if not trust_close:
+                    continue
                 # Trezo has it open; Alpaca does not. Close as manual
                 # with a reconcile note.
                 def _close(rid=r["id"]):
@@ -206,17 +218,52 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                         .eq("user_id", uid).eq("ticker", s)
                         .neq("status", "open")
                         .order("entry_at", desc=True)
-                        .limit(1)
+                        .limit(5)
                         .execute()
                     )
                 prev_rows = (await asyncio.to_thread(_last_closed)).data or []
                 if prev_rows:
                     from datetime import datetime, timezone, timedelta
-                    prev = prev_rows[0]
-                    ts = str(prev.get("entry_at") or "")
-                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
-                    if dt and (datetime.now(timezone.utc) - dt) < timedelta(hours=24)                             and (prev.get("side") or side) == side:
-                        inherited = prev
+                    now = datetime.now(timezone.utc)
+
+                    def _fresh_same_side(row):
+                        ts = str(row.get("entry_at") or "")
+                        try:
+                            dt = (datetime.fromisoformat(
+                                ts.replace("Z", "+00:00")) if ts else None)
+                        except Exception:
+                            dt = None
+                        if not dt or (now - dt) >= timedelta(hours=24):
+                            return False
+                        return (row.get("side") or side) == side
+
+                    # prev_rows are newest-first (entry_at desc). Take the
+                    # strategy from the newest qualifying row with a REAL
+                    # name (not blank / "reconciled"), and stop/target from
+                    # the newest qualifying row that carries them, so a
+                    # prior "reconciled" ghost can't bury the trade's true
+                    # strategy (2026-06-15).
+                    inh_strategy = None
+                    inh_stop = None
+                    inh_target = None
+                    for row in prev_rows:
+                        if not _fresh_same_side(row):
+                            continue
+                        if inh_strategy is None:
+                            cand = str(row.get("strategy") or "").strip()
+                            if cand and cand.lower() != "reconciled":
+                                inh_strategy = row.get("strategy")
+                        if inh_stop is None and row.get("stop_price"):
+                            inh_stop = row.get("stop_price")
+                        if inh_target is None and row.get("target_price"):
+                            inh_target = row.get("target_price")
+                    if (inh_strategy is not None or inh_stop is not None
+                            or inh_target is not None):
+                        inherited = {
+                            "strategy": inh_strategy,
+                            "stop_price": inh_stop,
+                            "target_price": inh_target,
+                        }
             except Exception:  # noqa: BLE001
                 inherited = None
 
@@ -286,3 +333,323 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
         "closed": total_closed,
         "details": per_user,
     }
+
+
+# ---------------------------------------------------------------------------
+# Balance + full-integrity reconcile (2026-06-16, Mike's "extend it to
+# everything" ask). Broker is the source of truth when connected; these are
+# idempotent, never zero the ledger on a failed read, and leave paper-only /
+# account-size-sim users (no broker) untouched.
+# ---------------------------------------------------------------------------
+
+
+async def reconcile_account_balances_all_users() -> dict[str, Any]:
+    """Sync each user's internal cash ledger (paper_accounts.current_cash_usd)
+    to Alpaca broker truth, when a broker is connected. Fixes ledger drift
+    (e.g. the dashboard read $39k while the broker held ~$5k). Only runs when
+    Alpaca is configured for the user; paper-only/sim accounts are left alone
+    so the account-size simulator still works. Never overwrites on a failed/
+    empty broker read."""
+    from app.brokers.alpaca import alpaca_configured, get_account, UserToken
+    from app.integrations.web_tokens import get_user_broker_token
+    from app.config import get_settings
+
+    s = get_settings()
+    if not (s.supabase_url and s.supabase_service_role_key):
+        return {"ok": False, "error": "Supabase not configured."}
+    try:
+        from supabase import create_client
+        client = create_client(s.supabase_url, s.supabase_service_role_key)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"Supabase client error: {e}"}
+
+    env_ok = alpaca_configured()
+    DRIFT_MIN = 1.0  # ignore sub-dollar noise
+
+    def _users():
+        return client.table("paper_accounts").select(
+            "user_id, current_cash_usd").execute()
+    rows = (await asyncio.to_thread(_users)).data or []
+
+    synced = 0
+    per_user: list[dict] = []
+    for u in rows:
+        user_id = u.get("user_id")
+        if not user_id:
+            continue
+        bt = await get_user_broker_token(user_id, "alpaca")
+        token = UserToken(
+            access_token=bt.access_token,
+            refresh_token=bt.refresh_token,
+            expires_at=bt.expires_at,
+        ) if bt else None
+        # No broker at all for this user -> leave the modeled/sim ledger be.
+        if token is None and not env_ok:
+            continue
+        try:
+            acct = await get_account(token=token)
+        except Exception:
+            acct = None
+        if acct is None:
+            continue  # failed read: never overwrite on a hiccup
+        broker_cash = round(float(acct.cash or 0.0), 2)
+        internal = round(float(u.get("current_cash_usd") or 0.0), 2)
+        drift = round(broker_cash - internal, 2)
+        if abs(drift) < DRIFT_MIN:
+            continue
+
+        def _patch(uid=user_id, cash=broker_cash):
+            return (
+                client.table("paper_accounts")
+                .update({"current_cash_usd": cash, "updated_at": _now_iso()})
+                .eq("user_id", uid)
+                .execute()
+            )
+        try:
+            await asyncio.to_thread(_patch)
+            synced += 1
+            per_user.append({
+                "user_id": str(user_id), "was": internal,
+                "now": broker_cash, "drift": drift,
+                "account": getattr(acct, "account_number", ""),
+            })
+        except Exception:
+            continue
+
+    return {"ok": True, "synced": synced, "details": per_user}
+
+
+async def detect_option_drift_all_users() -> dict[str, Any]:
+    """READ-ONLY drift report: compare each user's open options_positions
+    count against the broker's actual option positions. Flags phantoms
+    (tracked, not at broker) and orphans (at broker, untracked). Does NOT
+    close anything - the Options Scanner reconcile owns the close path."""
+    from app.brokers.alpaca import alpaca_configured, get_option_positions, UserToken
+    from app.integrations.web_tokens import get_user_broker_token
+    from app.config import get_settings
+
+    s = get_settings()
+    if not (s.supabase_url and s.supabase_service_role_key):
+        return {"ok": False, "error": "Supabase not configured."}
+    try:
+        from supabase import create_client
+        client = create_client(s.supabase_url, s.supabase_service_role_key)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"Supabase client error: {e}"}
+
+    env_ok = alpaca_configured()
+
+    def _users():
+        return client.table("paper_accounts").select("user_id").execute()
+    rows = (await asyncio.to_thread(_users)).data or []
+
+    flagged: list[dict] = []
+    for u in rows:
+        user_id = u.get("user_id")
+        if not user_id:
+            continue
+        bt = await get_user_broker_token(user_id, "alpaca")
+        token = UserToken(
+            access_token=bt.access_token,
+            refresh_token=bt.refresh_token,
+            expires_at=bt.expires_at,
+        ) if bt else None
+        if token is None and not env_ok:
+            continue
+        try:
+            broker_opts = await get_option_positions(token=token)
+        except Exception:
+            broker_opts = None
+        if broker_opts is None:
+            continue
+        broker_n = len(broker_opts)
+
+        def _trezo_opts(uid=user_id):
+            return (
+                client.table("options_positions")
+                .select("id").eq("user_id", uid).eq("status", "open").execute()
+            )
+        try:
+            trezo_n = len((await asyncio.to_thread(_trezo_opts)).data or [])
+        except Exception:
+            continue
+        if broker_n != trezo_n:
+            flagged.append({
+                "user_id": str(user_id),
+                "broker_options": broker_n,
+                "trezo_open_options": trezo_n,
+                "note": ("untracked broker options (orphans)" if broker_n > trezo_n
+                         else "tracked options not at broker (phantoms)"),
+            })
+    return {"ok": True, "mismatches": len(flagged), "details": flagged}
+
+
+async def run_integrity_sweep() -> dict[str, Any]:
+    """One self-healing pass aligning Trezo to broker truth across every
+    dimension we can: cash ledger + stock positions (active repair) and a
+    read-only option-position drift report. Idempotent; safe at startup or in
+    a tick loop. Each step is independently guarded."""
+    report: dict[str, Any] = {"ok": True}
+    try:
+        report["balances"] = await reconcile_account_balances_all_users()
+    except Exception as e:  # noqa: BLE001
+        report["balances"] = {"ok": False, "error": str(e)}
+    try:
+        report["stocks"] = await reconcile_stocks_all_users()
+    except Exception as e:  # noqa: BLE001
+        report["stocks"] = {"ok": False, "error": str(e)}
+    try:
+        report["options"] = await import_orphan_options_all_users()
+    except Exception as e:  # noqa: BLE001
+        report["options"] = {"ok": False, "error": str(e)}
+    return report
+
+
+def _parse_occ(occ: str):
+    """Parse an OCC option symbol (e.g. F260717P00014000) into its parts.
+    Returns dict(underlying, expiration 'YYYY-MM-DD', option_type, strike) or
+    None if it doesn't match the standard format."""
+    import re
+    m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", str(occ).strip().upper())
+    if not m:
+        return None
+    und, yymmdd, cp, strike = m.groups()
+    return {
+        "underlying": und,
+        "expiration": f"20{yymmdd[0:2]}-{yymmdd[2:4]}-{yymmdd[4:6]}",
+        "option_type": "call" if cp == "C" else "put",
+        "strike": int(strike) / 1000.0,
+    }
+
+
+async def import_orphan_options_all_users() -> dict[str, Any]:
+    """Repair: import option positions that exist at the broker but are NOT
+    tracked in Trezo (orphans - e.g. a Wheel CSP that fired but whose tracking
+    insert failed). Mirrors the Wheel's own insert shape. Deduped on
+    (underlying, type, strike, expiration) so it never double-imports, and
+    never runs on a failed broker read. Short put -> wheel_csp, short call ->
+    wheel_cc, long -> reconciled_option. Added 2026-06-16."""
+    from app.brokers.alpaca import alpaca_configured, get_option_positions, UserToken
+    from app.integrations.web_tokens import get_user_broker_token
+    from app.config import get_settings
+
+    s = get_settings()
+    if not (s.supabase_url and s.supabase_service_role_key):
+        return {"ok": False, "error": "Supabase not configured."}
+    try:
+        from supabase import create_client
+        client = create_client(s.supabase_url, s.supabase_service_role_key)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"Supabase client error: {e}"}
+
+    env_ok = alpaca_configured()
+
+    def _users():
+        return client.table("paper_accounts").select("user_id").execute()
+    rows = (await asyncio.to_thread(_users)).data or []
+
+    imported = 0
+    skipped = 0
+    details: list[dict] = []
+    for u in rows:
+        user_id = u.get("user_id")
+        if not user_id:
+            continue
+        bt = await get_user_broker_token(user_id, "alpaca")
+        token = UserToken(
+            access_token=bt.access_token, refresh_token=bt.refresh_token,
+            expires_at=bt.expires_at,
+        ) if bt else None
+        if token is None and not env_ok:
+            continue
+        try:
+            broker_opts = await get_option_positions(token=token)
+        except Exception:
+            broker_opts = None
+        if broker_opts is None:
+            continue  # failed read: never import on a hiccup
+
+        def _trezo_open(uid=user_id):
+            return (
+                client.table("options_positions")
+                .select("underlying, option_type, strike, expiration")
+                .eq("user_id", uid).eq("status", "open").execute()
+            )
+        try:
+            trezo_rows = (await asyncio.to_thread(_trezo_open)).data or []
+        except Exception:
+            continue
+
+        def _key(und, typ, strike, exp):
+            return (str(und).upper(), str(typ).lower(),
+                    round(float(strike or 0), 2), str(exp))
+        have = {
+            _key(r.get("underlying"), r.get("option_type"),
+                 r.get("strike"), r.get("expiration"))
+            for r in trezo_rows
+        }
+
+        for op in broker_opts:
+            occ = str(op.get("symbol") or "")
+            parsed = _parse_occ(occ)
+            if not parsed:
+                skipped += 1
+                continue
+            try:
+                qty = float(op.get("qty") or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(qty) < 1e-9:
+                continue
+            k = _key(parsed["underlying"], parsed["option_type"],
+                     parsed["strike"], parsed["expiration"])
+            if k in have:
+                continue  # already tracked
+            is_short = qty < 0
+            contracts = int(abs(qty)) or 1
+            try:
+                prem = float(op.get("avg_entry_price") or 0)
+            except (TypeError, ValueError):
+                prem = 0.0
+            if is_short and parsed["option_type"] == "put":
+                strat = "wheel_csp"
+            elif is_short and parsed["option_type"] == "call":
+                strat = "wheel_cc"
+            else:
+                strat = "reconciled_option"
+            row = {
+                "user_id": user_id,
+                "underlying": parsed["underlying"],
+                "strategy": strat,
+                "direction": "income" if is_short else "long",
+                "option_type": parsed["option_type"],
+                "strike": parsed["strike"],
+                "expiration": parsed["expiration"],
+                "contracts": contracts,
+                "net_premium_usd": round(prem * 100.0 * contracts, 2),
+                "legs": [{
+                    "action": "sell" if is_short else "buy",
+                    "type": parsed["option_type"],
+                    "strike": parsed["strike"], "premium": prem,
+                }],
+                "notes": (f"Imported from broker by integrity sweep (orphan) "
+                          f"· occ={occ}"),
+            }
+
+            def _ins(r=row):
+                return client.table("options_positions").insert(r).execute()
+            try:
+                await asyncio.to_thread(_ins)
+                imported += 1
+                have.add(k)
+                details.append({
+                    "user_id": str(user_id), "occ": occ,
+                    "underlying": parsed["underlying"], "strategy": strat,
+                    "contracts": contracts, "strike": parsed["strike"],
+                })
+            except Exception as e:  # noqa: BLE001
+                skipped += 1
+                details.append({"occ": occ, "error": str(e)[:120]})
+
+    return {"ok": True, "imported": imported, "skipped": skipped,
+            "details": details}

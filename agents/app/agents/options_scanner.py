@@ -48,6 +48,28 @@ from app.strategies.options_strategies import (
 
 from .base import Agent, AgentMessage
 
+import time
+
+# Wheel auto-fire cooldown (2026-06-16). When the broker rejects (or Trezo
+# blocks) an auto CSP/CC, record a per-(user, underlying, strategy) cooldown
+# so the SAME failing order is not re-submitted every 30-minute tick. That
+# retry loop is what flooded the ticker with ERROR "wheel auto blocked"
+# messages. The name is retried once the window elapses. In-memory only
+# (clears on restart, so a restart re-tests the broker exactly once).
+_WHEEL_BLOCK_COOLDOWN_S = 4 * 3600.0  # 4h: a couple retries a day, no spam
+_wheel_block_until: dict[tuple[str, str, str], float] = {}
+
+
+def _wheel_in_cooldown(user_id: str, underlying: str, strategy: str) -> bool:
+    key = (str(user_id), str(underlying).upper(), str(strategy))
+    until = _wheel_block_until.get(key)
+    return until is not None and time.time() < until
+
+
+def _wheel_set_cooldown(user_id: str, underlying: str, strategy: str) -> None:
+    key = (str(user_id), str(underlying).upper(), str(strategy))
+    _wheel_block_until[key] = time.time() + _WHEEL_BLOCK_COOLDOWN_S
+
 
 def _supabase():
     s = get_settings()
@@ -679,7 +701,12 @@ class OptionsScannerAgent(Agent):
                 collateral = float(pick.strike) * 100.0 * int(leg.contracts or 1)
                 opt_bp = float(getattr(acct, "options_buying_power", 0) or
                                getattr(acct, "buying_power", 0) or 0)
-                if opt_bp and collateral > opt_bp:
+                # 2026-06-16: dropped the "opt_bp and" guard. When buying
+                # power is 0 (small account fully deployed by existing CSPs),
+                # the old guard let the order through to Alpaca, which rejected
+                # it as an ERROR every tick. Treat 0/insufficient BP as a quiet
+                # info skip instead of hammering the broker.
+                if collateral > opt_bp:
                     return AgentMessage(
                         agent=self.name, kind="info",
                         payload={
@@ -688,9 +715,10 @@ class OptionsScannerAgent(Agent):
                             "underlying": underlying,
                             "strategy": strategy,
                             "reason": (
-                                f"CSP needs ${collateral:,.0f} collateral; "
-                                f"options buying power ${opt_bp:,.0f}. "
-                                f"Skipped without hitting Alpaca."
+                                f"CSP needs ${collateral:,.0f} collateral but "
+                                f"account buying power is ${opt_bp:,.0f} "
+                                f"(account fully deployed). Skipped without "
+                                f"hitting Alpaca."
                             ),
                             "routed_via": routed,
                         },
@@ -929,6 +957,12 @@ class OptionsScannerAgent(Agent):
                     halted = await _user_halted(client, user_id)
 
                     if cfg.wheel_auto_execute and not halted:
+                        # 2026-06-16: skip names the broker recently rejected
+                        # so a failing CSP/CC is not re-submitted every tick
+                        # (that retry loop flooded the ticker with ERROR
+                        # "wheel auto blocked"). Retried after the cooldown.
+                        if _wheel_in_cooldown(user_id, leg.underlying, strategy):
+                            continue
                         # AUTO-FIRE PATH
                         autofire = await self._wheel_auto_fire(
                             user_id=user_id,
@@ -938,6 +972,11 @@ class OptionsScannerAgent(Agent):
                             priced=priced,
                         )
                         if autofire is not None:
+                            ev = (autofire.payload or {}).get("event")
+                            if ev in ("wheel_auto_blocked",
+                                      "wheel_auto_tracking_failed"):
+                                _wheel_set_cooldown(
+                                    user_id, leg.underlying, strategy)
                             out.append(autofire)
                             continue
                         # Auto-fire failed; fall through to suggestion so

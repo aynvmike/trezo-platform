@@ -232,6 +232,45 @@ async def _naked_position_check(ticker: str, row: dict) -> dict | None:
     }
 
 
+# --- Liquidation throttle / circuit-breaker (Mike 2026-06-15) ----------------
+# The exit branches below call liquidate_position every tick while a position
+# sits past its stop. If the broker keeps REJECTING/CANCELING the close (e.g. a
+# day-TIF bracket conflict -- the GM 6/13 canceled-sell storm), an un-throttled
+# retry fires a market order every ~60s: order spam + repeated rejects that trip
+# the session kill-switch. This wrapper rate-limits attempts per symbol and
+# trips a circuit-breaker after repeated failures so the bot backs off + alerts
+# ONCE instead of hammering forever.
+_liq_attempt_at: dict[str, float] = {}
+_liq_fail_count: dict[str, int] = {}
+_LIQ_COOLDOWN_S = 120   # at most one close attempt per symbol per 2 min
+_LIQ_MAX_FAILS = 3      # after 3 consecutive failures, back off (alert once)
+
+
+async def _throttled_liquidate(symbol: str, asset_type: str = "stock"):
+    """Rate-limited + circuit-broken wrapper around liquidate_position.
+    Returns (result, status): 'ok' submitted; 'error:<msg>' broker ran but
+    failed; 'throttled' skipped (within cooldown); 'circuit_open' skipped (too
+    many consecutive fails). Never raises."""
+    import time as _t
+    now_s = _t.time()
+    if _liq_fail_count.get(symbol, 0) >= _LIQ_MAX_FAILS:
+        return None, "circuit_open"
+    if now_s - _liq_attempt_at.get(symbol, 0.0) < _LIQ_COOLDOWN_S:
+        return None, "throttled"
+    _liq_attempt_at[symbol] = now_s
+    try:
+        from app.brokers.alpaca import liquidate_position
+        _res, _err = await liquidate_position(symbol, asset_type=asset_type)
+    except Exception as e:  # noqa: BLE001
+        _liq_fail_count[symbol] = _liq_fail_count.get(symbol, 0) + 1
+        return None, "error:" + str(e)[:120]
+    if _err:
+        _liq_fail_count[symbol] = _liq_fail_count.get(symbol, 0) + 1
+        return None, "error:" + str(_err)
+    _liq_fail_count[symbol] = 0
+    return _res, "ok"
+
+
 class PositionMonitorAgent(Agent):
     name = "position_monitor"
     tick_interval_seconds = 60  # Throttled 2026-06-05 (was 30) to cut API load
@@ -260,8 +299,17 @@ class PositionMonitorAgent(Agent):
         )
         if is_initial or is_scheduled:
             try:
-                from app.paper.stocks_reconcile import reconcile_stocks_all_users
+                from app.paper.stocks_reconcile import (
+                    reconcile_stocks_all_users,
+                    reconcile_account_balances_all_users,
+                )
                 result = await reconcile_stocks_all_users()
+                # 2026-06-16: keep the cash ledger synced to broker truth on
+                # the same cadence (best-effort; never blocks the tick).
+                try:
+                    await reconcile_account_balances_all_users()
+                except Exception:  # noqa: BLE001
+                    pass
                 type(self)._did_initial_reconcile = True
                 if result.get("ok") and (
                     result.get("closed", 0)
@@ -410,11 +458,32 @@ class PositionMonitorAgent(Agent):
                             reason_c = "stop"
                         elif target_c is not None and price_c <= target_c:
                             reason_c = "target"
+                    # Scalp net-edge auto-exit (Mike 2026-06-15): fast/quick plays take
+                    # profit once they clear round-trip cost + the 0.01% net floor.
+                    # SCALP only; HODL/SWING/DCA keep their ladders.
+                    if reason_c is None and "scalp" in _strat_a:
+                        try:
+                            from app.strategies.crypto import clears_fee_edge as _cfe2
+                            from app.paper.engine import (
+                                CRYPTO_COMMISSION_BPS as _FEE2, SLIPPAGE_BPS as _SLIP2,
+                            )
+                            _ec = float(r.get("entry_price") or 0)
+                            if _ec > 0:
+                                _g = ((price_c - _ec) / _ec if r["side"] == "long"
+                                    else (_ec - price_c) / _ec)
+                                if _cfe2(_g, _FEE2, _SLIP2):
+                                    reason_c = "scalp_net_edge"
+                        except Exception:
+                            pass
                     if reason_c is None:
                         alpaca_managed += 1
                         continue
-                    _liq, liq_err = await liquidate_position(
+                    _liq, _cstat = await _throttled_liquidate(
                         tk, asset_type="crypto")
+                    if _cstat in ("throttled", "circuit_open"):
+                        alpaca_managed += 1
+                        continue
+                    liq_err = _cstat[6:] if _cstat.startswith("error:") else None
                     if liq_err:
                         # Leave the row open and retry next tick. NEVER
                         # close the Trezo row while Alpaca may still be
@@ -496,8 +565,10 @@ class PositionMonitorAgent(Agent):
                                 r, r["side"], price_a, stop_a,
                             )
                             if ts_reason:
-                                from app.brokers.alpaca import liquidate_position
-                                _liq, liq_err = await liquidate_position(tk)
+                                _liq, _liq_st = await _throttled_liquidate(tk)
+                                if _liq_st in ("throttled", "circuit_open"):
+                                    continue
+                                liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
                                 out.append(AgentMessage(
                                     agent=self.name, kind="info",
                                     payload={
@@ -531,8 +602,10 @@ class PositionMonitorAgent(Agent):
                             await _maybe_ladder_stop(r, price_x, EXTENDED_PROFIT_LADDER)
                             _xstop = float(r["stop_price"]) if r.get("stop_price") else None
                             if _xstop is not None and price_x <= _xstop:
-                                from app.brokers.alpaca import liquidate_position
-                                _xliq, _xerr = await liquidate_position(tk)
+                                _xliq, _x_st = await _throttled_liquidate(tk)
+                                if _x_st in ("throttled", "circuit_open"):
+                                    continue
+                                _xerr = _x_st[6:] if _x_st.startswith("error:") else None
                                 out.append(AgentMessage(
                                     agent=self.name, kind="info",
                                     payload={
@@ -546,8 +619,10 @@ class PositionMonitorAgent(Agent):
                                 continue
 
                     if strat_a.startswith("extended") and held_days >= SWING_MAX_HOLD_DAYS:
-                        from app.brokers.alpaca import liquidate_position
-                        _liq, liq_err = await liquidate_position(tk)
+                        _liq, _liq_st = await _throttled_liquidate(tk)
+                        if _liq_st in ("throttled", "circuit_open"):
+                            continue
+                        liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
                         out.append(AgentMessage(
                             agent=self.name, kind="info",
                             payload={"user_id": r["user_id"], "ticker": tk,
@@ -566,9 +641,37 @@ class PositionMonitorAgent(Agent):
                         if at == "stock":
                             note = await _naked_position_check(tk, r)
                             if note is not None:
-                                out.append(AgentMessage(
-                                    agent=self.name, kind="error",
-                                    payload=note))
+                                _enforced = False
+                                _pn = await _price(tk, at)
+                                _sp = float(r["stop_price"]) if r.get("stop_price") else None
+                                _tp = float(r["target_price"]) if r.get("target_price") else None
+                                _hit = None
+                                if _pn is not None:
+                                    if r["side"] == "long":
+                                        if _sp is not None and _pn <= _sp:
+                                            _hit = "stop"
+                                        elif _tp is not None and _pn >= _tp:
+                                            _hit = "target"
+                                    else:
+                                        if _sp is not None and _pn >= _sp:
+                                            _hit = "stop"
+                                        elif _tp is not None and _pn <= _tp:
+                                            _hit = "target"
+                                if _hit is not None:
+                                    _ol, _ost = await _throttled_liquidate(tk)
+                                    if _ost == "ok":
+                                        _enforced = True
+                                        out.append(AgentMessage(
+                                            agent=self.name, kind="info",
+                                            payload={"user_id": r["user_id"], "ticker": tk,
+                                                "note": (f"Orphan/naked {_hit} hit - enforced "
+                                                         f"exit at market (was unmanaged)."),
+                                                "position_id": r["id"], "broker": "alpaca",
+                                                "reason": f"orphan_{_hit}"}))
+                                if not _enforced:
+                                    out.append(AgentMessage(
+                                        agent=self.name, kind="error",
+                                        payload=note))
                 continue
 
             # --- Internal paper positions ----------------------------------

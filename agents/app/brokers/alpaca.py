@@ -38,6 +38,10 @@ class AlpacaAccount:
     # can actually fire.
     options_approved_level: int = 0
     options_trading_level: int = 0
+    # Account identity (2026-06-16): lets the bot prove WHICH Alpaca
+    # account it is bound to and never silently trade the wrong one.
+    account_number: str = ""
+    account_id: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -190,7 +194,61 @@ async def get_account(token: Optional["UserToken"] = None) -> Optional[AlpacaAcc
         trading_blocked=bool(data.get("trading_blocked")),
         options_approved_level=int(data.get("options_approved_level") or 0),
         options_trading_level=int(data.get("options_trading_level") or 0),
+        account_number=str(data.get("account_number") or ""),
+        account_id=str(data.get("id") or ""),
     )
+
+
+async def account_self_check() -> dict:
+    """Account-identity guard (2026-06-16). Confirms the bot is bound to a
+    real, tradable Alpaca account and surfaces WHICH one (account number +
+    buying power + options approval). If settings.alpaca_expected_account is
+    set and the live account differs, flags a mismatch so the bot never
+    silently trades the wrong account. Uses the env keys (the single-tenant
+    source of truth). Read-only; never raises."""
+    s = get_settings()
+    out = {
+        "ok": False, "configured": alpaca_configured(), "venue": broker_venue(),
+        "account_number": "", "buying_power": 0.0, "status": "",
+        "options_approved_level": 0, "trading_blocked": True,
+        "expected": (s.alpaca_expected_account or ""), "mismatch": False,
+        "note": "",
+    }
+    try:
+        if not alpaca_configured():
+            out["note"] = "Alpaca env keys not configured."
+            return out
+        acct = await get_account()
+        if acct is None:
+            out["note"] = "Alpaca account unreachable (keys invalid or API down)."
+            return out
+        out.update({
+            "ok": True,
+            "account_number": acct.account_number,
+            "buying_power": acct.buying_power,
+            "status": acct.status,
+            "options_approved_level": acct.options_approved_level,
+            "trading_blocked": acct.trading_blocked,
+        })
+        exp = (s.alpaca_expected_account or "").strip()
+        if exp and acct.account_number and exp != acct.account_number:
+            out["mismatch"] = True
+            out["note"] = (
+                f"ACCOUNT MISMATCH: bound to {acct.account_number} but expected "
+                f"{exp}. Check ALPACA_API_KEY / ALPACA_SECRET_KEY in agents/.env."
+            )
+        elif acct.trading_blocked:
+            out["note"] = "Account trading_blocked=true at Alpaca."
+        elif acct.options_approved_level < 1:
+            out["note"] = (
+                "Options approval level 0 - the Wheel cannot sell CSPs/CCs "
+                "until options trading is enabled on this Alpaca account."
+            )
+        else:
+            out["note"] = "Account healthy."
+    except Exception as e:  # noqa: BLE001
+        out["note"] = f"Self-check error: {e}"
+    return out
 
 
 async def get_positions(token: Optional["UserToken"] = None) -> list[dict]:

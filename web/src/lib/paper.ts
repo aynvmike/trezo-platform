@@ -75,7 +75,19 @@ export async function getClosedPositions(
     .neq("status", "open")
     .order("exit_at", { ascending: false })
     .limit(limit);
-  return (data ?? []) as PaperPosition[];
+  const rows = (data ?? []) as PaperPosition[];
+  // Hide reconciler "ghost" rows: an empty/errored broker read used to
+  // phantom-close real positions as closed_manual with a null exit_price
+  // and $0 P&L. Genuine manual closes always carry a real exit_price, so
+  // they are unaffected (open-bell phantom-close race, 2026-06-15).
+  return rows.filter(
+    (p) =>
+      !(
+        p.status === "closed_manual" &&
+        (p.exit_price === null || p.exit_price === undefined) &&
+        Number(p.realized_pnl_usd ?? 0) === 0
+      )
+  );
 }
 
 export async function getVaultTransactions(

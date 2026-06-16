@@ -115,6 +115,35 @@ EXTENDED_PROFIT_LADDER = (
 ACCUMULATION_MODES = frozenset({"hodl", "dca"})
 
 
+# ---- Fee-aware net-edge gate (Mike 2026-06-15) -----------------------------
+# Take a crypto trade whenever the expected move clears round-trip trading
+# cost (fee + slippage on BOTH the entry and the exit) PLUS a small net
+# cushion. NEVER gate crypto on the coin's price or absolute cost -- only on
+# whether the trade can net a profit after costs. Fee/slippage are modeled in
+# paper/engine.py; helpers take them as params so callers pass live values and
+# there's one source of truth. bps = basis points (1 bp = 0.01%).
+MIN_NET_EDGE_PCT = 0.0001  # +0.01% net cushion required ON TOP of round-trip cost
+
+
+def round_trip_cost_pct(fee_bps: float, slippage_bps: float) -> float:
+    """Round-trip trading cost as a fraction of notional: fee + slippage
+    charged on BOTH the entry fill and the exit fill."""
+    return 2.0 * (float(fee_bps) + float(slippage_bps)) / 10_000.0
+
+
+def net_edge_pct(target_pct: float, fee_bps: float, slippage_bps: float) -> float:
+    """Expected NET edge as a fraction: gross target move minus round-trip
+    cost. Positive => profitable after costs."""
+    return float(target_pct) - round_trip_cost_pct(fee_bps, slippage_bps)
+
+
+def clears_fee_edge(target_pct: float, fee_bps: float, slippage_bps: float,
+                    buffer: float = MIN_NET_EDGE_PCT) -> bool:
+    """The gate: True when expected net edge meets the required cushion
+    (default +0.01%). Independent of the coin's price/cost."""
+    return net_edge_pct(target_pct, fee_bps, slippage_bps) >= float(buffer)
+
+
 def is_accumulation_strategy(strategy: str | None) -> bool:
     """True if a strategy tag is an accumulate-across-days crypto mode
     (crypto_hodl / crypto_dca). Tolerant of tag shape: matches
