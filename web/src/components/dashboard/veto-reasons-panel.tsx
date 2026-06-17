@@ -82,9 +82,9 @@ export async function VetoReasonsPanel({ userId }: { userId: string }) {
     {
       key: "liquidity",
       label: "Liquidity (low average volume)",
-      hint: "Symbol's average daily volume is below the 1M-share floor. Most market-wide candidates fail this on small-caps.",
+      hint: "Symbol's average daily volume is below the liquidity floor (default 250k shares). Most thin market-wide small-caps still fail this.",
       test: /liquidity|average volume|avg volume|min.?volume/i,
-      lever: "Bot Tuning · Liquidity floor (when exposed; currently hardcoded 1M)."
+      lever: "Liquidity floor: default 250k shares, tunable via TREZO_MIN_AVG_VOLUME in agents/.env (per-strategy lanes still apply)."
     },
     {
       key: "spread",

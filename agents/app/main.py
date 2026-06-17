@@ -1136,25 +1136,25 @@ async def macro_snapshot():
     license requirements are honored. Returns `configured: false` when
     no backend is active."""
     from app.data.macro import (
-        get_macro_reading, classify_macro_regime,
-        active_source_attribution, pick_active_source,
+        best_reading_and_source, get_macro_reading, classify_macro_regime,
     )
 
-    reading = await get_macro_reading()
-    regime, why = classify_macro_regime(reading)
-    src = pick_active_source()
-
+    reading, src = await best_reading_and_source()
     if src is None:
+        r0 = await get_macro_reading()
         return {
             "configured": False,
             "source": None,
-            "note": reading.note or "No macro source configured.",
+            "note": r0.note or "No macro source configured.",
         }
+    if reading is None:
+        reading = await get_macro_reading()
+    regime, why = classify_macro_regime(reading)
 
     return {
         "configured": True,
-        "source": src.name,
-        "attribution": active_source_attribution(),
+        "source": getattr(reading, "source", None) or getattr(src, "name", "unknown"),
+        "attribution": getattr(src, "attribution", ""),
         "regime": regime,
         "reason": why,
         "vix": reading.vix,

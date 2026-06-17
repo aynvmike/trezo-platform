@@ -93,7 +93,8 @@ def eligible_strategies(asset_type: str, *, in_stms_window: bool = True,
 
 def select_strategy(candles, *, ctx: Optional[MarketContext] = None,
                     history: Optional[dict] = None,
-                    strategies: Optional[list] = None) -> StrategyPick:
+                    strategies: Optional[list] = None,
+                    outcome_edge: Optional[dict] = None) -> StrategyPick:
     """Score `candles` under each strategy and pick the best for this
     stock right now.
 
@@ -105,27 +106,44 @@ def select_strategy(candles, *, ctx: Optional[MarketContext] = None,
     strategies = strategies or STOCK_STRATEGIES
     history = history or {}
 
+    edge = outcome_edge or {}
     rows: list[dict] = []
     for strat in strategies:
         sc = calculate_score(candles, ctx, strategy=strat)
+        e = edge.get(strat) or {}
         rows.append({"strategy": strat, "score": sc, "tcs": int(sc.tcs),
                      "direction": sc.direction,
-                     "hist": history.get(strat)})
+                     "hist": history.get(strat),
+                     "verdict": e.get("verdict", "insufficient_data"),
+                     "expectancy": float(e.get("expectancy_usd") or 0.0)})
 
     # Long-only bot: prefer bullish reads. Drop strategies with a
     # net-loss backtest history on this stock from the running.
     bull = [r for r in rows if r["direction"] == "bullish"]
     healthy = [r for r in bull if (r["hist"] is None or r["hist"] >= 0)]
-    pool = healthy or bull or rows
+    # Outcome-weighted (2026-06-16): when alternatives exist, drop the
+    # strategies the user's LIVE record says to avoid (negative realized
+    # expectancy over a meaningful sample). Falls back to `healthy` when
+    # that would empty the pool, so a thin / all-avoid record never
+    # strands the selector.
+    not_avoid = [r for r in healthy if r["verdict"] != "avoid"]
+    pool = not_avoid or healthy or bull or rows
 
-    # Highest live TCS wins; backtest history breaks ties.
-    pool.sort(key=lambda r: (r["tcs"], r["hist"] or 0.0), reverse=True)
+    # Highest live TCS wins; then a proven live edge ("favor"); then
+    # realized expectancy; then backtest history as the final tiebreak.
+    pool.sort(key=lambda r: (
+        r["tcs"],
+        1 if r["verdict"] == "favor" else 0,
+        r["expectancy"],
+        r["hist"] or 0.0,
+    ), reverse=True)
     win = pool[0]
     sc = win["score"]
 
     considered = sorted(
         [{"strategy": r["strategy"], "tcs": r["tcs"],
-          "direction": r["direction"], "backtest_return_pct": r["hist"]}
+          "direction": r["direction"], "backtest_return_pct": r["hist"],
+          "live_verdict": r["verdict"]}
          for r in rows],
         key=lambda d: d["tcs"], reverse=True)
 
@@ -148,4 +166,9 @@ def _reason(win: dict, n_tested: int) -> str:
             bits.append(f"It also leads this stock's backtests ({h:+.1f}%).")
         else:
             bits.append("Other strategies have a weaker backtest record here.")
+    v = win.get("verdict")
+    if v == "favor":
+        bits.append(f"Live record favors it (avg ${win.get('expectancy', 0):+.0f}/trade).")
+    elif v == "avoid":
+        bits.append("Note: its live record is weak; kept only for lack of a better fit.")
     return " ".join(bits)

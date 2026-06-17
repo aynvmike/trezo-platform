@@ -226,7 +226,7 @@ async def get_strategy_stats(
             client.table("trade_outcomes")
             .select("strategy, tcs_at_entry, realized_pnl_usd, "
                     "iv_environment_at_entry, regime_at_entry, hold_minutes, "
-                    "ticker, closed_at")
+                    "asset_type, ticker, closed_at")
             .eq("user_id", user_id)
             .gte("closed_at", cutoff)
             .execute()
@@ -245,6 +245,10 @@ async def get_strategy_stats(
                 for k, v in _bucket(rows, "iv_environment_at_entry").items()}
     by_regime = {k: _summarise(v)
                  for k, v in _bucket(rows, "regime_at_entry").items()}
+    # Per trade-type (stock / crypto / option) so calls, CSPs/CCs and
+    # scalps each get their own learning bucket (2026-06-16).
+    by_asset_type = {k: _summarise(v)
+                     for k, v in _bucket(rows, "asset_type").items()}
 
     return {
         "configured": True,
@@ -253,6 +257,7 @@ async def get_strategy_stats(
         "by_strategy": by_strategy,
         "by_cycle": by_cycle,
         "by_regime": by_regime,
+        "by_asset_type": by_asset_type,
     }
 
 
@@ -272,8 +277,8 @@ def suggest_tuning(strategy_stats: dict[str, Any]) -> list[dict[str, Any]]:
         if n < 5:
             continue
         wr = stats.get("win_rate")
-        med_winner_tcs = stats.get("median_winner_tcs")
-        med_loser_tcs = stats.get("median_loser_tcs")
+        med_winner_tcs = stats.get("median_tcs_winners")
+        med_loser_tcs = stats.get("median_tcs_losers")
         # Heuristic 1: winners have a clearly higher TCS than losers -
         # raise the floor toward the winners' median.
         if (med_winner_tcs is not None and med_loser_tcs is not None

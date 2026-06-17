@@ -204,6 +204,16 @@ class PatternDetectionAgent(Agent):
             if not cfg.pattern_enabled:
                 continue
 
+            # Outcome-weighted selection (2026-06-16): this user's learned
+            # per-strategy edge, fetched once per tick (cached 10 min). The
+            # selector drops strategies the live record says to avoid and
+            # tiebreaks toward proven edge. {} = no opinion (thin data).
+            try:
+                from app.learning.strategy_weighting import get_live_strategy_edge
+                outcome_edge = await get_live_strategy_edge(user_id)
+            except Exception:  # noqa: BLE001
+                outcome_edge = {}
+
             threshold = int(cfg.tcs_threshold or self.signal_threshold)
 
             pool, breakdown = await expanded_scan_pool(tickers, limit=50)
@@ -287,6 +297,7 @@ class PatternDetectionAgent(Agent):
                         candles, ctx=ctx,
                         history=history.get(sym, {}),
                         strategies=pool_strats,
+                        outcome_edge=outcome_edge,
                     )
 
                     # Strategy-change detection + switching friction.
