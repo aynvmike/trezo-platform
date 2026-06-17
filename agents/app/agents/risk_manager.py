@@ -461,13 +461,34 @@ class RiskManagerAgent(Agent):
             cycle_bump = 150
             cycle_reason = " (earnings TODAY +150)"
 
-        # The confidence bar can be raised by the current regime posture
-        # AND the cycle-aware bump from above.
-        effective_min_tcs = min_tcs + scope.tcs_bump + cycle_bump
+        # Experience-driven floor nudge (2026-06-16, OPT-IN, default OFF).
+        # When enabled, the user's realized record moves the bar per strategy:
+        # a proven winner ("favor") trades a bit more freely, a proven loser
+        # ("avoid") needs higher conviction. Bounded + data-gated (>=8 closed
+        # trades) so it never changes behavior until turned on with real data.
+        outcome_delta = 0
+        outcome_reason = ""
+        try:
+            from app.config import get_settings as _get_cfg
+            if _get_cfg().outcome_gate_tuning_enabled:
+                from app.learning.strategy_weighting import (
+                    get_live_strategy_edge, floor_delta_for,
+                )
+                _edge = await get_live_strategy_edge(message.payload.get("user_id"))
+                outcome_delta = floor_delta_for(_edge, strategy)
+                if outcome_delta:
+                    sign = "+" if outcome_delta > 0 else ""
+                    outcome_reason = f" (record {sign}{outcome_delta})"
+        except Exception:  # noqa: BLE001
+            outcome_delta = 0
+
+        # The confidence bar can be raised by the current regime posture,
+        # the cycle-aware bump, and (opt-in) the per-strategy outcome nudge.
+        effective_min_tcs = min_tcs + scope.tcs_bump + cycle_bump + outcome_delta
         if tcs < effective_min_tcs:
             extra = (
-                f" (regime +{scope.tcs_bump}{cycle_reason})"
-                if scope.tcs_bump or cycle_bump
+                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason})"
+                if scope.tcs_bump or cycle_bump or outcome_delta
                 else ""
             )
             return [self._veto(

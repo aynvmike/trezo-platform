@@ -1,12 +1,14 @@
 # Trezo — Project Status Handoff
 
-**Last updated:** 2026-06-12 ~10:30 PM ET (final pass: RESTART CONFIRMED — new build is live and every formerly-dark agent is emitting. options_scanner produced its first messages EVER (74 tonight); crypto, watchdog, market_horizon, market_sentiment all alive; Position Monitor clean. Full-codebase audits green; git snapshot 720b941. NOTE: clear stale git locks before next git use — see section 6.A1.)
+**Last updated:** 2026-06-16 ~10 PM ET — large bug-fix + self-healing + learning-loop arc shipped & committed (HEAD `0eb7576` + the commit accompanying this update). Shipped this arc: self-healing integrity sweep (cash<-broker + stock + orphan-option reconcile; runs at startup, ~hourly, and GET /integrity-check); wheel auto-fire cooldown + $0-buying-power quiet-skip; liquidity floor 1M->250k tunable (TREZO_MIN_AVG_VOLUME); account-identity guard + GET /account-check; outcome-weighted strategy selection + per-asset-type learning buckets + suggest_tuning fix; macro fall-through + honest diagnostic (still needs a real VIX/treasury source -- Alpaca-ETF proxy recommended); REAL structure-based risk/reward replacing the old rr=120 placeholder; opt-in experience-driven risk gate (default OFF via TREZO_OUTCOME_GATE_TUNING_ENABLED). Verified live: 0 errors across 23 agents. WARNING: Alpaca account PA3PR4F6ZFWZ buying_power = $0 -> the real gate on NEW trades; reset/grow the paper account to see the fixes produce more activity. Git lock-fault still active (HEAD.lock + index.lock stuck, unlink-EPERM) -> commit via commit-tree + direct ref write. NOTE: clear stale git locks before next git use -- see section 6.A1.
 **Maintained by:** Mike (founder/architect) + Nova (Claude collaborator)
 **Repo root:** `C:\Trezo\trezo-platform`
 
 This document is the single source of truth for "where are we, what just shipped, what's next." Read this first when picking up the project.
 
 > 🍍 **Pineapple continuity check — 2026-06-13 (Nova):** Cross-session memory is live and honored this session — the auto-memory index and `project_pineapple_test.md` loaded, and the full status below was reviewed and is current as of 2026-06-13. Note: the Mem0 **MCP server** is NOT connected in this Cowork session (no `mcp__mem0__*` tools surfaced); the Trezo agent-side Mem0 brain (status rows 22–28) is a separate Python integration and is unaffected. Pineapple acknowledged. 🍍
+
+> 🍍 **Pineapple continuity check — 2026-06-16 (Nova):** Full session arc (bug fixes, integrity sweep, learning loop, real R/R, opt-in experience gate) captured in the auto-memory pineapple checkpoint `project_checkpoint_2026_06_16.md`. The agent-side Mem0 brain is verified WIRED (17 live add/search call sites). Unwired-feature audit completed — remaining scaffolds: shadow-backtest loop, alpaca_ws, user_support stub. Pineapple acknowledged. 🍍
 
 ---
 

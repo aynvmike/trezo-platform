@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     # 250,000. Per-strategy lanes in market_filter.py still apply floors.
     min_avg_volume: int = 250_000
 
+    # Experience-driven risk gate (2026-06-16, OPT-IN, default OFF). When
+    # true, the risk manager nudges the per-strategy TCS floor from realized
+    # outcomes: a proven "favor" strategy trades a bit more freely (-25), a
+    # proven "avoid" one needs higher conviction (+75). Bounded + data-gated
+    # (>=8 closed trades). Set TREZO_OUTCOME_GATE_TUNING_ENABLED=true to enable.
+    outcome_gate_tuning_enabled: bool = False
+
     # Cache
     upstash_redis_rest_url: str = ""
     upstash_redis_rest_token: str = ""

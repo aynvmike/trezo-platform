@@ -80,3 +80,22 @@ def edge_verdict(edge: "dict[str, dict]", strategy: str) -> str:
     """Verdict for one strategy; 'insufficient_data' when unknown."""
     e = (edge or {}).get(str(strategy))
     return e.get("verdict", "insufficient_data") if e else "insufficient_data"
+
+
+# --- Experience-driven risk-gate nudge (2026-06-16, opt-in) ---------------
+# Bounded + asymmetric toward caution: a proven winner trades a bit more
+# freely; a proven loser needs much higher conviction. Used by risk_manager
+# only when settings.outcome_gate_tuning_enabled is true.
+_FLOOR_RELAX_FAVOR = -25    # favor -> lower the TCS bar modestly
+_FLOOR_TIGHTEN_AVOID = 75   # avoid -> raise the bar a lot
+
+
+def floor_delta_for(edge: "dict[str, dict]", strategy: str) -> int:
+    """TCS-floor delta for a strategy from its live verdict. favor -> -25,
+    avoid -> +75, else 0. Bounded; 0 when data is insufficient."""
+    v = edge_verdict(edge, strategy)
+    if v == "favor":
+        return _FLOOR_RELAX_FAVOR
+    if v == "avoid":
+        return _FLOOR_TIGHTEN_AVOID
+    return 0

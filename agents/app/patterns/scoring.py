@@ -327,9 +327,12 @@ def calculate_score(
         breakdown["dividend_market_alignment"] = 10.0
 
     score_int = max(0, min(100, int(round(core))))
+    rr_ratio = _reward_risk_ratio(candles)
+    if rr_ratio is not None:
+        breakdown["reward_risk_ratio"] = round(rr_ratio, 2)
     return Score(
         score=score_int,
-        tcs=scale_to_tcs(score_int, ctx),
+        tcs=scale_to_tcs(score_int, ctx, rr_ratio=rr_ratio),
         detected_patterns=hit_patterns,
         breakdown=breakdown,
         dominant_pattern=dominant,
@@ -340,14 +343,67 @@ def calculate_score(
 # ---- TCS scaling ----------------------------------------------------------
 
 
-def scale_to_tcs(score_100: int, ctx: MarketContext) -> int:
+def _reward_risk_ratio(candles) -> "Optional[float]":
+    """Structure-based reward/risk for a LONG entry (2026-06-16; replaces the
+    old constant placeholder). Room up to recent resistance vs. room down to
+    recent support, each ATR-floored so a fresh breakout is not unfairly
+    zeroed and a tight entry cannot divide-by-zero. None when data is thin."""
+    if not candles or len(candles) < 15:
+        return None
+    look = candles[-20:]
+    try:
+        highs = [float(c.high) for c in look]
+        lows = [float(c.low) for c in look]
+        close = float(candles[-1].close)
+    except Exception:  # noqa: BLE001
+        return None
+    if close <= 0:
+        return None
+    swing_high = max(highs)
+    swing_low = min(lows)
+    rng = max(swing_high - swing_low, 0.0)
+    trs = []
+    for i in range(1, len(look)):
+        h = float(look[i].high)
+        lo = float(look[i].low)
+        pc = float(look[i - 1].close)
+        trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+    atr_val = (sum(trs) / len(trs)) if trs else 0.0
+    # Risk = distance to a realistic recent stop (last ~5 bars' low),
+    # ATR-floored - NOT the full-range low (which over-states breakout risk).
+    recent = look[-5:] if len(look) >= 5 else look
+    recent_low = min(float(c.low) for c in recent)
+    risk = max(close - recent_low, 0.75 * atr_val, close * 0.001)
+    # Reward = room to resistance; a genuine breakout (at/above the prior
+    # high) earns a measured-move target (~half the range) instead of ~0,
+    # so momentum/ORB entries are not unfairly zeroed.
+    if close >= swing_high - 0.25 * atr_val:
+        reward = max(0.5 * rng, 2.0 * atr_val)
+    else:
+        reward = max(swing_high - close, 2.0 * atr_val)
+    if risk <= 0:
+        return None
+    return reward / risk
+
+
+def _rr_points(rr_ratio: "Optional[float]") -> float:
+    """Map reward/risk ratio -> 0..150 TCS points. 2:1 -> 120 (the OLD
+    baseline, so typical setups are undisturbed); >=2.5:1 -> full 150; poor
+    positioning is penalized; None (thin data) -> a conservative 110."""
+    if rr_ratio is None:
+        return 110.0
+    return max(0.0, min(150.0, rr_ratio * 60.0))
+
+
+def scale_to_tcs(score_100: int, ctx: MarketContext,
+                 rr_ratio: "Optional[float]" = None) -> int:
     """Translate 0-100 pattern score into 0-1000 Trade Confidence Score.
 
     Allocation (from TREZO_PATTERN_ENGINE.md section 4):
       - Technical (pattern):    300 max  - from score_100
       - Options environment:    250 max  - from IV rank
       - Fundamental/event:      200 max  - catalyst signal
-      - Risk/reward:            150 max  - placeholder until Risk Manager wired
+      - Risk/reward:            150 max  - real structure-based R/R (2026-06-16)
       - Market conditions:      100 max  - SPY trending + confluence
     """
     technical = (score_100 / 100.0) * 300.0
@@ -364,7 +420,7 @@ def scale_to_tcs(score_100: int, ctx: MarketContext) -> int:
         options = 250.0 * max(0.0, (100.0 - ctx.iv_rank) / 40.0)
 
     fundamental = 200.0 if ctx.catalyst_today else 80.0
-    rr = 120.0  # placeholder constant until Risk Manager is wired
+    rr = _rr_points(rr_ratio)  # 2026-06-16: real structure-based R/R
     market = 50.0
     if ctx.spy_trending_up is True:
         market += 30.0
