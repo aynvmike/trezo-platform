@@ -109,8 +109,11 @@ function SimulationTab({ watchlists }: { watchlists: { id: string; name: string;
   return (
     <section className="space-y-6">
       <p className="beginner-only text-sm text-weave-600 leading-relaxed">
-        Stress-test harness. Pick a watchlist, a recent window (5, 7, 14,
-        30 days), and a starting account size. Trezo replays the period
+        Stress-test harness — and the home for testing how the agents adapt
+        at different account sizes ($1k, $5k, $10k, $25k, $100k), as a
+        simulation that never touches your live paper account. Pick a
+        watchlist, a recent window (5, 7, 14, 30 days), and a starting
+        account size. Trezo replays the period
         with every strategy scored per stock and stitches together the
         trades that would have fired. When a ticker looks good you can
         promote it straight into Core Winners.

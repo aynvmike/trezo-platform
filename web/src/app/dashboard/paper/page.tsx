@@ -3,7 +3,6 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 
-import { AccountSizeSim } from "@/components/dashboard/account-size-sim";
 import { ScannerPulse } from "@/components/dashboard/scanner-pulse";
 import { AlpacaSnapshot } from "@/components/dashboard/alpaca-snapshot";
 import { BotSettingsPanel } from "@/components/dashboard/bot-settings-panel";
@@ -157,7 +156,7 @@ export default async function PaperPage() {
             to LIVE: set TRADING_MODE=live in agents/.env AND restart
             the agents service. The live executor stays gated until
             Phase 10b ships - until then every trade still routes
-            paper even when "LIVE (requested)" is the mode.
+            paper even when &ldquo;LIVE (requested)&rdquo; is the mode.
           </p>
           <p>
             For the live executor to actually fire orders, the user
@@ -241,56 +240,6 @@ export default async function PaperPage() {
           desc={`If today's realized loss reaches ${fmtUsd(lossLimitTarget)}, Risk Manager vetoes all new signals for the rest of the day.`}
         />
       </section>
-
-      {/* Alpaca account snapshot */}
-      <AlpacaSnapshot />
-
-      {/* Market context */}
-      <MarketSidePanelServer />
-
-      <CyclesPanel userId={user.id} />
-
-      <Iso20022CryptoPanel />
-
-      <StrategyWindows />
-
-      {/* Task #72 (2026-06-05): Diagnostics + manual scans collapsed.
-          Mike: "these take a lot of space and aren't used every minute". */}
-      <Disclosure title="Diagnostics + manual scans (click to expand)">
-        <section className="grid gap-3 sm:grid-cols-3">
-          <RunScannerButton
-            name="pattern_detection"
-            label="Run stock scan now"
-            hint="Runs the Pattern Detection scanner immediately (scans your watchlist + market-wide pool)."
-          />
-          <DiagnoseNowButton />
-          <StocksReconcileButton />
-        </section>
-      </Disclosure>
-
-      <ManualTradeButton />
-
-      {/* Task #71 (2026-06-05): scanner + risk side-by-side strip.
-          Was two stacked panels, now one 2-col row to save vertical space. */}
-      <section className="grid gap-3 md:grid-cols-2">
-        <ScannerPulse userId={user.id} />
-        <VetoReasonsPanel userId={user.id} />
-      </section>
-      <Disclosure title="Signal trace - last hour (click to expand)">
-        <SignalTracePanel userId={user.id} />
-      </Disclosure>
-
-      {/* Today's execution feed */}
-      <Disclosure title="Today's execution feed (diagnostic - click to expand)">
-        <TodaysExecutionFeed userId={user.id} />
-      </Disclosure>
-
-      {/* Bot settings in-force snapshot */}
-      <Disclosure title="Bot settings — in force (click to expand)">
-        <BotSettingsPanel userId={user.id} />
-      </Disclosure>
-
-      <AccountSizeSim brokerConnected={Boolean(alpaca?.configured)} />
 
       {/* Open positions */}
       <section>
@@ -440,6 +389,54 @@ export default async function PaperPage() {
           </div>
         )}
       </section>
+      </Disclosure>
+
+      {/* Alpaca account snapshot */}
+      <AlpacaSnapshot />
+
+      {/* Market context */}
+      <MarketSidePanelServer />
+
+      <CyclesPanel userId={user.id} />
+
+      <Iso20022CryptoPanel />
+
+      <StrategyWindows />
+
+      {/* Task #72 (2026-06-05): Diagnostics + manual scans collapsed.
+          Mike: "these take a lot of space and aren't used every minute". */}
+      <Disclosure title="Diagnostics + manual scans (click to expand)">
+        <section className="grid gap-3 sm:grid-cols-3">
+          <RunScannerButton
+            name="pattern_detection"
+            label="Run stock scan now"
+            hint="Runs the Pattern Detection scanner immediately (scans your watchlist + market-wide pool)."
+          />
+          <DiagnoseNowButton />
+          <StocksReconcileButton />
+        </section>
+      </Disclosure>
+
+      <ManualTradeButton />
+
+      {/* Task #71 (2026-06-05): scanner + risk side-by-side strip.
+          Was two stacked panels, now one 2-col row to save vertical space. */}
+      <section className="grid gap-3 md:grid-cols-2">
+        <ScannerPulse userId={user.id} />
+        <VetoReasonsPanel userId={user.id} />
+      </section>
+      <Disclosure title="Signal trace - last hour (click to expand)">
+        <SignalTracePanel userId={user.id} />
+      </Disclosure>
+
+      {/* Today's execution feed */}
+      <Disclosure title="Today's execution feed (diagnostic - click to expand)">
+        <TodaysExecutionFeed userId={user.id} />
+      </Disclosure>
+
+      {/* Bot settings in-force snapshot */}
+      <Disclosure title="Bot settings — in force (click to expand)">
+        <BotSettingsPanel userId={user.id} />
       </Disclosure>
 
       <p className="text-[11px] text-weave-500 italic">
