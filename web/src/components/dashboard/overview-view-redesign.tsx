@@ -21,6 +21,8 @@ export type OverviewData = {
   week: { d: string; v: number }[];
   layers: OVLayer[];
   live: boolean;
+  agentsOnline: boolean;
+  buyingPower: number | null;
 };
 
 const SAMPLE: OverviewData = {
@@ -47,6 +49,8 @@ const SAMPLE: OverviewData = {
     { id: 7, name: "KINDRIP", status: "active", pnl: 92.0, agents: 1, risk: "Low" },
   ],
   live: false,
+  agentsOnline: false,
+  buyingPower: null,
 };
 
 const STATUS_TEXT: Record<string, string> = {
@@ -133,10 +137,29 @@ export function OverviewViewRedesign({ data }: { data?: OverviewData }) {
         <p className="mt-1 text-[13px] text-[rgb(var(--muted-foreground))]">At-a-glance health across all seven wealth layers</p>
       </div>
 
+      {d.live ? (
+        <div className="depth-card flex flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2.5 text-[12px]">
+          <span className="flex items-center gap-1.5">
+            <span className={"h-2 w-2 rounded-full " + (d.agentsOnline ? "bg-emerald-500" : "bg-red-500")} />
+            <span className="text-[rgb(var(--muted-foreground))]">Agents</span>
+            <span className={"font-medium " + (d.agentsOnline ? "text-emerald-500" : "text-red-500")}>{d.agentsOnline ? "Live" : "Offline"}</span>
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-[rgb(var(--muted-foreground))]">Buying power</span>
+            <span className="font-mono font-medium text-[rgb(var(--foreground))]">{d.buyingPower != null ? money0(d.buyingPower) : "—"}</span>
+          </span>
+          {!d.agentsOnline ? (
+            <span className="text-[11px] text-[rgb(var(--muted-foreground))]">Live numbers unavailable while the agents service is offline (start it on port 8001).</span>
+          ) : d.buyingPower === 0 ? (
+            <span className="text-[11px] text-[rgb(var(--muted-foreground))]">Agents are live, but the account has $0 buying power to trade.</span>
+          ) : null}
+        </div>
+      ) : null}
+
       <DepthTilt><WovenBasketHero layers={heroLayers} /></DepthTilt>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Kpi label="Portfolio Value" value={money0(d.portfolioValue)} sub="All layers combined" pill={d.live ? "Live" : "Sample"} pillClass="text-emerald-500 bg-emerald-500/10" />
+        <Kpi label="Portfolio Value" value={money0(d.portfolioValue)} sub="All layers combined" pill={!d.live ? "Sample" : d.agentsOnline ? "Live" : "Offline"} pillClass={!d.live ? "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]" : d.agentsOnline ? "text-emerald-500 bg-emerald-500/10" : "text-red-500 bg-red-500/10"} />
         <Kpi label="Week P&L" value={signed0(d.weekPnl)} up={d.weekPnl >= 0} sub="Realized, last 7 days" />
         <Kpi label="Total Open Risk" value={money0(d.deployed)} sub={d.deployedPct != null ? d.deployedPct.toFixed(1) + "% of portfolio deployed" : "Capital in open positions"} />
         <Kpi label="Layers Active" value={d.layersActive + " / 7"} sub="Layers holding a position now" />

@@ -102,6 +102,7 @@ export default async function PaperPage() {
 
   // Alpaca live override when configured.
   const alpacaActive = !!(alpaca?.configured && alpaca?.account);
+  const agentsOnline = alpaca !== null;
   const a = alpaca?.account;
   const displayCash = alpacaActive
     ? Number(a!.cash)
@@ -149,6 +150,24 @@ export default async function PaperPage() {
         </p>
       </header>
 
+      {/* Agents/service status — distinct from funding (Mike 6/19) */}
+      <div className="rounded-xl border border-weave-100 bg-white px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-1 text-sm">
+        <span className="flex items-center gap-1.5">
+          <span className={cn("h-2 w-2 rounded-full", agentsOnline ? "bg-emerald-500" : "bg-red-500")} />
+          <span className="text-weave-500">Agents</span>
+          <span className={cn("font-medium", agentsOnline ? "text-emerald-700" : "text-red-700")}>{agentsOnline ? "Live" : "Offline"}</span>
+        </span>
+        <span className="text-weave-500">
+          Buying power:{" "}
+          <span className="font-mono text-weave-800">{agentsOnline ? fmtUsd(displayCash) : "—"}</span>
+        </span>
+        {!agentsOnline ? (
+          <span className="text-xs text-amber-700">Agents service offline — live numbers unavailable. Start it on port 8001.</span>
+        ) : displayCash === 0 ? (
+          <span className="text-xs text-weave-500">Agents live, but $0 buying power to trade.</span>
+        ) : null}
+      </div>
+
       <Disclosure title="Going live — checklist">
         <div className="space-y-2 text-sm text-weave-700 leading-relaxed">
           <p>
@@ -195,7 +214,7 @@ export default async function PaperPage() {
       <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <KPI
           label="Cash (buying power)"
-          value={fmtUsd(displayCash)}
+          value={agentsOnline ? fmtUsd(displayCash) : "—"}
           tone="treasure"
         />
         <KPI
