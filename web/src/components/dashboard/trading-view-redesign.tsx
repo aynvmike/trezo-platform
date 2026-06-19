@@ -158,7 +158,7 @@ function Kpi(props: { label: string; value: string; sub: string; pill?: string; 
   );
 }
 
-export function TradingViewRedesign({ data }: { data?: TradingData }) {
+export function TradingViewRedesign({ data, closeAction }: { data?: TradingData; closeAction?: (formData: FormData) => Promise<void> }) {
   const d = data ?? SAMPLE;
   const net = d.positions.reduce((a, p) => a + (p.pnl ?? 0), 0);
   const winning = d.positions.filter((p) => (p.pnl ?? 0) > 0).length;
@@ -263,7 +263,16 @@ export function TradingViewRedesign({ data }: { data?: TradingData }) {
                       </div>
                     )}
                   </td>
-                  <td className="px-5 py-3"><span className="rounded-md border border-[rgb(var(--border))] px-2 py-1 text-[11px] text-[rgb(var(--muted-foreground))]">{p.layer}</span></td>
+                  <td className="px-5 py-3 text-right">
+                    {d.live && closeAction ? (
+                      <form action={closeAction}>
+                        <input type="hidden" name="position_id" value={String(p.id)} />
+                        <button type="submit" className="rounded-md border border-[rgb(var(--border))] px-2.5 py-1 text-[11px] text-[rgb(var(--muted-foreground))] transition hover:border-red-500/50 hover:text-red-500">Close</button>
+                      </form>
+                    ) : (
+                      <span className="rounded-md border border-[rgb(var(--border))] px-2 py-1 text-[11px] text-[rgb(var(--muted-foreground))]">{p.layer}</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
