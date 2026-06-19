@@ -32,9 +32,6 @@ export const NAV: NavItem[] = [
   // Paper + Live merged into single "Trading" tab on 2026-05-30.
   // /dashboard/live still redirects here.
   { href: "/dashboard/paper",              label: "Trading",           section: "monitor" },
-  { href: "/dashboard/trading-preview",    label: "Trading · New",     section: "monitor" },
-  { href: "/dashboard/home",               label: "Overview (classic)", section: "monitor" },
-  { href: "/dashboard/agents-preview",     label: "Agents · New",       section: "monitor" },
   { href: "/dashboard/agents",             label: "Agents",            section: "monitor" },
 
   // WEALTH LAYERS — outer ring (most volatile) → inner ring (most protected)
