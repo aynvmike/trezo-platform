@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { addChild, saveChild, deleteChild } from "./_actions";
 import { getQuotes } from "@/lib/services/finnhub";
@@ -93,21 +94,12 @@ export default async function KindripPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-5xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Layer 7 — KINDRIP
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          KINDRIP — generational wealth
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Layer 7 — scheduled contributions to a child&apos;s Future Index Account, auto-invested on an age-based glide path.</p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          The innermost ring. KINDRIP routes a contribution you set — a fixed
-          amount or a percentage, weekly or monthly — into a child&apos;s
-          account, which auto-invests into a steady index mix. Every deposit
-          carries a plain explanation the child can grow up reading.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Layer 7 — KINDRIP"
+        title="KINDRIP — generational wealth"
+        subtitle="Scheduled contributions to a child's Future Index Account, auto-invested on an age-based glide path."
+        explainer="The innermost ring. KINDRIP routes a contribution you set — fixed or a percentage, weekly or monthly — into a child's account that auto-invests into a steady index mix. Every deposit carries a plain explanation the child can grow up reading."
+      />
 
       <Disclosure title="The Future Index Account">
         <div className="space-y-2">

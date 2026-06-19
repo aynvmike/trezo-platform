@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
@@ -76,36 +77,13 @@ export default async function ExtendedPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-            Layer 4 — Stock Weekly
-          </p>
-          <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-            Stock Weekly
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-            Trezo&apos;s multi-day stock layer. Held positions live as
-            short as three days or as long as four weeks. The exit is
-            based on the trade winning or breaking down, not on a fixed
-            timer.
-          </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-            While the intraday layers trade in and out of names the same
-            session, Stock Weekly holds across sessions to catch
-            continuation moves on mid-cap names. It looks for four
-            setups: a pullback to the rising 50-day average, a held
-            breakout, an unfilled earnings gap, and a steady stair-step
-            climb. Each setup has a stop and a target; the trade is
-            closed on whichever hits first. Typical hold is one to
-            three weeks but can run as long as four if the move is
-            still extending.
-          </p>
-        </div>
-        <Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">
-          Watchlist quotes →
-        </Link>
-      </header>
+      <PageHeader
+        eyebrow="Layer 4 — Stock Weekly"
+        title="Stock Weekly"
+        subtitle="Trezo's multi-day stock layer — positions held three days to four weeks, exited on the trade winning or breaking down, not a fixed timer."
+        explainer="Stock Weekly holds across sessions for continuation moves on mid-cap names. It looks for four setups — a pullback to the rising 50-day, a held breakout, an unfilled earnings gap, and a stair-step climb — each with a stop and target."
+        action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>}
+      />
 
       {/* Scanner status */}
       <section

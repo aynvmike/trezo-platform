@@ -80,6 +80,9 @@
   --accent: 198 154 79;
   --border: 227 234 230;
   --ring: 74 112 98;
+  --font-sans: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-serif: 'Playfair Display', Georgia, serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 
 .dark {
@@ -148,23 +151,23 @@
   --amber-900: 245 232 205;
 
   /* card / panel surface — lifted obsidian, a touch above the page */
-  --surface: 22 24 26;
+  --surface: 18 18 27;
 
-  --background: 12 13 14;
-  --foreground: 219 233 226;
-  --muted: 16 19 20;
-  --muted-foreground: 138 163 156;
-  --primary: 169 198 188;
-  --primary-foreground: 12 13 14;
-  --accent: 203 181 136;
-  --border: 31 36 38;
-  --ring: 169 198 188;
+  --background: 11 11 17;
+  --foreground: 230 227 242;
+  --muted: 29 29 44;
+  --muted-foreground: 110 107 136;
+  --primary: 196 150 74;
+  --primary-foreground: 11 11 17;
+  --accent: 196 150 74;
+  --border: 40 40 56;
+  --ring: 196 150 74;
 }
 
 html, body {
   background: rgb(var(--background));
   color: rgb(var(--foreground));
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: 'DM Sans', ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -201,3 +204,242 @@ html, body {
  */
 html[data-experience="pro"] .beginner-only { display: none !important; }
 html[data-experience="beginner"] .pro-only { display: none !important; }
+
+/* Dependency-free entrance animation (replaces framer-motion fade). */
+@keyframes trezo-fade-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Onboarding wizard animations (framer-motion-free) */
+@keyframes trezo-drift {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(28px, -18px); }
+}
+@keyframes trezo-travel {
+  0% { left: 20%; }
+  100% { left: 76%; }
+}
+@keyframes trezo-shimmer {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(240%); }
+}
+
+/* ---- 3D atom hero (Woven Basket) — CSS 3D, no JS ---- */
+.trezo-atom-scene {
+  width: 100%;
+  max-width: 460px;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+  perspective: 1000px;
+}
+.trezo-atom {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+  animation: trezo-atom-spin 30s linear infinite;
+}
+.trezo-orbit {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-style: preserve-3d;
+}
+.trezo-orbit-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border-style: solid;
+  border-width: 2px;
+}
+.trezo-orbit-spinner {
+  position: absolute;
+  inset: 0;
+  transform-style: preserve-3d;
+  animation-name: trezo-orbit-spin;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+.trezo-electron {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+}
+.trezo-nucleus {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 66px;
+  height: 66px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle at 38% 32%, #fffdf6 0%, #f3e2bd 42%, #d8b97a 100%);
+  box-shadow: 0 0 32px 8px rgba(196, 150, 74, 0.45), inset -6px -6px 14px rgba(120, 86, 32, 0.4);
+  animation: trezo-nucleus-pulse 3.6s ease-in-out infinite;
+}
+.trezo-atom-glow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 70%;
+  height: 70%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(196, 150, 74, 0.18) 0%, transparent 65%);
+  filter: blur(18px);
+}
+@keyframes trezo-atom-spin {
+  0%   { transform: rotateX(-14deg) rotateY(0deg)   rotateZ(0deg); }
+  25%  { transform: rotateX(8deg)   rotateY(90deg)  rotateZ(4deg); }
+  50%  { transform: rotateX(-14deg) rotateY(180deg) rotateZ(0deg); }
+  75%  { transform: rotateX(8deg)   rotateY(270deg) rotateZ(-4deg); }
+  100% { transform: rotateX(-14deg) rotateY(360deg) rotateZ(0deg); }
+}
+@keyframes trezo-orbit-spin {
+  from { transform: rotateZ(0deg); }
+  to   { transform: rotateZ(360deg); }
+}
+@keyframes trezo-nucleus-pulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50%      { transform: translate(-50%, -50%) scale(1.1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .trezo-atom, .trezo-orbit-spinner, .trezo-nucleus { animation: none; }
+}
+
+/* ===== Depth design system (Neo Obsidian) =====
+   Layered surfaces, soft elevation, gold glow, recessed wells, and an ambient
+   page backdrop so content floats in space instead of reading flat. */
+.depth-card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.025), transparent 42%),
+    rgb(var(--surface));
+  border: 1px solid rgb(var(--border));
+  border-radius: 0.9rem;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.05),
+    0 12px 30px -14px rgba(0,0,0,0.55);
+  transition: transform .22s cubic-bezier(.22,1,.36,1), box-shadow .22s ease, border-color .22s ease;
+}
+.depth-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(196,150,74,0.34);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    0 24px 50px -16px rgba(0,0,0,0.66),
+    0 0 0 1px rgba(196,150,74,0.10);
+}
+.depth-raised {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.06),
+    0 22px 54px -18px rgba(0,0,0,0.66);
+}
+.depth-glow {
+  box-shadow:
+    0 0 0 1px rgba(196,150,74,0.22),
+    0 16px 50px -12px rgba(196,150,74,0.28);
+}
+.depth-inset {
+  box-shadow:
+    inset 0 2px 8px rgba(0,0,0,0.42),
+    inset 0 -1px 0 rgba(255,255,255,0.03);
+}
+.depth-hairline {
+  position: relative;
+}
+.depth-hairline::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, rgba(196,150,74,0.55), transparent);
+  pointer-events: none;
+}
+/* Ambient page backdrop — a faint lit-from-above glow + cool counter-light. */
+.depth-page {
+  position: relative;
+  isolation: isolate;
+}
+.depth-page::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(1100px 520px at 50% -10%, rgba(196,150,74,0.07), transparent 60%),
+    radial-gradient(760px 560px at 108% 4%, rgba(56,189,248,0.05), transparent 55%),
+    radial-gradient(680px 520px at -8% 30%, rgba(16,185,129,0.04), transparent 55%);
+}
+.depth-tilt {
+  transform-style: preserve-3d;
+  transition: transform .18s ease;
+  will-change: transform;
+}
+@media (prefers-reduced-motion: reduce) {
+  .depth-card, .depth-tilt { transition: none; }
+  .depth-card:hover { transform: none; }
+}
+
+/* Broad depth for legacy card pages — any rounded card surface inside a
+   .depth-page (the dashboard <main>) gets soft elevation + hover lift, so
+   every page floats without per-card edits. Redesign views use .depth-card
+   (no bg-white) so they're untouched here. */
+.depth-page .rounded-xl.bg-white,
+.depth-page .rounded-2xl.bg-white,
+.depth-page .rounded-xl.bg-treasure-50,
+.depth-page .rounded-2xl.bg-treasure-50,
+.depth-page .rounded-xl.bg-treasure-100,
+.depth-page .rounded-2xl.bg-treasure-100 {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 12px 30px -16px rgba(0,0,0,0.5);
+  transition: transform .2s cubic-bezier(.22,1,.36,1), box-shadow .2s ease;
+}
+.depth-page .rounded-xl.bg-white:hover,
+.depth-page .rounded-2xl.bg-white:hover,
+.depth-page .rounded-xl.bg-treasure-50:hover,
+.depth-page .rounded-2xl.bg-treasure-50:hover,
+.depth-page .rounded-xl.bg-treasure-100:hover,
+.depth-page .rounded-2xl.bg-treasure-100:hover {
+  transform: translateY(-2px);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 20px 44px -18px rgba(0,0,0,0.6);
+}
+
+/* ===== Lite Mode — performance / low-overhead view =====
+   Toggled by data-lite="on" on <html> (see LiteToggle / use-lite.ts).
+   Mirrors the reduced-motion treatment: stops the 3D atom + depth
+   animations and the ambient page backdrop so the browser (and the shared
+   agents backend) aren't doing extra work. Live data still flows — just
+   slower (see useLiteRefresh). Agent automation is untouched. */
+html[data-lite="on"] .trezo-atom,
+html[data-lite="on"] .trezo-orbit-spinner,
+html[data-lite="on"] .trezo-nucleus {
+  animation: none !important;
+}
+html[data-lite="on"] .trezo-atom-glow {
+  display: none !important;
+}
+html[data-lite="on"] .depth-card,
+html[data-lite="on"] .depth-tilt {
+  transition: none !important;
+  transform: none !important;
+}
+html[data-lite="on"] .depth-card:hover {
+  transform: none !important;
+}
+html[data-lite="on"] .depth-page::before {
+  display: none !important;
+}
+html[data-lite="on"] .depth-page .rounded-xl.bg-white:hover,
+html[data-lite="on"] .depth-page .rounded-2xl.bg-white:hover,
+html[data-lite="on"] .depth-page .rounded-xl.bg-treasure-50:hover,
+html[data-lite="on"] .depth-page .rounded-2xl.bg-treasure-50:hover,
+html[data-lite="on"] .depth-page .rounded-xl.bg-treasure-100:hover,
+html[data-lite="on"] .depth-page .rounded-2xl.bg-treasure-100:hover {
+  transform: none !important;
+}

@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
@@ -129,28 +130,17 @@ export default async function TaxPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-            Tax Optimizer
-          </p>
-          <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-            Tax position
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Real-time tax-impact tracker — set-aside estimate, harvest opportunities, account-type explanations.</p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-            A running estimate of what this year&apos;s realized trading gains
-            could cost you, so there are no April surprises. Built from every
-            closed paper position.
-          </p>
-        </div>
-        <a
-          href="/api/tax/export"
-          className="text-sm rounded-md border border-weave-300 px-4 py-2 text-weave-700 hover:bg-weave-50"
-        >
-          Export Schedule D CSV
-        </a>
-      </header>
+      <PageHeader
+        eyebrow="Tax Optimizer"
+        title="Tax position"
+        subtitle="Real-time tax-impact tracker — set-aside estimate, harvest opportunities, account-type explanations."
+        explainer="A running estimate of what this year's realized trading gains could cost you, so there are no April surprises. Built from every closed paper position."
+        action={
+          <a href="/api/tax/export" className="text-sm rounded-md border border-weave-300 px-4 py-2 text-weave-700 hover:bg-weave-50">
+            Export Schedule D CSV
+          </a>
+        }
+      />
 
       {/* Disclaimer — prominent, per Trezo brand + Nova's standards */}
       <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 leading-relaxed">

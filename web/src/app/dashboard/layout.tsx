@@ -9,6 +9,7 @@ import { HelpNudge } from "@/components/dashboard/help-nudge";
 import { ThemeToggle } from "@/components/dashboard/theme-toggle";
 import { LiveBanner } from "@/components/dashboard/live-banner";
 import { ExperienceToggle } from "@/components/dashboard/experience-toggle";
+import { LiteToggle } from "@/components/dashboard/lite-toggle";
 import { HelpChat } from "@/components/dashboard/help-chat";
 import { RegimeAlertBanner } from "@/components/dashboard/regime-alert-banner";
 
@@ -47,6 +48,7 @@ export default async function DashboardLayout({
           </div>
           <div className="flex items-center gap-3">
             <ExperienceToggle />
+            <LiteToggle />
             <ThemeToggle />
             <span className="hidden sm:inline text-sm text-weave-500">
               Hi, {profile?.display_name ?? "friend"}
@@ -66,7 +68,7 @@ export default async function DashboardLayout({
         <aside className="hidden md:block w-64 shrink-0 border-r border-weave-100 min-h-[calc(100vh-4rem)] bg-treasure-50/40">
           <Sidebar />
         </aside>
-        <main className="flex-1 min-w-0">{children}</main>
+        <main className="flex-1 min-w-0 depth-page">{children}</main>
       </div>
 
       <HelpNudge />

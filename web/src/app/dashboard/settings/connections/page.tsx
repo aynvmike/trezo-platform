@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import {
@@ -37,21 +38,12 @@ export default async function ConnectionsPage({
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-3xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Settings — Connections
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Connect a broker
-        </h1>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          One-click sign-in across {BROKER_PROVIDERS.length} providers in
-          three categories. Trezo never asks for your broker password or
-          API key — you sign in on the broker&apos;s own page and they
-          hand Trezo a token, encrypted at rest. The same pattern works
-          for every provider we add next.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Settings — Connections"
+        title="Connect a broker"
+        subtitle="One-click sign-in across your providers, in three categories."
+        explainer="Trezo never asks for your broker password or API key — you sign in on the broker's own page and they hand Trezo a token, encrypted at rest. The same pattern works for every provider we add next."
+      />
 
       {/* OAuth token health — shows refresh activity + per-broker
           health badges. Renders only when there are connections to

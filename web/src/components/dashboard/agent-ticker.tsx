@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
+import { useLiteRefresh } from "@/lib/use-lite";
 import {
   type FeedMessage,
   describeAgentMessage,
@@ -16,6 +17,8 @@ import {
  */
 export function AgentTicker() {
   const [items, setItems] = useState<FeedMessage[]>([]);
+
+  const refreshMs = useLiteRefresh(5) * 1000;
 
   useEffect(() => {
     let cancelled = false;
@@ -33,12 +36,12 @@ export function AgentTicker() {
     }
 
     void load();
-    const id = setInterval(load, 5000);
+    const id = setInterval(load, refreshMs);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [refreshMs]);
 
   if (items.length === 0) return null;
 

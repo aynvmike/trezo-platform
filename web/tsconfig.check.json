@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "next-env.d.ts",
+    "src/components/dashboard/fade-in.tsx",
+    "src/components/dashboard/ambient-background.tsx",
+    "src/components/dashboard/woven-basket-hero.tsx",
+    "src/components/dashboard/animated-number.tsx",
+    "src/components/dashboard/mini-area-chart.tsx",
+    "src/components/dashboard/trading-view-redesign.tsx",
+    "src/components/dashboard/overview-view-redesign.tsx",
+    "src/components/dashboard/agents-view-redesign.tsx",
+    "src/components/dashboard/sleeve-panel.tsx",
+    "src/lib/sleeve-snapshot.ts",
+    "src/app/dashboard/sleeves/page.tsx",
+    "src/app/dashboard/trading-preview/page.tsx",
+    "src/app/dashboard/overview-preview/page.tsx",
+    "src/app/dashboard/agents-preview/page.tsx"
+  ]
+}

@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import Link from "next/link";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { listWatchlists, getOrSeedDefaultWatchlist, seedExampleWatchlists, listWatchlistsWithTickers } from "@/lib/watchlists";
 import {
@@ -52,36 +52,13 @@ export default async function WatchlistsIndex() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-            Layer 2 — Watchlists
-          </p>
-          <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-            Your watchlists
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">What the bot scans. Group tickers by theme; pick from the income-ETF library to fund the Dividends layer.</p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-            Group tickers however suits the way you trade. The Income ETF
-            picker below pours straight into the{" "}
-            <Link
-              href="/dashboard/yieldmax"
-              className="underline hover:text-weave-800"
-            >
-              Dividends layer
-            </Link>
-            . Ethical filters apply on every add - settings live under{" "}
-            <Link
-              href="/dashboard/settings/filters"
-              className="underline hover:text-weave-800"
-            >
-              Filters
-            </Link>
-            .
-          </p>
-        </div>
-        <NewWatchlistButton />
-      </header>
+      <PageHeader
+        eyebrow="Layer 2 — Watchlists"
+        title="Your watchlists"
+        subtitle="What the bot scans. Group tickers by theme; pick from the income-ETF library to fund the Dividends layer."
+        explainer="The Income ETF picker pours straight into the Dividends layer. Ethical filters apply on every add — settings live under Filters."
+        action={<NewWatchlistButton />}
+      />
 
       <GlobalTickerAdd chips={chips} />
 

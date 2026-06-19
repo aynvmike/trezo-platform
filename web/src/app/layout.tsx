@@ -20,6 +20,20 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
+        {/* Neo-Obsidian typography — DM Sans (UI), Playfair Display
+            (serif headers), JetBrains Mono (numbers). Loaded via a head
+            <link> rather than a CSS @import so it never participates in
+            Tailwind/PostCSS ordering (the @import broke a clean build). */}
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600&display=swap"
+          rel="stylesheet"
+        />
         {/* Applies the saved theme and experience level before paint —
             no flash of the wrong mode. */}
         <script
@@ -31,6 +45,8 @@ export default function RootLayout({
               + "if(d){document.documentElement.classList.add('dark');}"
               + "var x=localStorage.getItem('trezo_experience');"
               + "document.documentElement.setAttribute('data-experience',x==='pro'?'pro':'beginner');"
+              + "var l=localStorage.getItem('trezo_lite');"
+              + "document.documentElement.setAttribute('data-lite',l==='on'?'on':'off');"
               + "}catch(e){}})();"
           }}
         />

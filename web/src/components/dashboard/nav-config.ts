@@ -32,6 +32,9 @@ export const NAV: NavItem[] = [
   // Paper + Live merged into single "Trading" tab on 2026-05-30.
   // /dashboard/live still redirects here.
   { href: "/dashboard/paper",              label: "Trading",           section: "monitor" },
+  { href: "/dashboard/trading-preview",    label: "Trading · New",     section: "monitor" },
+  { href: "/dashboard/home",               label: "Overview (classic)", section: "monitor" },
+  { href: "/dashboard/agents-preview",     label: "Agents · New",       section: "monitor" },
   { href: "/dashboard/agents",             label: "Agents",            section: "monitor" },
 
   // WEALTH LAYERS — outer ring (most volatile) → inner ring (most protected)
@@ -49,6 +52,7 @@ export const NAV: NavItem[] = [
   // Budget Mirror + Future Projections merged into "Grasping Wallet"
   // on 2026-05-30. /dashboard/projections still redirects here.
   { href: "/dashboard/budget",             label: "Grasping Wallet",   section: "plan" },
+  { href: "/dashboard/sleeves",            label: "Capital Sleeves",   section: "plan" },
   { href: "/dashboard/tax",                label: "Tax Optimizer",     section: "plan" },
 
   // CONFIGURE — knobs + reference
@@ -58,5 +62,6 @@ export const NAV: NavItem[] = [
   { href: "/dashboard/settings/connections", label: "Connections",     section: "configure" },
   { href: "/dashboard/settings/live",      label: "Live Trading",      section: "configure" },
   { href: "/dashboard/settings/profile",   label: "Profile",           section: "configure" },
+  { href: "/onboarding/tour",              label: "Setup Wizard",      section: "configure" },
   { href: "/dashboard/help",               label: "Help & FAQ",        section: "configure" },
 ];

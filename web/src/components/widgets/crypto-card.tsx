@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
+import { useLiteRefresh } from "@/lib/use-lite";
 
 type CryptoPrice = {
   symbol: string;
@@ -27,6 +28,8 @@ export function CryptoCards({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const effMs = useLiteRefresh(refreshSec) * 1000;
+
   useEffect(() => {
     let cancelled = false;
 
@@ -48,12 +51,12 @@ export function CryptoCards({
     }
 
     load();
-    const id = setInterval(load, refreshSec * 1000);
+    const id = setInterval(load, effMs);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
-  }, [symbols, refreshSec]);
+  }, [symbols, effMs]);
 
   if (loading && data.length === 0) {
     return (

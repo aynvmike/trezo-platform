@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
+import { useLiteRefresh } from "@/lib/use-lite";
 import {
   type FeedMessage,
   describeAgentMessage,
@@ -33,6 +34,8 @@ export function ActivityFeed({
   const [items, setItems] = useState<FeedMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  const effMs = useLiteRefresh(refreshSec) * 1000;
+
   useEffect(() => {
     let cancelled = false;
 
@@ -51,12 +54,12 @@ export function ActivityFeed({
     }
 
     void load();
-    const id = setInterval(load, refreshSec * 1000);
+    const id = setInterval(load, effMs);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
-  }, [limit, refreshSec]);
+  }, [limit, effMs]);
 
   if (items.length === 0 && !error) {
     return (

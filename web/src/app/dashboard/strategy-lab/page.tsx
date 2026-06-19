@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import {
   getOrSeedDefaultWatchlist,
@@ -38,22 +39,11 @@ export default async function StrategyLabPage({
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-6 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Strategy Lab
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Score, replay, stress-test
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-          Three lenses on the same engine. <span className="font-medium">Live
-          Patterns</span> shows what the bot sees right now;{" "}
-          <span className="font-medium">Backtest</span> replays history for
-          one strategy on a ticker or watchlist;{" "}
-          <span className="font-medium">Simulation</span> stress-tests every
-          strategy across a recent window at once.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Strategy Lab"
+        title="Score, replay, stress-test"
+        subtitle="Three lenses on the same engine — Live Patterns shows what the bot sees now; Backtest replays history for one strategy; Simulation stress-tests every strategy across a recent window at once."
+      />
 
       <StrategyLabTabs />
 

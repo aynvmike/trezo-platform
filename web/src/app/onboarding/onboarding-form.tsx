@@ -37,13 +37,13 @@ export function OnboardingForm() {
             <div
               className={cn(
                 "h-1.5 rounded-full",
-                i <= step ? "bg-weave-600" : "bg-weave-100"
+                i <= step ? "bg-[rgb(var(--primary))]" : "bg-[rgb(var(--muted))]"
               )}
             />
             <p
               className={cn(
                 "mt-2 text-xs font-medium",
-                i === step ? "text-weave-700" : "text-weave-400"
+                i === step ? "text-[rgb(var(--foreground))]" : "text-[rgb(var(--muted-foreground))]"
               )}
             >
               {i + 1}. {label}
@@ -64,7 +64,7 @@ export function OnboardingForm() {
 
         {/* Step 2: capital */}
         <section className={cn(step === 1 ? "block" : "hidden", "space-y-4")}>
-          <p className="text-sm text-weave-600">
+          <p className="text-sm text-[rgb(var(--muted-foreground))]">
             Trezo never holds your money. These numbers help us right-size every trade.
           </p>
           <div className="space-y-2">
@@ -89,7 +89,7 @@ export function OnboardingForm() {
               id="risk_tolerance"
               name="risk_tolerance"
               defaultValue="balanced"
-              className="flex h-10 w-full rounded-md border border-weave-200 bg-white px-3 py-2 text-sm text-weave-800 focus:outline-none focus:ring-2 focus:ring-weave-500"
+              className="flex h-10 w-full rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 py-2 text-sm text-[rgb(var(--foreground))] focus:outline-none focus:ring-2 focus:ring-[rgb(var(--ring))]"
             >
               <option value="conservative">Conservative — patience first</option>
               <option value="balanced">Balanced — measured risk</option>
@@ -106,7 +106,7 @@ export function OnboardingForm() {
               step="0.01"
               defaultValue="0"
             />
-            <p className="text-xs text-weave-500">
+            <p className="text-xs text-[rgb(var(--muted-foreground))]">
               The Daily Profit Lock saves at least this much before extending the day.
             </p>
           </div>
@@ -120,7 +120,7 @@ export function OnboardingForm() {
               id="tax_filing_status"
               name="tax_filing_status"
               defaultValue="single"
-              className="flex h-10 w-full rounded-md border border-weave-200 bg-white px-3 py-2 text-sm text-weave-800 focus:outline-none focus:ring-2 focus:ring-weave-500"
+              className="flex h-10 w-full rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 py-2 text-sm text-[rgb(var(--foreground))] focus:outline-none focus:ring-2 focus:ring-[rgb(var(--ring))]"
             >
               <option value="single">Single</option>
               <option value="married_joint">Married, filing jointly</option>
@@ -130,12 +130,12 @@ export function OnboardingForm() {
           </div>
 
           {/* Tax-strategy fields — all optional, power the Tax Optimizer's advice */}
-          <div className="rounded-xl border border-weave-100 bg-weave-50/60 p-4 space-y-4">
+          <div className="rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--muted))] p-4 space-y-4">
             <div>
-              <p className="text-sm font-medium text-weave-800">
+              <p className="text-sm font-medium text-[rgb(var(--foreground))]">
                 Finding your tax savings (optional)
               </p>
-              <p className="mt-1 text-xs text-weave-500 leading-relaxed">
+              <p className="mt-1 text-xs text-[rgb(var(--muted-foreground))] leading-relaxed">
                 If you have a job with a retirement plan, these let the Tax
                 Optimizer show whether you are capturing your full employer
                 match — usually the highest-return move available. Leave any
@@ -183,7 +183,7 @@ export function OnboardingForm() {
                   defaultValue=""
                   placeholder="e.g. 50"
                 />
-                <p className="text-xs text-weave-500">
+                <p className="text-xs text-[rgb(var(--muted-foreground))]">
                   How much your employer adds per dollar — 50 means 50&cent; on the dollar.
                 </p>
               </div>
@@ -199,14 +199,14 @@ export function OnboardingForm() {
                   defaultValue=""
                   placeholder="e.g. 6"
                 />
-                <p className="text-xs text-weave-500">
+                <p className="text-xs text-[rgb(var(--muted-foreground))]">
                   The match usually stops once you contribute this much.
                 </p>
               </div>
             </div>
           </div>
 
-          <p className="text-xs text-weave-500">
+          <p className="text-xs text-[rgb(var(--muted-foreground))]">
             Trezo is not your tax advisor — this keeps the Tax Optimizer in
             the right bracket and shows you the math, not personalized advice.
           </p>

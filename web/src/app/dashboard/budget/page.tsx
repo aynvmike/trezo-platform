@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { BudgetMirror } from "./_budget-mirror";
 import { DataGuide } from "./_data-guide";
@@ -31,26 +32,12 @@ export default async function GraspingWalletPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-12 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Grasping Wallet
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Hold tight, then let it grow
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-          See where money goes today, then see where the freed-up dollars
-          land in twenty years.
-        </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          Wealth gets built in two motions: pinch the leaks, then let the
-          rest compound. The first half of this page maps your spending
-          — private, in-browser, never uploaded. The second half
-          projects what the freed-up dollars become in each account type
-          Trezo can hold them in. Move money from the leak side to the
-          growth side and the projection lifts in real time.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Grasping Wallet"
+        title="Hold tight, then let it grow"
+        subtitle="See where money goes today, then see where the freed-up dollars land in twenty years."
+        explainer="Wealth gets built in two motions: pinch the leaks, then let the rest compound. The first half maps your spending — private, in-browser, never uploaded. The second half projects what the freed-up dollars become in each account type, in real time."
+      />
 
       <section className="space-y-6">
         <div className="border-l-2 border-treasure-500 pl-4">

@@ -14,7 +14,7 @@ export function SiteNav() {
             <Button variant="ghost" size="sm">Sign in</Button>
           </Link>
           <Link href="/sign-up">
-            <Button size="sm">Get started</Button>
+            <Button size="sm" className="bg-[#c4964a] text-[#1c130a] hover:bg-[#b3863f]">Get started</Button>
           </Link>
         </nav>
       </div>

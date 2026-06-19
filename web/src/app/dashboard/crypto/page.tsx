@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { CryptoCards } from "@/components/widgets/crypto-card";
 import { cn } from "@/lib/utils";
@@ -48,21 +49,12 @@ export default async function CryptoPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Layer 1 — Crypto Bot
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Crypto Bot
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Layer 1 — 24/7 crypto scanner. Detects SCALP / SWING / DCA / HODL modes from RSI, Bollinger width, and volume.</p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          24/7 scanning of ETH, SOL, and the ISO 20022 cluster (XRP, XLM, HBAR, ALGO, QNT, XDC, IOTA, XYO). The bot picks one of four modes
-          per coin — SCALP (quick moves), SWING (trend rides), DCA (oversold
-          accumulation), or HODL (deep-value buy-and-hold) — and trades it on the paper account. Live spot prices
-          below; bot activity underneath.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Layer 1 — Crypto Bot"
+        title="Crypto Bot"
+        subtitle="24/7 crypto scanner — detects SCALP / SWING / DCA / HODL modes from RSI, Bollinger width, and volume."
+        explainer="24/7 scanning of ETH, SOL, and the ISO 20022 cluster (XRP, XLM, HBAR, ALGO, QNT, XDC, IOTA, XYO). The bot picks one of four modes per coin — SCALP, SWING, DCA, or HODL — and trades it on the paper account."
+      />
 
       <section>
         <h2 className="font-serif text-xl text-weave-800 mb-3">Live prices</h2>

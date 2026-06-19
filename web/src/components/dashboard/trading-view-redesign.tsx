@@ -1,0 +1,322 @@
+import { RefreshCw, Info } from "lucide-react";
+
+/**
+ * Trading view — Neo Obsidian layout. Renders LIVE data when a `data`
+ * prop is supplied (see dashboard/trading-preview/page.tsx) and falls
+ * back to a clearly-labelled sample when it is not.
+ */
+
+export type TVPosition = {
+  id: string | number;
+  ticker: string;
+  side: string;
+  layer: string;
+  chip: number;
+  entry: number;
+  current: number | null;
+  qty: number;
+  pnl: number | null;
+  pct: number | null;
+};
+
+export type TVFeed = {
+  id: string | number;
+  time: string;
+  agent: string;
+  action: string;
+  reason: string;
+  layer: number;
+  type: string;
+};
+
+export type TVMarket = { label: string; value: string; delta: string; up: boolean };
+
+export type TradingData = {
+  portfolioValue: number;
+  todayPnl: number;
+  todayPct: number | null;
+  deployed: number;
+  deployedPct: number | null;
+  openCount: number;
+  pnlSeries: number[];
+  positions: TVPosition[];
+  feed: TVFeed[];
+  market: TVMarket[];
+  paperMode: boolean;
+  autoTrade: boolean;
+  riskLimit: number;
+  asOf: string;
+  live: boolean;
+};
+
+const SAMPLE: TradingData = {
+  portfolioValue: 142380,
+  todayPnl: 2147,
+  todayPct: 1.53,
+  deployed: 8420,
+  deployedPct: 5.9,
+  openCount: 6,
+  pnlSeries: [0, 420, 310, 780, 650, 920, 1100, 870, 1350, 1580, 1420, 1760, 1890, 2147],
+  positions: [
+    { id: 1, ticker: "NVDA", side: "LONG", layer: "Stock", chip: 2, entry: 874.2, current: 891.45, qty: 10, pnl: 172.5, pct: 1.97 },
+    { id: 2, ticker: "BTC-PERP", side: "LONG", layer: "Crypto", chip: 1, entry: 67240, current: 68910, qty: 0.25, pnl: 417.5, pct: 2.49 },
+    { id: 3, ticker: "SPY 560C 06/21", side: "LONG", layer: "Options", chip: 3, entry: 3.8, current: 5.1, qty: 5, pnl: 650, pct: 34.21 },
+    { id: 4, ticker: "AAPL", side: "SHORT", layer: "Stock", chip: 2, entry: 192.4, current: 189.15, qty: 15, pnl: 48.75, pct: 1.69 },
+    { id: 5, ticker: "ETH-PERP", side: "LONG", layer: "Crypto", chip: 1, entry: 3185, current: 3090, qty: 1.5, pnl: -142.5, pct: -2.98 },
+    { id: 6, ticker: "MSFT 420P 06/28", side: "LONG", layer: "Options", chip: 3, entry: 2.15, current: 1.8, qty: 3, pnl: -105, pct: -16.28 },
+  ],
+  feed: [
+    { id: 1, time: "15:47", agent: "Crypto Bot", action: "Opened BTC-PERP long", reason: "RSI reset at 4H support, MACD bullish cross", layer: 1, type: "open" },
+    { id: 2, time: "14:32", agent: "Stock Bot", action: "Partial exit NVDA x5", reason: "Price reached first target, locking 50% gain", layer: 2, type: "exit" },
+    { id: 3, time: "13:15", agent: "Options Bot", action: "Opened SPY 560C x5", reason: "IV rank low, momentum aligning with the weekly trend", layer: 3, type: "open" },
+    { id: 4, time: "12:58", agent: "Wheel Bot", action: "Closed TSLA CSP, expired worthless", reason: "Option expired OTM, premium captured in full", layer: 5, type: "exit" },
+    { id: 5, time: "11:20", agent: "Stock Bot", action: "Opened AAPL short x15", reason: "Overbought on the daily, rejection at resistance", layer: 2, type: "open" },
+    { id: 6, time: "10:04", agent: "Crypto Bot", action: "Risk alert on ETH volatility spike", reason: "Trailing stop tightened automatically to -4%", layer: 1, type: "alert" },
+  ],
+  market: [
+    { label: "SPY", value: "557.82", delta: "+0.84%", up: true },
+    { label: "QQQ", value: "478.14", delta: "+1.12%", up: true },
+    { label: "VIX", value: "13.4", delta: "-1.8", up: false },
+    { label: "BTC", value: "$68,910", delta: "+2.49%", up: true },
+    { label: "10Y", value: "4.28%", delta: "+0.03%", up: true },
+    { label: "DXY", value: "104.2", delta: "-0.21%", up: false },
+  ],
+  paperMode: true,
+  autoTrade: false,
+  riskLimit: 500,
+  asOf: "Thu Jun 18, 2026 · US Market Open",
+  live: false,
+};
+
+const LAYER_CHIP: Record<number, string> = {
+  1: "text-treasure-400 bg-treasure-400/10",
+  2: "text-sky-500 bg-sky-500/10",
+  3: "text-amber-500 bg-amber-500/10",
+  4: "text-violet-500 bg-violet-500/10",
+  5: "text-emerald-500 bg-emerald-500/10",
+  7: "text-treasure-500 bg-treasure-500/10",
+};
+const DOT: Record<string, string> = { open: "bg-emerald-500", exit: "bg-sky-500", alert: "bg-amber-500" };
+
+function money(n: number) {
+  return (n < 0 ? "-" : "") + "$" + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function money0(n: number) {
+  return (n < 0 ? "-" : "") + "$" + Math.abs(Math.round(n)).toLocaleString();
+}
+function signed0(n: number) {
+  return (n >= 0 ? "+" : "-") + "$" + Math.abs(Math.round(n)).toLocaleString();
+}
+function price(n: number) {
+  return n > 1000 ? "$" + n.toLocaleString() : "$" + n.toFixed(2);
+}
+
+function Sparkline({ data }: { data: number[] }) {
+  const w = 600;
+  const h = 140;
+  const pad = 8;
+  const safe = data.length >= 2 ? data : [0, 0];
+  const min = Math.min(...safe);
+  const max = Math.max(...safe);
+  const span = max - min || 1;
+  const pts = safe.map((v, i) => {
+    const x = (i / (safe.length - 1)) * w;
+    const y = h - pad - ((v - min) / span) * (h - pad * 2);
+    return x.toFixed(1) + " " + y.toFixed(1);
+  });
+  const line = "M " + pts.join(" L ");
+  const area = line + " L " + w + " " + h + " L 0 " + h + " Z";
+  return (
+    <svg viewBox={"0 0 " + w + " " + h} className="w-full" style={{ height: 140 }} preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="pnlg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="rgb(var(--emerald-500))" stopOpacity={0.22} />
+          <stop offset="100%" stopColor="rgb(var(--emerald-500))" stopOpacity={0.02} />
+        </linearGradient>
+      </defs>
+      <path d={area} fill="url(#pnlg)" />
+      <path d={line} fill="none" stroke="rgb(var(--emerald-500))" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function Kpi(props: { label: string; value: string; sub: string; pill?: string; pillClass?: string; delta?: string; up?: boolean }) {
+  return (
+    <div className="depth-card p-4">
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] text-[rgb(var(--muted-foreground))]">{props.label}</span>
+        {props.pill ? (
+          <span className={"rounded-full px-1.5 py-0.5 font-mono text-[10px] " + (props.pillClass || "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>{props.pill}</span>
+        ) : null}
+      </div>
+      <div className="mt-2 flex items-baseline gap-2">
+        <span className="font-mono text-[22px] text-[rgb(var(--foreground))]" style={{ fontWeight: 600 }}>{props.value}</span>
+        {props.delta ? <span className={"font-mono text-[12px] " + (props.up ? "text-emerald-500" : "text-red-500")}>{props.up ? "▲" : "▼"} {props.delta}</span> : null}
+      </div>
+      <p className="mt-1 text-[11px] text-[rgb(var(--muted-foreground))]">{props.sub}</p>
+    </div>
+  );
+}
+
+export function TradingViewRedesign({ data }: { data?: TradingData }) {
+  const d = data ?? SAMPLE;
+  const net = d.positions.reduce((a, p) => a + (p.pnl ?? 0), 0);
+  const winning = d.positions.filter((p) => (p.pnl ?? 0) > 0).length;
+  const losing = d.positions.filter((p) => (p.pnl ?? 0) < 0).length;
+  const showMarket = d.market.length > 0;
+  const sessionFacts: TVMarket[] = [
+    { label: "Open positions", value: String(d.openCount), delta: "", up: true },
+    { label: "Net unrealized", value: signed0(net), delta: "", up: net >= 0 },
+    { label: "Deployed", value: money0(d.deployed), delta: d.deployedPct != null ? d.deployedPct.toFixed(1) + "%" : "", up: true },
+    { label: "Mode", value: d.paperMode ? "Paper" : "Live", delta: "", up: true },
+  ];
+  return (
+    <div className="space-y-8 depth-page">
+      {d.live ? null : (
+        <div className="rounded-lg border border-dashed border-amber-500/40 bg-amber-500/5 px-4 py-2 text-[12px] text-[rgb(var(--muted-foreground))]">
+          Design preview &mdash; the Neo Obsidian Trading layout with sample data. Sign in and open this page with the agents service running to see it live.
+        </div>
+      )}
+
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="font-serif text-[28px] text-[rgb(var(--foreground))]">Trading</h1>
+          <p className="mt-1 text-[13px] text-[rgb(var(--muted-foreground))]">{d.live ? "Live session" : "Sample session"} &middot; {d.asOf}</p>
+        </div>
+        <span className="flex items-center gap-1.5 rounded-lg border border-[rgb(var(--border))] px-3 py-1.5 text-[12px] text-[rgb(var(--muted-foreground))]">
+          <RefreshCw size={12} /> {d.live ? "Auto-refreshes on reload" : "Preview"}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <Kpi label="Portfolio Value" value={money0(d.portfolioValue)} sub="Cash + vault, across all 7 layers" pill={d.paperMode ? "Paper" : "Live"} pillClass="text-emerald-500 bg-emerald-500/10" />
+        <Kpi label="Today's P&L" value={signed0(d.todayPnl)} delta={d.todayPct != null ? d.todayPct.toFixed(2) + "%" : undefined} up={d.todayPnl >= 0} sub={d.live ? "Realized — trades closed today" : "Since market open at 9:30 AM"} />
+        <Kpi label="Open Risk" value={money0(d.deployed)} sub="Capital deployed in open positions" pill={d.deployedPct != null ? d.deployedPct.toFixed(1) + "% deployed" : undefined} pillClass="text-sky-500 bg-sky-500/10" />
+        <Kpi label="Open Positions" value={String(d.openCount)} sub={winning + " winning · " + losing + " losing"} pill={d.openCount > 0 ? "live" : "flat"} />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <div className="depth-card p-4 md:col-span-2">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h3 className="text-[13px] font-medium text-[rgb(var(--foreground))]">{"Intraday P&L"}</h3>
+              <p className="text-[11px] text-[rgb(var(--muted-foreground))]">{d.live ? "Cumulative realized P&L today" : "Cumulative gain/loss since market open"}</p>
+            </div>
+            <span className={"font-mono text-[13px] " + (d.todayPnl >= 0 ? "text-emerald-500" : "text-red-500")}>{signed0(d.todayPnl)}</span>
+          </div>
+          <Sparkline data={d.pnlSeries} />
+        </div>
+        <div className="depth-card p-4">
+          <h3 className="mb-3 text-[13px] font-medium text-[rgb(var(--foreground))]">{showMarket ? "Market Context" : "This Session"}</h3>
+          <div className="space-y-2.5">
+            {(showMarket ? d.market : sessionFacts).map((m) => (
+              <div key={m.label} className="flex items-center justify-between">
+                <span className="font-mono text-[12px] text-[rgb(var(--muted-foreground))]">{m.label}</span>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-[12px] text-[rgb(var(--foreground))]">{m.value}</span>
+                  {m.delta ? <span className={"font-mono text-[11px] " + (m.up ? "text-emerald-500" : "text-red-500")}>{m.delta}</span> : null}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 border-t border-[rgb(var(--border))] pt-3">
+            <p className="text-[11px] text-[rgb(var(--muted-foreground))]">{showMarket ? "Low VIX means a calm market — your options strategies tend to do better here." : "These are your live account figures, refreshed each time you open the page."}</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="overflow-hidden depth-card">
+        <div className="flex items-center justify-between border-b border-[rgb(var(--border))] px-5 py-4">
+          <div>
+            <h3 className="text-[13px] font-medium text-[rgb(var(--foreground))]">Open Positions</h3>
+            <p className="mt-0.5 text-[11px] text-[rgb(var(--muted-foreground))]">{d.positions.length} open &mdash; {winning} winning, {losing} losing</p>
+          </div>
+          <span className={"font-mono text-[12px] font-medium " + (net >= 0 ? "text-emerald-500" : "text-red-500")}>Net {net >= 0 ? "+" : ""}{money(net)}</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-[12px]">
+            <thead>
+              <tr className="border-b border-[rgb(var(--border))]">
+                {["Ticker", "Layer", "Side", "Entry", "Current", "Qty", "P&L", ""].map((c, i) => (
+                  <th key={i} className="px-5 py-3 text-left font-mono font-medium tracking-wide text-[rgb(var(--muted-foreground))]">{c}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {d.positions.length === 0 ? (
+                <tr><td colSpan={8} className="px-5 py-8 text-center text-[rgb(var(--muted-foreground))]">No open positions. When an approved signal fires, it lands here.</td></tr>
+              ) : d.positions.map((p) => (
+                <tr key={p.id} className="border-b border-[rgb(var(--border))] last:border-0 hover:bg-[rgb(var(--muted))]">
+                  <td className="px-5 py-3 font-mono font-medium text-[rgb(var(--foreground))]">{p.ticker}</td>
+                  <td className="px-5 py-3"><span className={"rounded-md px-2 py-0.5 font-mono text-[11px] " + (LAYER_CHIP[p.chip] || "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>{p.chip} &middot; {p.layer}</span></td>
+                  <td className="px-5 py-3"><span className={"rounded px-1.5 py-0.5 font-mono text-[11px] " + (p.side === "LONG" ? "text-emerald-500 bg-emerald-500/10" : "text-red-500 bg-red-500/10")}>{p.side}</span></td>
+                  <td className="px-5 py-3 font-mono text-[rgb(var(--muted-foreground))]">{price(p.entry)}</td>
+                  <td className="px-5 py-3 font-mono text-[rgb(var(--foreground))]">{p.current == null ? "—" : price(p.current)}</td>
+                  <td className="px-5 py-3 font-mono text-[rgb(var(--muted-foreground))]">{p.qty}</td>
+                  <td className="px-5 py-3">
+                    {p.pnl == null ? (
+                      <span className="font-mono text-[rgb(var(--muted-foreground))]">—</span>
+                    ) : (
+                      <div className="flex flex-col">
+                        <span className={"font-mono font-medium " + (p.pnl >= 0 ? "text-emerald-500" : "text-red-500")}>{p.pnl >= 0 ? "+" : ""}{money(p.pnl)}</span>
+                        {p.pct != null ? <span className={"font-mono text-[10px] opacity-75 " + (p.pct >= 0 ? "text-emerald-500" : "text-red-500")}>{p.pct >= 0 ? "+" : ""}{p.pct.toFixed(2)}%</span> : null}
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-5 py-3"><span className="rounded-md border border-[rgb(var(--border))] px-2 py-1 text-[11px] text-[rgb(var(--muted-foreground))]">{p.layer}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="overflow-hidden depth-card">
+        <div className="border-b border-[rgb(var(--border))] px-5 py-4">
+          <h3 className="text-[13px] font-medium text-[rgb(var(--foreground))]">Agent Activity</h3>
+          <p className="mt-0.5 text-[11px] text-[rgb(var(--muted-foreground))]">What your bots have been doing today, in plain English</p>
+        </div>
+        <div>
+          {d.feed.length === 0 ? (
+            <div className="px-5 py-8 text-center text-[12px] text-[rgb(var(--muted-foreground))]">No agent activity yet. When the agents service runs, its plain-English updates appear here.</div>
+          ) : d.feed.map((r) => (
+            <div key={r.id} className="flex items-start gap-4 border-b border-[rgb(var(--border))] px-5 py-3.5 last:border-0 hover:bg-[rgb(var(--muted))]">
+              <span className="mt-0.5 min-w-[36px] shrink-0 font-mono text-[11px] text-[rgb(var(--muted-foreground))]">{r.time}</span>
+              <div className={"mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full " + (DOT[r.type] || "bg-[rgb(var(--muted-foreground))]")} />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[12px] font-medium text-[rgb(var(--foreground))]">{r.action}</span>
+                  <span className={"rounded px-1.5 py-0.5 font-mono text-[10px] " + (LAYER_CHIP[r.layer] || "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>{r.layer ? r.layer + " · " : ""}{r.agent}</span>
+                </div>
+                {r.reason ? <p className="mt-0.5 text-[12px] text-[rgb(var(--muted-foreground))]">{r.reason}</p> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="depth-card p-5">
+        <div className="mb-4 flex items-center gap-2">
+          <h3 className="text-[13px] font-medium text-[rgb(var(--foreground))]">Session Settings</h3>
+          <span className="rounded-full border border-dashed border-amber-500/40 px-2 py-0.5 font-mono text-[11px] text-amber-500">{d.paperMode ? "Paper Mode" : "Live Mode"}</span>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          {[
+            { label: "Trading Mode", value: d.paperMode ? "Paper" : "Live", note: d.paperMode ? "No real orders. Safe to test." : "Live brokerage routing." },
+            { label: "Auto-Trade", value: d.autoTrade ? "ON" : "OFF", note: d.autoTrade ? "Bots execute approved signals." : "Bots signal but do not execute." },
+            { label: "Risk Limit / Day", value: money0(d.riskLimit), note: "Max realized loss before bots pause." },
+          ].map((it) => (
+            <div key={it.label} className="rounded-lg border border-[rgb(var(--border))] bg-[rgb(var(--muted))] p-3">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-[11px] text-[rgb(var(--muted-foreground))]">{it.label}</span>
+                <Info size={11} className="text-[rgb(var(--muted-foreground))]" />
+              </div>
+              <div className="font-mono text-[13px] font-medium text-[rgb(var(--foreground))]">{it.value}</div>
+              <p className="mt-1 text-[11px] text-[rgb(var(--muted-foreground))]">{it.note}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

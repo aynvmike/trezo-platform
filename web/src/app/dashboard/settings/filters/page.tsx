@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { getUserSettings, type EthicalSettings } from "@/lib/services/ethical";
 import { FiltersForm } from "./_filters-form";
@@ -28,21 +29,12 @@ export default async function FilterSettingsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-3xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Settings — Ethical Filters
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          What Trezo refuses to invest in
-        </h1>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          A treasure built on the backs of others isn&apos;t a treasure. These
-          toggles control which categories Trezo blocks when you try to add
-          tickers to a watchlist. Defaults (human rights, OFAC, fraud) are
-          always on — they aren&apos;t shown here because they can&apos;t be
-          turned off.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Settings — Ethical Filters"
+        title="What Trezo refuses to invest in"
+        subtitle="A treasure built on the backs of others isn't a treasure."
+        explainer="These toggles control which categories Trezo blocks when you add tickers to a watchlist. The defaults — human rights, OFAC, fraud — are always on and can't be turned off."
+      />
 
       <FiltersForm initial={settings} counts={counts} />
 

@@ -24,16 +24,16 @@ export default async function OnboardingPage() {
   }
 
   return (
-    <div className="min-h-screen bg-treasure-50">
+    <div className="min-h-screen bg-[rgb(var(--background))]">
       <div className="mx-auto max-w-2xl px-4 py-12 sm:py-16">
         <header className="mb-8">
-          <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
+          <p className="text-sm font-medium uppercase tracking-widest text-treasure-400">
             Welcome
           </p>
-          <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
+          <h1 className="mt-2 font-serif text-3xl text-[rgb(var(--foreground))] tracking-tight">
             Let&apos;s set the first layer.
           </h1>
-          <p className="mt-3 text-weave-600 leading-relaxed">
+          <p className="mt-3 text-[rgb(var(--muted-foreground))] leading-relaxed">
             A few questions so Trezo can right-size every trade and tax estimate.
             Nothing here leaves your account.
           </p>

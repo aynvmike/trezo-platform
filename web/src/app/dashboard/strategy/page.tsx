@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import {
@@ -113,26 +114,12 @@ export default async function StrategyPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Settings — Strategy Engine
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Strategy Engine &amp; Adaptive Scope
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-          The page where the bot tells you which strategies it wants to
-          favour, trim, or pause — and when it wants to change its mind.
-        </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          Trezo carries a library of proven strategies the agents reason
-          over, and an Adaptive Scope engine that reads the market regime
-          and breaking news, then adjusts how the bot trades — tightening
-          stops, raising the confidence bar, pausing a strategy, or
-          flagging a ticker — without you having to track any of it by
-          hand.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Settings — Strategy Engine"
+        title="Strategy Engine & Adaptive Scope"
+        subtitle="Where the bot tells you which strategies it wants to favour, trim, or pause — and when it wants to change its mind."
+        explainer="Trezo carries a library of proven strategies the agents reason over, plus an Adaptive Scope engine that reads the market regime and breaking news, then adjusts how the bot trades — tightening stops, raising the confidence bar, pausing a strategy, or flagging a ticker — without you tracking any of it by hand."
+      />
 
       {/* Current posture */}
       <section>

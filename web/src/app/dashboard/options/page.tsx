@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
@@ -128,29 +129,12 @@ export default async function OptionsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Layer 3 — Options Engine
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Options Engine
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-          The directional options surface. Long calls, bull/bear
-          spreads, iron condors. Sits separately from the Wheel
-          (Options) layer below, which is income-focused.
-        </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          The options layer runs two things. The Wheel (Layer 5)
-          collects premium automatically on quality dividend stocks by
-          selling cash-secured puts and covered calls. This page is the
-          DIRECTIONAL desk: long calls, bull / bear spreads, and iron
-          condors. Each card shows the full position Greeks so the real
-          exposure is visible. These are surfaced as suggestions you
-          review and place yourself — never auto-executed — because
-          directional options carry real risk.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Layer 3 — Options Engine"
+        title="Options Engine"
+        subtitle="The directional options surface — long calls, bull/bear spreads, iron condors. Separate from the income-focused Wheel layer below."
+        explainer="Pattern-driven, multi-strategy, risk-defined per trade. The Wheel (Layer 5) handles automated income; this page is the directional side."
+      />
 
       <WheelReconcileButton />
 

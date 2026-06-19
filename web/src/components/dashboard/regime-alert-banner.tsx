@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
+import { useLiteRefresh } from "@/lib/use-lite";
 
 type Adjustment = {
   id: string;
@@ -65,11 +66,12 @@ export function RegimeAlertBanner() {
     }
   }
 
+  const refreshMs = useLiteRefresh(30) * 1000;
   useEffect(() => {
     fetchLatest();
-    const t = setInterval(fetchLatest, 30_000);
+    const t = setInterval(fetchLatest, refreshMs);
     return () => clearInterval(t);
-  }, []);
+  }, [refreshMs]);
 
   if (!latest || dismissed) return null;
 

@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { BotTuningForm } from "./_bot-form";
@@ -36,24 +37,12 @@ export default async function BotTuningPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-3xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Settings — Bot Tuning
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          How the bot behaves
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-          The dials that drive every agent — risk, confidence threshold,
-          strategy on/off, autonomy mode. Changes apply within ~30 seconds.
-        </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          These dials control the agents directly. The Risk Manager reads the
-          confidence threshold and position cap; the paper engine reads the
-          risk and stop/target percentages. Changes apply within ~30 seconds —
-          no restart needed.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Settings — Bot Tuning"
+        title="How the bot behaves"
+        subtitle="The dials that drive every agent — risk, confidence threshold, strategy on/off, autonomy mode. Changes apply within ~30 seconds."
+        explainer="These dials control the agents directly. The Risk Manager reads the confidence threshold and position cap; the paper engine reads the risk and stop/target percentages — no restart needed."
+      />
 
       <div
         className={cn(

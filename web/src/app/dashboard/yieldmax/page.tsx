@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { YieldMaxTracker } from "@/components/widgets/yieldmax-tracker";
@@ -17,35 +18,13 @@ export default async function YieldMaxPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-            Layer 6 — Dividends
-          </p>
-          <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-            Your dividend holdings
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Your dividend holdings — live prices and DRIP tracking. Add from Watchlists; manage shares and DRIP on each card.</p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-            This page shows the dividend income holdings you actually own —
-            what they are worth and what they pay. Add new holdings from{" "}
-            <Link
-              href="/dashboard/watchlists"
-              className="underline hover:text-weave-800"
-            >
-              Watchlists
-            </Link>{" "}
-            (the Income ETF picker lives there now). With DRIP on, each
-            distribution reinvests and the position compounds.
-          </p>
-        </div>
-        <Link
-          href="/dashboard/watchlists"
-          className="rounded-md bg-weave-600 px-4 py-2 text-sm font-medium text-treasure-50 hover:bg-weave-700"
-        >
-          Add holdings →
-        </Link>
-      </header>
+      <PageHeader
+        eyebrow="Layer 6 — Dividends"
+        title="Your dividend holdings"
+        subtitle="Your dividend holdings — live prices and DRIP tracking. Add from Watchlists; manage shares and DRIP on each card."
+        explainer="The dividend income holdings you actually own — what they're worth and what they pay. With DRIP on, each distribution reinvests and the position compounds."
+        action={<Link href="/dashboard/watchlists" className="rounded-md bg-weave-600 px-4 py-2 text-sm font-medium text-treasure-50 hover:bg-weave-700">Add holdings →</Link>}
+      />
 
       {positions.length === 0 ? (
         <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-8 text-center space-y-3">

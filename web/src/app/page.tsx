@@ -5,7 +5,7 @@ import { SevenLayers } from "@/components/site/seven-layers";
 
 export default function LandingPage() {
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen flex flex-col depth-page">
       <SiteNav />
       <main className="flex-1">
         <Hero />

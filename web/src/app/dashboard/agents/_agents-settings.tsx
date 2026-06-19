@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { cn } from "@/lib/utils";
+import { useLiteRefresh } from "@/lib/use-lite";
 
 type AgentInfo = {
   name: string;
@@ -62,11 +63,12 @@ export function AgentsSettings() {
     }
   }, []);
 
+  const refreshMs = useLiteRefresh(5) * 1000;
   useEffect(() => {
     void reload();
-    const id = setInterval(reload, 5000);
+    const id = setInterval(reload, refreshMs);
     return () => clearInterval(id);
-  }, [reload]);
+  }, [reload, refreshMs]);
 
   async function toggle(name: string, enabled: boolean) {
     setAgents((cur) => cur.map((a) => (a.name === name ? { ...a, enabled } : a)));

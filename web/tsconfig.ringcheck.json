@@ -1,0 +1,1 @@
+{ "extends": "./tsconfig.json", "include": ["next-env.d.ts", "src/components/site/protective-rings.tsx"] }

@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
@@ -30,19 +31,12 @@ export default async function LiveSettingsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-3xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Settings — Live Trading
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Live trading
-        </h1>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          Live mode means real-money orders route through your brokerage.
-          Trezo is deliberately paper-only today; the live executor is
-          part of the next phase. This page is where it switches on.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Settings — Live Trading"
+        title="Live trading"
+        subtitle="Live mode means real-money orders route through your brokerage."
+        explainer="Trezo is deliberately paper-only today; the live executor is part of the next phase. This page is where it switches on."
+      />
 
       <section
         className={cn(

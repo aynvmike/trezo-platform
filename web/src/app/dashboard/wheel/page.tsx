@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 
@@ -378,29 +379,12 @@ export default async function WheelPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Layer 5 — Wheel Options on Dividend Stocks
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          The Wheel
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-          An options strategy played on dividend-paying stocks. Sell
-          cash-secured puts on names worth owning. If assigned, hold
-          the shares and collect the dividend. Sell covered calls
-          against them while you wait. If called away, the wheel resets
-          and starts again. Premium + dividend stack together.
-        </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          A conservative income engine. Trezo sells cash-secured puts on
-          quality dividend names — if a put expires out-of-the-money the full
-          premium is kept; if it assigns, you own 100 shares and the bot
-          writes covered calls against them. Round and round the wheel turns,
-          collecting premium on every revolution — plus dividends and
-          securities-lending income whenever you are holding the shares.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Layer 5 — Wheel Options on Dividend Stocks"
+        title="The Wheel"
+        subtitle="An options income strategy on dividend stocks — sell cash-secured puts on names worth owning; if assigned, hold and sell covered calls. Premium + dividend stack."
+        explainer="A conservative income engine: Trezo sells cash-secured puts on quality dividend names; if assigned it holds the shares, collects the dividend, and sells covered calls until called away — then the wheel resets."
+      />
 
       {/* Headline tiles — when Alpaca is connected and reports open
           option legs, these read from the broker (LIVE). Otherwise

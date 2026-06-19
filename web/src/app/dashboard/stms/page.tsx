@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
@@ -69,34 +70,13 @@ export default async function StmsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <header className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-            Layer 2 — Stock Bot
-          </p>
-          <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-            Stock Bot
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">
-            The intraday stock layer. Runs the Small Trades Momentum
-            Strategy (STMS) and other intraday plays on any liquid
-            stock — names not currently wrapped in a Wheel Options
-            cycle. Different strategies fire under different
-            conditions; STMS is the first one live.
-          </p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-            STMS is one strategy here, not the whole bot. It captures
-            explosive small-cap momentum during the 7–11 AM ET window:
-            $1–$20 stocks already up 10%+ on the day, on 5× average
-            volume, with a Trade Confidence Score of 750+. More
-            strategies plug into this layer as the bot learns what
-            works for you.
-          </p>
-        </div>
-        <Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">
-          Watchlist quotes →
-        </Link>
-      </header>
+      <PageHeader
+        eyebrow="Layer 2 — Stock Bot"
+        title="Stock Bot"
+        subtitle="The intraday stock layer — runs the Small Trades Momentum Strategy (STMS) and other intraday plays on liquid stocks not in a Wheel cycle."
+        explainer="STMS captures explosive small-cap momentum in the 7–11 AM ET window: $1–$20 stocks up 10%+ on 5× average volume with a Trade Confidence Score of 750+. More strategies plug in as the bot learns."
+        action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>}
+      />
 
       {/* Scanner status */}
       <section

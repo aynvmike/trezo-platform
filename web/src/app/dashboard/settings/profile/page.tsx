@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
 import { ProfileForm } from "./_profile-form";
 import { DisplayPreferences } from "@/components/dashboard/display-preferences";
@@ -27,20 +28,12 @@ export default async function ProfileSettingsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-3xl">
-      <header>
-        <p className="text-sm font-medium uppercase tracking-widest text-treasure-600">
-          Settings — Profile
-        </p>
-        <h1 className="mt-2 font-serif text-3xl text-weave-800 tracking-tight">
-          Your account
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm text-weave-700 leading-relaxed">Capital, discipline rules, and tax filing status. Saved here, read by the agents on their next tick.</p>
-        <p className="beginner-only mt-3 max-w-2xl text-weave-600 leading-relaxed">
-          Capital, discipline rules, and tax filing status. Saving an updated daily
-          profit target or daily loss limit applies immediately — the agents pick up
-          the new values on their next tick.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Settings — Profile"
+        title="Your account"
+        subtitle="Capital, discipline rules, and tax filing status. Saved here, read by the agents on their next tick."
+        explainer="Saving an updated daily profit target or daily loss limit applies immediately — the agents pick up the new values on their next tick."
+      />
 
       <DisplayPreferences />
 

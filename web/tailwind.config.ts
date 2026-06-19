@@ -84,8 +84,9 @@ const config: Config = {
         }
       },
       fontFamily: {
-        sans: ["ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
-        serif: ["ui-serif", "Georgia", "Cambria", "serif"]
+        sans: ["DM Sans", "ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
+        serif: ["Playfair Display", "ui-serif", "Georgia", "Cambria", "serif"],
+        mono: ["JetBrains Mono", "ui-monospace", "monospace"]
       }
     }
   },
