@@ -23,6 +23,8 @@ export type OverviewData = {
   live: boolean;
   agentsOnline: boolean;
   buyingPower: number | null;
+  stale: boolean;
+  asOf: string | null;
 };
 
 const SAMPLE: OverviewData = {
@@ -51,6 +53,8 @@ const SAMPLE: OverviewData = {
   live: false,
   agentsOnline: false,
   buyingPower: null,
+  stale: false,
+  asOf: null,
 };
 
 const STATUS_TEXT: Record<string, string> = {
@@ -69,6 +73,13 @@ function money(n: number) {
 }
 function money0(n: number) {
   return (n < 0 ? "-" : "") + "$" + Math.abs(Math.round(n)).toLocaleString();
+}
+function agoLabel(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 60_000) return "just now";
+  if (ms < 3_600_000) return Math.floor(ms / 60_000) + "m ago";
+  if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + "h ago";
+  return Math.floor(ms / 86_400_000) + "d ago";
 }
 function signed0(n: number) {
   return (n >= 0 ? "+" : "-") + "$" + Math.abs(Math.round(n)).toLocaleString();
@@ -148,18 +159,22 @@ export function OverviewViewRedesign({ data }: { data?: OverviewData }) {
             <span className="text-[rgb(var(--muted-foreground))]">Buying power</span>
             <span className="font-mono font-medium text-[rgb(var(--foreground))]">{d.buyingPower != null ? money0(d.buyingPower) : "—"}</span>
           </span>
-          {!d.agentsOnline ? (
+          {d.agentsOnline ? (
+            d.buyingPower === 0 ? (
+              <span className="text-[11px] text-[rgb(var(--muted-foreground))]">Agents are live, but the account has $0 buying power to trade.</span>
+            ) : null
+          ) : d.stale ? (
+            <span className="text-[11px] text-amber-500">Showing last known data{d.asOf ? " · as of " + agoLabel(d.asOf) : ""} — agents offline. Start the service on port 8001 for live numbers.</span>
+          ) : (
             <span className="text-[11px] text-[rgb(var(--muted-foreground))]">Live numbers unavailable while the agents service is offline (start it on port 8001).</span>
-          ) : d.buyingPower === 0 ? (
-            <span className="text-[11px] text-[rgb(var(--muted-foreground))]">Agents are live, but the account has $0 buying power to trade.</span>
-          ) : null}
+          )}
         </div>
       ) : null}
 
       <DepthTilt><WovenBasketHero layers={heroLayers} /></DepthTilt>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Kpi label="Portfolio Value" value={money0(d.portfolioValue)} sub="All layers combined" pill={!d.live ? "Sample" : d.agentsOnline ? "Live" : "Offline"} pillClass={!d.live ? "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]" : d.agentsOnline ? "text-emerald-500 bg-emerald-500/10" : "text-red-500 bg-red-500/10"} />
+        <Kpi label="Portfolio Value" value={money0(d.portfolioValue)} sub="All layers combined" pill={!d.live ? "Sample" : d.agentsOnline ? "Live" : d.stale ? "Last known" : "Offline"} pillClass={!d.live ? "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]" : d.agentsOnline ? "text-emerald-500 bg-emerald-500/10" : d.stale ? "text-amber-500 bg-amber-500/10" : "text-red-500 bg-red-500/10"} />
         <Kpi label="Week P&L" value={signed0(d.weekPnl)} up={d.weekPnl >= 0} sub="Realized, last 7 days" />
         <Kpi label="Total Open Risk" value={money0(d.deployed)} sub={d.deployedPct != null ? d.deployedPct.toFixed(1) + "% of portfolio deployed" : "Capital in open positions"} />
         <Kpi label="Layers Active" value={d.layersActive + " / 7"} sub="Layers holding a position now" />

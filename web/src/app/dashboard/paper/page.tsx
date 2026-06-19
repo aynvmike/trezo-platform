@@ -34,6 +34,14 @@ function fmtUsd(n: number | null | undefined): string {
   });
 }
 
+function agoLabel(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 60_000) return "just now";
+  if (ms < 3_600_000) return Math.floor(ms / 60_000) + "m ago";
+  if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + "h ago";
+  return Math.floor(ms / 86_400_000) + "d ago";
+}
+
 function prettyStrategy(s: string | null | undefined): string {
   const v = String(s ?? "system");
   if (v === "default" || v === "system") return "system";
@@ -102,7 +110,9 @@ export default async function PaperPage() {
 
   // Alpaca live override when configured.
   const alpacaActive = !!(alpaca?.configured && alpaca?.account);
-  const agentsOnline = alpaca !== null;
+  const agentsOnline = alpaca !== null && !alpaca.stale;
+  const snapshotStale = !!alpaca?.stale;
+  const snapshotAsOf = alpaca?.cached_at ?? null;
   const a = alpaca?.account;
   const displayCash = alpacaActive
     ? Number(a!.cash)
@@ -159,13 +169,17 @@ export default async function PaperPage() {
         </span>
         <span className="text-weave-500">
           Buying power:{" "}
-          <span className="font-mono text-weave-800">{agentsOnline ? fmtUsd(displayCash) : "—"}</span>
+          <span className="font-mono text-weave-800">{alpacaActive ? fmtUsd(displayCash) : "—"}</span>
         </span>
-        {!agentsOnline ? (
+        {agentsOnline ? (
+          displayCash === 0 ? (
+            <span className="text-xs text-weave-500">Agents live, but $0 buying power to trade.</span>
+          ) : null
+        ) : snapshotStale ? (
+          <span className="text-xs text-amber-700">Showing last known data{snapshotAsOf ? " · as of " + agoLabel(snapshotAsOf) : ""} — agents offline. Start it on port 8001 for live.</span>
+        ) : (
           <span className="text-xs text-amber-700">Agents service offline — live numbers unavailable. Start it on port 8001.</span>
-        ) : displayCash === 0 ? (
-          <span className="text-xs text-weave-500">Agents live, but $0 buying power to trade.</span>
-        ) : null}
+        )}
       </div>
 
       <Disclosure title="Going live — checklist">
@@ -214,7 +228,7 @@ export default async function PaperPage() {
       <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <KPI
           label="Cash (buying power)"
-          value={agentsOnline ? fmtUsd(displayCash) : "—"}
+          value={alpacaActive ? fmtUsd(displayCash) : "—"}
           tone="treasure"
         />
         <KPI

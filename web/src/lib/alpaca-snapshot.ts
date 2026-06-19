@@ -5,7 +5,11 @@
  * single request so it only hits the agents service once.
  */
 
+import { cacheGet, cacheSet } from "@/lib/cache";
+
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
+const SNAP_CACHE_KEY = "alpaca:last-snapshot";
+const SNAP_TTL_SEC = 24 * 60 * 60;
 
 export type AlpacaAccount = {
   equity: number;
@@ -45,6 +49,10 @@ export type AlpacaSnapshot = {
   positions?: AlpacaPosition[];
   as_of?: string;
   note?: string;
+  // Set when this snapshot is the last-known cached copy served because the
+  // live agents service was unreachable; cached_at is when it was captured.
+  stale?: boolean;
+  cached_at?: string;
 };
 
 export async function fetchAlpacaSnapshot(): Promise<AlpacaSnapshot | null> {
@@ -53,9 +61,23 @@ export async function fetchAlpacaSnapshot(): Promise<AlpacaSnapshot | null> {
       cache: "no-store",
       signal: AbortSignal.timeout(8000)
     });
-    if (!r.ok) return null;
-    return (await r.json()) as AlpacaSnapshot;
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const snap = (await r.json()) as AlpacaSnapshot;
+    // Remember the last live snapshot that carried real account data, so the
+    // dashboard can show "last known" numbers when 8001 is later unreachable.
+    if (snap?.configured && snap?.account) {
+      await cacheSet(
+        SNAP_CACHE_KEY,
+        { ...snap, stale: false, cached_at: new Date().toISOString() },
+        SNAP_TTL_SEC
+      );
+    }
+    return { ...snap, stale: false };
   } catch {
+    // Service unreachable -> serve the last known good snapshot (marked stale)
+    // so the platform shows last-known data instead of blanks.
+    const last = await cacheGet<AlpacaSnapshot>(SNAP_CACHE_KEY);
+    if (last?.account) return { ...last, stale: true };
     return null;
   }
 }

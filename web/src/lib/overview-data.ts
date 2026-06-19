@@ -64,7 +64,9 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
   const closed = (closedRes.data ?? []) as ClosedRow[];
 
   const alpacaActive = !!(alpaca?.configured && alpaca?.account);
-  const agentsOnline = alpaca !== null;
+  const agentsOnline = alpaca !== null && !alpaca.stale;
+  const stale = !!alpaca?.stale;
+  const asOf = alpaca?.cached_at ?? null;
   const buyingPower = alpacaActive ? Number(alpaca!.account!.buying_power) : null;
   const portfolioValue = alpacaActive
     ? Number(alpaca!.account!.equity)
@@ -119,5 +121,5 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
   }
   const weekPnl = week.reduce((s, x) => s + x.v, 0);
 
-  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower };
+  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf };
 }
