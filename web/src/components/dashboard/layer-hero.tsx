@@ -48,14 +48,14 @@ export function LayerHero({
   action,
 }: {
   id: number;
-  openCount: number;
+  openCount?: number;
   todayPnl?: number | null;
   weekPnl?: number | null;
   status?: "active" | "idle" | "paused";
   action?: ReactNode;
 }) {
   const m = LAYER_META[id] ?? LAYER_META[2];
-  const st = status ?? (openCount > 0 ? "active" : "idle");
+  const st = status ?? (openCount == null ? "active" : openCount > 0 ? "active" : "idle");
   const stClass =
     st === "active" ? "text-emerald-500 bg-emerald-500/10"
       : st === "paused" ? "text-amber-500 bg-amber-500/10"
@@ -104,7 +104,7 @@ export function LayerHero({
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Tile label="Today's P&L" value={todayPnl == null ? "—" : money(todayPnl)} sub="Realized today" />
         <Tile label="Week P&L" value={weekPnl == null ? "—" : money(weekPnl)} sub="Rolling 7-day" />
-        <Tile label="Open positions" value={String(openCount)} sub="Live in this layer" />
+        <Tile label="Open positions" value={openCount == null ? "—" : String(openCount)} sub="Live in this layer" />
         <Tile label="Status" value={st === "active" ? "Trading" : st === "paused" ? "Paused" : "Idle"} sub={m.cadence} />
       </div>
     </div>

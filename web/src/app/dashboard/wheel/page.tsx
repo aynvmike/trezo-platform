@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 
@@ -379,12 +379,7 @@ export default async function WheelPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Layer 5 — Wheel Options on Dividend Stocks"
-        title="The Wheel"
-        subtitle="An options income strategy on dividend stocks — sell cash-secured puts on names worth owning; if assigned, hold and sell covered calls. Premium + dividend stack."
-        explainer="A conservative income engine: Trezo sells cash-secured puts on quality dividend names; if assigned it holds the shares, collects the dividend, and sells covered calls until called away — then the wheel resets."
-      />
+      <LayerHero id={5} />
 
       {/* Headline tiles — when Alpaca is connected and reports open
           option legs, these read from the broker (LIVE). Otherwise

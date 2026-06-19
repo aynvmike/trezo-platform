@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import { createClient } from "@/lib/supabase/server";
 import { addChild, saveChild, deleteChild } from "./_actions";
 import { getQuotes } from "@/lib/services/finnhub";
@@ -94,12 +94,7 @@ export default async function KindripPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-5xl">
-      <PageHeader
-        eyebrow="Layer 7 — KINDRIP"
-        title="KINDRIP — generational wealth"
-        subtitle="Scheduled contributions to a child's Future Index Account, auto-invested on an age-based glide path."
-        explainer="The innermost ring. KINDRIP routes a contribution you set — fixed or a percentage, weekly or monthly — into a child's account that auto-invests into a steady index mix. Every deposit carries a plain explanation the child can grow up reading."
-      />
+      <LayerHero id={7} />
 
       <Disclosure title="The Future Index Account">
         <div className="space-y-2">

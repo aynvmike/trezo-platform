@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { YieldMaxTracker } from "@/components/widgets/yieldmax-tracker";
@@ -18,13 +18,7 @@ export default async function YieldMaxPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Layer 6 — Dividends"
-        title="Your dividend holdings"
-        subtitle="Your dividend holdings — live prices and DRIP tracking. Add from Watchlists; manage shares and DRIP on each card."
-        explainer="The dividend income holdings you actually own — what they're worth and what they pay. With DRIP on, each distribution reinvests and the position compounds."
-        action={<Link href="/dashboard/watchlists" className="rounded-md bg-weave-600 px-4 py-2 text-sm font-medium text-treasure-50 hover:bg-weave-700">Add holdings →</Link>}
-      />
+      <LayerHero id={6} openCount={positions.length} action={<Link href="/dashboard/watchlists" className="rounded-md bg-weave-600 px-4 py-2 text-sm font-medium text-treasure-50 hover:bg-weave-700">Add holdings →</Link>} />
 
       {positions.length === 0 ? (
         <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-8 text-center space-y-3">
