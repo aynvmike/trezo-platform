@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
@@ -77,13 +77,7 @@ export default async function ExtendedPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Layer 4 — Stock Weekly"
-        title="Stock Weekly"
-        subtitle="Trezo's multi-day stock layer — positions held three days to four weeks, exited on the trade winning or breaking down, not a fixed timer."
-        explainer="Stock Weekly holds across sessions for continuation moves on mid-cap names. It looks for four setups — a pullback to the rising 50-day, a held breakout, an unfilled earnings gap, and a stair-step climb — each with a stop and target."
-        action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>}
-      />
+      <LayerHero id={4} openCount={openPositions.length} action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>} />
 
       {/* Scanner status */}
       <section

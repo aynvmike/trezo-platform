@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
@@ -129,12 +129,7 @@ export default async function OptionsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Layer 3 — Options Engine"
-        title="Options Engine"
-        subtitle="The directional options surface — long calls, bull/bear spreads, iron condors. Separate from the income-focused Wheel layer below."
-        explainer="Pattern-driven, multi-strategy, risk-defined per trade. The Wheel (Layer 5) handles automated income; this page is the directional side."
-      />
+      <LayerHero id={3} openCount={openBook.length} />
 
       <WheelReconcileButton />
 

@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import { createClient } from "@/lib/supabase/server";
 import { CryptoCards } from "@/components/widgets/crypto-card";
 import { cn } from "@/lib/utils";
@@ -49,12 +49,7 @@ export default async function CryptoPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Layer 1 — Crypto Bot"
-        title="Crypto Bot"
-        subtitle="24/7 crypto scanner — detects SCALP / SWING / DCA / HODL modes from RSI, Bollinger width, and volume."
-        explainer="24/7 scanning of ETH, SOL, and the ISO 20022 cluster (XRP, XLM, HBAR, ALGO, QNT, XDC, IOTA, XYO). The bot picks one of four modes per coin — SCALP, SWING, DCA, or HODL — and trades it on the paper account."
-      />
+      <LayerHero id={1} openCount={openCrypto.length} />
 
       <section>
         <h2 className="font-serif text-xl text-weave-800 mb-3">Live prices</h2>

@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { PageHeader } from "@/components/dashboard/page-header";
+import { LayerHero } from "@/components/dashboard/layer-hero";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
@@ -70,13 +70,7 @@ export default async function StmsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Layer 2 — Stock Bot"
-        title="Stock Bot"
-        subtitle="The intraday stock layer — runs the Small Trades Momentum Strategy (STMS) and other intraday plays on liquid stocks not in a Wheel cycle."
-        explainer="STMS captures explosive small-cap momentum in the 7–11 AM ET window: $1–$20 stocks up 10%+ on 5× average volume with a Trade Confidence Score of 750+. More strategies plug in as the bot learns."
-        action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>}
-      />
+      <LayerHero id={2} openCount={openPositions.length} action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>} />
 
       {/* Scanner status */}
       <section
