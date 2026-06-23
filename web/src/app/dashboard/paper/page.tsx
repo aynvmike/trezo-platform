@@ -133,6 +133,7 @@ export default async function PaperPage() {
       current: ap ? Number(ap.current_price) : null,
       pnl: ap ? Number(ap.unrealized_pl) : null,
       pct: ap ? Number(ap.unrealized_plpc) * 100 : null,
+      flag: ap ? ("live" as const) : ((p.asset_type ?? "").toLowerCase() === "crypto" ? ("modeled" as const) : ("unconfirmed" as const)),
     };
   });
 

@@ -17,6 +17,7 @@ export type TVPosition = {
   qty: number;
   pnl: number | null;
   pct: number | null;
+  flag?: "live" | "modeled" | "unconfirmed";
 };
 
 export type TVFeed = {
@@ -163,6 +164,7 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
   const net = d.positions.reduce((a, p) => a + (p.pnl ?? 0), 0);
   const winning = d.positions.filter((p) => (p.pnl ?? 0) > 0).length;
   const losing = d.positions.filter((p) => (p.pnl ?? 0) < 0).length;
+  const unconfirmed = d.positions.filter((p) => p.flag === "unconfirmed").length;
   const showMarket = d.market.length > 0;
   const sessionFacts: TVMarket[] = [
     { label: "Open positions", value: String(d.openCount), delta: "", up: true },
@@ -229,7 +231,7 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
         <div className="flex items-center justify-between border-b border-[rgb(var(--border))] px-5 py-4">
           <div>
             <h3 className="text-[13px] font-medium text-[rgb(var(--foreground))]">Open Positions</h3>
-            <p className="mt-0.5 text-[11px] text-[rgb(var(--muted-foreground))]">{d.positions.length} open &mdash; {winning} winning, {losing} losing</p>
+            <p className="mt-0.5 text-[11px] text-[rgb(var(--muted-foreground))]">{d.positions.length} open &mdash; {winning} winning, {losing} losing{unconfirmed > 0 ? <span className="text-amber-500"> &middot; {unconfirmed} unconfirmed</span> : null}</p>
           </div>
           <span className={"font-mono text-[12px] font-medium " + (net >= 0 ? "text-emerald-500" : "text-red-500")}>Net {net >= 0 ? "+" : ""}{money(net)}</span>
         </div>
@@ -247,7 +249,16 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
                 <tr><td colSpan={8} className="px-5 py-8 text-center text-[rgb(var(--muted-foreground))]">No open positions. When an approved signal fires, it lands here.</td></tr>
               ) : d.positions.map((p) => (
                 <tr key={p.id} className="border-b border-[rgb(var(--border))] last:border-0 hover:bg-[rgb(var(--muted))]">
-                  <td className="px-5 py-3 font-mono font-medium text-[rgb(var(--foreground))]">{p.ticker}</td>
+                  <td className="px-5 py-3 font-mono font-medium text-[rgb(var(--foreground))]">
+                    <span className="inline-flex items-center gap-1.5">
+                      {p.ticker}
+                      {p.flag === "unconfirmed" ? (
+                        <span title="No matching position at Alpaca — unconfirmed (a just-submitted order, a modeled fill, or a phantom row to reconcile)" className="rounded px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-amber-500 bg-amber-500/10">unconfirmed</span>
+                      ) : p.flag === "modeled" ? (
+                        <span title="Modeled — runs on Trezo's paper engine, not held at Alpaca" className="rounded px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]">modeled</span>
+                      ) : null}
+                    </span>
+                  </td>
                   <td className="px-5 py-3"><span className={"rounded-md px-2 py-0.5 font-mono text-[11px] " + (LAYER_CHIP[p.chip] || "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>{p.chip} &middot; {p.layer}</span></td>
                   <td className="px-5 py-3"><span className={"rounded px-1.5 py-0.5 font-mono text-[11px] " + (p.side === "LONG" ? "text-emerald-500 bg-emerald-500/10" : "text-red-500 bg-red-500/10")}>{p.side}</span></td>
                   <td className="px-5 py-3 font-mono text-[rgb(var(--muted-foreground))]">{price(p.entry)}</td>
