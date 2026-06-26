@@ -105,15 +105,17 @@ async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
     position still holds. Returns the new stop if it ratcheted up (and
     persists it to the row), else None. Long-only."""
     from app.strategies.crypto import HODL_TRAIL_TRIGGER, HODL_TRAIL_GIVEBACK
+    from app.runtime.capabilities import trailing_stop_from_price
     try:
         entry = float(r.get("entry_price") or 0)
     except (TypeError, ValueError):
         return None
     if entry <= 0 or price <= 0:
         return None
-    if price < entry * (1.0 + HODL_TRAIL_TRIGGER):
-        return None  # not far enough in profit -> keep the catastrophe stop
-    new_stop = round(price * (1.0 - HODL_TRAIL_GIVEBACK), 8)
+    new_stop = trailing_stop_from_price(
+        price, "long", HODL_TRAIL_GIVEBACK, entry=entry, trigger_gain=HODL_TRAIL_TRIGGER)
+    if new_stop is None:
+        return None
     try:
         cur = float(r["stop_price"]) if r.get("stop_price") else None
     except (TypeError, ValueError):
@@ -145,20 +147,10 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     ``ladder`` = ((gain_trigger, locked_floor), ...) as fractions of entry.
     Returns the new stop if it ratcheted up (and persists it), else None.
     Never lowers a stop. Long-only."""
-    try:
-        entry = float(r.get("entry_price") or 0)
-    except (TypeError, ValueError):
-        return None
-    if entry <= 0 or price <= 0:
-        return None
-    gain = (price - entry) / entry
-    locked = None
-    for trigger, floor in ladder:
-        if gain >= trigger:
-            locked = floor
-    if locked is None:
-        return None  # below the first rung -> keep the original stop
-    new_stop = round(entry * (1.0 + locked), 8)
+    from app.runtime.capabilities import ladder_stop
+    new_stop = ladder_stop(r.get("entry_price"), price, ladder, "long")
+    if new_stop is None:
+        return None  # below the first rung / bad input -> keep original stop
     try:
         cur = float(r["stop_price"]) if r.get("stop_price") else None
     except (TypeError, ValueError):

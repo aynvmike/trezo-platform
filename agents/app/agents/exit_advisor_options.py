@@ -193,7 +193,8 @@ class ExitAdvisorOptionsAgent(Agent):
 
                 gain_pct = unrealized / cost_basis if cost_basis > 0 else 0.0
                 peak_pct = peak / cost_basis if cost_basis > 0 else 0.0
-                drawback_pct = ((peak - unrealized) / peak) if peak > 0 else 0.0
+                from app.runtime.capabilities import peak_giveback_pct
+                drawback_pct = peak_giveback_pct(peak, unrealized)
 
                 # Decide which alert (if any) to raise. Run rules in
                 # priority order; first match wins per position per tick.

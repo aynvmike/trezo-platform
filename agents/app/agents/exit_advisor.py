@@ -239,7 +239,8 @@ class ExitAdvisorAgent(Agent):
         # Active only when we ever had a positive peak AND current pnl
         # is positive too (no point alerting on a stop-bound trade).
         if peak > 0 and pnl > 0:
-            giveback = (peak - pnl) / peak
+            from app.runtime.capabilities import peak_giveback_pct
+            giveback = peak_giveback_pct(peak, pnl)
             # Use entry cost to derive peak gain percentage so the
             # tier picker can scale appropriately.
             peak_pct = (peak / entry_value) if entry_value > 0 else 0.0

@@ -50,6 +50,84 @@ def trailing_profit_stop(
     return None
 
 
+def trailing_stop_from_price(
+    price: float, side: str, giveback: float,
+    entry: float | None = None, trigger_gain: float | None = None,
+) -> float | None:
+    """Price-anchored trailing stop (shared; used by the crypto HODL trail):
+    place the stop ``giveback`` below the live price for a long (above for a
+    short) so the position keeps running while protecting a fixed % off the
+    peak price. Optionally gated by ``trigger_gain`` -- only trail once the
+    position is at least that far in profit vs ``entry``. Caller ratchets +
+    persists. Returns the proposed stop or None (bad input / before trigger)."""
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    s = str(side or "").lower()
+    if trigger_gain is not None and entry:
+        try:
+            e = float(entry)
+        except (TypeError, ValueError):
+            e = 0.0
+        if e > 0:
+            if s == "long" and price < e * (1.0 + trigger_gain):
+                return None
+            if s == "short" and price > e * (1.0 - trigger_gain):
+                return None
+    if s == "long":
+        return round(price * (1.0 - giveback), 8)
+    if s == "short":
+        return round(price * (1.0 + giveback), 8)
+    return None
+
+
+def ladder_stop(entry, price: float, ladder, side: str = "long") -> float | None:
+    """Tiered step-ladder profit lock (shared; used by crypto SWING / DCA /
+    Extended). ``ladder`` = ((gain_trigger, locked_floor), ...) as fractions
+    of entry. As the gain climbs through the rungs, lock the stop at the
+    highest rung reached: entry*(1+floor) for a long, entry*(1-floor) for a
+    short. Caller ratchets + persists. Returns the proposed stop or None
+    (below rung one / bad input)."""
+    try:
+        entry = float(entry)
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or price <= 0:
+        return None
+    s = str(side or "").lower()
+    gain = (price - entry) / entry if s == "long" else (entry - price) / entry
+    locked = None
+    for trigger, floor in ladder:
+        if gain >= trigger:
+            locked = floor
+    if locked is None:
+        return None
+    if s == "long":
+        return round(entry * (1.0 + locked), 8)
+    if s == "short":
+        return round(entry * (1.0 - locked), 8)
+    return None
+
+
+def peak_giveback_pct(peak: float, current: float) -> float:
+    """Drawback from a position's best unrealized P&L (shared; used by both
+    Exit Advisors): (peak - current) / peak, or 0.0 when there is no positive
+    peak yet. Pure -- no side effects, no clamping (matches the advisors'
+    existing semantics where a giveback can exceed 100%)."""
+    try:
+        peak = float(peak)
+        current = float(current)
+    except (TypeError, ValueError):
+        return 0.0
+    if peak <= 0:
+        return 0.0
+    return (peak - current) / peak
+
+
 # The shared toolbox every agent should be aware of. Add new protections
 # here so the whole system + the seeded shared memory stay in sync.
 CAPABILITIES: list[dict] = [
