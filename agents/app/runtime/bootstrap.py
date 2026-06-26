@@ -116,4 +116,16 @@ def bootstrap_agents() -> None:
 
     bus.subscribe(_persist)
 
+    # Shared capability library -> seed into shared agent memory so every
+    # agent is aware of the available risk/exit/profit toolbox (Mike 6/23).
+    try:
+        from app.runtime.capabilities import seed_shared_capabilities
+        import asyncio as _aio
+        try:
+            _aio.get_running_loop().create_task(seed_shared_capabilities())
+        except RuntimeError:
+            _aio.run(seed_shared_capabilities())
+    except Exception as e:  # noqa: BLE001
+        log.warning("capabilities.seed.failed", error=str(e))
+
     log.info("agents.bootstrap.complete", count=len(registry.all()))

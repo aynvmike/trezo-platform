@@ -190,24 +190,24 @@ async def _maybe_trail_stock_profit(r: dict, price: float) -> float | None:
     locking the profit. The new stop is always below the current price and
     never below entry -- so it can only protect a winner, never force a loss,
     and never sells the instant it engages. Persists the stop. Long-only."""
+    from app.runtime.capabilities import trailing_profit_stop
+    side = str(r.get("side") or "").lower()
     try:
         entry = float(r.get("entry_price") or 0)
     except (TypeError, ValueError):
         return None
-    if entry <= 0 or price <= 0:
+    new_stop = trailing_profit_stop(entry, price, side, STOCK_TRAIL_MIN_GAIN, STOCK_TRAIL_GIVEBACK)
+    if new_stop is None:
         return None
-    gain = price - entry
-    if gain <= entry * STOCK_TRAIL_MIN_GAIN:
-        return None  # not enough profit yet -> keep the original stop
-    new_stop = round(entry + gain * (1.0 - STOCK_TRAIL_GIVEBACK), 4)
-    if new_stop <= entry:
-        return None  # only ever lock ACTUAL profit, never below entry
     try:
         cur = float(r["stop_price"]) if r.get("stop_price") else None
     except (TypeError, ValueError):
         cur = None
-    if cur is not None and new_stop <= cur:
-        return None  # only ever ratchet UP
+    if cur is not None:
+        if side == "long" and new_stop <= cur:
+            return None  # long: ratchet UP only
+        if side == "short" and new_stop >= cur:
+            return None  # short: ratchet DOWN only (tighter)
     client = _supabase()
     if client is None:
         return None
@@ -767,7 +767,7 @@ class PositionMonitorAgent(Agent):
                     if _ld is not None:
                         stop = _ld
 
-            if at == "stock" and side == "long" and STOCK_TRAIL_ENABLED:
+            if at == "stock" and side in ("long", "short") and STOCK_TRAIL_ENABLED:
                 _strail = await _maybe_trail_stock_profit(r, price)
                 if _strail is not None:
                     stop = _strail
@@ -792,6 +792,12 @@ class PositionMonitorAgent(Agent):
                 else:  # short
                     if stop is not None and price >= stop:
                         close_reason = "stop"
+                        try:
+                            _e = float(r.get("entry_price") or 0)
+                            if at == "stock" and _e and stop < _e:
+                                close_detail = "profit_lock"
+                        except (TypeError, ValueError):
+                            pass
                     elif target is not None and price <= target:
                         close_reason = "target"
 
