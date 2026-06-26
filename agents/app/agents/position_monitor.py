@@ -15,6 +15,7 @@ Ticks every 30 seconds. For every open paper position across all users:
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from app.config import get_settings
@@ -28,6 +29,16 @@ from .base import Agent, AgentMessage
 MAX_HOLD_MINUTES = 90
 STAGNATION_MINUTES = 75
 STAGNATION_R = 0.25
+
+# Stock profit trail-to-lock (Mike 2026-06-23: catch profit drawdown on
+# HELD stocks, not just at entry). Once a long stock is >= MIN_GAIN above
+# entry, ratchet its stop UP to lock (1 - GIVEBACK) of the gain; it sells
+# on a giveback. The trailed stop sits below the current price and never
+# below entry -> can only protect a winner, never forces a loss, never an
+# instant sell on activation. Default ON; env-tunable.
+STOCK_TRAIL_ENABLED = os.getenv("TREZO_STOCK_PROFIT_TRAIL", "1").strip().lower() not in ("0", "false", "no", "off")
+STOCK_TRAIL_MIN_GAIN = float(os.getenv("TREZO_STOCK_TRAIL_MIN_GAIN", "0.03"))
+STOCK_TRAIL_GIVEBACK = float(os.getenv("TREZO_STOCK_TRAIL_GIVEBACK", "0.30"))
 
 
 def _decide_time_stop(
@@ -148,6 +159,49 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     if locked is None:
         return None  # below the first rung -> keep the original stop
     new_stop = round(entry * (1.0 + locked), 8)
+    try:
+        cur = float(r["stop_price"]) if r.get("stop_price") else None
+    except (TypeError, ValueError):
+        cur = None
+    if cur is not None and new_stop <= cur:
+        return None  # only ever ratchet UP
+    client = _supabase()
+    if client is None:
+        return None
+    rid = r.get("id")
+
+    def _upd():
+        return (client.table("paper_positions")
+                .update({"stop_price": new_stop}).eq("id", rid).execute())
+
+    try:
+        await asyncio.to_thread(_upd)
+    except Exception:  # noqa: BLE001
+        return None
+    r["stop_price"] = new_stop
+    return new_stop
+
+
+async def _maybe_trail_stock_profit(r: dict, price: float) -> float | None:
+    """Stock profit trail-to-lock (Mike 2026-06-23). For a LONG stock up
+    >= STOCK_TRAIL_MIN_GAIN over entry, RAISE (never lower) the stop to lock
+    in (1 - STOCK_TRAIL_GIVEBACK) of the current gain. As price climbs the
+    stop ratchets up; when price gives back to it the normal stop-check sells,
+    locking the profit. The new stop is always below the current price and
+    never below entry -- so it can only protect a winner, never force a loss,
+    and never sells the instant it engages. Persists the stop. Long-only."""
+    try:
+        entry = float(r.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or price <= 0:
+        return None
+    gain = price - entry
+    if gain <= entry * STOCK_TRAIL_MIN_GAIN:
+        return None  # not enough profit yet -> keep the original stop
+    new_stop = round(entry + gain * (1.0 - STOCK_TRAIL_GIVEBACK), 4)
+    if new_stop <= entry:
+        return None  # only ever lock ACTUAL profit, never below entry
     try:
         cur = float(r["stop_price"]) if r.get("stop_price") else None
     except (TypeError, ValueError):
@@ -713,6 +767,11 @@ class PositionMonitorAgent(Agent):
                     if _ld is not None:
                         stop = _ld
 
+            if at == "stock" and side == "long" and STOCK_TRAIL_ENABLED:
+                _strail = await _maybe_trail_stock_profit(r, price)
+                if _strail is not None:
+                    stop = _strail
+
             close_reason: str | None = None
             close_detail = ""
             # QW1: an explicit user close request takes priority.
@@ -722,6 +781,12 @@ class PositionMonitorAgent(Agent):
                 if side == "long":
                     if stop is not None and price <= stop:
                         close_reason = "stop"
+                        try:
+                            _e = float(r.get("entry_price") or 0)
+                            if at == "stock" and _e and stop > _e:
+                                close_detail = "profit_lock"
+                        except (TypeError, ValueError):
+                            pass
                     elif target is not None and price >= target:
                         close_reason = "target"
                 else:  # short
