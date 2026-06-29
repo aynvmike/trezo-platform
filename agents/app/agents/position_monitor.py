@@ -22,6 +22,7 @@ from app.config import get_settings
 from app.data.candles import fetch_candles_for
 from app.paper.engine import close_position, check_and_lock_profit
 from app.strategies.extended import SWING_MAX_HOLD_DAYS
+from app.agents.reevaluator import REEVAL_ENABLED, reevaluate_position
 
 from .base import Agent, AgentMessage
 
@@ -764,11 +765,35 @@ class PositionMonitorAgent(Agent):
                 if _strail is not None:
                     stop = _strail
 
+            # Continuous re-evaluation (Mike 6/29). Re-judges this position
+            # with the shared capability library and actively manages it
+            # (tighten stop / lower target / rotate / advise add). Master-
+            # flagged OFF, so this is a no-op until enabled -- live behavior
+            # is unchanged today.
+            reeval_close: str | None = None
+            if REEVAL_ENABLED:
+                try:
+                    _rv = await reevaluate_position(
+                        r, price, side, at, strat, stop, target,
+                        emit=out, agent_name="reevaluator",
+                    )
+                    if _rv:
+                        if _rv.get("stop") is not None:
+                            stop = _rv["stop"]
+                        if _rv.get("target") is not None:
+                            target = _rv["target"]
+                        reeval_close = _rv.get("close")
+                except Exception as _re:  # noqa: BLE001
+                    out.append(AgentMessage(agent=self.name, kind="info",
+                               payload={"note": f"reeval error: {str(_re)[:120]}"}))
+
             close_reason: str | None = None
             close_detail = ""
             # QW1: an explicit user close request takes priority.
             if r.get("close_requested"):
                 close_reason, close_detail = "manual", "manual_close"
+            elif reeval_close:
+                close_reason, close_detail = "reeval", reeval_close
             if close_reason is None:
                 if side == "long":
                     if stop is not None and price <= stop:
