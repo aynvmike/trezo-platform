@@ -64,9 +64,68 @@ function feedType(kind: string): string {
   return "open";
 }
 
+const STRATEGY_THESIS: Record<string, string> = {
+  wheel_csp: "Cash-secured put — collecting premium; held until it decays to profit or you're assigned shares at a discount.",
+  cash_secured_put: "Cash-secured put — collecting premium; held until it decays to profit or you're assigned shares at a discount.",
+  wheel_cc: "Covered call — collecting premium against shares you already hold.",
+  wheel: "Wheel income — collecting option premium on a quality name.",
+  stms: "Short-term momentum swing — riding the move until the target hits or momentum fades.",
+  orb: "Opening-range breakout — an intraday momentum push toward its target.",
+  pattern: "Technical pattern setup — held toward target while the pattern stays valid.",
+  extended: "Multi-day swing — held across sessions toward a larger target.",
+  hodl: "Patient accumulation — held with a catastrophe stop, trailing up once it runs.",
+  swing: "Crypto swing — held toward target with step-ladder profit locks.",
+  dca: "Dollar-cost accumulation — building the position in steps toward target.",
+  dividend: "Income position — held to capture the distribution.",
+  yieldmax: "Aggressive income — held to capture high distributions.",
+};
+function thesisFor(strategy: string, assetType: string): string {
+  const s = (strategy || "").toLowerCase();
+  for (const key of Object.keys(STRATEGY_THESIS)) {
+    if (s.startsWith(key) || s.includes(key)) return STRATEGY_THESIS[key];
+  }
+  if ((assetType || "").toLowerCase() === "crypto") return "Crypto position — held on its entry thesis with a protective stop.";
+  return "Held on its entry thesis, working toward its target.";
+}
+function pxFmt(n: number): string {
+  return n >= 1000 ? "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : "$" + n.toFixed(2);
+}
+function planText(side: string, entry: number, current: number | null, target: number | null, stop: number | null): string {
+  const isLong = side !== "SHORT";
+  if (current == null) {
+    if (target != null && stop != null) return `Sells at target ${pxFmt(target)} for profit; stop ${pxFmt(stop)} caps the loss. Live price unavailable right now.`;
+    if (target != null) return `Target ${pxFmt(target)} — sells there for profit. Live price unavailable right now.`;
+    return "Held on thesis — live price unavailable right now.";
+  }
+  const parts: string[] = [];
+  const inProfit = isLong ? current >= entry : current <= entry;
+  if (inProfit) {
+    parts.push("In profit");
+    if (target != null) {
+      const toT = isLong ? ((target - current) / current) * 100 : ((current - target) / current) * 100;
+      parts.push(`target ${pxFmt(target)} (${toT >= 0 ? "+" : ""}${toT.toFixed(1)}% away)`);
+    }
+    parts.push("the profit-lock trails the stop up so a pullback still books the gain");
+  } else {
+    const beNeed = isLong ? ((entry - current) / current) * 100 : ((current - entry) / current) * 100;
+    parts.push(`break-even at ${pxFmt(entry)} (needs ${beNeed >= 0 ? "+" : ""}${beNeed.toFixed(1)}%)`);
+    if (target != null) {
+      const toT = isLong ? ((target - current) / current) * 100 : ((current - target) / current) * 100;
+      parts.push(`target ${pxFmt(target)} = ${toT >= 0 ? "+" : ""}${toT.toFixed(1)}% from here`);
+    }
+    if (stop != null) {
+      const toS = isLong ? ((current - stop) / current) * 100 : ((stop - current) / current) * 100;
+      parts.push(`cuts the loss at stop ${pxFmt(stop)} (${toS >= 0 ? "−" : "+"}${Math.abs(toS).toFixed(1)}%)`);
+    }
+    if (target == null && stop == null) parts.push("no target or stop set yet — held on thesis while the agent manages the exit");
+  }
+  return parts.join(" · ");
+}
+
 type OpenPos = {
   id: string; ticker: string; asset_type: string | null; side: string | null;
   quantity: number | null; entry_price: number | null; strategy: string | null;
+  stop_price: number | null; target_price: number | null; entry_at: string | null;
 };
 type ClosedPos = {
   id: string; ticker: string; side: string; entry_price: number;
@@ -86,7 +145,7 @@ export default async function PaperPage() {
     supabase.from("paper_accounts").select("*").eq("user_id", user.id).maybeSingle(),
     supabase
       .from("paper_positions")
-      .select("id, ticker, asset_type, side, quantity, entry_price, strategy")
+      .select("id, ticker, asset_type, side, quantity, entry_price, strategy, stop_price, target_price, entry_at")
       .eq("user_id", user.id).eq("status", "open").order("entry_at", { ascending: false }),
     supabase
       .from("paper_positions")
@@ -127,13 +186,25 @@ export default async function PaperPage() {
   const positions: TVPosition[] = open.map((p) => {
     const { layer, name } = layerFor(p.asset_type ?? "", p.strategy ?? "");
     const ap = findAp(String(p.ticker));
+    const sideU = String(p.side ?? "").toUpperCase();
+    const entryN = Number(p.entry_price ?? 0);
+    const curN = ap ? Number(ap.current_price) : null;
+    const stopN = p.stop_price != null ? Number(p.stop_price) : null;
+    const targetN = p.target_price != null ? Number(p.target_price) : null;
+    const isLong = sideU !== "SHORT";
+    const locked = stopN != null && entryN > 0 && (isLong ? stopN > entryN : stopN < entryN);
     return {
-      id: p.id, ticker: p.ticker, side: String(p.side ?? "").toUpperCase(),
-      layer: name, chip: layer, entry: Number(p.entry_price ?? 0), qty: Number(p.quantity ?? 0),
-      current: ap ? Number(ap.current_price) : null,
+      id: p.id, ticker: p.ticker, side: sideU,
+      layer: name, chip: layer, entry: entryN, qty: Number(p.quantity ?? 0),
+      current: curN,
       pnl: ap ? Number(ap.unrealized_pl) : null,
       pct: ap ? Number(ap.unrealized_plpc) * 100 : null,
       flag: ap ? ("live" as const) : ((p.asset_type ?? "").toLowerCase() === "crypto" ? ("modeled" as const) : ("unconfirmed" as const)),
+      stop: stopN, target: targetN,
+      heldSince: p.entry_at ? agoLabel(p.entry_at) : undefined,
+      why: thesisFor(p.strategy ?? "", p.asset_type ?? ""),
+      plan: planText(sideU, entryN, curN, targetN, stopN),
+      locked,
     };
   });
 

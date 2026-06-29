@@ -18,6 +18,12 @@ export type TVPosition = {
   pnl: number | null;
   pct: number | null;
   flag?: "live" | "modeled" | "unconfirmed";
+  stop?: number | null;
+  target?: number | null;
+  heldSince?: string;
+  why?: string;
+  plan?: string;
+  locked?: boolean;
 };
 
 export type TVFeed = {
@@ -247,8 +253,8 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
             <tbody>
               {d.positions.length === 0 ? (
                 <tr><td colSpan={8} className="px-5 py-8 text-center text-[rgb(var(--muted-foreground))]">No open positions. When an approved signal fires, it lands here.</td></tr>
-              ) : d.positions.map((p) => (
-                <tr key={p.id} className="border-b border-[rgb(var(--border))] last:border-0 hover:bg-[rgb(var(--muted))]">
+              ) : d.positions.flatMap((p) => [
+                <tr key={String(p.id) + "-m"} className="border-b border-[rgb(var(--border))] last:border-0 hover:bg-[rgb(var(--muted))]">
                   <td className="px-5 py-3 font-mono font-medium text-[rgb(var(--foreground))]">
                     <span className="inline-flex items-center gap-1.5">
                       {p.ticker}
@@ -284,8 +290,24 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
                       <span className="rounded-md border border-[rgb(var(--border))] px-2 py-1 text-[11px] text-[rgb(var(--muted-foreground))]">{p.layer}</span>
                     )}
                   </td>
-                </tr>
-              ))}
+                </tr>,
+                (p.why || p.plan || p.stop != null || p.target != null) ? (
+                  <tr key={String(p.id) + "-why"} className="border-b border-[rgb(var(--border))] last:border-0">
+                    <td colSpan={8} className="px-5 pb-3 pt-0">
+                      <div className="rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--muted))] px-3 py-2">
+                        {p.why ? <p className="text-[11px] text-[rgb(var(--foreground))]">{p.why}</p> : null}
+                        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-[rgb(var(--muted-foreground))]">
+                          {p.heldSince ? <span>Held {p.heldSince}</span> : null}
+                          {p.stop != null ? <span>Stop {price(p.stop)}</span> : null}
+                          {p.target != null ? <span>Target {price(p.target)}</span> : null}
+                          {p.locked ? <span className="text-emerald-500">● Profit locked</span> : null}
+                        </div>
+                        {p.plan ? <p className="mt-1 text-[11px] text-[rgb(var(--muted-foreground))]">{p.plan}</p> : null}
+                      </div>
+                    </td>
+                  </tr>
+                ) : null,
+              ])}
             </tbody>
           </table>
         </div>
