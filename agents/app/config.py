@@ -192,6 +192,16 @@ class Settings(BaseSettings):
     # cash_secured + premium-at-risk across open positions). 0 disables.
     options_hopeful_allocation_cap_pct: float = 0.03
 
+    # Continuous re-evaluation engine (2026-06-29, Mike). Master OFF by
+    # default; sub-actions on except average-down (spends capital). Tunable
+    # via agents/.env, e.g. TREZO_REEVAL_ENABLED=true. The engine lives in
+    # agents/app/agents/reevaluator.py and runs inside the position monitor.
+    trezo_reeval_enabled: bool = False
+    trezo_reeval_tighten_stop: bool = True
+    trezo_reeval_lower_target: bool = True
+    trezo_reeval_rotate: bool = True
+    trezo_reeval_average_down: bool = False
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

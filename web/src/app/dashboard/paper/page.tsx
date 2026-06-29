@@ -183,9 +183,11 @@ export default async function PaperPage() {
     );
   };
 
+  const matchedSymbols = new Set<string>();
   const positions: TVPosition[] = open.map((p) => {
     const { layer, name } = layerFor(p.asset_type ?? "", p.strategy ?? "");
     const ap = findAp(String(p.ticker));
+    if (ap) matchedSymbols.add(String(ap.symbol).toUpperCase());
     const sideU = String(p.side ?? "").toUpperCase();
     const entryN = Number(p.entry_price ?? 0);
     const curN = ap ? Number(ap.current_price) : null;
@@ -208,7 +210,31 @@ export default async function PaperPage() {
     };
   });
 
-  const deployed = positions.reduce((acc, p) => acc + p.entry * p.qty, 0);
+  // Show everything actually held at the broker, even if Trezo's ledger has
+  // not caught it yet -- append any Alpaca position not already listed.
+  const brokerOnly: TVPosition[] = apos
+    .filter((ap) => !matchedSymbols.has(String(ap.symbol).toUpperCase()))
+    .map((ap) => {
+      const e = Number(ap.avg_entry_price ?? 0);
+      const c = Number(ap.current_price ?? 0);
+      const isLong = String(ap.side ?? "long").toLowerCase() !== "short";
+      const inProfit = isLong ? c >= e : c <= e;
+      return {
+        id: "alpaca:" + String(ap.symbol), ticker: String(ap.symbol),
+        side: String(ap.side ?? "long").toUpperCase(), layer: "Broker", chip: 0,
+        entry: e, qty: Number(ap.qty ?? 0), current: c,
+        pnl: Number(ap.unrealized_pl ?? 0), pct: Number(ap.unrealized_plpc ?? 0) * 100,
+        flag: "live" as const, stop: null, target: null, heldSince: undefined,
+        why: "Held at your Alpaca broker, not yet tracked in Trezo's ledger \u2014 the agents reconcile it shortly. Shown so nothing is hidden.",
+        plan: inProfit
+          ? "In profit at the broker \u2014 the agents will adopt and manage it on the next reconcile."
+          : "The agents will adopt and manage it on the next reconcile (a stop and target get set then).",
+        locked: false,
+      };
+    });
+  const positionsAll: TVPosition[] = [...positions, ...brokerOnly];
+
+  const deployed = positionsAll.reduce((acc, p) => acc + p.entry * p.qty, 0);
   const deployedPct = portfolioValue > 0 ? (deployed / portfolioValue) * 100 : null;
 
   const feed: TVFeed[] = ((msgsRes.data ?? []) as MsgRow[]).map((m) => {
@@ -227,7 +253,7 @@ export default async function PaperPage() {
 
   const data: TradingData = {
     portfolioValue, todayPnl, todayPct: null, deployed, deployedPct,
-    openCount: positions.length, pnlSeries: [0, todayPnl], positions, feed, market: [],
+    openCount: positionsAll.length, pnlSeries: [0, todayPnl], positions: positionsAll, feed, market: [],
     paperMode: true, autoTrade: botRow?.auto_trade_enabled !== false,
     riskLimit: Number(profileRow?.daily_loss_limit_usd ?? 100),
     asOf: snapshotStale ? "last known" : agentsOnline ? "live account" : "agents offline",

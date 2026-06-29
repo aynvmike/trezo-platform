@@ -22,7 +22,7 @@ from app.config import get_settings
 from app.data.candles import fetch_candles_for
 from app.paper.engine import close_position, check_and_lock_profit
 from app.strategies.extended import SWING_MAX_HOLD_DAYS
-from app.agents.reevaluator import REEVAL_ENABLED, reevaluate_position
+from app.agents.reevaluator import reeval_is_enabled, reevaluate_position
 
 from .base import Agent, AgentMessage
 
@@ -771,7 +771,7 @@ class PositionMonitorAgent(Agent):
             # flagged OFF, so this is a no-op until enabled -- live behavior
             # is unchanged today.
             reeval_close: str | None = None
-            if REEVAL_ENABLED:
+            if reeval_is_enabled():
                 try:
                     _rv = await reevaluate_position(
                         r, price, side, at, strat, stop, target,

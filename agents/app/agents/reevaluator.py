@@ -43,12 +43,25 @@ def _num(name: str, default: float) -> float:
         return default
 
 
-# --- master + per-action switches (master OFF until Mike enables) ----------
-REEVAL_ENABLED = _flag("TREZO_REEVAL_ENABLED", "0")
-REEVAL_TIGHTEN_STOP = _flag("TREZO_REEVAL_TIGHTEN_STOP", "1")
-REEVAL_LOWER_TARGET = _flag("TREZO_REEVAL_LOWER_TARGET", "1")
-REEVAL_ROTATE = _flag("TREZO_REEVAL_ROTATE", "1")
-REEVAL_AVERAGE_DOWN = _flag("TREZO_REEVAL_AVERAGE_DOWN", "0")  # spends capital -> off until wired + capped
+# --- master + per-action switches -----------------------------------------
+# Read through pydantic Settings so agents/.env reliably controls them: this
+# app loads .env via Settings, NOT os.environ, so a bare os.getenv would miss
+# .env. Falls back to a real env var, then the default. Master OFF until set.
+def _settings_flag(attr: str, env: str, default: bool) -> bool:
+    try:
+        from app.config import get_settings
+        v = getattr(get_settings(), attr, None)
+        if v is not None:
+            return bool(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return _flag(env, "1" if default else "0")
+
+
+def reeval_is_enabled() -> bool:
+    """Master switch -- True only when TREZO_REEVAL_ENABLED is set in
+    agents/.env (or the environment). Default OFF."""
+    return _settings_flag("trezo_reeval_enabled", "TREZO_REEVAL_ENABLED", False)
 
 # --- tunable bounds --------------------------------------------------------
 COOLDOWN_SEC = _num("TREZO_REEVAL_COOLDOWN_SEC", 900)
@@ -156,7 +169,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
     an action is taken, else None. Persists stop/target changes itself and logs
     every action. Fail-open: any error returns None."""
     try:
-        if not REEVAL_ENABLED:
+        if not reeval_is_enabled():
             return None
         pid = str(r.get("id"))
         now = _time.monotonic()
@@ -182,6 +195,10 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         stale = held >= STALE_DAYS
         very_stale = held >= ROTATE_DAYS
         low_edge = _low_edge(str(strat or ""), str(at or ""))
+        tighten_on = _settings_flag("trezo_reeval_tighten_stop", "TREZO_REEVAL_TIGHTEN_STOP", True)
+        lower_on = _settings_flag("trezo_reeval_lower_target", "TREZO_REEVAL_LOWER_TARGET", True)
+        rotate_on = _settings_flag("trezo_reeval_rotate", "TREZO_REEVAL_ROTATE", True)
+        avgdown_on = _settings_flag("trezo_reeval_average_down", "TREZO_REEVAL_AVERAGE_DOWN", False)
 
         giveback = 0.0
         try:
@@ -204,7 +221,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
             cur_target = None
 
         # ---- 1) Rotate a dead position out -> free the capital -----------
-        if REEVAL_ROTATE and (very_stale or (stale and (regime == "risk_off" or low_edge))):
+        if rotate_on and (very_stale or (stale and (regime == "risk_off" or low_edge))):
             reason = (f"{ticker}: held {held:.0f}d, down {abs(gain) * 100:.1f}% and the edge has "
                       f"faded{' (risk-off)' if regime == 'risk_off' else ''} -- closing to free the "
                       f"capital for a higher-edge setup.")
@@ -213,7 +230,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
             return {"close": "reeval_rotate"}
 
         # ---- 2) Average down (ADVISORY only this part) -------------------
-        if (REEVAL_AVERAGE_DOWN and regime != "risk_off" and not very_stale
+        if (avgdown_on and regime != "risk_off" and not very_stale
                 and gain <= -AVGDOWN_TRIGGER and is_long):
             reason = (f"{ticker}: down {abs(gain) * 100:.1f}% with the thesis still intact -- a measured "
                       f"add near {_pf(price)} would lower the cost basis. (Averaging-down is staged for "
@@ -223,7 +240,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
             return None
 
         # ---- 3) Lower an unrealistic target so it can exit green ---------
-        if REEVAL_LOWER_TARGET and stale and cur_target is not None:
+        if lower_on and stale and cur_target is not None:
             far = ((cur_target - price) / price) if is_long else ((price - cur_target) / price)
             if far > TARGET_FAR_PCT:
                 if is_long:
@@ -243,7 +260,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                     return {"target": new_t}
 
         # ---- 4) Tighten the stop to cut the loss sooner -----------------
-        if REEVAL_TIGHTEN_STOP and (regime == "risk_off" or giveback >= TIGHTEN_GIVEBACK or stale):
+        if tighten_on and (regime == "risk_off" or giveback >= TIGHTEN_GIVEBACK or stale):
             if is_long:
                 new_s = round(price * (1 - TIGHTEN_BAND), 4)
                 ok = new_s < price and (cur_stop is None or new_s > cur_stop)
