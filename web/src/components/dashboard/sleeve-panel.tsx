@@ -1,16 +1,18 @@
-import { Zap, Clock, Anchor, type LucideIcon } from "lucide-react";
+import { Zap, Clock, Anchor, TrendingUp, Coins, type LucideIcon } from "lucide-react";
 import { fetchSleeveSnapshot, type SleeveRow } from "@/lib/sleeve-snapshot";
 
 /**
- * Capital Sleeves panel — ported from the Neo-Obsidian "update 2" design
- * (CapitalSleevesView), wired to the REAL /sleeves/snapshot data. Server
- * component (no framer-motion); animation via CSS + the depth system.
+ * Allocation Pockets panel — the Neo-Obsidian "update 2" card design, wired
+ * to the REAL /allocations/snapshot data: the per-market-type budgets the
+ * Trade Execution gate enforces (Phase 8a.2). Server component (no
+ * framer-motion); animation via CSS + the depth system.
  */
 
 const META: Record<string, { name: string; horizon: string; accent: string; velocity: string; Icon: LucideIcon }> = {
-  active: { name: "Active", horizon: "Intraday → next-day", accent: "16 185 129", velocity: "Fast — recycles capital several times a week", Icon: Zap },
-  options: { name: "Quick Options", horizon: "2–3 day", accent: "245 158 11", velocity: "Medium — a couple of recycles a week", Icon: Clock },
-  holding: { name: "Holding", horizon: "Days → indefinite", accent: "56 189 248", velocity: "Slow — anchors the basket", Icon: Anchor },
+  stocks: { name: "Stocks", horizon: "Day → swing", accent: "16 185 129", velocity: "Fast — day-to-swing plays recycle capital weekly", Icon: TrendingUp },
+  crypto: { name: "Crypto", horizon: "Swing → HODL", accent: "245 158 11", velocity: "Mixed — swing trades recycle; HODL accumulates slowly", Icon: Coins },
+  options: { name: "Options", horizon: "2–3 day", accent: "168 85 247", velocity: "Fast — short plays, +30% take-profit recycle", Icon: Clock },
+  income: { name: "Income", horizon: "Weeks → indefinite", accent: "56 189 248", velocity: "Slow — wheel cycles + dividends anchor the basket", Icon: Anchor },
 };
 
 function money(n: number): string {
@@ -58,8 +60,8 @@ export default async function SleevePanel({ userId }: { userId: string }) {
         </span>
       </section>
 
-      {/* Three sleeve cards */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      {/* One card per pocket */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
         {snap.sleeves.map((s) => (
           <SleeveCard key={s.id} s={s} />
         ))}
@@ -69,7 +71,7 @@ export default async function SleevePanel({ userId }: { userId: string }) {
 }
 
 function SleeveCard({ s }: { s: SleeveRow }) {
-  const m = META[s.id] ?? META.active;
+  const m = META[s.id] ?? META.stocks;
   const accent = `rgb(${m.accent})`;
   const Icon = m.Icon;
   const usedPct = Math.min(100, Math.max(0, s.used_pct));
@@ -138,7 +140,7 @@ function SleeveCard({ s }: { s: SleeveRow }) {
       {/* Layer chips */}
       {s.layers && s.layers.length ? (
         <div className="border-t border-[rgb(var(--border))] pt-3">
-          <div className="mb-2 text-[10px] uppercase tracking-wider text-[rgb(var(--muted-foreground))]">Layers feeding this sleeve</div>
+          <div className="mb-2 text-[10px] uppercase tracking-wider text-[rgb(var(--muted-foreground))]">Layers feeding this pocket</div>
           <div className="flex flex-wrap gap-1.5">
             {s.layers.map((l, i) => {
               const mm = l.match(/^(\d+)\s+(.*)$/);

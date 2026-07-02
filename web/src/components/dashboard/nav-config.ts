@@ -49,7 +49,7 @@ export const NAV: NavItem[] = [
   // Budget Mirror + Future Projections merged into "Grasping Wallet"
   // on 2026-05-30. /dashboard/projections still redirects here.
   { href: "/dashboard/budget",             label: "Grasping Wallet",   section: "plan" },
-  { href: "/dashboard/sleeves",            label: "Capital Sleeves",   section: "plan" },
+  { href: "/dashboard/sleeves",            label: "Allocation Pockets", section: "plan" },
   { href: "/dashboard/tax",                label: "Tax Optimizer",     section: "plan" },
 
   // CONFIGURE — knobs + reference

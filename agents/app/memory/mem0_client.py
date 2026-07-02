@@ -200,6 +200,27 @@ def normalize_tags(metadata: dict) -> dict:
         return dict(metadata or {})
 
 
+# --- Token-lean layer (Mike 2026-07-01): dedupe + digest + recall cache ---
+_RECENT_ADDS: dict[str, float] = {}          # (agent|action|ticker) -> ts
+_SEARCH_CACHE: dict[str, tuple[float, list]] = {}   # query key -> (ts, rows)
+_DIGEST_LOCK = _threading.Lock()
+_DIGEST_BUF: list[str] = []
+_DIGEST_FIRST_TS: float = 0.0
+
+
+def _digest_limits() -> tuple[int, float]:
+    """Flush the digest after N items or S seconds, whichever first."""
+    try:
+        n = int(_os.getenv("TREZO_MEM0_DIGEST_MAX_ITEMS", "25"))
+    except (TypeError, ValueError):
+        n = 25
+    try:
+        s = float(_os.getenv("TREZO_MEM0_DIGEST_MAX_AGE_SEC", "900"))
+    except (TypeError, ValueError):
+        s = 900.0
+    return max(1, n), max(30.0, s)
+
+
 def budget_status() -> dict:
     """Current spend vs limits. Surfaced via TrezoMemory.health()."""
     max_day, max_week, max_search = _budget_limits()
@@ -342,6 +363,20 @@ class TrezoMemory:
         Persist an agent decision to Mem0. Returns the memory ID on
         success, None on failure. Never raises.
         """
+        # Dedupe (2026-07-02): an identical (agent, action, ticker) within
+        # the window re-learns nothing -- skip BEFORE spending budget.
+        try:
+            _dk = f"{decision.agent}|{decision.action}|{decision.ticker}"
+            _ttl = float(_os.getenv("TREZO_MEM0_DEDUPE_SEC", "1800"))
+            _prev = _RECENT_ADDS.get(_dk, 0.0)
+            _nowt = _time.time()
+            if _ttl > 0 and (_nowt - _prev) < _ttl:
+                return None
+            _RECENT_ADDS[_dk] = _nowt
+            if len(_RECENT_ADDS) > 4096:
+                _RECENT_ADDS.clear()
+        except Exception:  # noqa: BLE001
+            pass
         if not self._available or _writes_paused():
             return None
         if not _budget_try_spend("add"):
@@ -442,6 +477,16 @@ class TrezoMemory:
         """
         if not self._available:
             return []
+        # Shared-recall cache (2026-07-02): agents asking the same question
+        # within the TTL share ONE Mem0 search -- saves tokens + budget.
+        _ck = f"{query}|{limit}|{agent}|{ticker}|{kind}".lower()
+        try:
+            _hit = _SEARCH_CACHE.get(_ck)
+            _ttl = float(_os.getenv("TREZO_MEM0_RECALL_TTL_SEC", "180"))
+            if _hit and (_time.time() - _hit[0]) < _ttl:
+                return list(_hit[1])
+        except Exception:  # noqa: BLE001
+            pass
         if not _budget_try_spend("search"):
             _budget_throttle_log("search")
             return []
@@ -471,10 +516,67 @@ class TrezoMemory:
                         if str(_meta(r).get("ticker", "")).upper() == ticker.upper()]
             if kind:
                 rows = [r for r in rows if _meta(r).get("kind") == kind]
-            return rows[:int(limit)]
+            out = rows[:int(limit)]
+            try:
+                _SEARCH_CACHE[_ck] = (_time.time(), list(out))
+                if len(_SEARCH_CACHE) > 512:
+                    _SEARCH_CACHE.clear()
+            except Exception:  # noqa: BLE001
+                pass
+            return out
         except Exception as e:  # noqa: BLE001
             logger.warning("Mem0 recall_similar failed for %r: %s", query, e)
             return []
+
+    # ------------------------------------------------------------------
+    # Batch digest -- token-lean shorthand delivery (Mike 2026-07-01)
+    # ------------------------------------------------------------------
+
+    def queue_note(self, agent: str, text: str,
+                   ticker: str | None = None) -> None:
+        """Buffer one routine observation in shorthand. The buffer flushes
+        as ONE combined Mem0 add per window (default 25 items / 15 min),
+        so dozens of small observations cost a single API call. Full
+        detail always lives in the free local activity log. Never raises."""
+        global _DIGEST_FIRST_TS
+        if not self._available:
+            return
+        try:
+            line = f"{(ticker or '').upper()} {text}".strip()[:160]
+            items = None
+            with _DIGEST_LOCK:
+                if not _DIGEST_BUF:
+                    _DIGEST_FIRST_TS = _time.time()
+                _DIGEST_BUF.append(line)
+                max_n, max_age = _digest_limits()
+                if (len(_DIGEST_BUF) >= max_n
+                        or (_time.time() - _DIGEST_FIRST_TS) >= max_age):
+                    items = list(_DIGEST_BUF)
+                    _DIGEST_BUF.clear()
+            if items:
+                self._flush_digest(items)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _flush_digest(self, items: list[str]) -> None:
+        """One combined add for a whole window of observations."""
+        if _writes_paused() or not _budget_try_spend("add"):
+            _budget_throttle_log("add")
+            return
+        try:
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime("%m-%d %H:%MZ")
+            content = f"[digest {stamp}] " + "; ".join(items)
+            self._client.add(
+                messages=[{"role": "assistant", "content": content[:4000]}],
+                user_id=self.user_id,
+                metadata=normalize_tags({
+                    "kind": "digest", "agent": "digest",
+                    "count": len(items),
+                }),
+            )
+        except Exception as e:  # noqa: BLE001
+            _maybe_pause_writes(e)
 
     # ------------------------------------------------------------------
     # Health + utility
@@ -499,12 +601,21 @@ class TrezoMemory:
 
     @staticmethod
     def _format_decision(d: AgentDecision) -> str:
-        meta_str = ", ".join(f"{k}={v}" for k, v in d.metadata.items())
+        # Token-lean (2026-07-02): reasoning capped + metadata trimmed to
+        # identity keys. The full story is in the local activity log for
+        # free; Mem0 only pays for the lesson.
+        try:
+            cap = int(_os.getenv("TREZO_MEM0_MAX_REASON_CHARS", "200"))
+        except (TypeError, ValueError):
+            cap = 200
+        body = (d.reasoning or "").strip()
+        if cap > 0 and len(body) > cap:
+            body = body[: cap - 1] + "~"
+        keep = ("tcs", "strategy", "user_id", "decision_key")
+        meta_str = ", ".join(
+            f"{k}={v}" for k, v in d.metadata.items() if k in keep)
         head = f"[{d.agent}] {d.action.upper()} {d.ticker}"
-        body = d.reasoning
-        if meta_str:
-            body = f"{body} ({meta_str})"
-        return f"{head}: {body}"
+        return f"{head}: {body}" + (f" ({meta_str})" if meta_str else "")
 
     @staticmethod
     def _format_outcome(o: TradeOutcome) -> str:

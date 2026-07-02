@@ -24,6 +24,32 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _roll_realized(client, user_id, pnl: float) -> None:
+    """Fold a reconcile-close P/L into the account realized counters
+    (today/week/ytd). P/L stats only -- cash is deliberately untouched so
+    the internal cash ledger cannot drift from this path (2026-07-02)."""
+    try:
+        def _acct():
+            return (client.table("paper_accounts")
+                    .select("today_realized_pnl_usd, week_realized_pnl_usd, "
+                            "ytd_realized_pnl_usd")
+                    .eq("user_id", user_id).single().execute())
+        row = (await asyncio.to_thread(_acct)).data or {}
+
+        def _upd():
+            return (client.table("paper_accounts").update({
+                "today_realized_pnl_usd": round(
+                    float(row.get("today_realized_pnl_usd") or 0) + pnl, 2),
+                "week_realized_pnl_usd": round(
+                    float(row.get("week_realized_pnl_usd") or 0) + pnl, 2),
+                "ytd_realized_pnl_usd": round(
+                    float(row.get("ytd_realized_pnl_usd") or 0) + pnl, 2),
+            }).eq("user_id", user_id).execute())
+        await asyncio.to_thread(_upd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def reconcile_stocks_all_users() -> dict[str, Any]:
     """Reconcile every user's open paper_positions stocks against the
     Alpaca broker truth. Idempotent + safe to call from a tick loop.
@@ -128,9 +154,32 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                 # as a close (open-bell phantom-close race, 2026-06-15).
                 if not trust_close:
                     continue
-                # Trezo has it open; Alpaca does not. Close as manual
-                # with a reconcile note.
-                def _close(rid=r["id"]):
+                # Trezo has it open; Alpaca does not. Close as manual --
+                # and recover the REAL exit fill so realized P/L is true
+                # ($0-realized rows corrupted the learning loop and kept
+                # the weekly kill-switch blind; fixed 2026-07-02).
+                exit_px = None
+                try:
+                    from app.brokers.alpaca import get_recent_closed_orders
+                    _r_side = str(r.get("side") or "long")
+                    _close_side = "sell" if _r_side == "long" else "buy"
+                    for o in await get_recent_closed_orders(sym, token=token):
+                        if (str(o.get("side")) == _close_side
+                                and o.get("filled_avg_price")):
+                            exit_px = float(o["filled_avg_price"])
+                            break
+                except Exception:  # noqa: BLE001
+                    exit_px = None
+                _qty = float(r.get("quantity") or 0)
+                _entry = float(r.get("entry_price") or 0)
+                realized = 0.0
+                if exit_px and _entry > 0 and _qty > 0:
+                    realized = round(
+                        _qty * (exit_px - _entry)
+                        if str(r.get("side") or "long") == "long"
+                        else _qty * (_entry - exit_px), 2)
+
+                def _close(rid=r["id"], _px=exit_px, _pnl=realized):
                     return (
                         client.table("paper_positions")
                         .update({
@@ -141,8 +190,8 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                             # reconcile reason now lives in the summary
                             # message + agent log only.
                             "status": "closed_manual",
-                            "exit_price": None,
-                            "realized_pnl_usd": 0,
+                            "exit_price": _px,
+                            "realized_pnl_usd": _pnl,
                             "exit_at": _now_iso(),
                         })
                         .eq("id", rid)
@@ -152,6 +201,20 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     await asyncio.to_thread(_close)
                     closed += 1
                     notes_list.append(f"{sym} closed (phantom)")
+                    if realized:
+                        await _roll_realized(client, user_id, realized)
+                    try:
+                        from app.agents.activity_log import record as _arec
+                        _arec("reconcile_close", sym,
+                              reason=(f"broker no longer holds it - closed "
+                                      f"with realized ${realized:+.2f}"
+                                      if exit_px else
+                                      "broker no longer holds it - closed; "
+                                      "no closing fill found so P/L unknown"),
+                              extra={"user_id": str(user_id),
+                                     "exit_price": exit_px})
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:
                     continue
                 continue

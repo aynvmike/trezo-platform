@@ -1,7 +1,8 @@
 /**
- * Server-only helper for the Capital Sleeves snapshot. Mirrors
- * alpaca-snapshot.ts: one fetch of the agents `/sleeves/snapshot` endpoint,
- * deduped by Next within a request.
+ * Server-only helper for the Allocation Pockets snapshot. Mirrors
+ * alpaca-snapshot.ts: one fetch of the agents `/allocations/snapshot`
+ * endpoint (the REAL per-market-type budgets the Trade Execution gate
+ * enforces), deduped by Next within a request.
  */
 
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
@@ -32,7 +33,7 @@ export async function fetchSleeveSnapshot(
 ): Promise<SleeveSnapshot | null> {
   try {
     const qs = new URLSearchParams({ user_id: userId });
-    const r = await fetch(`${AGENTS_BASE}/sleeves/snapshot?${qs.toString()}`, {
+    const r = await fetch(`${AGENTS_BASE}/allocations/snapshot?${qs.toString()}`, {
       cache: "no-store",
       signal: AbortSignal.timeout(8000),
     });

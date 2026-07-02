@@ -1371,6 +1371,73 @@ class _StockTrimReq(BaseModel):
     reason: str = "user_trim"
 
 
+@app.get("/allocations/snapshot", tags=["paper"])
+async def allocations_snapshot(user_id: str):
+    """The REAL capital pockets the Trade Execution gate enforces (Phase
+    8a.2 allocation): per-market-type dollar budgets under the account's
+    posture, plus how much of each pocket is deployed right now. Added
+    2026-07-02 to replace the dead /sleeves/snapshot the Capital Sleeves
+    page pointed at -- the UI now shows exactly what the gate enforces."""
+    from app.paper.allocation import (
+        MARKET_TYPES, build_allocation, deployed_capital,
+    )
+    from app.paper.engine import get_account
+    from app.runtime.settings import get_bot_settings
+
+    cfg = get_bot_settings(user_id)
+    account = await get_account(user_id)
+    equity = 0.0
+    if account:
+        equity = (float(account.get("current_cash_usd") or 0)
+                  + float(account.get("vault_balance_usd") or 0))
+    alloc = build_allocation(
+        equity,
+        posture_setting=cfg.account_posture,
+        overrides=cfg.allocation_overrides,
+    )
+    deployed = await deployed_capital(user_id)
+    copy = {
+        "stocks": ("Stocks", "Day-to-swing stock strategies.",
+                   "Ladder stops; the profit trail locks gains on giveback.",
+                   ["1 Stock Bot"]),
+        "crypto": ("Crypto", "Crypto swings + patient HODL accumulation.",
+                   "Entries must net a profit after fees + slippage; "
+                   "trail-to-lock protects big runs.",
+                   ["2 Crypto Bot"]),
+        "options": ("Options", "Directional option plays.",
+                    "Drawback ladder + take-profit recycle.",
+                    ["3 Options"]),
+        "income": ("Income", "Wheel cycles + dividend holdings.",
+                   "Collect premium and dividends; assignment is part "
+                   "of the plan.",
+                   ["4 Dividend Wheel", "5 Dividends"]),
+    }
+    sleeves = []
+    for mt in MARKET_TYPES:
+        b = float(alloc.budgets.get(mt, 0.0))
+        d = float(deployed.get(mt, 0.0))
+        label, hold, profit, layers = copy[mt]
+        sleeves.append({
+            "id": mt,
+            "label": label,
+            "budget_usd": round(b, 2),
+            "deployed_usd": round(d, 2),
+            "free_usd": round(max(0.0, b - d), 2),
+            "used_pct": round((d / b * 100.0) if b > 0 else 0.0, 1),
+            "hold": hold,
+            "profit": profit,
+            "layers": layers,
+        })
+    return {
+        "configured": bool(account),
+        "profile": alloc.posture,
+        "equity_usd": round(equity, 2),
+        "scaled_max_open": int(cfg.max_open_positions),
+        "summary": alloc.summary,
+        "sleeves": sleeves,
+    }
+
+
 @app.post("/paper/positions/trim", tags=["paper"])
 async def paper_positions_trim(req: _StockTrimReq) -> dict:
     """Sell a fraction of an open paper position. Backs the stock

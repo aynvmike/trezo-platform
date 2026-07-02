@@ -852,19 +852,14 @@ class RiskManagerAgent(Agent):
             if mem.available and not _is_routine:
                 # Patched 2026-06-04: fire-and-forget on worker thread.
                 # Sync Mem0 calls block the event loop when Mem0 is slow.
+                # Batch digest (2026-07-02): vetoes ride the token-lean
+                # digest buffer -- one combined Mem0 add per window instead
+                # of one API call per veto. Full reason is in the local
+                # activity log already.
                 asyncio.create_task(asyncio.to_thread(
-                    mem.log_decision,
-                    AgentDecision(
-                        agent="risk_manager",
-                        action="veto",
-                        ticker=ticker,
-                        reasoning=reason,
-                        metadata={
-                            "tcs": int(tcs),
-                            "strategy": strategy or "unknown",
-                            "user_id": user_id or "global",
-                        },
-                    ),
+                    mem.queue_note, "risk_manager",
+                    f"v tcs{int(tcs)} {strategy or '?'}: {reason[:90]}",
+                    ticker,
                 ))
         except Exception:
             pass  # memory failure cannot block a veto

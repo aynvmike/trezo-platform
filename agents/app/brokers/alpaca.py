@@ -302,6 +302,23 @@ ALPACA_CRYPTO_SYMBOLS = frozenset({
 })
 
 
+async def get_recent_closed_orders(symbol: str,
+                                   token: Optional["UserToken"] = None,
+                                   limit: int = 8) -> list[dict]:
+    """Most recent closed orders for one symbol, newest first. Lets the
+    reconciler recover the TRUE exit fill for a position that vanished at
+    the broker instead of booking $0 realized (2026-07-02)."""
+    try:
+        rows = await _get(
+            f"/v2/orders?status=closed&symbols={symbol.upper()}"
+            f"&limit={int(limit)}&direction=desc",
+            token=token,
+        )
+        return rows if isinstance(rows, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def alpaca_crypto_supports(symbol: str) -> bool:
     """True when the symbol is in the Alpaca crypto allowlist."""
     return (symbol or "").upper().strip() in ALPACA_CRYPTO_SYMBOLS
