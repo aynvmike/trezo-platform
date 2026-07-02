@@ -272,6 +272,9 @@ async def fetch_candles_for(
 ) -> list[Candle]:
     """Single dispatch for stock vs crypto."""
     sym = symbol.upper()
+    if asset_type == "forex":
+        from app.data.forex import fetch_forex_candles
+        return await fetch_forex_candles(sym, interval_min=240)
     if asset_type == "crypto" or sym in COIN_MAP:
         return await fetch_crypto_ohlc(sym, days=90)
     return await fetch_stock_candles(sym)

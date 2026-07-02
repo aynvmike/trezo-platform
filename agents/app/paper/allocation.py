@@ -27,13 +27,15 @@ from app.config import get_settings
 
 
 POSTURES = ("growth", "balanced", "income")
-MARKET_TYPES = ("crypto", "stocks", "options", "income")
+MARKET_TYPES = ("crypto", "stocks", "options", "income", "forex")
 
 # Per-posture split of equity across market types (fractions, sum to 1.0).
+# Forex added 2026-07-02 (modeled engine, Kraken data): a small dedicated
+# pocket carved from stocks+crypto so FX trades never eat the other lanes.
 POSTURE_SPLIT: dict[str, dict[str, float]] = {
-    "growth":   {"crypto": 0.35, "stocks": 0.45, "options": 0.10, "income": 0.10},
-    "balanced": {"crypto": 0.20, "stocks": 0.35, "options": 0.20, "income": 0.25},
-    "income":   {"crypto": 0.10, "stocks": 0.20, "options": 0.20, "income": 0.50},
+    "growth":   {"crypto": 0.32, "stocks": 0.42, "options": 0.10, "income": 0.10, "forex": 0.06},
+    "balanced": {"crypto": 0.18, "stocks": 0.32, "options": 0.20, "income": 0.25, "forex": 0.05},
+    "income":   {"crypto": 0.09, "stocks": 0.18, "options": 0.20, "income": 0.48, "forex": 0.05},
 }
 
 # How each posture leans on realized gains.
@@ -63,6 +65,8 @@ def market_type_for(strategy: str, asset_type: str) -> str:
     """Map a trade's strategy + asset type to one of the MARKET_TYPES buckets."""
     s = (strategy or "").lower()
     at = (asset_type or "").lower()
+    if at == "forex" or s.startswith("forex"):
+        return "forex"
     if at == "crypto" or s.startswith("crypto"):
         return "crypto"
     if s.startswith("wheel"):

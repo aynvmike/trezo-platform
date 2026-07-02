@@ -1,4 +1,4 @@
-import { Zap, Clock, Anchor, TrendingUp, Coins, type LucideIcon } from "lucide-react";
+import { Zap, Clock, Anchor, TrendingUp, Coins, Globe, type LucideIcon } from "lucide-react";
 import { fetchSleeveSnapshot, type SleeveRow } from "@/lib/sleeve-snapshot";
 
 /**
@@ -13,6 +13,7 @@ const META: Record<string, { name: string; horizon: string; accent: string; velo
   crypto: { name: "Crypto", horizon: "Swing → HODL", accent: "245 158 11", velocity: "Mixed — swing trades recycle; HODL accumulates slowly", Icon: Coins },
   options: { name: "Options", horizon: "2–3 day", accent: "168 85 247", velocity: "Fast — short plays, +30% take-profit recycle", Icon: Clock },
   income: { name: "Income", horizon: "Weeks → indefinite", accent: "56 189 248", velocity: "Slow — wheel cycles + dividends anchor the basket", Icon: Anchor },
+  forex: { name: "Forex", horizon: "Hours → days, 24×5", accent: "236 72 153", velocity: "Quick — ATR-fit moves on the majors, long or short", Icon: Globe },
 };
 
 function money(n: number): string {

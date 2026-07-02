@@ -171,7 +171,13 @@ class TradeExecutionAgent(Agent):
         side: str,
         source_payload: dict,
     ) -> list[AgentMessage]:
-        asset_type = "crypto" if ticker.upper() in CRYPTO_SYMBOLS else "stock"
+        # Forex (2026-07-02): the signal declares its own asset_type;
+        # ticker-derived detection stays the fallback for stock/crypto.
+        _declared = str(source_payload.get("asset_type") or "").lower()
+        if _declared == "forex":
+            asset_type = "forex"
+        else:
+            asset_type = "crypto" if ticker.upper() in CRYPTO_SYMBOLS else "stock"
         # Strategy label - prefer the field the source agent set explicitly,
         # then fall back to the richer per-pick selection metadata, then the
         # dominant detected pattern, then a generic "system" tag (never the

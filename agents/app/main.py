@@ -1411,6 +1411,9 @@ async def allocations_snapshot(user_id: str):
                    "Collect premium and dividends; assignment is part "
                    "of the plan.",
                    ["4 Dividend Wheel", "5 Dividends"]),
+        "forex": ("Forex", "Major fiat pairs, long or short (modeled).",
+                  "ATR-fit targets; quick realistic moves, 24x5.",
+                  ["Forex Majors"]),
     }
     sleeves = []
     for mt in MARKET_TYPES:

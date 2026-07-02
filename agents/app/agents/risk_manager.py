@@ -507,6 +507,11 @@ class RiskManagerAgent(Agent):
         from app.strategies.crypto import is_accumulation_strategy
         _coin_u = ticker.upper()
         _is_crypto = _coin_u in _COIN_MAP_ACC
+        # Forex (2026-07-02): fiat pairs skip the US-equity session and
+        # stock-liquidity gates; costs are tiny (5bps slip each way) and
+        # the scanner's ATR targets clear them. Pocket + sizing still gate.
+        _is_forex = (str(message.payload.get("asset_type") or "").lower()
+                     == "forex")
         _accumulate_mode = is_accumulation_strategy(strategy)
         accumulation_add = False
         if _is_crypto:
@@ -621,7 +626,7 @@ class RiskManagerAgent(Agent):
         # Read the crypto set from COIN_MAP so the ISO 20022-aligned
         # coin expansion (Mike 2026-05-31) is picked up automatically.
         from app.data.candles import COIN_MAP as _COIN_MAP
-        if ticker.upper() not in _COIN_MAP:
+        if ticker.upper() not in _COIN_MAP and not _is_forex:
             from app.strategies.market_filter import (
                 get_market_bias, direction_blocked, liquidity_check,
                 overextension_check, spread_quality_check,
@@ -709,6 +714,7 @@ class RiskManagerAgent(Agent):
         # per-user instead of falling through to NULL.
         approve_payload: dict = {
             "user_id": message.payload.get("user_id"),
+            "asset_type": message.payload.get("asset_type"),
             "ticker": ticker,
             "direction": direction,
             "tcs": tcs,
