@@ -477,6 +477,54 @@ async def get_open_orders_for(symbol: str) -> Optional[list]:
     return data if isinstance(data, list) else None
 
 
+async def cancel_open_orders_for(symbol: str) -> tuple[int, Optional[str]]:
+    """Cancel every open order on one symbol (the cancel-legs-first
+    pattern from the 6/12 GM fix, as a reusable primitive). Returns
+    (count_requested, error) -- error only when the LISTING failed."""
+    sym = symbol.upper()
+    orders = await _get(f"/v2/orders?status=open&symbols={sym}")
+    if not isinstance(orders, list):
+        return 0, "could not list open orders"
+    n = 0
+    for o in orders:
+        oid = o.get("id")
+        if oid:
+            await _delete(f"/v2/orders/{oid}")
+            n += 1
+    return n, None
+
+
+async def submit_market_sell(
+    symbol: str, qty: float,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Plain market sell (profit-stepping slice, 2026-07-02)."""
+    return await _post("/v2/orders", {
+        "symbol": symbol.upper(),
+        "qty": str(qty),
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day",
+    })
+
+
+async def submit_oco_sell(
+    symbol: str, qty: float, limit_price: float, stop_price: float,
+) -> tuple[Optional[dict], Optional[str]]:
+    """OCO exit pair for an existing LONG: take-profit limit + stop, one
+    cancels the other. Re-protects a remainder after a partial sell
+    (2026-07-02). Prices rounded to pennies (Alpaca sub-penny rule)."""
+    return await _post("/v2/orders", {
+        "symbol": symbol.upper(),
+        "qty": str(qty),
+        "side": "sell",
+        "type": "limit",
+        "time_in_force": "gtc",
+        "order_class": "oco",
+        "take_profit": {"limit_price": str(round(float(limit_price), 2))},
+        "stop_loss": {"stop_price": str(round(float(stop_price), 2))},
+    })
+
+
 async def liquidate_position(
     symbol: str, asset_type: str = "stock",
 ) -> tuple[Optional[dict], Optional[str]]:

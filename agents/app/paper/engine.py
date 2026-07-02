@@ -702,6 +702,104 @@ async def record_external_position(
         return FillResult(ok=False, error=str(e))
 
 
+async def record_external_partial_close(
+    user_id: str,
+    position_id: str,
+    slice_qty: float,
+    fill_price: float,
+    reason: str = "profit_step",
+) -> FillResult:
+    """Book a PARTIAL close of an external-broker (Alpaca) position:
+    a closed-slice row is written (so the row-truth kill-switch and the
+    learning loop both see the banked P/L) and the open row's quantity is
+    reduced. No cash/counter mutation -- external rows follow
+    record_external_close's convention: rows are the truth (2026-07-02)."""
+    client = _supabase()
+    if not client:
+        return FillResult(ok=False, error="Supabase not configured")
+
+    def _sync_get():
+        return (
+            client.table("paper_positions")
+            .select("*")
+            .eq("id", position_id)
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+
+    res = await asyncio.to_thread(_sync_get)
+    pos = res.data if res else None
+    if not pos or pos.get("status") != "open":
+        return FillResult(ok=False, error="Position not open")
+    qty_total = float(pos.get("quantity") or 0)
+    sq = float(slice_qty)
+    if sq <= 0 or sq >= qty_total:
+        return FillResult(ok=False, error="Bad slice quantity")
+    entry = float(pos.get("entry_price") or 0)
+    side = pos.get("side") or "long"
+    pnl = (sq * (fill_price - entry) if side == "long"
+           else sq * (entry - fill_price))
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _ins_slice():
+        return client.table("paper_positions").insert({
+            "user_id": user_id,
+            "ticker": pos.get("ticker"),
+            "asset_type": pos.get("asset_type"),
+            "side": side,
+            "broker": pos.get("broker"),
+            "strategy": pos.get("strategy"),
+            "quantity": sq,
+            "entry_price": entry,
+            "entry_at": pos.get("entry_at"),
+            "stop_price": pos.get("stop_price"),
+            "target_price": pos.get("target_price"),
+            "source_payload": pos.get("source_payload"),
+            "fees_usd": 0,
+            "status": "closed_partial",
+            "exit_price": fill_price,
+            "exit_at": now_iso,
+            "realized_pnl_usd": round(pnl, 2),
+        }).execute()
+
+    def _shrink():
+        return (client.table("paper_positions")
+                .update({"quantity": qty_total - sq})
+                .eq("id", position_id).execute())
+
+    try:
+        await asyncio.to_thread(_ins_slice)
+        await asyncio.to_thread(_shrink)
+        try:
+            from app.learning.outcomes import record_paper_close
+            await record_paper_close(
+                user_id=user_id,
+                position_id=position_id,
+                ticker=pos.get("ticker"),
+                asset_type=pos.get("asset_type"),
+                side=side,
+                strategy=pos.get("strategy"),
+                direction=(pos.get("source_payload") or {}).get("direction"),
+                entry_price=entry,
+                exit_price=fill_price,
+                quantity=sq,
+                realized_pnl_usd=pnl,
+                exit_reason=reason,
+                status="closed_partial",
+                opened_at=pos.get("entry_at"),
+                closed_at=now_iso,
+                source_payload=pos.get("source_payload"),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return FillResult(ok=True, position_id=position_id,
+                          fill_price=fill_price,
+                          realized_pnl_usd=round(pnl, 2))
+    except Exception as e:  # noqa: BLE001
+        return FillResult(ok=False, error=str(e))
+
+
 async def record_external_close(
     user_id: str,
     position_id: str,

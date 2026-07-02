@@ -302,6 +302,68 @@ _LIQ_COOLDOWN_S = 120   # at most one close attempt per symbol per 2 min
 _LIQ_MAX_FAILS = 3      # after 3 consecutive failures, back off (alert once)
 
 
+async def _alpaca_profit_step(r, price: float) -> tuple[bool, str]:
+    """Bank a slice of a broker-held LONG stock winner, then re-protect the
+    remainder with an OCO. VERIFIED at each step; on failure it restores
+    protection and reports. (Mike 2026-07-02: partial selling controls
+    drawdown -- but a botched leg dance leaves shares naked, so nothing
+    proceeds unverified.) Returns (stepped, note)."""
+    from app.brokers.alpaca import (
+        cancel_open_orders_for, get_open_orders_for,
+        submit_market_sell, submit_oco_sell,
+    )
+    sym = str(r.get("ticker") or "").upper()
+    try:
+        qty_total = float(r.get("quantity") or 0)
+        entry = float(r.get("entry_price") or 0)
+        stop_p = float(r.get("stop_price") or 0)
+        target_p = float(r.get("target_price") or 0)
+    except (TypeError, ValueError):
+        return False, "bad row numbers"
+    if entry <= 0 or stop_p <= 0 or target_p <= entry:
+        return False, "row lacks usable stop/target"
+    frac = min(0.9, max(0.1, float(
+        os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
+    slice_qty = float(int(qty_total * frac))
+    remaining = qty_total - slice_qty
+    if slice_qty < 1 or remaining < 1:
+        return False, "too small to split"
+    # 1) Release the shares: cancel bracket legs (cancel-legs-first,
+    #    6/12 lesson) and VERIFY they are gone before selling anything.
+    _n, err = await cancel_open_orders_for(sym)
+    if err:
+        return False, f"could not list legs ({err}) - aborted untouched"
+    left = None
+    for _ in range(4):
+        left = await get_open_orders_for(sym)
+        if left == []:
+            break
+        await asyncio.sleep(0.7)
+    if left:
+        return False, "legs did not cancel - aborted untouched"
+    # 2) Sell the slice at market.
+    order, serr = await submit_market_sell(sym, slice_qty)
+    if serr or not order:
+        # Nothing sold -- put the FULL protection back before leaving.
+        await submit_oco_sell(sym, qty_total, target_p, stop_p)
+        return False, f"slice sell rejected ({serr}); protection restored"
+    # 3) Re-protect the remainder (OCO: original target + stop), retry once.
+    prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
+    if perr or not prot:
+        await asyncio.sleep(1.0)
+        prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
+    protected = bool(prot) and not perr
+    # 4) Book the slice (closed_partial row + reduced open row).
+    from app.paper.engine import record_external_partial_close
+    fill = await record_external_partial_close(
+        r["user_id"], r["id"], slice_qty, price)
+    booked = f"${fill.realized_pnl_usd:+.2f}" if fill.ok else "booking failed"
+    note = (f"banked {int(slice_qty)}/{int(qty_total)} shares ({booked}); "
+            + ("remainder re-protected (OCO)" if protected
+               else "remainder NOT re-protected - naked-guard enforcing"))
+    return True, note
+
+
 async def _throttled_liquidate(symbol: str, asset_type: str = "stock"):
     """Rate-limited + circuit-broken wrapper around liquidate_position.
     Returns (result, status): 'ok' submitted; 'error:<msg>' broker ran but
@@ -655,6 +717,51 @@ class PositionMonitorAgent(Agent):
                                 # reconciles the Trezo row once Alpaca
                                 # drops it from open positions.
                                 continue
+
+                    # Profit stepping for Alpaca-held stock longs (Mike
+                    # 2026-07-02: partial selling controls drawdown). The
+                    # broker-side twin of the modeled stepping: cancel legs
+                    # -> sell slice -> OCO re-protect, verified at each step.
+                    if (os.getenv("TREZO_PROFIT_STEP_ALPACA", "1") != "0"
+                            and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"
+                            and at == "stock"
+                            and r["side"] == "long"
+                            and str(r.get("id")) not in _profit_stepped):
+                        try:
+                            _e2 = float(r.get("entry_price") or 0)
+                            _t2 = float(r.get("target_price") or 0)
+                            _q2 = float(r.get("quantity") or 0)
+                            if _e2 > 0 and _t2 > _e2 and _q2 >= 2:
+                                price_ps = await _price(tk, at)
+                                _at2 = float(os.getenv("TREZO_PROFIT_STEP_AT", "0.6"))
+                                if (price_ps is not None and price_ps > _e2
+                                        and (price_ps - _e2) / (_t2 - _e2) >= _at2):
+                                    stepped, note = await _alpaca_profit_step(r, price_ps)
+                                    if stepped:
+                                        _profit_stepped.add(str(r.get("id")))
+                                        affected_users.add(r["user_id"])
+                                        out.append(AgentMessage(
+                                            agent=self.name, kind="info",
+                                            payload={
+                                                "user_id": r["user_id"],
+                                                "ticker": tk,
+                                                "note": f"Profit step: {note}",
+                                                "position_id": r["id"],
+                                                "broker": "alpaca",
+                                            }))
+                                    try:
+                                        from app.agents.activity_log import record as _arec
+                                        _arec("profit_step" if stepped else "profit_step_abort",
+                                              tk, strategy=(r.get("strategy") or ""),
+                                              reason=note,
+                                              extra={"user_id": str(r.get("user_id")),
+                                                     "broker": "alpaca"})
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    if stepped:
+                                        continue
+                        except Exception:  # noqa: BLE001
+                            pass
 
                     # Extended trailing step-ladder (crypto Part 2b ext,
                     # 2026-06-13): lock return-on-capital as a stock swing
