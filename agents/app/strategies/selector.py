@@ -20,7 +20,7 @@ from app.patterns.scoring import calculate_score, MarketContext
 # Directional strategies that can be auto-selected, by asset type.
 # Options and the Dividend Wheel are not stop/target directional trades,
 # so they are not part of the selection pool.
-STOCK_STRATEGIES = ["default", "pattern", "stms", "orb", "extended"]
+STOCK_STRATEGIES = ["default", "pattern", "stms", "orb", "extended", "scalp"]
 CRYPTO_STRATEGIES = ["default", "pattern", "crypto", "extended"]
 
 # Cycle-aware strategies (Phase 13a). These ONLY appear in the

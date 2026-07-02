@@ -218,6 +218,7 @@ STRATEGY_FAMILY = {
     "crypto_scalp": "momentum",
     "crypto_swing": "trend",
     "crypto_dca": "mean_reversion",
+    "scalp": "momentum",
     # Phase 13a cycle-aware strategies (Layer B). These only enter the
     # scoring pool when eligible_strategies() activates them based on
     # the symbol's cycle position (earnings window / ex-div window).

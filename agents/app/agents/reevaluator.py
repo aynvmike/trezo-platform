@@ -220,16 +220,54 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         except (TypeError, ValueError):
             giveback = 0.0
 
-        # Visibility heartbeat (2026-07-01): prove the re-check ran even
-        # when the verdict is HOLD -- at most one line per position per hour.
+        # Visibility heartbeat + TCS RE-SCORE (2026-07-01/02): once per
+        # position per hour, prove the re-check ran AND re-judge the thesis
+        # with fresh candles (Mike's ask: re-evaluate TCS on held trades
+        # even with a stop already in). A collapsed score is evidence the
+        # setup is GONE -- rotate the capital instead of babysitting it.
+        # Tunables: TREZO_REEVAL_TCS_RESCORE / TREZO_REEVAL_TCS_COLLAPSE_FRAC.
         try:
             if (now - _hb_at.get(pid, 0.0)) >= 3600.0:
                 _hb_at[pid] = now
+                fresh_tcs = None
+                if _flag("TREZO_REEVAL_TCS_RESCORE", "1"):
+                    try:
+                        from app.data.candles import fetch_candles_for
+                        from app.patterns.scoring import calculate_score
+                        _cnd = await fetch_candles_for(ticker, str(at or "stock"))
+                        if _cnd and len(_cnd) >= 15:
+                            fresh_tcs = int(calculate_score(
+                                _cnd, strategy=str(strat or "") or None).tcs)
+                    except Exception:  # noqa: BLE001
+                        fresh_tcs = None
+                collapsed = False
+                _thr = 700
+                if fresh_tcs is not None:
+                    try:
+                        from app.runtime.settings import get_bot_settings
+                        _thr = int(get_bot_settings(user_id).tcs_threshold or 700)
+                    except Exception:  # noqa: BLE001
+                        _thr = 700
+                    _cfrac = _num("TREZO_REEVAL_TCS_COLLAPSE_FRAC", 0.5)
+                    collapsed = fresh_tcs < int(_thr * _cfrac)
                 from app.agents.activity_log import record as _arec
-                _arec("reeval_check", ticker, strategy=str(strat or ""),
+                _arec("reeval_check", ticker, tcs=fresh_tcs,
+                      strategy=str(strat or ""),
                       reason=(f"down {abs(gain) * 100:.1f}%, held {held:.1f}d, "
-                              f"giveback {giveback * 100:.0f}%, regime {regime} - evaluating"),
+                              f"giveback {giveback * 100:.0f}%, regime {regime}"
+                              + (f"; fresh TCS {fresh_tcs} vs bar {_thr}"
+                                 if fresh_tcs is not None else "")
+                              + (" -- thesis COLLAPSED" if collapsed else "")),
                       extra={"user_id": str(user_id or "shared")})
+                if rotate_on and collapsed and held >= 1.0:
+                    reason = (f"{ticker}: fresh TCS {fresh_tcs} is below half the "
+                              f"entry bar ({_thr}) after {held:.1f}d, down "
+                              f"{abs(gain) * 100:.1f}% -- the setup is gone; "
+                              f"rotating the capital out.")
+                    _last_action[pid] = now
+                    await _log(emit, agent_name, user_id, ticker,
+                               "rotate_tcs_collapse", reason)
+                    return {"close": "reeval_tcs_collapse"}
         except Exception:  # noqa: BLE001
             pass
         try:

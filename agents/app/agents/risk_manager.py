@@ -736,8 +736,28 @@ class RiskManagerAgent(Agent):
                     tier_for, adjust_stop_target,
                 )
                 _tier = await tier_for(ticker)
+                # Scalp lane (2026-07-02): reserved for liquid mega/large
+                # names; everything else is vetoed before it takes a slot.
+                if str(strategy or "").lower() == "scalp":
+                    from app.strategies.cap_tiers import scalp_ok as _scalp_ok
+                    if not _scalp_ok(_tier):
+                        return [self._veto(
+                            ticker, tcs,
+                            f"Scalp gate: {_tier or 'unknown'}-cap name - "
+                            f"scalps are reserved for liquid mega/large caps",
+                            strategy=strategy,
+                            user_id=message.payload.get("user_id"),
+                        )]
                 _s0 = approve_payload.get("stop_pct")
                 _t0 = approve_payload.get("target_pct")
+                # Pattern/default signals carry no stop/target -- they used
+                # to pick up RAW bot defaults later at execution and skip
+                # the formula layer entirely. Fill them here so EVERY trade
+                # gets tier + realism scaling (2026-07-02).
+                if _s0 is None:
+                    _s0 = float(getattr(cfg, "default_stop_pct", 0.05) or 0.05)
+                if _t0 is None:
+                    _t0 = float(getattr(cfg, "default_target_pct", 0.10) or 0.10)
                 _s1, _t1 = adjust_stop_target(_tier, _s0, _t0)
                 if _s1 is not None:
                     approve_payload["stop_pct"] = _s1
@@ -757,6 +777,13 @@ class RiskManagerAgent(Agent):
                         _last_close = float(stock_candles[-1].close)
                         _atr_abs = float(_atr_fn(stock_candles) or 0.0)
                         _atr_pct = (_atr_abs / _last_close) if _last_close > 0 else 0.0
+                        # Scalp geometry (2026-07-02): the scalp lane IS
+                        # the ATR -- stop 0.8x, target 1.0x the daily range.
+                        if _atr_pct > 0 and str(strategy or "").lower() == "scalp":
+                            approve_payload["stop_pct"] = round(
+                                max(0.004, 0.8 * _atr_pct), 4)
+                            approve_payload["target_pct"] = round(
+                                max(0.006, 1.0 * _atr_pct), 4)
                         _t_cur = approve_payload.get("target_pct")
                         if _atr_pct > 0 and _t_cur is not None:
                             _mult = float(os.getenv("TREZO_TARGET_ATR_MULT", "1.5"))

@@ -165,6 +165,42 @@ async def check_all(client) -> KillSwitch:
             except Exception:  # noqa: BLE001
                 pass
 
+        # Row-truth override (2026-07-02): the counters drift (WMT's -$61
+        # bracket stop never rolled them; manual closes booked $0 until the
+        # 7/1 fix). The kill-switch now SUMS this week's closed rows itself,
+        # so it is correct regardless of which close path wrote the row.
+        try:
+            _today_s = date.today().isoformat()
+            _monday_s = (date.today()
+                         - timedelta(days=date.today().weekday())).isoformat()
+
+            def _rows(uid=acct["user_id"], m=_monday_s):
+                return (client.table("paper_positions")
+                        .select("realized_pnl_usd, exit_at")
+                        .eq("user_id", uid)
+                        .gte("exit_at", m)
+                        .like("status", "closed%")
+                        .order("exit_at", desc=True)
+                        .limit(500).execute())
+            _rr = (await asyncio.to_thread(_rows)).data or []
+            _wk = sum(float(x.get("realized_pnl_usd") or 0) for x in _rr)
+            _dy = sum(float(x.get("realized_pnl_usd") or 0) for x in _rr
+                      if str(x.get("exit_at") or "")[:10] == _today_s)
+            _streak = 0
+            for x in _rr:
+                _p = float(x.get("realized_pnl_usd") or 0)
+                if _p < 0:
+                    _streak += 1
+                elif _p > 0:
+                    break
+            acct = {**acct,
+                    "week_realized_pnl_usd": round(_wk, 2),
+                    "today_realized_pnl_usd": round(_dy, 2),
+                    "consecutive_losses": max(
+                        int(acct.get("consecutive_losses") or 0), _streak)}
+        except Exception:  # noqa: BLE001
+            pass
+
         ks = evaluate(acct, consec_limit)
         if ks.halted:
             if not acct.get("trading_halted") and ks.scope in ("day", "week"):
