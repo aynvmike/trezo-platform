@@ -36,7 +36,7 @@ _MAX_FIRES_PER_TICK = 2
 
 class ForexScannerAgent(Agent):
     name = "forex_scanner"
-    tick_interval_seconds = 600  # 10 min -- FX is slower than equities
+    tick_interval_seconds = 180  # crypto cadence (Mike 2026-07-02): market data matters in FX too
     _last_hb: float = 0.0
 
     async def tick(self) -> list[AgentMessage]:

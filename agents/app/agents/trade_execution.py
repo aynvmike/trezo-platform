@@ -38,6 +38,10 @@ def _all_crypto_symbols() -> set:
 
 CRYPTO_SYMBOLS = _all_crypto_symbols()
 
+# Priority-rotation throttle (2026-07-02): at most N weakest-hold
+# rotations per day, process-local; the activity log carries each one.
+_ROTATIONS_TODAY: dict = {"day": "", "n": 0}
+
 
 class TradeExecutionAgent(Agent):
     name = "trade_execution"
@@ -307,6 +311,23 @@ class TradeExecutionAgent(Agent):
             overrides=cfg.allocation_overrides,
         )
         budget = float(alloc.budgets.get(mt, 0.0))
+        # Small-account soft pockets (Mike 2026-07-02): hard pockets work
+        # at size, but at low equity they SQUEEZE -- a 10% pocket of a
+        # $5k account cannot fund one option, and swing holds starve the
+        # fast lanes. Below TREZO_HARD_POCKET_MIN_EQUITY the pockets act
+        # as soft WEIGHTS: each lane stretches by TREZO_SMALL_ACCT_POCKET_
+        # STRETCH (capped at 60% of equity per lane). At size, pockets
+        # harden back to exact fractions automatically.
+        try:
+            import os as _os2
+            _min_eq = float(_os2.getenv("TREZO_HARD_POCKET_MIN_EQUITY", "25000"))
+            if equity and float(equity) < _min_eq:
+                _stretch = float(_os2.getenv(
+                    "TREZO_SMALL_ACCT_POCKET_STRETCH", "1.75"))
+                budget = min(budget * max(1.0, _stretch),
+                             float(equity) * 0.60)
+        except Exception:  # noqa: BLE001
+            pass
         # Intraday overflow (2026-07-02): multi-day swing holds were
         # filling the stocks pocket and STARVING every intraday idea
         # (found live: TSLL/BITO/TZA approvals skipped all morning).
@@ -325,7 +346,86 @@ class TradeExecutionAgent(Agent):
         remaining = max(0.0, budget - deployed)
         return mt, budget, deployed, remaining, alloc.posture
 
-    def _budget_skip(self, user_id, ticker, mt, budget, deployed, posture):
+    async def _budget_skip(self, user_id, ticker, mt, budget, deployed,
+                           posture):
+        # Priority rotation (Mike 2026-07-02: "the bots should weigh out
+        # the decision to actually take certain trades over others").
+        # When live demand keeps hitting a FULL pocket, the lane's weakest
+        # stale hold (36h+ old, entry conviction under 550) is asked to
+        # leave through the normal close_requested flow -- capital
+        # recycles to fresher, higher-priority demand in the SAME lane.
+        # Income lanes are never rotated for fast lanes; max N/day.
+        try:
+            import os as _os3
+            if (_os3.getenv("TREZO_PRIORITY_ROTATION", "1") != "0"
+                    and mt in ("stocks", "crypto", "forex")):
+                from datetime import date as _date
+                from datetime import datetime, timezone
+                global _ROTATIONS_TODAY
+                _today = _date.today().isoformat()
+                if _ROTATIONS_TODAY.get("day") != _today:
+                    _ROTATIONS_TODAY = {"day": _today, "n": 0}
+                _max_rot = int(float(_os3.getenv(
+                    "TREZO_PRIORITY_ROTATION_MAX_PER_DAY", "2")))
+                if _ROTATIONS_TODAY["n"] < _max_rot:
+                    from app.runtime.settings import _supabase
+                    client = _supabase()
+                    if client is not None:
+                        import asyncio as _aio
+
+                        def _q():
+                            return (client.table("paper_positions")
+                                    .select("id, ticker, entry_at, "
+                                            "source_payload, strategy")
+                                    .eq("user_id", user_id)
+                                    .eq("status", "open")
+                                    .eq("close_requested", False)
+                                    .execute())
+                        rows = (await _aio.to_thread(_q)).data or []
+                        from app.paper.allocation import market_type_for
+                        now = datetime.now(timezone.utc)
+                        cands = []
+                        for r in rows:
+                            if market_type_for(r.get("strategy"), None) != mt:
+                                continue
+                            if str(r.get("ticker") or "").upper() == str(ticker).upper():
+                                continue
+                            try:
+                                ea = datetime.fromisoformat(
+                                    str(r.get("entry_at")).replace("Z", "+00:00"))
+                                held_h = (now - ea).total_seconds() / 3600.0
+                            except Exception:  # noqa: BLE001
+                                continue
+                            _tcs0 = int(((r.get("source_payload") or {})
+                                         .get("tcs")) or 0)
+                            if held_h >= 36 and _tcs0 < 550:
+                                cands.append((held_h, _tcs0, r))
+                        if cands:
+                            cands.sort(key=lambda x: (x[1], -x[0]))
+                            _held_h, _tcs0, victim = cands[0]
+
+                            def _flag(rid=victim["id"]):
+                                return (client.table("paper_positions")
+                                        .update({"close_requested": True})
+                                        .eq("id", rid).execute())
+                            await _aio.to_thread(_flag)
+                            _ROTATIONS_TODAY["n"] += 1
+                            try:
+                                from app.agents.activity_log import record as _arec
+                                _arec("priority_rotation",
+                                      str(victim.get("ticker")),
+                                      reason=(f"{mt} pocket full while demand "
+                                              f"queues ({ticker}) - weakest hold "
+                                              f"(entry TCS {_tcs0}, held "
+                                              f"{_held_h:.0f}h) asked to leave; "
+                                              f"capital recycles to stronger "
+                                              f"signals"),
+                                      extra={"user_id": str(user_id),
+                                             "displaced_by": str(ticker)})
+                            except Exception:  # noqa: BLE001
+                                pass
+        except Exception:  # noqa: BLE001
+            pass
         # Visibility pack (2026-07-01): pocket-full skips are the #1 silent
         # trade-dropper -- make every one visible with the pocket numbers.
         try:
@@ -368,7 +468,7 @@ class TradeExecutionAgent(Agent):
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, equity, strategy, asset_type)
         if remaining <= 0:
-            return self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+            return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
 
         kwargs: dict = {
             "user_id": user_id,
@@ -454,7 +554,7 @@ class TradeExecutionAgent(Agent):
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "stock")
         if remaining <= 0:
-            return self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+            return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
 
         sp = float(stop_pct) if isinstance(stop_pct, (int, float)) and stop_pct > 0 else 0.05
         tp = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
@@ -614,7 +714,7 @@ class TradeExecutionAgent(Agent):
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "crypto")
         if remaining <= 0:
-            return self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+            return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
 
         sp = float(stop_pct) if isinstance(stop_pct, (int, float)) and stop_pct > 0 else 0.05
         tp = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
