@@ -52,6 +52,34 @@ POSTURE_SUMMARY = {
 }
 
 
+async def effective_equity(user_id: str) -> float:
+    """The equity pockets are sized from. Prefers the BROKER's account
+    equity (the truth about buying power) when Alpaca is configured; falls
+    back to the internal ledger (cash + vault). Decision 2026-07-02: the
+    internal ledger had drifted ($2.8k) from the broker ($4.8k), silently
+    shrinking every pocket by ~40%."""
+    try:
+        from app.brokers.alpaca import alpaca_configured
+        from app.brokers.alpaca import get_account as _broker_account
+        if alpaca_configured():
+            acct = await _broker_account()
+            if acct is not None:
+                _eq = float(getattr(acct, "equity", 0) or 0)
+                if _eq > 0:
+                    return _eq
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.paper.engine import get_account
+        account = await get_account(user_id)
+        if account:
+            return (float(account.get("current_cash_usd") or 0)
+                    + float(account.get("vault_balance_usd") or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
 def default_posture(equity: float) -> str:
     """The AI's default posture, chosen purely from account size."""
     if equity < 25_000:

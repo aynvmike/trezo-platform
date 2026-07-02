@@ -288,7 +288,16 @@ class TradeExecutionAgent(Agent):
     async def _allocation_gate(self, user_id, equity, strategy, asset_type):
         from app.paper.allocation import (
             build_allocation, deployed_capital, market_type_for,
+            effective_equity,
         )
+        # Pockets size from BROKER-truth equity (2026-07-02) -- the internal
+        # ledger had drifted below the broker and was shrinking every pocket.
+        try:
+            _true_eq = await effective_equity(user_id)
+            if _true_eq > 0:
+                equity = _true_eq
+        except Exception:  # noqa: BLE001
+            pass
         from app.runtime.settings import get_bot_settings
         cfg = get_bot_settings()
         mt = market_type_for(strategy, asset_type)

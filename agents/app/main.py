@@ -1384,12 +1384,10 @@ async def allocations_snapshot(user_id: str):
     from app.paper.engine import get_account
     from app.runtime.settings import get_bot_settings
 
+    from app.paper.allocation import effective_equity
     cfg = get_bot_settings(user_id)
     account = await get_account(user_id)
-    equity = 0.0
-    if account:
-        equity = (float(account.get("current_cash_usd") or 0)
-                  + float(account.get("vault_balance_usd") or 0))
+    equity = await effective_equity(user_id)
     alloc = build_allocation(
         equity,
         posture_setting=cfg.account_posture,
@@ -1413,7 +1411,7 @@ async def allocations_snapshot(user_id: str):
                    ["4 Dividend Wheel", "5 Dividends"]),
         "forex": ("Forex", "Major fiat pairs, long or short (modeled).",
                   "ATR-fit targets; quick realistic moves, 24x5.",
-                  ["Forex Majors"]),
+                  ["6 Forex"]),
     }
     sleeves = []
     for mt in MARKET_TYPES:
