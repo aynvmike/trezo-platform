@@ -702,6 +702,28 @@ async def record_external_position(
         return FillResult(ok=False, error=str(e))
 
 
+async def count_profit_steps(user_id: str, position_id: str) -> int:
+    """How many profit-step slices this position has already banked
+    (trade_outcomes rows, exit_reason='profit_step'). Makes the step
+    ladder restart-proof (2026-07-02). Best-effort: 0 on any failure."""
+    client = _supabase()
+    if not client:
+        return 0
+
+    def _q():
+        return (client.table("trade_outcomes")
+                .select("position_id")
+                .eq("user_id", user_id)
+                .eq("position_id", position_id)
+                .eq("exit_reason", "profit_step")
+                .limit(10).execute())
+    try:
+        res = await asyncio.to_thread(_q)
+        return len(res.data or [])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def record_external_partial_close(
     user_id: str,
     position_id: str,

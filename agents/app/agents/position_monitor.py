@@ -24,11 +24,55 @@ import os
 
 from app.paper.engine import close_position, check_and_lock_profit
 
-# Profit stepping (2026-07-02): position ids already stepped this
-# process-life. Best-effort restart note: after a service restart a
-# between-step-and-target position may step once more; the trail +
-# breakeven-side stops keep that benign on paper.
-_profit_stepped: set[str] = set()
+# Profit-stepping LADDER (2026-07-02, multi-step per Mike: "it should be
+# able to do it multiple times, stepping out over time"). Each step banks
+# a fraction of the REMAINING shares when the run to target advances
+# another gap: 60%, then 80%, then 100% of the way (defaults; env-
+# tunable). Cooldown between steps + a max count stop noise-whittling.
+# Restart-proof: on first sight of a position we ask trade_outcomes how
+# many steps it already banked (exit_reason='profit_step').
+_step_state: dict[str, dict] = {}
+
+
+def _step_params() -> tuple[float, float, int, float]:
+    def _f(name, d):
+        try:
+            return float(os.getenv(name, str(d)))
+        except (TypeError, ValueError):
+            return d
+    return (_f("TREZO_PROFIT_STEP_AT", 0.6),
+            _f("TREZO_PROFIT_STEP_GAP", 0.2),
+            int(_f("TREZO_PROFIT_STEP_MAX", 3)),
+            _f("TREZO_PROFIT_STEP_COOLDOWN_S", 900.0))
+
+
+async def _step_check(pid: str, user_id, run: float) -> tuple[bool, int]:
+    """Should the NEXT step fire at this run-progress? -> (fire, steps_so_far)."""
+    import time as _t
+    at0, gap, max_n, cool = _step_params()
+    st = _step_state.get(pid)
+    if st is None:
+        n0 = 0
+        try:
+            from app.paper.engine import count_profit_steps
+            n0 = await count_profit_steps(str(user_id), pid)
+        except Exception:  # noqa: BLE001
+            n0 = 0
+        st = {"n": int(n0), "ts": 0.0}
+        _step_state[pid] = st
+    if st["n"] >= max_n:
+        return False, st["n"]
+    if (_t.time() - st["ts"]) < cool:
+        return False, st["n"]
+    need = at0 + gap * st["n"]
+    return (run >= need), st["n"]
+
+
+def _step_mark(pid: str) -> None:
+    import time as _t
+    st = _step_state.setdefault(pid, {"n": 0, "ts": 0.0})
+    st["n"] += 1
+    st["ts"] = _t.time()
 from app.strategies.extended import SWING_MAX_HOLD_DAYS
 from app.agents.reevaluator import reeval_is_enabled, reevaluate_position
 
@@ -725,20 +769,24 @@ class PositionMonitorAgent(Agent):
                     if (os.getenv("TREZO_PROFIT_STEP_ALPACA", "1") != "0"
                             and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"
                             and at == "stock"
-                            and r["side"] == "long"
-                            and str(r.get("id")) not in _profit_stepped):
+                            and r["side"] == "long"):
                         try:
                             _e2 = float(r.get("entry_price") or 0)
                             _t2 = float(r.get("target_price") or 0)
                             _q2 = float(r.get("quantity") or 0)
                             if _e2 > 0 and _t2 > _e2 and _q2 >= 2:
                                 price_ps = await _price(tk, at)
-                                _at2 = float(os.getenv("TREZO_PROFIT_STEP_AT", "0.6"))
-                                if (price_ps is not None and price_ps > _e2
-                                        and (price_ps - _e2) / (_t2 - _e2) >= _at2):
+                                _run2 = ((price_ps - _e2) / (_t2 - _e2)
+                                         if price_ps is not None else -1.0)
+                                _ok2, _n2 = (await _step_check(
+                                    str(r.get("id")), r.get("user_id"), _run2)
+                                    if price_ps is not None and price_ps > _e2
+                                    else (False, 0))
+                                if _ok2:
                                     stepped, note = await _alpaca_profit_step(r, price_ps)
+                                    note = f"step {_n2 + 1}: {note}"
                                     if stepped:
-                                        _profit_stepped.add(str(r.get("id")))
+                                        _step_mark(str(r.get("id")))
                                         affected_users.add(r["user_id"])
                                         out.append(AgentMessage(
                                             agent=self.name, kind="info",
@@ -968,15 +1016,17 @@ class PositionMonitorAgent(Agent):
             # 6/12). Tunables: TREZO_PROFIT_STEP_ENABLED / _AT / _FRACTION.
             if (close_reason is None and side == "long"
                     and r.get("broker") != "alpaca"
-                    and str(r.get("id")) not in _profit_stepped
                     and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
                 try:
                     _e = float(r.get("entry_price") or 0)
                     _q = float(r.get("quantity") or 0)
-                    if _e > 0 and _q > 0 and target is not None and float(target) > _e:
+                    _big_enough = (at == "crypto") or _q >= 2
+                    if (_e > 0 and _q > 0 and _big_enough
+                            and target is not None and float(target) > _e):
                         _run = (price - _e) / (float(target) - _e)
-                        _at_frac = float(os.getenv("TREZO_PROFIT_STEP_AT", "0.6"))
-                        if _run >= _at_frac:
+                        _ok_step, _n_prev = await _step_check(
+                            str(r.get("id")), r.get("user_id"), _run)
+                        if _ok_step:
                             _frac = min(0.9, max(0.1, float(
                                 os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
                             from app.paper.engine import close_partial_position
@@ -984,15 +1034,16 @@ class PositionMonitorAgent(Agent):
                                 r["user_id"], r["id"], _frac, price,
                                 reason="profit_step")
                             if _pf.ok:
-                                _profit_stepped.add(str(r.get("id")))
+                                _step_mark(str(r.get("id")))
                                 affected_users.add(r["user_id"])
                                 try:
                                     from app.agents.activity_log import record as _arec
                                     _arec("profit_step", tk, strategy=strat,
-                                          reason=(f"banked {_frac * 100:.0f}% at "
+                                          reason=(f"step {_n_prev + 1}: banked "
+                                                  f"{_frac * 100:.0f}% of remaining at "
                                                   f"{_run * 100:.0f}% of the run to "
                                                   f"target (${_pf.realized_pnl_usd:+.2f}); "
-                                                  f"rest rides the trail"),
+                                                  f"rest rides on"),
                                           extra={"user_id": str(r.get("user_id"))})
                                 except Exception:  # noqa: BLE001
                                     pass
