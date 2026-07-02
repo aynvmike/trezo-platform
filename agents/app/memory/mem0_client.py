@@ -114,6 +114,27 @@ def _budget_roll(b: dict) -> dict:
     return b
 
 
+_BUDGET_WARNED: dict[str, str] = {}
+
+
+def _budget_warn_once(b: dict, max_day: int, max_week: int) -> None:
+    """One activity-log line per day when the add budget starts blocking --
+    an exhausted memory budget must be VISIBLE, not silent (2026-07-01)."""
+    try:
+        day = str(b.get("day"))
+        if _BUDGET_WARNED.get("add") == day:
+            return
+        _BUDGET_WARNED["add"] = day
+        from app.agents.activity_log import record as _arec
+        _arec("memory_budget_exhausted", "MEM0",
+              reason=(f"adds {b.get('adds_today', 0)}/{max_day} today, "
+                      f"{b.get('adds_week', 0)}/{max_week} week - new lessons "
+                      f"are being skipped until the budget rolls"),
+              extra={"scope": "add"})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _budget_try_spend(kind: str) -> bool:
     """Atomically check + spend one unit of 'add' or 'search' budget.
     False = cap exhausted, caller must skip the API call. Never raises;
@@ -125,6 +146,7 @@ def _budget_try_spend(kind: str) -> bool:
             if kind == "add":
                 if (b.get("adds_today", 0) >= max_day
                         or b.get("adds_week", 0) >= max_week):
+                    _budget_warn_once(b, max_day, max_week)
                     return False
                 b["adds_today"] = b.get("adds_today", 0) + 1
                 b["adds_week"] = b.get("adds_week", 0) + 1

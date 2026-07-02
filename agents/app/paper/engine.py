@@ -153,6 +153,16 @@ async def open_position(
 
     # Entry price with slippage
     fill_price = apply_slippage(market_price, side, "open")
+    # Visibility pack (2026-07-01): show the slippage rule working on every
+    # modeled fill. File-append only; never raises.
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("fill_open_modeled", ticker,
+              reason=(f"{side} fill {fill_price:.6g} vs mkt {market_price:.6g} "
+                      f"({SLIPPAGE_BPS}bps slippage applied)"),
+              extra={"user_id": str(user_id), "asset_type": asset_type})
+    except Exception:  # noqa: BLE001
+        pass
 
     # Compute stop + target prices
     if side == "long":
@@ -281,6 +291,16 @@ async def close_position(
     else:
         gross_pnl = qty * (entry - fill_price)
     pnl = gross_pnl - fee - float(pos.get("fees_usd", 0))
+    # Visibility pack (2026-07-01): closes show slippage + fee + net P/L.
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("fill_close_modeled", str(pos.get("ticker") or "?"),
+              strategy=str(pos.get("strategy") or "") or None,
+              reason=(f"{reason}: fill {fill_price:.6g} vs mkt {market_price:.6g} "
+                      f"({SLIPPAGE_BPS}bps slip + ${fee:.2f} fee), pnl {pnl:+.2f}"),
+              extra={"user_id": str(user_id), "asset_type": asset_type})
+    except Exception:  # noqa: BLE001
+        pass
 
     # Map reason → status
     status_map = {

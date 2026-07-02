@@ -75,6 +75,7 @@ MIN_BANK_PROFIT = _num("TREZO_REEVAL_MIN_BANK_PROFIT", 0.005)
 AVGDOWN_TRIGGER = _num("TREZO_REEVAL_AVGDOWN_TRIGGER", 0.08)
 
 _last_action: dict[str, float] = {}
+_hb_at: dict[str, float] = {}   # visibility heartbeat throttle (7/1)
 
 
 def _supabase():
@@ -136,6 +137,14 @@ async def _persist(rid, **fields) -> bool:
 
 
 async def _log(emit, agent_name, user_id, ticker, action, reason) -> None:
+    # Visibility pack (2026-07-01): every re-eval ACTION also lands in the
+    # local activity log so Mike can see the engine working.
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec(f"reeval_{action}", ticker, reason=reason,
+              extra={"user_id": str(user_id or "shared")})
+    except Exception:  # noqa: BLE001
+        pass
     try:
         emit.append(AgentMessage(
             agent=agent_name, kind="info",
@@ -211,6 +220,18 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         except (TypeError, ValueError):
             giveback = 0.0
 
+        # Visibility heartbeat (2026-07-01): prove the re-check ran even
+        # when the verdict is HOLD -- at most one line per position per hour.
+        try:
+            if (now - _hb_at.get(pid, 0.0)) >= 3600.0:
+                _hb_at[pid] = now
+                from app.agents.activity_log import record as _arec
+                _arec("reeval_check", ticker, strategy=str(strat or ""),
+                      reason=(f"down {abs(gain) * 100:.1f}%, held {held:.1f}d, "
+                              f"giveback {giveback * 100:.0f}%, regime {regime} - evaluating"),
+                      extra={"user_id": str(user_id or "shared")})
+        except Exception:  # noqa: BLE001
+            pass
         try:
             cur_stop = float(stop) if stop is not None else None
         except (TypeError, ValueError):

@@ -808,6 +808,16 @@ class RiskManagerAgent(Agent):
         except Exception:
             pass
 
+        # Visibility pack (2026-07-01): approvals in the activity log too.
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("approve", str(approve_payload.get("ticker") or "?"),
+                  tcs=int(tcs), strategy=approve_payload.get("strategy"),
+                  reason="cleared all gates",
+                  extra={"user_id": approve_payload.get("user_id") or "global",
+                         "direction": approve_payload.get("direction")})
+        except Exception:  # noqa: BLE001
+            pass
         return [
             AgentMessage(
                 agent=self.name,
@@ -858,6 +868,15 @@ class RiskManagerAgent(Agent):
                 ))
         except Exception:
             pass  # memory failure cannot block a veto
+        # Visibility pack (2026-07-01): EVERY veto lands in the local
+        # activity log, including the routine ones Mem0 skips. File-append
+        # only; never raises, never blocks the decision.
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("veto", ticker, tcs=int(tcs), strategy=strategy,
+                  reason=reason, extra={"user_id": user_id or "global"})
+        except Exception:  # noqa: BLE001
+            pass
         # Patched 2026-06-05 (Task #47): include user_id so vetoes are
         # per-user attributable in the audit trail.
         return AgentMessage(

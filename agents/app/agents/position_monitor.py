@@ -313,8 +313,20 @@ async def _throttled_liquidate(symbol: str, asset_type: str = "stock"):
         return None, "error:" + str(e)[:120]
     if _err:
         _liq_fail_count[symbol] = _liq_fail_count.get(symbol, 0) + 1
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("exit_error", symbol, reason=str(_err)[:180],
+                  extra={"asset_type": asset_type})
+        except Exception:  # noqa: BLE001
+            pass
         return None, "error:" + str(_err)
     _liq_fail_count[symbol] = 0
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("exit_liquidate", symbol, reason="liquidation submitted",
+              extra={"asset_type": asset_type})
+    except Exception:  # noqa: BLE001
+        pass
     return _res, "ok"
 
 

@@ -297,6 +297,18 @@ class TradeExecutionAgent(Agent):
         return mt, budget, deployed, remaining, alloc.posture
 
     def _budget_skip(self, user_id, ticker, mt, budget, deployed, posture):
+        # Visibility pack (2026-07-01): pocket-full skips are the #1 silent
+        # trade-dropper -- make every one visible with the pocket numbers.
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("pocket_skip", ticker,
+                  reason=f"{mt} pocket full under the {posture} posture "
+                         f"(${deployed:,.0f} of ${budget:,.0f} deployed) - trade skipped",
+                  extra={"user_id": str(user_id), "market_type": mt,
+                         "budget_usd": round(budget, 2),
+                         "deployed_usd": round(deployed, 2)})
+        except Exception:  # noqa: BLE001
+            pass
         return [AgentMessage(
             agent=self.name, kind="info",
             payload={
@@ -477,9 +489,24 @@ class TradeExecutionAgent(Agent):
         if err or not order:
             from app.paper.killswitch import record_broker_reject
             record_broker_reject()
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("broker_reject", ticker, strategy=strategy,
+                      reason=str(err)[:200],
+                      extra={"user_id": str(user_id), "asset_type": "stock"})
+            except Exception:  # noqa: BLE001
+                pass
             return _err(f"Alpaca rejected the order: {err}")
 
         order_id = order.get("id")
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("submitted", ticker, strategy=strategy,
+                  reason=f"{side} {plan.quantity} @ ~{market_price} "
+                         f"(stop {stop_price}, target {target_price})",
+                  extra={"user_id": str(user_id), "asset_type": "stock"})
+        except Exception:  # noqa: BLE001
+            pass
         rec = await record_external_position(
             user_id=user_id,
             ticker=ticker,
@@ -595,9 +622,23 @@ class TradeExecutionAgent(Agent):
         if err or not order:
             from app.paper.killswitch import record_broker_reject
             record_broker_reject()
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("broker_reject", ticker, strategy=strategy,
+                      reason=str(err)[:200],
+                      extra={"user_id": str(user_id), "asset_type": "crypto"})
+            except Exception:  # noqa: BLE001
+                pass
             return _err(f"Alpaca rejected the crypto order: {err}")
 
         order_id = order.get("id")
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("submitted", ticker, strategy=strategy,
+                  reason=f"{side} {plan.quantity} crypto @ ~{market_price}",
+                  extra={"user_id": str(user_id), "asset_type": "crypto"})
+        except Exception:  # noqa: BLE001
+            pass
         await record_external_position(
             user_id=user_id,
             ticker=ticker,
