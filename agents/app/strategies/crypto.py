@@ -221,13 +221,30 @@ def _bb_width_pct(values: list[float]) -> float:
 #   HODL  = stays TIGHT + selective -- deepest value only (RSI < HODL_RSI_MAX),
 #           hold and never chase; the catastrophe stop is the only exit.
 # All edges live here so they are easy to retune in one place.
+# Mode thresholds -- env-tunable + RECALIBRATED 2026-07-02. The old
+# SCALP_BB_MAX=2.2 was calibrated for a different BB scale: real daily
+# bb_width_pct readings run 17-36%, so SCALP could mathematically NEVER
+# fire, and SWING's 1.1x volume-expansion demand kept the whole crypto
+# pocket idle through quiet weeks (activity-log evidence 7/2: ETH/SOL/XRP
+# all "no_setup" on vol 0.2-0.6x). Entries remain gated by TCS floor +
+# net-edge (fees+slippage) + per-coin cap + the allocation pocket.
+import os as _os
+
+
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(_os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 SCALP_RSI_LO, SCALP_RSI_HI = 40, 68
-SCALP_BB_MAX = 2.2
-SCALP_VOL_MIN = 1.1
+SCALP_BB_MAX = _envf("TREZO_CRYPTO_SCALP_BB_MAX", 25.0)
+SCALP_VOL_MIN = _envf("TREZO_CRYPTO_SCALP_VOL_MIN", 0.4)
 SWING_RSI_LO, SWING_RSI_HI = 48, 72
-SWING_BB_MIN = 2.0
-SWING_VOL_MIN = 1.1
-DCA_RSI_MAX = 40
+SWING_BB_MIN = _envf("TREZO_CRYPTO_SWING_BB_MIN", 2.0)
+SWING_VOL_MIN = _envf("TREZO_CRYPTO_SWING_VOL_MIN", 0.8)
+DCA_RSI_MAX = _envf("TREZO_CRYPTO_DCA_RSI_MAX", 40)
 
 
 def indicators(candles: list[Candle]) -> dict:

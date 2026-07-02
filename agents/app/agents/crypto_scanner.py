@@ -27,6 +27,8 @@ class CryptoScannerAgent(Agent):
     # stocks — the per-coin stops are tighter. Still gated by Risk Manager.
     MIN_TCS = 650
 
+    _last_hb: float = 0.0
+
     async def tick(self) -> list[AgentMessage]:
         from app.runtime.settings import get_bot_settings
         # Honor the user's Bot Tuning TCS slider. Crypto stays slightly
@@ -104,6 +106,20 @@ class CryptoScannerAgent(Agent):
                     payload={"ticker": coin, "error": str(e)},
                 ))
 
+        # Hourly visibility heartbeat (2026-07-02): the crypto story in one
+        # activity-log line -- crypto scans were previously invisible there.
+        try:
+            import time as _t
+            if (_t.time() - CryptoScannerAgent._last_hb) >= 3600.0:
+                CryptoScannerAgent._last_hb = _t.time()
+                from app.agents.activity_log import record as _arec
+                _summary = ", ".join(
+                    f"{d.get('ticker')}:{d.get('result')}" for d in detail[:6])
+                _arec("crypto_scan", "CRYPTO",
+                      reason=f"{scanned} scanned, {triggered} fired -- {_summary}",
+                      extra={"triggered": triggered})
+        except Exception:  # noqa: BLE001
+            pass
         out.append(AgentMessage(
             agent=self.name, kind="info",
             payload={

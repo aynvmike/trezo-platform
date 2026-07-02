@@ -19,6 +19,7 @@ Rules:
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import deque
 
 from app.config import get_settings
@@ -743,6 +744,44 @@ class RiskManagerAgent(Agent):
                 if _t1 is not None:
                     approve_payload["target_pct"] = _t1
                 approve_payload["cap_tier"] = _tier
+                # Realistic-move target (Mike 2026-07-02): on an idle tape
+                # a big defined target is "waiting money" -- the position
+                # barcodes between green and red and never fills. Cap the
+                # target at what the name ACTUALLY moves (1.5x its 14-day
+                # ATR%), floored above round-trip costs, so quick real
+                # profits get banked instead of waited on. Tunables:
+                # TREZO_TARGET_ATR_MULT / TREZO_TARGET_MIN_PCT.
+                try:
+                    from app.strategies.market_filter import atr as _atr_fn
+                    if stock_candles and len(stock_candles) >= 15:
+                        _last_close = float(stock_candles[-1].close)
+                        _atr_abs = float(_atr_fn(stock_candles) or 0.0)
+                        _atr_pct = (_atr_abs / _last_close) if _last_close > 0 else 0.0
+                        _t_cur = approve_payload.get("target_pct")
+                        if _atr_pct > 0 and _t_cur is not None:
+                            _mult = float(os.getenv("TREZO_TARGET_ATR_MULT", "1.5"))
+                            _floor = float(os.getenv("TREZO_TARGET_MIN_PCT", "0.006"))
+                            _cap = max(_floor, round(_mult * _atr_pct, 4))
+                            if float(_t_cur) > _cap:
+                                approve_payload["target_pct"] = _cap
+                                approve_payload["target_realism"] = True
+                                approve_payload["reason"] += (
+                                    f"; realistic target {_cap * 100:.1f}%"
+                                    f" (1.5x ATR {_atr_pct * 100:.1f}%)")
+                                try:
+                                    from app.agents.activity_log import record as _arec
+                                    _arec("realistic_target", ticker,
+                                          strategy=strategy,
+                                          reason=(f"idle-tape realism: target "
+                                                  f"{float(_t_cur) * 100:.1f}% -> "
+                                                  f"{_cap * 100:.1f}% "
+                                                  f"({_mult}x ATR {_atr_pct * 100:.2f}%)"),
+                                          extra={"user_id": message.payload.get("user_id")
+                                                 or "global", "cap_tier": _tier})
+                                except Exception:  # noqa: BLE001
+                                    pass
+                except Exception:  # noqa: BLE001
+                    pass
                 if _tier != "unknown" and (_s1 != _s0 or _t1 != _t0):
                     approve_payload["reason"] += f"; {_tier}-cap formulas"
                     try:

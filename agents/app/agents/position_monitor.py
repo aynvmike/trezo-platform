@@ -20,7 +20,15 @@ from datetime import datetime, timezone
 
 from app.config import get_settings
 from app.data.candles import fetch_candles_for
+import os
+
 from app.paper.engine import close_position, check_and_lock_profit
+
+# Profit stepping (2026-07-02): position ids already stepped this
+# process-life. Best-effort restart note: after a service restart a
+# between-step-and-target position may step once more; the trail +
+# breakeven-side stops keep that benign on paper.
+_profit_stepped: set[str] = set()
 from app.strategies.extended import SWING_MAX_HOLD_DAYS
 from app.agents.reevaluator import reeval_is_enabled, reevaluate_position
 
@@ -845,6 +853,44 @@ class PositionMonitorAgent(Agent):
             if not close_reason and strat.startswith("extended"):
                 if _minutes_since(r.get("entry_at")) / 1440.0 >= SWING_MAX_HOLD_DAYS:
                     close_reason, close_detail = "time", "swing_time_stop"
+
+            # Profit stepping (Mike 2026-07-02): bank HALF once the move
+            # has covered most of the trip to target; the rest rides the
+            # trail. Modeled rows only in v1 -- Alpaca partials must
+            # renegotiate bracket legs first (queued, cancel-legs lesson
+            # 6/12). Tunables: TREZO_PROFIT_STEP_ENABLED / _AT / _FRACTION.
+            if (close_reason is None and side == "long"
+                    and r.get("broker") != "alpaca"
+                    and str(r.get("id")) not in _profit_stepped
+                    and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
+                try:
+                    _e = float(r.get("entry_price") or 0)
+                    _q = float(r.get("quantity") or 0)
+                    if _e > 0 and _q > 0 and target is not None and float(target) > _e:
+                        _run = (price - _e) / (float(target) - _e)
+                        _at_frac = float(os.getenv("TREZO_PROFIT_STEP_AT", "0.6"))
+                        if _run >= _at_frac:
+                            _frac = min(0.9, max(0.1, float(
+                                os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
+                            from app.paper.engine import close_partial_position
+                            _pf = await close_partial_position(
+                                r["user_id"], r["id"], _frac, price,
+                                reason="profit_step")
+                            if _pf.ok:
+                                _profit_stepped.add(str(r.get("id")))
+                                affected_users.add(r["user_id"])
+                                try:
+                                    from app.agents.activity_log import record as _arec
+                                    _arec("profit_step", tk, strategy=strat,
+                                          reason=(f"banked {_frac * 100:.0f}% at "
+                                                  f"{_run * 100:.0f}% of the run to "
+                                                  f"target (${_pf.realized_pnl_usd:+.2f}); "
+                                                  f"rest rides the trail"),
+                                          extra={"user_id": str(r.get("user_id"))})
+                                except Exception:  # noqa: BLE001
+                                    pass
+                except Exception:  # noqa: BLE001
+                    pass
 
             if close_reason:
                 fill = await close_position(r["user_id"], r["id"], price, reason=close_reason)

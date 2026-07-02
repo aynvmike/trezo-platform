@@ -118,17 +118,36 @@ async def fetch_crypto_ohlc(symbol: str, days: int = 30) -> list[Candle]:
     except Exception:  # noqa: BLE001
         return []
 
-    out: list[Candle] = []
-    for row in rows:
-        if len(row) < 5:
-            continue
-        ts = datetime.fromtimestamp(int(row[0]) / 1000.0, tz=timezone.utc)
-        out.append(Candle(
-            timestamp=ts,
-            open=float(row[1]), high=float(row[2]),
-            low=float(row[3]), close=float(row[4]),
-            volume=0.0,
-        ))
+    def _parse_cg(raw) -> list[Candle]:
+        parsed: list[Candle] = []
+        for row in (raw or []):
+            if len(row) < 5:
+                continue
+            ts = datetime.fromtimestamp(int(row[0]) / 1000.0, tz=timezone.utc)
+            parsed.append(Candle(
+                timestamp=ts,
+                open=float(row[1]), high=float(row[2]),
+                low=float(row[3]), close=float(row[4]),
+                volume=0.0,
+            ))
+        return parsed
+
+    out = _parse_cg(rows)
+    # CoinGecko /ohlc granularity trap (found 2026-07-02): days=90 comes
+    # back in 4-DAY candles (~23 bars) -- two short of detect_mode's
+    # 25-bar minimum, which silently froze every CoinGecko-fed coin
+    # (HBAR/QNT/XDC/IOTA/XYO). Refetch wider when short.
+    if len(out) < 25:
+        try:
+            params["days"] = "180"
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                r = await client.get(url, params=params)
+                if r.status_code == 200:
+                    wider = _parse_cg(r.json())
+                    if len(wider) > len(out):
+                        out = wider
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 
