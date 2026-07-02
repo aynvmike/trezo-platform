@@ -176,6 +176,16 @@ async def open_position(
     # risk math, so the position range scales with account size.
     from app.paper.sizing import plan_position
     equity = cash + float(account.get("vault_balance_usd") or 0)
+    # Coverage trades stay SMALL (Mike 2026-07-02): shrink risk so the
+    # modeled test position lands near TREZO_COVERAGE_TRADE_USD notional.
+    if (source_payload or {}).get("coverage_trade"):
+        try:
+            import os as _osc
+            _cov = float(_osc.getenv("TREZO_COVERAGE_TRADE_USD", "150"))
+            _rp = (_cov * float(stop_pct)) / max(equity, 1.0)
+            risk_pct = min(float(risk_pct), max(_rp, 0.0005))
+        except Exception:  # noqa: BLE001
+            pass
     plan = plan_position(
         equity=equity,
         entry_price=fill_price,

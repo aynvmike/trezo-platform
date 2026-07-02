@@ -468,7 +468,8 @@ class TradeExecutionAgent(Agent):
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, equity, strategy, asset_type)
         if remaining <= 0:
-            return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+            if not (source_payload or {}).get("coverage_trade"):
+                return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
 
         kwargs: dict = {
             "user_id": user_id,
@@ -554,7 +555,8 @@ class TradeExecutionAgent(Agent):
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "stock")
         if remaining <= 0:
-            return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+            if not (source_payload or {}).get("coverage_trade"):
+                return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
 
         sp = float(stop_pct) if isinstance(stop_pct, (int, float)) and stop_pct > 0 else 0.05
         tp = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
@@ -579,6 +581,19 @@ class TradeExecutionAgent(Agent):
             asset_type="stock",
             buying_power=min(acct.buying_power, remaining),
         )
+        # Coverage trades stay SMALL (Mike 2026-07-02): one labeled test
+        # position per strategy, capped near TREZO_COVERAGE_TRADE_USD.
+        if plan.ok and (source_payload or {}).get("coverage_trade"):
+            try:
+                import dataclasses as _dc
+                import os as _osc
+                _cov = float(_osc.getenv("TREZO_COVERAGE_TRADE_USD", "150"))
+                _maxq = max(1.0, float(int(_cov / max(market_price, 0.01))))
+                if plan.quantity > _maxq:
+                    plan = _dc.replace(plan, quantity=_maxq,
+                                       notional_usd=round(_maxq * market_price, 2))
+            except Exception:  # noqa: BLE001
+                pass
         force_min = int(source_payload.get("force_min_qty") or 0)
         if not plan.ok and force_min >= 1 and acct.buying_power >= market_price:
             from app.paper.sizing import SizingPlan as _SP, account_tier as _at
@@ -714,7 +729,8 @@ class TradeExecutionAgent(Agent):
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "crypto")
         if remaining <= 0:
-            return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+            if not (source_payload or {}).get("coverage_trade"):
+                return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
 
         sp = float(stop_pct) if isinstance(stop_pct, (int, float)) and stop_pct > 0 else 0.05
         tp = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
@@ -739,6 +755,17 @@ class TradeExecutionAgent(Agent):
             asset_type="crypto",
             buying_power=min(acct.buying_power, remaining),
         )
+        if plan.ok and (source_payload or {}).get("coverage_trade"):
+            try:
+                import dataclasses as _dc
+                import os as _osc
+                _cov = float(_osc.getenv("TREZO_COVERAGE_TRADE_USD", "150"))
+                _maxq = _cov / max(market_price, 1e-9)
+                if plan.quantity > _maxq:
+                    plan = _dc.replace(plan, quantity=_maxq,
+                                       notional_usd=round(_maxq * market_price, 2))
+            except Exception:  # noqa: BLE001
+                pass
         if not plan.ok:
             return _err(plan.reject_reason or "Sizing rejected the trade")
 

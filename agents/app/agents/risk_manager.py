@@ -395,6 +395,16 @@ class RiskManagerAgent(Agent):
         # the global row otherwise.
         cfg = get_bot_settings(message.payload.get("user_id"))
         min_tcs = cfg.tcs_threshold
+        # Strategy-coverage test mode (Mike 2026-07-02): drop the floor to
+        # TREZO_COVERAGE_TCS (400) so EVERY strategy can find one live,
+        # labeled trade instead of waiting on perfect tape.
+        _coverage_on = os.getenv("TREZO_COVERAGE_MODE", "0") != "0"
+        if _coverage_on:
+            try:
+                min_tcs = min(int(min_tcs),
+                              int(float(os.getenv("TREZO_COVERAGE_TCS", "400"))))
+            except (TypeError, ValueError):
+                min_tcs = min(int(min_tcs), 400)
         max_open = cfg.max_open_positions
 
         # Adaptive Scope - the news/regime self-tuner (Phase 7.5). The Risk
@@ -909,6 +919,81 @@ class RiskManagerAgent(Agent):
                     ),
                 ))
         except Exception:
+            pass
+
+        # Coverage tag (Mike 2026-07-02): in coverage mode, a strategy's
+        # FIRST-EVER trade is marked so the pocket gate lets a small
+        # labeled test position through -- one per strategy.
+        if _coverage_on:
+            try:
+                client_cov = _supabase()
+                if client_cov is not None:
+                    import asyncio as _aio
+
+                    def _qcov():
+                        return (client_cov.table("paper_positions")
+                                .select("id")
+                                .eq("user_id", message.payload.get("user_id"))
+                                .eq("strategy", strategy)
+                                .limit(1).execute())
+                    _had = (await _aio.to_thread(_qcov)).data or []
+                    if not _had:
+                        approve_payload["coverage_trade"] = True
+                        approve_payload["reason"] += (
+                            f"; coverage: first live {strategy} trade")
+                        try:
+                            from app.agents.activity_log import record as _arec
+                            _arec("coverage_trade", ticker, tcs=int(tcs),
+                                  strategy=strategy,
+                                  reason=(f"first live {strategy} trade -- "
+                                          f"small labeled test position"),
+                                  extra={"user_id": message.payload.get("user_id")
+                                         or "global"})
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Trade thesis (Mike 2026-07-02): every approval carries its own
+        # breakdown -- WHY it was taken, WHAT the exit watches, and the
+        # plan BOTH ways. Persists on the position row (source_payload)
+        # and prints one activity-log line.
+        try:
+            _sp_pct = float(approve_payload.get("stop_pct") or 0) * 100
+            _tp_pct = float(approve_payload.get("target_pct") or 0) * 100
+            _tier_t = approve_payload.get("cap_tier") or "untiered"
+            _pat_t = (message.payload.get("dominant_pattern")
+                      or (message.payload.get("crypto_signal") or {}).get("reason")
+                      or "")
+            _sname = str(strategy or "signal")
+            _fast_t = _sname.startswith(("scalp", "orb", "stms"))
+            approve_payload["thesis"] = {
+                "why": (f"{_sname} fired {direction} at TCS {tcs}"
+                        + (f" on {_pat_t}" if _pat_t else "")
+                        + f"; {_tier_t}-cap formulas sized the geometry"),
+                "exit_watch": (
+                    f"target +{_tp_pct:.1f}%, stop -{_sp_pct:.1f}%"
+                    + ("; intraday rules: 90-min max hold, 3:45 ET force-exit, "
+                       "75-min stagnation exit" if _fast_t
+                       else "; hourly re-score guards the thesis")),
+                "if_with_us": ("profit-step ladder banks 50% of what's left at "
+                               "60/80/100% of the run; the trail locks the rest; "
+                               "never round-trip a green trade"),
+                "if_against_us": (f"hard stop -{_sp_pct:.1f}% caps the loss; "
+                                  "hourly TCS re-score rotates out early if the "
+                                  "setup collapses; daily kill-switch caps the "
+                                  "book at -3%"),
+            }
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("thesis", ticker, tcs=int(tcs), strategy=strategy,
+                      reason=(approve_payload["thesis"]["why"] + " | exit: "
+                              + approve_payload["thesis"]["exit_watch"])[:220],
+                      extra={"user_id": message.payload.get("user_id")
+                             or "global"})
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
             pass
 
         # Visibility pack (2026-07-01): approvals in the activity log too.
