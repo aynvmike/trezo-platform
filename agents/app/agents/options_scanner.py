@@ -167,6 +167,7 @@ def _occ_match(occ: str, underlying: str, opt_type: str, strike: float,
 
 
 class OptionsScannerAgent(Agent):
+    _last_rescore: float = 0.0
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
@@ -451,6 +452,93 @@ class OptionsScannerAgent(Agent):
         res = await asyncio.to_thread(_sync_get)
         rows = res.data or []
         out: list[AgentMessage] = []
+
+        # Held-option RE-SCORE (Mike 2026-07-02: "re-evaluate the IV score
+        # ... for a current trade it is holding even though it has a stop
+        # in"). Hourly, every open (non-expired) option row gets its thesis
+        # re-measured from live data: current premium vs the credit
+        # collected (the practical IV read for short premium), moneyness,
+        # and days-to-expiry. ADVISORY by design -- exits keep the
+        # drawback-ladder + expiry flow; this makes the risk VISIBLE.
+        try:
+            import time as _t
+            if (_t.time() - OptionsScannerAgent._last_rescore) >= 3600.0:
+                OptionsScannerAgent._last_rescore = _t.time()
+
+                def _sync_open_live():
+                    return (
+                        client.table("options_positions")
+                        .select("id, user_id, underlying, strategy, "
+                                "option_type, strike, contracts, "
+                                "net_premium_usd, expiration")
+                        .eq("status", "open")
+                        .gt("expiration", today)
+                        .execute()
+                    )
+                _live = (await asyncio.to_thread(_sync_open_live)).data or []
+                for lr in _live[:12]:
+                    try:
+                        _u = str(lr.get("underlying") or "").upper()
+                        _strike = float(lr.get("strike") or 0)
+                        _otype = str(lr.get("option_type") or "put").lower()
+                        _exp = str(lr.get("expiration") or "")
+                        _credit = float(lr.get("net_premium_usd") or 0)
+                        _ct = int(lr.get("contracts") or 1)
+                        if not _u or _strike <= 0 or len(_exp) < 10:
+                            continue
+                        _cnd = await fetch_candles_for(_u, "stock")
+                        _spot = float(_cnd[-1].close) if _cnd else 0.0
+                        _dte = (date.fromisoformat(_exp[:10])
+                                - date.today()).days
+                        _occ = (f"{_u}{_exp[2:4]}{_exp[5:7]}{_exp[8:10]}"
+                                f"{'C' if _otype.startswith('c') else 'P'}"
+                                f"{int(round(_strike * 1000)):08d}")
+                        from app.brokers.alpaca_data import get_option_quote
+                        _prem_now = await get_option_quote(_occ)
+                        _entry_prem = (abs(_credit) / (100.0 * _ct)
+                                       if _credit and _ct else None)
+                        _ratio = ((float(_prem_now) / _entry_prem)
+                                  if _prem_now and _entry_prem else None)
+                        _money = ((_spot - _strike) / _strike * 100.0
+                                  if _spot > 0 else None)
+                        _risk = bool(
+                            (_ratio is not None and _ratio >= 2.0)
+                            or (_money is not None and _dte <= 5
+                                and ((_otype.startswith("p") and _money < 2.0)
+                                     or (_otype.startswith("c")
+                                         and _money > -2.0))))
+                        from app.agents.activity_log import record as _arec
+                        _arec("reeval_option", _u,
+                              strategy=str(lr.get("strategy") or ""),
+                              reason=(f"{_otype.upper()} {_strike:g} exp "
+                                      f"{_exp[:10]} (DTE {_dte}): premium now "
+                                      + (f"{float(_prem_now):.2f}" if _prem_now else "?")
+                                      + " vs entry "
+                                      + (f"{_entry_prem:.2f}" if _entry_prem else "?")
+                                      + (f" ({_ratio:.1f}x)" if _ratio else "")
+                                      + (f", spot {_money:+.1f}% vs strike"
+                                         if _money is not None else "")
+                                      + (" -- RISK: thesis deteriorating"
+                                         if _risk else " -- healthy")),
+                              extra={"user_id": str(lr.get("user_id"))})
+                        if _risk:
+                            out.append(AgentMessage(
+                                agent=self.name, kind="alert",
+                                payload={
+                                    "user_id": lr.get("user_id"),
+                                    "underlying": _u,
+                                    "note": (f"Held option risk: {_otype} "
+                                             f"{_strike:g} exp {_exp[:10]} -- "
+                                             "premium "
+                                             + (f"{_ratio:.1f}x entry"
+                                                if _ratio else "n/a")
+                                             + f", DTE {_dte}. Advisory only."),
+                                },
+                            ))
+                    except Exception:  # noqa: BLE001
+                        continue
+        except Exception:  # noqa: BLE001
+            pass
 
         for r in rows:
             candles = await fetch_candles_for(r["underlying"], "stock")

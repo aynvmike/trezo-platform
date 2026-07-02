@@ -24,6 +24,7 @@ DAILY_DRAWDOWN_PCT = 0.03
 WEEKLY_DRAWDOWN_PCT = 0.06
 MAX_CONSECUTIVE_LOSSES = 3
 MAX_BROKER_REJECTS = 3
+MAX_SLIPPAGE_BREACHES = 3   # fills slipping worse than the limit / session
 
 
 # --- Session-scoped broker-reject counter (in-process) ----------------
@@ -43,6 +44,35 @@ def broker_reject_count() -> int:
 def reset_broker_rejects() -> None:
     global _broker_rejects
     _broker_rejects = 0
+
+
+# --- Session-scoped slippage tracker (2026-07-02) ---------------------
+# Rules doc §1's slippage halt, deferred "until real (non-modeled) fills
+# exist to measure" -- they exist now. The reconciler measures each fill
+# (decision price vs the broker's avg fill) and feeds breaches here.
+_slippage_breaches: list[float] = []
+
+
+def record_fill_slippage(bps: float) -> int:
+    """Track one measured fill's ADVERSE slippage (bps, positive = worse
+    than the decision price). Counts a breach when it exceeds
+    TREZO_SLIPPAGE_HALT_BPS (default 75). Returns the session breach count."""
+    import os as _o
+    try:
+        limit = float(_o.getenv("TREZO_SLIPPAGE_HALT_BPS", "75"))
+    except (TypeError, ValueError):
+        limit = 75.0
+    if bps > limit:
+        _slippage_breaches.append(float(bps))
+    return len(_slippage_breaches)
+
+
+def slippage_breach_count() -> int:
+    return len(_slippage_breaches)
+
+
+def reset_slippage_breaches() -> None:
+    _slippage_breaches.clear()
 
 
 def _f(v) -> float:
@@ -127,6 +157,12 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
     if rj >= MAX_BROKER_REJECTS:
         return KillSwitch(True, "session",
                           f"{rj} broker order rejects this session")
+
+    sb = slippage_breach_count()
+    if sb >= MAX_SLIPPAGE_BREACHES:
+        return KillSwitch(True, "session",
+                          f"{sb} fills slipped past the limit this session "
+                          f"- execution quality halt")
 
     return KillSwitch(False, None, None)
 

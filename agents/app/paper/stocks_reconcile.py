@@ -233,6 +233,30 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
 
             drift_qty = abs(ap_qty - trezo_qty) > 1e-6
             drift_entry = abs(ap_entry - trezo_entry) > 0.01
+            # Slippage rule (2026-07-02, rules doc §1): the entry drift IS
+            # the realized fill slippage -- decision price (our row) vs the
+            # broker's avg fill. Measure ONCE (the patch below overwrites
+            # our copy), log it, feed the session slippage halt.
+            if drift_entry and trezo_entry > 0 and ap_entry > 0:
+                try:
+                    _side_r = str(r.get("side") or "long")
+                    _adverse = ((ap_entry - trezo_entry) / trezo_entry
+                                if _side_r == "long"
+                                else (trezo_entry - ap_entry) / trezo_entry)
+                    _bps = _adverse * 10_000.0
+                    _n_breach = 0
+                    if _bps > 0:
+                        from app.paper.killswitch import record_fill_slippage
+                        _n_breach = record_fill_slippage(_bps)
+                    from app.agents.activity_log import record as _arec3
+                    _arec3("fill_slippage", sym,
+                           reason=(f"decision {trezo_entry:g} -> fill "
+                                   f"{ap_entry:g} = {_bps:+.0f}bps"),
+                           extra={"user_id": str(user_id),
+                                  "bps": round(_bps, 1),
+                                  "session_breaches": _n_breach})
+                except Exception:  # noqa: BLE001
+                    pass
             if drift_qty or drift_entry:
                 def _patch(rid=r["id"], q=ap_qty, e=ap_entry):
                     return (
