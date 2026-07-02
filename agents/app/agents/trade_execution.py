@@ -307,6 +307,20 @@ class TradeExecutionAgent(Agent):
             overrides=cfg.allocation_overrides,
         )
         budget = float(alloc.budgets.get(mt, 0.0))
+        # Intraday overflow (2026-07-02): multi-day swing holds were
+        # filling the stocks pocket and STARVING every intraday idea
+        # (found live: TSLL/BITO/TZA approvals skipped all morning).
+        # Self-liquidating strategies (scalp/orb/stms exit by 3:45) may
+        # run the pocket over by a bounded fraction -- they give the
+        # capital back the same session.
+        try:
+            import os as _os
+            _s = (strategy or "").lower()
+            if _s.startswith(("scalp", "orb", "stms")):
+                _ov = float(_os.getenv("TREZO_INTRADAY_OVERFLOW_PCT", "0.25"))
+                budget = budget * (1.0 + max(0.0, _ov))
+        except Exception:  # noqa: BLE001
+            pass
         deployed = float((await deployed_capital(user_id)).get(mt, 0.0))
         remaining = max(0.0, budget - deployed)
         return mt, budget, deployed, remaining, alloc.posture

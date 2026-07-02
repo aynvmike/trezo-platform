@@ -1371,6 +1371,56 @@ class _StockTrimReq(BaseModel):
     reason: str = "user_trim"
 
 
+@app.get("/activity/today", tags=["paper"])
+async def activity_today(limit: int = 14):
+    """Today's agent decision trail for the UI (2026-07-02): the Overview
+    was position-derived and told the user NOTHING about what the agents
+    were doing. This reads the local activity log (the same file the
+    midday snapshot uses) and returns event counts + the last N lines."""
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    root = _os.path.abspath(_os.path.join(here, ".."))
+    logdir = _os.getenv("TREZO_ACTIVITY_LOG_DIR") or _os.path.join(
+        _os.path.dirname(root), "logs")
+    today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+    path = _os.path.join(logdir, f"activity-{today}.jsonl")
+    counts: dict = {}
+    last: list = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+        for ln in lines:
+            try:
+                rec = _json.loads(ln)
+            except Exception:  # noqa: BLE001
+                continue
+            ev = str(rec.get("event") or "?")
+            counts[ev] = counts.get(ev, 0) + 1
+        for ln in lines[-max(1, int(limit)):]:
+            try:
+                rec = _json.loads(ln)
+            except Exception:  # noqa: BLE001
+                continue
+            last.append({
+                "ts": rec.get("ts"),
+                "event": rec.get("event"),
+                "ticker": rec.get("ticker"),
+                "reason": str(rec.get("reason") or "")[:140],
+            })
+        last.reverse()
+        return {"available": True, "date": today,
+                "total": sum(counts.values()), "counts": counts,
+                "last": last}
+    except FileNotFoundError:
+        return {"available": False, "date": today, "total": 0,
+                "counts": {}, "last": []}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "date": today, "total": 0,
+                "counts": {}, "last": [], "error": str(e)[:120]}
+
+
 @app.get("/allocations/snapshot", tags=["paper"])
 async def allocations_snapshot(user_id: str):
     """The REAL capital pockets the Trade Execution gate enforces (Phase

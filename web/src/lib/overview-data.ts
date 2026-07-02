@@ -1,6 +1,25 @@
 import { createClient } from "@/lib/supabase/server";
 import { fetchAlpacaSnapshot, type AlpacaPosition } from "@/lib/alpaca-snapshot";
-import type { OverviewData, OVLayer } from "@/components/dashboard/overview-view-redesign";
+import type { OverviewData, OVLayer, OVActivity } from "@/components/dashboard/overview-view-redesign";
+
+const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
+
+/** Today's agent decision trail (approvals, vetoes, pocket skips ...) --
+ *  the piece that ties what the agents DO to what the Overview SHOWS. */
+async function fetchAgentActivity(): Promise<OVActivity | null> {
+  try {
+    const r = await fetch(`${AGENTS_BASE}/activity/today?limit=10`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as OVActivity & { available?: boolean };
+    if (!j || j.available === false) return null;
+    return { total: j.total ?? 0, counts: j.counts ?? {}, last: j.last ?? [] };
+  } catch {
+    return null;
+  }
+}
 
 type PaperPos = {
   ticker: string;
@@ -43,7 +62,7 @@ function layerOf(assetType: string, strategy: string): number {
 export async function buildOverviewData(userId: string): Promise<OverviewData> {
   const supabase = createClient();
   const sinceIso = new Date(Date.now() - 7 * 864e5).toISOString();
-  const [accountRes, openRes, closedRes, alpaca] = await Promise.all([
+  const [accountRes, openRes, closedRes, alpaca, activity] = await Promise.all([
     supabase.from("paper_accounts").select("*").eq("user_id", userId).maybeSingle(),
     supabase
       .from("paper_positions")
@@ -57,6 +76,7 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
       .neq("status", "open")
       .gte("exit_at", sinceIso),
     fetchAlpacaSnapshot(),
+    fetchAgentActivity(),
   ]);
 
   const account = accountRes.data as Record<string, number> | null;
@@ -121,5 +141,5 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
   }
   const weekPnl = week.reduce((s, x) => s + x.v, 0);
 
-  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf };
+  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf, activity };
 }

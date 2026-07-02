@@ -48,6 +48,20 @@ TIER_PROFILES: dict[str, dict] = {
                 "min_avg_vol": 400_000},
 }
 
+# Liquid funds/ETFs have NO market cap at Finnhub, so they classified
+# "unknown" and lost scalp eligibility -- yet the most-actives pool is
+# full of them and they are the MOST scalp-friendly names on the tape
+# (found live 2026-07-02: TSLL/BITO/TZA approvals tiered unknown).
+KNOWN_LIQUID_ETFS: frozenset = frozenset({
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI",
+    "XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+    "TQQQ", "SQQQ", "SOXL", "SOXS", "TZA", "TNA", "UVXY", "SVXY",
+    "BITO", "TSLL", "TSLQ", "NVDL", "NVDX", "LABU", "LABD",
+    "GLD", "SLV", "USO", "TLT", "HYG", "EEM", "FXI", "ARKK",
+})
+TIER_PROFILES["etf"] = {"stop_mult": 0.85, "target_mult": 0.75,
+                        "scalp_ok": True, "min_avg_vol": 1_000_000}
+
 _TIER_CACHE: dict[str, tuple[float, str]] = {}
 _TIER_TTL = 86_400.0  # cap tier barely moves intraday
 
@@ -66,6 +80,8 @@ async def tier_for(symbol: str, price: Optional[float] = None) -> str:
     sym = (symbol or "").upper().strip()
     if not sym:
         return "unknown"
+    if sym in KNOWN_LIQUID_ETFS:
+        return "etf"
     hit = _TIER_CACHE.get(sym)
     if hit and (_time.time() - hit[0]) < _TIER_TTL:
         return hit[1]

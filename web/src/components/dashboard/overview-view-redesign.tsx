@@ -11,6 +11,12 @@ export type OVLayer = {
   idleReason?: string;
 };
 
+export type OVActivity = {
+  total: number;
+  counts: Record<string, number>;
+  last: { ts: string | null; event: string | null; ticker: string | null; reason: string | null }[];
+};
+
 export type OverviewData = {
   portfolioValue: number;
   weekPnl: number;
@@ -25,6 +31,7 @@ export type OverviewData = {
   buyingPower: number | null;
   stale: boolean;
   asOf: string | null;
+  activity?: OVActivity | null;
 };
 
 const SAMPLE: OverviewData = {
@@ -55,6 +62,7 @@ const SAMPLE: OverviewData = {
   buyingPower: null,
   stale: false,
   asOf: null,
+  activity: null,
 };
 
 const STATUS_TEXT: Record<string, string> = {
@@ -179,6 +187,47 @@ export function OverviewViewRedesign({ data }: { data?: OverviewData }) {
         <Kpi label="Total Open Risk" value={money0(d.deployed)} sub={d.deployedPct != null ? d.deployedPct.toFixed(1) + "% of portfolio deployed" : "Capital in open positions"} />
         <Kpi label="Layers Active" value={d.layersActive + " / 7"} sub="Layers holding a position now" />
       </div>
+
+      {d.activity && d.activity.total > 0 ? (
+        <div className="depth-card p-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-[13px] font-medium text-[rgb(var(--foreground))]">Agent Activity Today</h3>
+              <p className="text-[11px] text-[rgb(var(--muted-foreground))]">Every decision the agents made — straight from the activity log</p>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                ["approve", "approvals", "text-emerald-500 bg-emerald-500/10"],
+                ["submitted", "orders", "text-emerald-500 bg-emerald-500/10"],
+                ["veto", "vetoes", "text-red-400 bg-red-500/10"],
+                ["pocket_skip", "pocket skips", "text-amber-500 bg-amber-500/10"],
+                ["profit_step", "profit steps", "text-emerald-500 bg-emerald-500/10"],
+                ["reeval_check", "re-checks", "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]"],
+              ].map(([key, lbl, cls]) =>
+                d.activity!.counts[key] ? (
+                  <span key={key} className={"rounded-full px-2 py-0.5 font-mono text-[10px] " + cls}>
+                    {d.activity!.counts[key]} {lbl}
+                  </span>
+                ) : null
+              )}
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            {d.activity.last.slice(0, 8).map((ev, i) => (
+              <div key={i} className="flex items-baseline gap-2 text-[11px]">
+                <span className="shrink-0 font-mono text-[10px] text-[rgb(var(--muted-foreground))]">
+                  {ev.ts ? String(ev.ts).slice(11, 16) + "Z" : "--:--"}
+                </span>
+                <span className={"shrink-0 rounded px-1.5 font-mono text-[10px] " + (ev.event === "approve" || ev.event === "submitted" || ev.event === "profit_step" ? "text-emerald-500 bg-emerald-500/10" : ev.event === "veto" ? "text-red-400 bg-red-500/10" : ev.event === "pocket_skip" ? "text-amber-500 bg-amber-500/10" : "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>
+                  {ev.event}
+                </span>
+                <span className="shrink-0 font-mono font-medium text-[rgb(var(--foreground))]">{ev.ticker}</span>
+                <span className="truncate text-[rgb(var(--muted-foreground))]">{ev.reason}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <div className="depth-card p-4 md:col-span-2">
