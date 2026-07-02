@@ -79,7 +79,14 @@ class ExtendedScannerAgent(Agent):
         scanned = 0
         signals = 0
 
-        for symbol in EXTENDED_WATCHLIST:
+        # Market-first (2026-07-02): watchlist leads, market fills.
+        try:
+            from app.data.market_universe import expanded_scan_pool
+            scan_pool, _pool_info = await expanded_scan_pool(
+                list(EXTENDED_WATCHLIST), limit=40)
+        except Exception:  # noqa: BLE001
+            scan_pool, _pool_info = list(EXTENDED_WATCHLIST), {}
+        for symbol in scan_pool:
             if symbol in self._signalled:
                 continue
             try:
@@ -127,6 +134,8 @@ class ExtendedScannerAgent(Agent):
                 "scanned": scanned,
                 "signals": signals,
                 "watchlist_size": len(EXTENDED_WATCHLIST),
+                "pool_size": len(scan_pool),
+                "pool_market_wide": int(_pool_info.get("market_wide", 0)),
             },
         ))
         # Task #60 (2026-06-05): scanner_pulse summary emission.

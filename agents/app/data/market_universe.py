@@ -57,24 +57,52 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
     universe: list[str] = []
     seen: set[str] = set()
 
+    def _clean(sym: str) -> bool:
+        # Drop warrants/units/odd share classes ("KRSP.WS", "ABC-U") --
+        # they wasted scan slots and always died at the gates (2026-07-02).
+        return sym.isalpha() and 1 <= len(sym) <= 5
+
     try:
-        from app.brokers.alpaca_data import get_market_movers
+        from app.brokers.alpaca_data import get_market_movers, get_most_actives
         movers = await get_market_movers(top=30)
     except Exception:  # noqa: BLE001
         movers = {}
+        get_most_actives = None  # type: ignore[assignment]
 
-    # Gainers + losers both — direction-aware scanners want either.
-    for side in ("gainers", "losers"):
+    actives: list[str] = []
+    if get_most_actives is not None:
+        try:
+            actives = [s for s in await get_most_actives(top=25) if _clean(s)]
+        except Exception:  # noqa: BLE001
+            actives = []
+
+    gainers: list[str] = []
+    losers: list[str] = []
+    junk_skipped = 0
+    for side, dest in (("gainers", gainers), ("losers", losers)):
         for entry in (movers.get(side, []) if isinstance(movers, dict) else []):
             sym = str(entry.get("symbol", "")).upper().strip()
-            if not sym or sym in seen:
+            if not sym:
                 continue
-            seen.add(sym)
-            universe.append(sym)
-            if len(universe) >= limit:
-                _cache["universe"] = universe
-                _cached_at = now
-                return list(universe)
+            if not _clean(sym):
+                junk_skipped += 1
+                continue
+            dest.append(sym)
+
+    # Interleave: most-actives first (liquid, scalp-friendly), then
+    # gainers/losers round-robin so both directions stay represented.
+    lists = [actives, gainers, losers]
+    i = 0
+    while len(universe) < limit and any(lists):
+        src_list = lists[i % 3]
+        i += 1
+        if not src_list:
+            continue
+        sym = src_list.pop(0)
+        if sym in seen:
+            continue
+        seen.add(sym)
+        universe.append(sym)
 
     # Always make room for the sector / index leaders — they hold the
     # macro context the bot reasons against.
@@ -82,6 +110,18 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
         if sym not in seen and len(universe) < limit:
             seen.add(sym)
             universe.append(sym)
+
+    # Visibility (2026-07-02): one line per refresh showing what the
+    # market handed the scanners.
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("scan_pool_refresh", "MARKET",
+              reason=(f"{len([s for s in universe if s not in SECTOR_LEADERS])} "
+                      f"market names ({i and 'actives+gainers+losers' or 'none'}), "
+                      f"{junk_skipped} junk symbols skipped"),
+              extra={"pool_size": len(universe)})
+    except Exception:  # noqa: BLE001
+        pass
 
     _cache["universe"] = universe
     _cached_at = now

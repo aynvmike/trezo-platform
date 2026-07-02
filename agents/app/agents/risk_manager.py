@@ -726,6 +726,37 @@ class RiskManagerAgent(Agent):
         if target_pct is not None:
             approve_payload["target_pct"] = target_pct
 
+        # Market-cap tier formulas (2026-07-02): the LAST formula step.
+        # Megas trade tight + quick (scalp-friendly); micros get room and
+        # the risk math sizes them smaller via the wider stop. Fail-open.
+        if not _is_crypto:
+            try:
+                from app.strategies.cap_tiers import (
+                    tier_for, adjust_stop_target,
+                )
+                _tier = await tier_for(ticker)
+                _s0 = approve_payload.get("stop_pct")
+                _t0 = approve_payload.get("target_pct")
+                _s1, _t1 = adjust_stop_target(_tier, _s0, _t0)
+                if _s1 is not None:
+                    approve_payload["stop_pct"] = _s1
+                if _t1 is not None:
+                    approve_payload["target_pct"] = _t1
+                approve_payload["cap_tier"] = _tier
+                if _tier != "unknown" and (_s1 != _s0 or _t1 != _t0):
+                    approve_payload["reason"] += f"; {_tier}-cap formulas"
+                    try:
+                        from app.agents.activity_log import record as _arec
+                        _arec("cap_tier_adjust", ticker, strategy=strategy,
+                              reason=(f"{_tier}-cap: stop {_s0} -> {_s1}, "
+                                      f"target {_t0} -> {_t1}"),
+                              extra={"user_id": message.payload.get("user_id")
+                                     or "global"})
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+
         # Path beta: hopeful-bucket cap enforcement. If this signal is
         # a hopeful-bucket strategy and the user is already at or above
         # their cap, veto - we don't want to push their hopeful

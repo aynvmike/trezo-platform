@@ -64,7 +64,15 @@ class ORBScannerAgent(Agent):
         scanned = 0
         breakouts = 0
 
-        for symbol in ORB_WATCHLIST:
+        # Market-first (2026-07-02): the watchlist leads, the live
+        # market fills the rest -- the watchlist is NOT the universe.
+        try:
+            from app.data.market_universe import expanded_scan_pool
+            scan_pool, _pool_info = await expanded_scan_pool(
+                list(ORB_WATCHLIST), limit=40)
+        except Exception:  # noqa: BLE001
+            scan_pool, _pool_info = list(ORB_WATCHLIST), {}
+        for symbol in scan_pool:
             if symbol in self._alerted:
                 continue
             try:
@@ -112,6 +120,8 @@ class ORBScannerAgent(Agent):
                 "scanned": scanned,
                 "breakouts": breakouts,
                 "watchlist_size": len(ORB_WATCHLIST),
+                "pool_size": len(scan_pool),
+                "pool_market_wide": int(_pool_info.get("market_wide", 0)),
             },
         ))
         # Task #60 (2026-06-05): scanner_pulse summary emission.

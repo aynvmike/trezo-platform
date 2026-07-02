@@ -65,7 +65,8 @@ def _decide_time_stop(
     Preserving the comparisons here to avoid behavior drift.
     """
     strat = (r.get("strategy") or "").lower()
-    if not (strat.startswith("stms") or strat.startswith("orb")):
+    if not (strat.startswith("stms") or strat.startswith("orb")
+            or strat.startswith("scalp")):
         return None, ""
 
     now = datetime.now(timezone.utc)

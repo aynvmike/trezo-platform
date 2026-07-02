@@ -251,6 +251,24 @@ async def get_daily_bars(symbol: str, lookback_days: int = 140) -> list:
     return bars if isinstance(bars, list) else []
 
 
+async def get_most_actives(top: int = 25) -> list[str]:
+    """Most-active stocks by share volume -- the LIQUID end of today's
+    tape (2026-07-02). These are the scalp-friendly names; movers skew
+    to tiny caps. Empty list on any failure."""
+    try:
+        data = await _data_get("/v1beta1/screener/stocks/most-actives",
+                               {"by": "volume", "top": str(int(top))})
+    except Exception:  # noqa: BLE001
+        return []
+    rows = (data or {}).get("most_actives", []) if isinstance(data, dict) else []
+    out: list[str] = []
+    for r in rows:
+        sym = str((r or {}).get("symbol", "")).upper().strip()
+        if sym:
+            out.append(sym)
+    return out
+
+
 async def get_market_movers(top: int = 25) -> dict:
     """Today's biggest stock gainers and losers — Alpaca's movers screener.
 
