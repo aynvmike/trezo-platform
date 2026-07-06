@@ -94,6 +94,23 @@ _cache: dict[Optional[str], tuple[BotSettings, float]] = {}
 _TTL = 30.0
 
 
+def _primary_user_id():
+    import os as _o
+    v = (_o.getenv("TREZO_PRIMARY_USER_ID") or "").strip()
+    return v or None
+
+
+def _single_row_mode() -> bool:
+    import os as _o
+    return _o.getenv("TREZO_SETTINGS_SINGLE_ROW", "1") != "0"
+
+
+def clear_settings_cache() -> None:
+    """Force every consumer's next get_bot_settings() to re-read the
+    database -- the audit page's 'Sync agents now' action (2026-07-06)."""
+    _cache.clear()
+
+
 def _supabase():
     s = get_settings()
     if not s.supabase_url or not s.supabase_service_role_key:
@@ -191,6 +208,14 @@ def get_bot_settings(user_id: Optional[str] = None) -> BotSettings:
     argument, reads the most-recently-updated row (the global,
     single-user default). Falls back to defaults on any miss.
     """
+    # Single-row mode (2026-07-06): one operator, ONE settings row. The
+    # web app saves the signed-in user's row while engine signals carry
+    # the paper-engine's user id -- two rows drifted apart and Bot Tuning
+    # edits stopped reaching the trades. With TREZO_PRIMARY_USER_ID set,
+    # EVERY consumer (global or per-user) resolves to that row.
+    _prim = _primary_user_id()
+    if _prim and _single_row_mode():
+        user_id = _prim
     now = time.time()
     hit = _cache.get(user_id)
     if hit is not None and (now - hit[1]) < _TTL:

@@ -35,6 +35,23 @@ export function SettingsAuditPanel() {
     }
   }
 
+  // Sync agents now (Mike 2026-07-06): clears the agents' 30s settings
+  // cache and re-audits, so a save reaches every agent immediately and
+  // any REMAINING drift is real (env override / hardcode) — the audit
+  // response explains which.
+  async function runSync() {
+    setStage("running");
+    try {
+      const res = await fetch("/api/admin/settings-sync", { method: "POST" });
+      const j = (await res.json()) as Resp;
+      setR(j);
+      setStage(j.ok || j.checks ? "done" : "error");
+    } catch (e) {
+      setR({ ok: false, error: e instanceof Error ? e.message : "request failed" });
+      setStage("error");
+    }
+  }
+
   return (
     <section className="rounded-xl border border-weave-100 bg-white p-5 space-y-3">
       <div className="flex items-baseline justify-between gap-3 flex-wrap">
@@ -48,14 +65,25 @@ export function SettingsAuditPanel() {
             kept STMS stuck at TCS 750 earlier today).
           </p>
         </div>
-        <button
-          type="button"
-          onClick={run}
-          disabled={stage === "running"}
-          className="rounded-md bg-weave-600 px-3 py-1.5 text-xs font-medium text-treasure-50 hover:bg-weave-700 disabled:opacity-60"
-        >
-          {stage === "running" ? "Auditing…" : "Run audit"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={run}
+            disabled={stage === "running"}
+            className="rounded-md bg-weave-600 px-3 py-1.5 text-xs font-medium text-treasure-50 hover:bg-weave-700 disabled:opacity-60"
+          >
+            {stage === "running" ? "Working…" : "Run audit"}
+          </button>
+          <button
+            type="button"
+            onClick={runSync}
+            disabled={stage === "running"}
+            title="Clears the agents' 30-second settings cache and re-audits — your latest save reaches every agent immediately."
+            className="rounded-md border border-weave-300 px-3 py-1.5 text-xs font-medium text-weave-700 hover:bg-weave-50 disabled:opacity-60"
+          >
+            Sync agents now
+          </button>
+        </div>
       </div>
       {r && (
         <div className="space-y-2">

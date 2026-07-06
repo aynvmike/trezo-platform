@@ -942,6 +942,32 @@ def _veto_bucket(reason: str) -> str:
 
 
 
+@app.post("/admin/settings-sync", tags=["admin"])
+async def admin_settings_sync():
+    """Force-sync (Mike 2026-07-06: "auto fix if needed, or give a reason
+    why it will not set"). Clears the 30s settings cache so every agent
+    re-reads the saved row on its next tick, then re-runs the audit.
+    Drift that SURVIVES a sync is real and the response says what that
+    means; drift right after saving is just the cache window."""
+    from app.runtime.settings import clear_settings_cache
+    clear_settings_cache()
+    out = await admin_settings_audit()
+    try:
+        out["sync"] = {
+            "cache_cleared": True,
+            "how_it_heals": ("agents re-read settings within one tick; "
+                             "values refresh automatically every 30s after "
+                             "any save -- no restart needed for Bot Tuning"),
+            "if_drift_remains": ("a field still drifting AFTER this sync "
+                                 "means an env override or a hardcoded "
+                                 "value is winning for that field -- "
+                                 "report it to Nova with the field name"),
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 @app.get("/admin/settings-audit", tags=["admin"])
 async def admin_settings_audit():
     """End-to-end proof that Bot Tuning values reach the agents.
@@ -962,8 +988,15 @@ async def admin_settings_audit():
             import asyncio
             cl = create_client(s.supabase_url, s.supabase_service_role_key)
             def _q():
-                return (cl.table("bot_settings").select("*")
-                        .order("updated_at", desc=True).limit(1).execute())
+                # Compare the SAME row the agents read (2026-07-06):
+                # with TREZO_PRIMARY_USER_ID set, that row; else the
+                # most-recently-updated one (legacy).
+                import os as _o
+                _prim = (_o.getenv("TREZO_PRIMARY_USER_ID") or "").strip()
+                qq = cl.table("bot_settings").select("*")
+                if _prim:
+                    qq = qq.eq("user_id", _prim)
+                return qq.order("updated_at", desc=True).limit(1).execute()
             res = await asyncio.to_thread(_q)
             if res.data:
                 saved = res.data[0]
