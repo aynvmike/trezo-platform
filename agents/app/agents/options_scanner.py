@@ -789,6 +789,59 @@ class OptionsScannerAgent(Agent):
                 collateral = float(pick.strike) * 100.0 * int(leg.contracts or 1)
                 opt_bp = float(getattr(acct, "options_buying_power", 0) or
                                getattr(acct, "buying_power", 0) or 0)
+                # Wheel collateral allowance (2026-07-06, found live: three
+                # CSPs consumed 95% of equity and $0 BP 403'd every stock
+                # order). CSP cash is reserved-not-spent, but it still
+                # starves every other lane -- cap TOTAL open CSP collateral
+                # at TREZO_WHEEL_COLLATERAL_PCT (default 50%) of equity.
+                try:
+                    import os as _os
+                    _cap_pct = float(_os.getenv("TREZO_WHEEL_COLLATERAL_PCT", "0.5"))
+                    _eq = float(getattr(acct, "equity", 0) or 0)
+                    if _eq > 0 and _cap_pct > 0:
+                        from app.runtime.settings import _supabase as _sb
+                        _cl = _sb()
+                        if _cl is None:
+                            raise RuntimeError("no client")
+                        def _q_csp():
+                            return (_cl.table("options_positions")
+                                    .select("strike, contracts")
+                                    .eq("user_id", user_id)
+                                    .eq("status", "open")
+                                    .eq("strategy", "wheel_csp")
+                                    .execute())
+                        import asyncio as _aio
+                        _open_csp = (await _aio.to_thread(_q_csp)).data or []
+                        _held_coll = sum(
+                            float(x.get("strike") or 0) * 100.0
+                            * int(x.get("contracts") or 1)
+                            for x in _open_csp)
+                        if _held_coll + collateral > _cap_pct * _eq:
+                            try:
+                                from app.agents.activity_log import record as _arec
+                                _arec("wheel_collateral_cap", underlying,
+                                      reason=(f"CSP skipped: ${_held_coll:,.0f} already "
+                                              f"reserved + ${collateral:,.0f} new would pass "
+                                              f"{_cap_pct * 100:.0f}% of equity (${_eq:,.0f}) "
+                                              f"- other lanes keep their buying power"),
+                                      extra={"user_id": str(user_id)})
+                            except Exception:  # noqa: BLE001
+                                pass
+                            return AgentMessage(
+                                agent=self.name, kind="info",
+                                payload={
+                                    "user_id": user_id,
+                                    "event": "wheel_collateral_cap",
+                                    "underlying": underlying,
+                                    "reason": (
+                                        f"Wheel collateral allowance reached "
+                                        f"({_cap_pct * 100:.0f}% of equity) - "
+                                        f"skipped so other lanes keep buying power."),
+                                    "routed_via": routed,
+                                },
+                            )
+                except Exception:  # noqa: BLE001
+                    pass
                 # 2026-06-16: dropped the "opt_bp and" guard. When buying
                 # power is 0 (small account fully deployed by existing CSPs),
                 # the old guard let the order through to Alpaca, which rejected

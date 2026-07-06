@@ -29,6 +29,23 @@ type PaperPos = {
   strategy: string | null;
 };
 type ClosedRow = { realized_pnl_usd: number | null; exit_at: string | null };
+type OptRow = {
+  underlying: string;
+  strategy: string | null;
+  option_type: string | null;
+  strike: number | null;
+  contracts: number | null;
+  expiration: string | null;
+};
+
+/** OCC symbol for an options row — matches Alpaca's position symbols. */
+function occSymbol(o: OptRow): string {
+  const exp = String(o.expiration ?? "").slice(0, 10); // YYYY-MM-DD
+  if (exp.length < 10 || !o.strike) return "";
+  const cp = String(o.option_type ?? "put").toLowerCase().startsWith("c") ? "C" : "P";
+  const k = String(Math.round(Number(o.strike) * 1000)).padStart(8, "0");
+  return `${String(o.underlying).toUpperCase()}${exp.slice(2, 4)}${exp.slice(5, 7)}${exp.slice(8, 10)}${cp}${k}`;
+}
 
 const LAYER_NAME: Record<number, string> = {
   1: "Crypto",
@@ -62,7 +79,7 @@ function layerOf(assetType: string, strategy: string): number {
 export async function buildOverviewData(userId: string): Promise<OverviewData> {
   const supabase = createClient();
   const sinceIso = new Date(Date.now() - 7 * 864e5).toISOString();
-  const [accountRes, openRes, closedRes, alpaca, activity] = await Promise.all([
+  const [accountRes, openRes, closedRes, alpaca, activity, optRes] = await Promise.all([
     supabase.from("paper_accounts").select("*").eq("user_id", userId).maybeSingle(),
     supabase
       .from("paper_positions")
@@ -77,6 +94,11 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
       .gte("exit_at", sinceIso),
     fetchAlpacaSnapshot(),
     fetchAgentActivity(),
+    supabase
+      .from("options_positions")
+      .select("underlying, strategy, option_type, strike, contracts, expiration")
+      .eq("user_id", userId)
+      .eq("status", "open"),
   ]);
 
   const account = accountRes.data as Record<string, number> | null;
@@ -109,6 +131,20 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
     layerPnl[layer] = (layerPnl[layer] ?? 0) + pnl;
     layerCount[layer] = (layerCount[layer] ?? 0) + 1;
     deployed += Number(p.entry_price ?? 0) * Number(p.quantity ?? 0);
+  }
+
+  // Options positions live in their OWN table (2026-07-06: three live
+  // CSPs were invisible on the Overview). Fold them into layers 3/5 with
+  // Alpaca's mark-to-market P/L, matched by OCC symbol.
+  const optRows = (optRes.data ?? []) as OptRow[];
+  for (const o of optRows) {
+    const layer = String(o.strategy ?? "").startsWith("wheel") ? 5 : 3;
+    const occ = occSymbol(o);
+    const ap = occ ? apos.find((x) => String(x.symbol).toUpperCase() === occ) : undefined;
+    const pnl = ap ? Number(ap.unrealized_pl) : 0;
+    layerPnl[layer] = (layerPnl[layer] ?? 0) + pnl;
+    layerCount[layer] = (layerCount[layer] ?? 0) + 1;
+    deployed += Number(o.strike ?? 0) * 100 * Number(o.contracts ?? 1);
   }
 
   const layers: OVLayer[] = [1, 2, 3, 4, 5, 6, 7].map((id) => {
