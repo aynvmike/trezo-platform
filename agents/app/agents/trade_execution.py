@@ -523,6 +523,16 @@ class TradeExecutionAgent(Agent):
         from app.integrations.web_tokens import get_user_broker_token
 
         def _err(msg: str) -> list[AgentMessage]:
+            # Visibility (2026-07-06): execution-stage rejections were
+            # INVISIBLE in the activity feed -- approvals showed, then
+            # silence (the R:R-floor incident). Every _err now logs.
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("execute_error", ticker, strategy=strategy,
+                      reason=str(msg)[:180],
+                      extra={"user_id": str(user_id)})
+            except Exception:  # noqa: BLE001
+                pass
             return [AgentMessage(
                 agent=self.name, kind="error",
                 payload={"user_id": user_id, "ticker": ticker,
@@ -705,6 +715,16 @@ class TradeExecutionAgent(Agent):
         from app.integrations.web_tokens import get_user_broker_token
 
         def _err(msg: str) -> list[AgentMessage]:
+            # Visibility (2026-07-06): execution-stage rejections were
+            # INVISIBLE in the activity feed -- approvals showed, then
+            # silence (the R:R-floor incident). Every _err now logs.
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("execute_error", ticker, strategy=strategy,
+                      reason=str(msg)[:180],
+                      extra={"user_id": str(user_id)})
+            except Exception:  # noqa: BLE001
+                pass
             return [AgentMessage(
                 agent=self.name, kind="error",
                 payload={"user_id": user_id, "ticker": ticker,

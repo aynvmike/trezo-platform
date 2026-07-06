@@ -811,6 +811,28 @@ class RiskManagerAgent(Agent):
                                 approve_payload["reason"] += (
                                     f"; realistic target {_cap * 100:.1f}%"
                                     f" (1.5x ATR {_atr_pct * 100:.1f}%)")
+                                # R:R consistency (2026-07-06): a realistic
+                                # target NEEDS a proportionate stop, or the
+                                # sizing floor (min_reward_risk) rejects the
+                                # trade -- found live: EVERY approval since
+                                # 7/2 died at "Reward:risk 0.9 below 1.5".
+                                # Tight target -> tight stop is Mike's
+                                # geometry anyway; floor at 0.5x ATR so
+                                # daily noise cannot wick it out.
+                                try:
+                                    _rr = float(getattr(cfg, "min_reward_risk", 1.5) or 1.5)
+                                    _s_cur = approve_payload.get("stop_pct")
+                                    _s_need = round(_cap / max(_rr, 0.1), 4)
+                                    if _s_cur is None or float(_s_cur) > _s_need:
+                                        _s_new = max(_s_need,
+                                                     round(0.5 * _atr_pct, 4),
+                                                     0.004)
+                                        approve_payload["stop_pct"] = _s_new
+                                        approve_payload["reason"] += (
+                                            f"; stop {_s_new * 100:.1f}% keeps "
+                                            f"R:R >= {_rr:g}")
+                                except Exception:  # noqa: BLE001
+                                    pass
                                 try:
                                     from app.agents.activity_log import record as _arec
                                     _arec("realistic_target", ticker,
