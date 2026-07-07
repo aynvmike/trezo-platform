@@ -201,6 +201,21 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     await asyncio.to_thread(_close)
                     closed += 1
                     notes_list.append(f"{sym} closed (phantom)")
+                    # 2026-07-07: ghost rows CAUSE broker rejects (selling
+                    # shares the broker no longer has). Once the ghosts are
+                    # reconciled the cause is gone -- clear the session
+                    # reject counter so the kill-switch can reopen the day.
+                    try:
+                        from app.paper.killswitch import reset_broker_rejects
+                        reset_broker_rejects()
+                        from app.agents.activity_log import record as _arec0
+                        _arec0("halt_cleared", sym,
+                               reason=("ghost position reconciled - broker-"
+                                       "reject counter reset; session can "
+                                       "trade again"),
+                               extra={"user_id": str(user_id)})
+                    except Exception:  # noqa: BLE001
+                        pass
                     if realized:
                         await _roll_realized(client, user_id, realized)
                     try:

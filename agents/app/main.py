@@ -942,6 +942,32 @@ def _veto_bucket(reason: str) -> str:
 
 
 
+@app.post("/admin/clear-session-halt", tags=["admin"])
+async def admin_clear_session_halt():
+    """One-click recovery (Mike 2026-07-07): resets the session-scoped
+    broker-reject and slippage counters so the kill-switch stops vetoing,
+    without waiting for the daily roll. Day/week drawdown halts are NOT
+    touched -- those protect capital and clear on their own schedule."""
+    from app.paper.killswitch import (
+        broker_reject_count, reset_broker_rejects,
+        reset_slippage_breaches, slippage_breach_count,
+    )
+    before = {"broker_rejects": broker_reject_count(),
+              "slippage_breaches": slippage_breach_count()}
+    reset_broker_rejects()
+    reset_slippage_breaches()
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("halt_cleared", "SESSION",
+              reason=(f"manual clear: rejects {before['broker_rejects']} -> 0, "
+                      f"slippage breaches {before['slippage_breaches']} -> 0"),
+              extra={})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "before": before, "after": {"broker_rejects": 0,
+                                                    "slippage_breaches": 0}}
+
+
 @app.post("/admin/settings-sync", tags=["admin"])
 async def admin_settings_sync():
     """Force-sync (Mike 2026-07-06: "auto fix if needed, or give a reason

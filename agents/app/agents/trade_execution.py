@@ -631,6 +631,36 @@ class TradeExecutionAgent(Agent):
         # else gets GTC legs that survive until filled or cancelled.
         _s = (strategy or "").lower()
         tif = "day" if (_s.startswith("stms") or _s.startswith("orb")) else "gtc"
+        # Broker sanity clamps (2026-07-07, from the morning's rejects):
+        # (1) Alpaca 422: take_profit must sit >= base+0.01 and the stop
+        #     <= base-0.01 -- tight ATR targets can round INTO the base.
+        # (2) Alpaca 403: risk-based sizing with tight stops can explode
+        #     notional past buying power -- cap at max_position_pct of
+        #     equity AND 90% of current BP. Three of these rejects tripped
+        #     the session kill-switch and killed the whole day.
+        try:
+            _tick = max(0.01, round(float(market_price) * 0.001, 2))
+            if target_price is not None:
+                target_price = max(float(target_price),
+                                   round(float(market_price) + _tick, 2))
+            if stop_price is not None:
+                stop_price = min(float(stop_price),
+                                 round(float(market_price) - _tick, 2))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import dataclasses as _dc
+            from app.config import get_settings as _gcfg
+            _mp_pct = float(getattr(_gcfg(), "max_position_pct", 0.25) or 0.25)
+            _cap_usd = min(_mp_pct * float(acct.equity or 0),
+                           0.90 * float(acct.buying_power or 0))
+            if _cap_usd > 0 and plan.ok:
+                _maxq2 = max(1.0, float(int(_cap_usd / max(market_price, 0.01))))
+                if plan.quantity > _maxq2:
+                    plan = _dc.replace(plan, quantity=_maxq2,
+                                       notional_usd=round(_maxq2 * market_price, 2))
+        except Exception:  # noqa: BLE001
+            pass
         order, err = await submit_bracket_order(
             symbol=ticker,
             qty=plan.quantity,

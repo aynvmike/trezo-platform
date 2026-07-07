@@ -22,6 +22,8 @@ import asyncio
 import os
 from collections import deque
 
+_LAST_KS_LOG = 0.0   # kill-switch veto log throttle (2026-07-07)
+
 from app.config import get_settings
 from app.memory import get_memory, AgentDecision
 from app.learning.recall_helpers import recall_decision_context
@@ -1076,10 +1078,22 @@ class RiskManagerAgent(Agent):
         # Visibility pack (2026-07-01): EVERY veto lands in the local
         # activity log, including the routine ones Mem0 skips. File-append
         # only; never raises, never blocks the decision.
+        # 2026-07-07: kill-switch vetoes THROTTLED to one log line per 10
+        # minutes -- a session halt vetoes every signal all day (4,091
+        # identical lines drowned the feed). The VETO still applies.
         try:
-            from app.agents.activity_log import record as _arec
-            _arec("veto", ticker, tcs=int(tcs), strategy=strategy,
-                  reason=reason, extra={"user_id": user_id or "global"})
+            _log_it = True
+            if reason.startswith("Kill-switch"):
+                import time as _t
+                global _LAST_KS_LOG
+                if (_t.time() - _LAST_KS_LOG) < 600.0:
+                    _log_it = False
+                else:
+                    _LAST_KS_LOG = _t.time()
+            if _log_it:
+                from app.agents.activity_log import record as _arec
+                _arec("veto", ticker, tcs=int(tcs), strategy=strategy,
+                      reason=reason, extra={"user_id": user_id or "global"})
         except Exception:  # noqa: BLE001
             pass
         # Patched 2026-06-05 (Task #47): include user_id so vetoes are
