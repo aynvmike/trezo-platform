@@ -108,6 +108,9 @@ def _supabase():
 _BOOT_AT = datetime.now(timezone.utc)
 
 
+_JANITOR_DAY = ""   # daily agent_messages purge marker (2026-07-07)
+
+
 class OpsWatchdogAgent(Agent):
     """The 21st agent. Supervisor / health monitor."""
 
@@ -124,6 +127,39 @@ class OpsWatchdogAgent(Agent):
 
     async def tick(self) -> list[AgentMessage]:
         out: list[AgentMessage] = []
+        # Daily DB janitor (2026-07-07, Task #56 finally shipped): purge
+        # agent_messages older than 48h once per day. The table regrew to
+        # 266k rows and pinned the nano Supabase instance before the 7/7
+        # manual purge -- this keeps it permanently small.
+        try:
+            global _JANITOR_DAY
+            from datetime import date as _d
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
+            from datetime import timezone as _tz
+            _today = _d.today().isoformat()
+            if _JANITOR_DAY != _today:
+                _JANITOR_DAY = _today
+                from app.runtime.settings import _supabase as _sb
+                _cl = _sb()
+                if _cl is not None:
+                    _cut = (_dt.now(_tz.utc) - _td(hours=48)).isoformat()
+
+                    def _purge():
+                        return (_cl.table("agent_messages")
+                                .delete().lt("created_at", _cut).execute())
+                    import asyncio as _aio
+                    await _aio.to_thread(_purge)
+                    try:
+                        from app.agents.activity_log import record as _arec
+                        _arec("db_janitor", "SYSTEM",
+                              reason="daily purge: agent_messages older "
+                                     "than 48h removed",
+                              extra={})
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
         try:
             # Fixed 2026-06-11: this used to import _last_tick_at from
             # app.runtime.scheduler -- a name that NEVER existed. The

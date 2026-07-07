@@ -66,12 +66,39 @@ def _skip_persist_kinds() -> set:
     return out
 
 
+_HB_SEEN: dict[str, int] = {}   # telemetry-diet counters (2026-07-07)
+
+
 async def persist_message(message: AgentMessage, user_id: Optional[str] = None) -> None:
     """Queue a message for batched persistence. Returns immediately.
     Filters out kinds in SKIP_PERSIST_KINDS (signal by default - the
     scanner_pulse summary row covers what the trace panel needs)."""
     if message.kind in _skip_persist_kinds():
         return
+    # Telemetry diet (2026-07-07): heartbeat chatter (idle scanner pulses,
+    # "Position check", "scan complete" notes) regrew agent_messages to
+    # 266k rows and pinned the nano DB's CPU. Keep 1 in 5 per agent;
+    # anything carrying real news (fires, signals, breakouts) always
+    # persists, as do vetoes/approvals/errors/closes.
+    try:
+        _p = message.payload or {}
+        _hb = False
+        if message.kind == "scanner_pulse":
+            _hb = not (_p.get("fired") or _p.get("signals")
+                       or _p.get("breakouts") or _p.get("modes_triggered"))
+        elif message.kind == "info":
+            _note = str(_p.get("note") or "")
+            _hb = _note.startswith((
+                "Position check", "Crypto scan complete", "ORB scan complete",
+                "Extended scan complete", "Outside", "No open position",
+                "Forex DISABLED"))
+        if _hb:
+            _k = f"{message.agent}|{message.kind}"
+            _HB_SEEN[_k] = _HB_SEEN.get(_k, 0) + 1
+            if _HB_SEEN[_k] % 5 != 1:
+                return
+    except Exception:  # noqa: BLE001
+        pass
     row = {
         "user_id": user_id,
         "agent_name": message.agent,

@@ -26,6 +26,12 @@ MAX_CONSECUTIVE_LOSSES = 3
 MAX_BROKER_REJECTS = 3
 MAX_SLIPPAGE_BREACHES = 3   # fills slipping worse than the limit / session
 
+_ROWSUM_CACHE: dict[str, tuple] = {}   # user -> (ts, wk, dy, streak) 30s TTL
+
+
+class _RowsumCached(Exception):
+    """Internal flow control: row-truth served from cache."""
+
 
 # --- Session-scoped broker-reject counter (in-process) ----------------
 _broker_rejects = 0
@@ -205,7 +211,19 @@ async def check_all(client) -> KillSwitch:
         # bracket stop never rolled them; manual closes booked $0 until the
         # 7/1 fix). The kill-switch now SUMS this week's closed rows itself,
         # so it is correct regardless of which close path wrote the row.
+        # 2026-07-07: cached 30s per user -- check_all runs per SIGNAL, and
+        # during a veto storm the uncached sums hammered the nano DB.
         try:
+            import time as _t
+            _ck = str(acct.get("user_id"))
+            _hit = _ROWSUM_CACHE.get(_ck)
+            if _hit and (_t.time() - _hit[0]) < 30.0:
+                acct = {**acct,
+                        "week_realized_pnl_usd": _hit[1],
+                        "today_realized_pnl_usd": _hit[2],
+                        "consecutive_losses": max(
+                            int(acct.get("consecutive_losses") or 0), _hit[3])}
+                raise _RowsumCached()
             _today_s = date.today().isoformat()
             _monday_s = (date.today()
                          - timedelta(days=date.today().weekday())).isoformat()
@@ -234,6 +252,10 @@ async def check_all(client) -> KillSwitch:
                     "today_realized_pnl_usd": round(_dy, 2),
                     "consecutive_losses": max(
                         int(acct.get("consecutive_losses") or 0), _streak)}
+            _ROWSUM_CACHE[_ck] = (_t.time(), round(_wk, 2), round(_dy, 2),
+                                  _streak)
+        except _RowsumCached:
+            pass
         except Exception:  # noqa: BLE001
             pass
 
