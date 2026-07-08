@@ -6,6 +6,7 @@ export type OVLayer = {
   name: string;
   status: string;
   pnl: number;
+  positions?: number;
   agents: number;
   risk: string;
   idleReason?: string;
@@ -275,10 +276,13 @@ export function OverviewViewRedesign({ data }: { data?: OverviewData }) {
                   <span className={"text-[11px] capitalize " + (STATUS_TEXT[layer.status] || "text-[rgb(var(--muted-foreground))]")}>{layer.status}</span>
                 </div>
               </div>
-              {layer.pnl !== 0 ? (
+              {(layer.positions ?? 0) > 0 || layer.pnl !== 0 ? (
                 <div>
                   <div className={"font-mono text-[18px] font-medium " + (layer.pnl >= 0 ? "text-emerald-500" : "text-red-500")}>{money(layer.pnl)}</div>
-                  <div className="text-[11px] text-[rgb(var(--muted-foreground))]">open P&L</div>
+                  <div className="text-[11px] text-[rgb(var(--muted-foreground))]">
+                    {(layer.positions ?? 0) > 0 ? `${layer.positions} open · ` : ""}open P&L
+                    {layer.id === 1 || layer.id === 8 ? " (modeled)" : ""}
+                  </div>
                 </div>
               ) : (
                 <div>

@@ -55,6 +55,7 @@ const LAYER_NAME: Record<number, string> = {
   5: "Wheel",
   6: "Dividends",
   7: "KINDRIP",
+  8: "Forex",
 };
 const LAYER_RISK: Record<number, string> = {
   1: "High",
@@ -64,11 +65,13 @@ const LAYER_RISK: Record<number, string> = {
   5: "Low",
   6: "Very Low",
   7: "Low",
+  8: "Medium",
 };
 
 function layerOf(assetType: string, strategy: string): number {
   const a = (assetType || "").toLowerCase();
   const s = (strategy || "").toLowerCase();
+  if (a === "forex" || s.startsWith("forex")) return 8;
   if (a === "crypto") return 1;
   if (a === "option" || a === "options") return 3;
   if (s.startsWith("wheel") || s.includes("dividend")) return 5;
@@ -147,13 +150,14 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
     deployed += Number(o.strike ?? 0) * 100 * Number(o.contracts ?? 1);
   }
 
-  const layers: OVLayer[] = [1, 2, 3, 4, 5, 6, 7].map((id) => {
+  const layers: OVLayer[] = [1, 2, 3, 4, 5, 6, 7, 8].map((id) => {
     const count = layerCount[id] ?? 0;
     return {
       id,
       name: LAYER_NAME[id],
       status: count > 0 ? "active" : "idle",
       pnl: Math.round((layerPnl[id] ?? 0) * 100) / 100,
+      positions: count,
       agents: count > 0 ? 1 : 0,
       risk: LAYER_RISK[id],
       idleReason: count > 0 ? undefined : "No open position right now",

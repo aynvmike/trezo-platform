@@ -796,8 +796,54 @@ class OptionsScannerAgent(Agent):
                 # at TREZO_WHEEL_COLLATERAL_PCT (default 50%) of equity.
                 try:
                     import os as _os
-                    _cap_pct = float(_os.getenv("TREZO_WHEEL_COLLATERAL_PCT", "0.5"))
                     _eq = float(getattr(acct, "equity", 0) or 0)
+                    # Posture-scaled wheel limits (Mike 2026-07-08: "an
+                    # account this small should focus on growth and should
+                    # NOT be locking capital for 30 days across 3 trades").
+                    # Small/growth accounts: 1 CSP, <=21 DTE, 25% collateral.
+                    # The caps loosen as the account grows into balanced /
+                    # income postures. Env overrides trump posture defaults.
+                    _limits = {"growth": (0.25, 1, 21),
+                               "balanced": (0.40, 2, 35),
+                               "income": (0.50, 3, 45)}
+                    try:
+                        from app.paper.allocation import default_posture
+                        from app.runtime.settings import get_bot_settings as _gbs
+                        _post = str(getattr(_gbs(), "account_posture", "auto") or "auto")
+                        if _post not in _limits:
+                            _post = default_posture(_eq)
+                    except Exception:  # noqa: BLE001
+                        _post = "growth"
+                    _d_pct, _d_max, _d_dte = _limits.get(_post, _limits["growth"])
+                    _cap_pct = float(_os.getenv("TREZO_WHEEL_COLLATERAL_PCT",
+                                                str(_d_pct)))
+                    _max_csp = int(float(_os.getenv("TREZO_WHEEL_MAX_OPEN_CSP",
+                                                    str(_d_max))))
+                    _max_dte = int(float(_os.getenv("TREZO_WHEEL_MAX_DTE",
+                                                    str(_d_dte))))
+                    # DTE gate: no long lock-ups on small accounts.
+                    try:
+                        from datetime import date as _dd
+                        _exp = str(getattr(leg, "expiration", None)
+                                   or getattr(pick, "expiration", "") or "")[:10]
+                        if len(_exp) == 10:
+                            _dte_v = (_dd.fromisoformat(_exp) - _dd.today()).days
+                            if _dte_v > _max_dte:
+                                from app.agents.activity_log import record as _arecd
+                                _arecd("wheel_limit", underlying,
+                                       reason=(f"CSP skipped: {_dte_v} DTE exceeds the "
+                                               f"{_post}-posture cap of {_max_dte} days "
+                                               f"- no long capital lock-ups at this size"),
+                                       extra={"user_id": str(user_id)})
+                                return AgentMessage(
+                                    agent=self.name, kind="info",
+                                    payload={"user_id": user_id,
+                                             "event": "wheel_limit",
+                                             "underlying": underlying,
+                                             "reason": f"DTE {_dte_v} > {_max_dte} ({_post})",
+                                             "routed_via": routed})
+                    except Exception:  # noqa: BLE001
+                        pass
                     if _eq > 0 and _cap_pct > 0:
                         from app.runtime.settings import _supabase as _sb
                         _cl = _sb()
@@ -816,6 +862,22 @@ class OptionsScannerAgent(Agent):
                             float(x.get("strike") or 0) * 100.0
                             * int(x.get("contracts") or 1)
                             for x in _open_csp)
+                        # Concurrent-CSP gate (posture-scaled).
+                        if len(_open_csp) >= _max_csp:
+                            from app.agents.activity_log import record as _arecc
+                            _arecc("wheel_limit", underlying,
+                                   reason=(f"CSP skipped: {len(_open_csp)} already "
+                                           f"open = the {_post}-posture max "
+                                           f"({_max_csp}) - capital stays free "
+                                           f"for the growth lanes"),
+                                   extra={"user_id": str(user_id)})
+                            return AgentMessage(
+                                agent=self.name, kind="info",
+                                payload={"user_id": user_id,
+                                         "event": "wheel_limit",
+                                         "underlying": underlying,
+                                         "reason": f"open CSPs {len(_open_csp)} >= {_max_csp} ({_post})",
+                                         "routed_via": routed})
                         if _held_coll + collateral > _cap_pct * _eq:
                             try:
                                 from app.agents.activity_log import record as _arec
