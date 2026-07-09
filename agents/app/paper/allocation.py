@@ -80,6 +80,36 @@ async def effective_equity(user_id: str) -> float:
     return 0.0
 
 
+def position_pct_for_equity(equity: float) -> float:
+    """Per-trade notional cap as a fraction of equity -- Mike's account-
+    size curve (2026-07-08): "a small account can not afford that move
+    for long compared to a larger account; with $20k it can really rely
+    on 1-2% profits on $5-10k trades."
+      < $10k   -> 15%   (protect longevity -- no oversized swings)
+      $10-25k  -> 30%   (quick 1-2% plays on size become viable)
+      $25-100k -> 25%
+      >= $100k -> 15%   (conservative at scale)
+    TREZO_MAX_POSITION_PCT forces a flat cap when set; the user's
+    bot_settings.max_position_pct slider still overrides everything."""
+    import os as _os
+    _flat = _os.getenv("TREZO_MAX_POSITION_PCT")
+    if _flat:
+        try:
+            v = float(_flat)
+            if 0.01 <= v <= 1.0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    e = float(equity or 0)
+    if e < 10_000:
+        return 0.15
+    if e < 25_000:
+        return 0.30
+    if e < 100_000:
+        return 0.25
+    return 0.15
+
+
 def default_posture(equity: float) -> str:
     """The AI's default posture, chosen purely from account size."""
     if equity < 25_000:

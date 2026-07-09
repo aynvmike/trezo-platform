@@ -118,6 +118,14 @@ def plan_position(
     # the hard cap is buying_power - we can never trade more cash than
     # the broker accepts.
     cap_pct = NOTIONAL_CAP_PCT
+    # Account-size curve (Mike 2026-07-08): the default concentration cap
+    # scales with equity -- 15% under $10k, 30% at $10-25k, 25% to $100k,
+    # 15% beyond. An explicit user slider below still overrides it.
+    try:
+        from app.paper.allocation import position_pct_for_equity
+        cap_pct = position_pct_for_equity(equity)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from app.runtime.settings import get_bot_settings as _gbs2
         _bs = _gbs2()

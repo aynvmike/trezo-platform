@@ -651,7 +651,11 @@ class TradeExecutionAgent(Agent):
         try:
             import dataclasses as _dc
             from app.config import get_settings as _gcfg
-            _mp_pct = float(getattr(_gcfg(), "max_position_pct", 0.25) or 0.25)
+            try:
+                from app.paper.allocation import position_pct_for_equity
+                _mp_pct = position_pct_for_equity(float(acct.equity or 0))
+            except Exception:  # noqa: BLE001
+                _mp_pct = float(getattr(_gcfg(), "max_position_pct", 0.25) or 0.25)
             _cap_usd = min(_mp_pct * float(acct.equity or 0),
                            0.90 * float(acct.buying_power or 0))
             if _cap_usd > 0 and plan.ok:
