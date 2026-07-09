@@ -69,10 +69,23 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
         movers = {}
         get_most_actives = None  # type: ignore[assignment]
 
+    # Rotating-slice universe (Mike 2026-07-08: "I see the same stocks
+    # keep getting triggered -- use more of the market"). Pull a DEEP
+    # most-actives list (top 60) and keep the head PLUS an hour-rotating
+    # window from the tail, so different liquid names cycle through the
+    # pool all day instead of the same leaders every scan.
     actives: list[str] = []
     if get_most_actives is not None:
         try:
-            actives = [s for s in await get_most_actives(top=25) if _clean(s)]
+            _deep = [s for s in await get_most_actives(top=60) if _clean(s)]
+            _head, _tail = _deep[:12], _deep[12:]
+            if _tail:
+                import time as _t
+                _off = (int(_t.time() // 3600)) % max(len(_tail), 1)
+                _rot = (_tail[_off:] + _tail[:_off])[:13]
+            else:
+                _rot = []
+            actives = _head + _rot
         except Exception:  # noqa: BLE001
             actives = []
 

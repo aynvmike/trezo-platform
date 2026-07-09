@@ -807,12 +807,35 @@ class RiskManagerAgent(Agent):
                             _mult = float(os.getenv("TREZO_TARGET_ATR_MULT", "1.5"))
                             _floor = float(os.getenv("TREZO_TARGET_MIN_PCT", "0.006"))
                             _cap = max(_floor, round(_mult * _atr_pct, 4))
+                            # Learned-target calibration (Mike 2026-07-08):
+                            # if the lane's trades have only been REACHING
+                            # ~2% lately, stop asking for 10% -- cap the
+                            # target at the recent median achieved move and
+                            # test the strategy at the number it earns.
+                            _lrn_n = 0
+                            try:
+                                from app.learning.target_calibration import (
+                                    achieved_move_pct,
+                                )
+                                _lrn, _lrn_n = await achieved_move_pct(
+                                    str(strategy or ""), "stock",
+                                    message.payload.get("user_id"))
+                                if _lrn:
+                                    _lmult = float(os.getenv(
+                                        "TREZO_LEARNED_TARGET_MULT", "1.0"))
+                                    _cap = max(_floor,
+                                               min(_cap,
+                                                   round(_lrn * _lmult, 4)))
+                            except Exception:  # noqa: BLE001
+                                _lrn = None
                             if float(_t_cur) > _cap:
                                 approve_payload["target_pct"] = _cap
                                 approve_payload["target_realism"] = True
                                 approve_payload["reason"] += (
                                     f"; realistic target {_cap * 100:.1f}%"
-                                    f" (1.5x ATR {_atr_pct * 100:.1f}%)")
+                                    f" (ATR {_atr_pct * 100:.1f}%"
+                                    + (f", learned from {_lrn_n} recent trades"
+                                       if _lrn_n else "") + ")")
                                 # R:R consistency (2026-07-06): a realistic
                                 # target NEEDS a proportionate stop, or the
                                 # sizing floor (min_reward_risk) rejects the
