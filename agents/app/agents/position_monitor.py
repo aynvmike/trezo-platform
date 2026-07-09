@@ -34,6 +34,25 @@ from app.paper.engine import close_position, check_and_lock_profit
 _step_state: dict[str, dict] = {}
 
 
+def _step_profile(notional: float) -> tuple[float, float]:
+    """(first-step trigger, bank fraction) for one position. BIG positions
+    (Mike 2026-07-08: "take 5% and be able to make another trade -- two
+    quick wins beat locking $1k on a 10% probability") step EARLIER (40%
+    of the run) and bank BIGGER (60%), so the capital recycles into the
+    next setup instead of waiting on the full move."""
+    try:
+        big = float(os.getenv("TREZO_BIG_TRADE_USD", "900"))
+        if notional >= big:
+            return (float(os.getenv("TREZO_BIG_TRADE_STEP_AT", "0.4")),
+                    min(0.9, max(0.1, float(os.getenv(
+                        "TREZO_BIG_TRADE_STEP_FRACTION", "0.6")))))
+    except Exception:  # noqa: BLE001
+        pass
+    return (float(os.getenv("TREZO_PROFIT_STEP_AT", "0.6")),
+            min(0.9, max(0.1, float(os.getenv(
+                "TREZO_PROFIT_STEP_FRACTION", "0.5")))))
+
+
 def _step_params() -> tuple[float, float, int, float]:
     def _f(name, d):
         try:
@@ -46,10 +65,13 @@ def _step_params() -> tuple[float, float, int, float]:
             _f("TREZO_PROFIT_STEP_COOLDOWN_S", 900.0))
 
 
-async def _step_check(pid: str, user_id, run: float) -> tuple[bool, int]:
+async def _step_check(pid: str, user_id, run: float,
+                      at0_override: float | None = None) -> tuple[bool, int]:
     """Should the NEXT step fire at this run-progress? -> (fire, steps_so_far)."""
     import time as _t
     at0, gap, max_n, cool = _step_params()
+    if at0_override is not None:
+        at0 = float(at0_override)
     st = _step_state.get(pid)
     if st is None:
         n0 = 0
@@ -346,7 +368,8 @@ _LIQ_COOLDOWN_S = 120   # at most one close attempt per symbol per 2 min
 _LIQ_MAX_FAILS = 3      # after 3 consecutive failures, back off (alert once)
 
 
-async def _alpaca_profit_step(r, price: float) -> tuple[bool, str]:
+async def _alpaca_profit_step(r, price: float,
+                              frac: float | None = None) -> tuple[bool, str]:
     """Bank a slice of a broker-held LONG stock winner, then re-protect the
     remainder with an OCO. VERIFIED at each step; on failure it restores
     protection and reports. (Mike 2026-07-02: partial selling controls
@@ -366,8 +389,9 @@ async def _alpaca_profit_step(r, price: float) -> tuple[bool, str]:
         return False, "bad row numbers"
     if entry <= 0 or stop_p <= 0 or target_p <= entry:
         return False, "row lacks usable stop/target"
-    frac = min(0.9, max(0.1, float(
-        os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
+    if frac is None:
+        frac = min(0.9, max(0.1, float(
+            os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
     slice_qty = float(int(qty_total * frac))
     remaining = qty_total - slice_qty
     if slice_qty < 1 or remaining < 1:
@@ -778,12 +802,15 @@ class PositionMonitorAgent(Agent):
                                 price_ps = await _price(tk, at)
                                 _run2 = ((price_ps - _e2) / (_t2 - _e2)
                                          if price_ps is not None else -1.0)
+                                _at02, _frac2 = _step_profile(_e2 * _q2)
                                 _ok2, _n2 = (await _step_check(
-                                    str(r.get("id")), r.get("user_id"), _run2)
+                                    str(r.get("id")), r.get("user_id"), _run2,
+                                    at0_override=_at02)
                                     if price_ps is not None and price_ps > _e2
                                     else (False, 0))
                                 if _ok2:
-                                    stepped, note = await _alpaca_profit_step(r, price_ps)
+                                    stepped, note = await _alpaca_profit_step(
+                                        r, price_ps, frac=_frac2)
                                     note = f"step {_n2 + 1}: {note}"
                                     if stepped:
                                         _step_mark(str(r.get("id")))
@@ -1024,11 +1051,11 @@ class PositionMonitorAgent(Agent):
                     if (_e > 0 and _q > 0 and _big_enough
                             and target is not None and float(target) > _e):
                         _run = (price - _e) / (float(target) - _e)
+                        _at0, _frac = _step_profile(_e * _q)
                         _ok_step, _n_prev = await _step_check(
-                            str(r.get("id")), r.get("user_id"), _run)
+                            str(r.get("id")), r.get("user_id"), _run,
+                            at0_override=_at0)
                         if _ok_step:
-                            _frac = min(0.9, max(0.1, float(
-                                os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
                             from app.paper.engine import close_partial_position
                             _pf = await close_partial_position(
                                 r["user_id"], r["id"], _frac, price,
