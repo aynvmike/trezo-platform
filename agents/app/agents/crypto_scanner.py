@@ -25,7 +25,7 @@ class CryptoScannerAgent(Agent):
 
     # Crypto signals can be acted on with a slightly lower TCS bar than
     # stocks — the per-coin stops are tighter. Still gated by Risk Manager.
-    MIN_TCS = 650
+    MIN_TCS = 65   # 0-100 scale
 
     _last_hb: float = 0.0
 
@@ -82,7 +82,7 @@ class CryptoScannerAgent(Agent):
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="signal",
-                    confidence=score.tcs / 1000.0,
+                    confidence=score.tcs / 100.0,
                     payload={
                         "ticker": coin,
                         "tcs": score.tcs,

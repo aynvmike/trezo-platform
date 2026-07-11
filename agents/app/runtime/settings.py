@@ -17,7 +17,7 @@ from app.config import get_settings
 
 @dataclass
 class BotSettings:
-    tcs_threshold: int = 700
+    tcs_threshold: int = 70   # 0-100 scale (2026-07-08)
     max_open_positions: int = 3
     consecutive_loss_limit: int = 3
     risk_per_trade_pct: float = 0.05
@@ -124,7 +124,7 @@ def _supabase():
 
 def _from_row(r: dict) -> BotSettings:
     return BotSettings(
-        tcs_threshold=int(r.get("tcs_threshold", 700)),
+        tcs_threshold=int(r.get("tcs_threshold", 70)),
         max_open_positions=int(r.get("max_open_positions", 3)),
         consecutive_loss_limit=int(r.get("consecutive_loss_limit", 3)),
         risk_per_trade_pct=float(r.get("risk_per_trade_pct", 0.05)),
@@ -195,7 +195,7 @@ def required_switch_advantage(
     base = max(0.0, float(base_pct)) / 100.0
     if tcs_threshold <= 0:
         return base
-    scale = 800.0 / float(tcs_threshold)
+    scale = 80.0 / float(tcs_threshold)
     if scale < 1.0:
         scale = 1.0  # never make friction EASIER than the base
     return base * scale

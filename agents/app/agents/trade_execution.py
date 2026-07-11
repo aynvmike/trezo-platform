@@ -398,7 +398,7 @@ class TradeExecutionAgent(Agent):
                                 continue
                             _tcs0 = int(((r.get("source_payload") or {})
                                          .get("tcs")) or 0)
-                            if held_h >= 36 and _tcs0 < 550:
+                            if held_h >= 36 and _tcs0 < 55:
                                 cands.append((held_h, _tcs0, r))
                         if cands:
                             cands.sort(key=lambda x: (x[1], -x[0]))

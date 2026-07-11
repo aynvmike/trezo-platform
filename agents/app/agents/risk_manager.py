@@ -404,9 +404,9 @@ class RiskManagerAgent(Agent):
         if _coverage_on:
             try:
                 min_tcs = min(int(min_tcs),
-                              int(float(os.getenv("TREZO_COVERAGE_TCS", "400"))))
+                              int(float(os.getenv("TREZO_COVERAGE_TCS", "40"))))
             except (TypeError, ValueError):
-                min_tcs = min(int(min_tcs), 400)
+                min_tcs = min(int(min_tcs), 40)
         max_open = cfg.max_open_positions
 
         # Adaptive Scope - the news/regime self-tuner (Phase 7.5). The Risk
@@ -468,10 +468,10 @@ class RiskManagerAgent(Agent):
             and 0 < days_to_earnings <= 3
             and not cycle_aware_strategy
         ):
-            cycle_bump = 50
+            cycle_bump = 5
             cycle_reason = f" (earnings in {days_to_earnings}d +50)"
         elif iv_env == "earnings_day" and not cycle_aware_strategy:
-            cycle_bump = 150
+            cycle_bump = 15
             cycle_reason = " (earnings TODAY +150)"
 
         # Experience-driven floor nudge (2026-06-16, OPT-IN, default OFF).
@@ -886,6 +886,27 @@ class RiskManagerAgent(Agent):
             except Exception:  # noqa: BLE001
                 pass
 
+        # Global R:R harmonizer (2026-07-08): whichever layer compressed
+        # the target -- tier multiplier, ATR realism, learned calibration --
+        # the stop must follow, or sizing's reward:risk floor silently
+        # rejects the trade (the 7/6 lesson, now enforced on EVERY path).
+        if not _is_crypto:
+            try:
+                _sf = approve_payload.get("stop_pct")
+                _tf = approve_payload.get("target_pct")
+                if _sf and _tf and float(_sf) > 0:
+                    _rrf = float(getattr(cfg, "min_reward_risk", 1.5) or 1.5)
+                    if float(_tf) / float(_sf) < _rrf:
+                        _new_s = max(round(float(_tf) / max(_rrf, 0.1), 4),
+                                     0.004)
+                        if _new_s < float(_sf):
+                            approve_payload["stop_pct"] = _new_s
+                            approve_payload["reason"] += (
+                                f"; stop {_new_s * 100:.1f}% keeps "
+                                f"R:R >= {_rrf:g}")
+            except Exception:  # noqa: BLE001
+                pass
+
         # Path beta: hopeful-bucket cap enforcement. If this signal is
         # a hopeful-bucket strategy and the user is already at or above
         # their cap, veto - we don't want to push their hopeful
@@ -1057,7 +1078,7 @@ class RiskManagerAgent(Agent):
             AgentMessage(
                 agent=self.name,
                 kind="approve",
-                confidence=tcs / 1000.0,
+                confidence=tcs / 100.0,
                 payload=approve_payload,
             )
         ]

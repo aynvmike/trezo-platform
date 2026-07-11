@@ -50,7 +50,7 @@ EXTENDED_WATCHLIST: list[str] = [
     "NVDA", "MSFT", "AAPL", "PYPL", "DIS", "BAC", "F",
 ]
 
-EXTENDED_TCS_MIN = 700          # a signal must clear this to be emitted
+EXTENDED_TCS_MIN = 70           # 0-100 scale; a signal must clear this to be emitted
 MIN_CANDLES = 60                # ~60 daily bars needed for a 50-day EMA
 SWING_MAX_HOLD_DAYS = 7         # multi-day time stop (~5 trading days)
 

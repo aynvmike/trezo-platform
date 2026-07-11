@@ -241,11 +241,11 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                     except Exception:  # noqa: BLE001
                         fresh_tcs = None
                 collapsed = False
-                _thr = 700
+                _thr = 70
                 if fresh_tcs is not None:
                     try:
                         from app.runtime.settings import get_bot_settings
-                        _thr = int(get_bot_settings(user_id).tcs_threshold or 700)
+                        _thr = int(get_bot_settings(user_id).tcs_threshold or 70)
                     except Exception:  # noqa: BLE001
                         _thr = 700
                     _cfrac = _num("TREZO_REEVAL_TCS_COLLAPSE_FRAC", 0.5)

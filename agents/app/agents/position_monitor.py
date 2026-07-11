@@ -146,8 +146,8 @@ def _decide_time_stop(
     now = datetime.now(timezone.utc)
     held = _minutes_since(r.get("entry_at"))
 
-    if strat.startswith("stms") and now.hour >= 15:
-        return "time", "stms_11am_stop"
+    # 2026-07-08 (Mike): STMS trades all day now -- the 11 AM force-stop
+    # is retired; the generic intraday rules below still govern it.
     if now.hour > 19 or (now.hour == 19 and now.minute >= 45):
         return "eod", "force_exit_345pm"
     if held >= MAX_HOLD_MINUTES:

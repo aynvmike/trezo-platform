@@ -33,18 +33,27 @@ TIER_THRESHOLDS_M: tuple[tuple[str, float], ...] = (
 # strategy asked for; scalp_ok marks tiers liquid enough for quick
 # in-and-out trades; min_avg_vol is a SUGGESTED liquidity bar for
 # scanners (the risk gate keeps its own tunable floor).
+# Mike 2026-07-08: quick-take targets EVERYWHERE — "2% of $1,200 taken
+# beats waiting on 7% to maybe happen." Target multipliers compressed to
+# 0.65-0.80 across ALL tiers; stops keep their protective width (wild
+# names still need room to breathe) and the global R:R harmonizer in the
+# risk manager shrinks the stop per-trade whenever the compressed target
+# would break the reward:risk floor. Scalp eligibility extended down to
+# mid and small tiers (ATR-based scalp geometry scales the target to the
+# name's real range, so spread toll stays covered); micro stays with
+# STMS, its purpose-built fast lane.
 TIER_PROFILES: dict[str, dict] = {
-    "mega":    {"stop_mult": 0.80, "target_mult": 0.70, "scalp_ok": True,
+    "mega":    {"stop_mult": 0.80, "target_mult": 0.65, "scalp_ok": True,
                 "min_avg_vol": 1_000_000},
-    "large":   {"stop_mult": 0.90, "target_mult": 0.85, "scalp_ok": True,
+    "large":   {"stop_mult": 0.90, "target_mult": 0.75, "scalp_ok": True,
                 "min_avg_vol": 750_000},
-    "mid":     {"stop_mult": 1.00, "target_mult": 1.00, "scalp_ok": False,
+    "mid":     {"stop_mult": 1.00, "target_mult": 0.80, "scalp_ok": True,
                 "min_avg_vol": 400_000},
-    "small":   {"stop_mult": 1.25, "target_mult": 1.30, "scalp_ok": False,
+    "small":   {"stop_mult": 1.25, "target_mult": 0.80, "scalp_ok": True,
                 "min_avg_vol": 250_000},
-    "micro":   {"stop_mult": 1.60, "target_mult": 1.80, "scalp_ok": False,
+    "micro":   {"stop_mult": 1.60, "target_mult": 0.80, "scalp_ok": False,
                 "min_avg_vol": 250_000},
-    "unknown": {"stop_mult": 1.00, "target_mult": 1.00, "scalp_ok": False,
+    "unknown": {"stop_mult": 1.00, "target_mult": 0.85, "scalp_ok": False,
                 "min_avg_vol": 400_000},
 }
 
@@ -59,7 +68,7 @@ KNOWN_LIQUID_ETFS: frozenset = frozenset({
     "BITO", "TSLL", "TSLQ", "NVDL", "NVDX", "LABU", "LABD",
     "GLD", "SLV", "USO", "TLT", "HYG", "EEM", "FXI", "ARKK",
 })
-TIER_PROFILES["etf"] = {"stop_mult": 0.85, "target_mult": 0.75,
+TIER_PROFILES["etf"] = {"stop_mult": 0.85, "target_mult": 0.70,
                         "scalp_ok": True, "min_avg_vol": 1_000_000}
 
 _TIER_CACHE: dict[str, tuple[float, str]] = {}

@@ -39,7 +39,7 @@ SEED_WATCHLIST: list[str] = [
 
 
 # ---- Configurable thresholds ----------------------------------------------
-TCS_THRESHOLD       = 750
+TCS_THRESHOLD       = 75   # 0-100 scale
 PRICE_MIN           = 1.00
 PRICE_MAX           = 20.00
 DAILY_MOVE_MIN_PCT  = 10.0   # already up 10%+

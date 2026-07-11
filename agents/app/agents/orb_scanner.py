@@ -90,7 +90,7 @@ class ORBScannerAgent(Agent):
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="signal",
-                    confidence=sig.tcs / 1000.0,
+                    confidence=sig.tcs / 100.0,
                     payload={
                         "ticker": sig.symbol,
                         "tcs": sig.tcs,

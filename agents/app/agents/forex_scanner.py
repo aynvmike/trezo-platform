@@ -63,7 +63,7 @@ class ForexScannerAgent(Agent):
         fired = 0
         top_tcs = 0
         detail: list[dict] = []
-        tcs_floor = int(getattr(cfg, "tcs_threshold", 700) or 700)
+        tcs_floor = int(getattr(cfg, "tcs_threshold", 70) or 70)
 
         for pair in FOREX_WATCHLIST:
             if pair not in FOREX_MAJORS:
@@ -102,7 +102,7 @@ class ForexScannerAgent(Agent):
                                "atr_pct": round(atr_pct * 100, 3)})
                 out.append(AgentMessage(
                     agent=self.name, kind="signal",
-                    confidence=tcs / 1000.0,
+                    confidence=tcs / 100.0,
                     payload={
                         "ticker": pair,
                         "asset_type": "forex",

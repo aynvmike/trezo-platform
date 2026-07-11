@@ -1,7 +1,7 @@
 """Trezo pattern scoring engine.
 
 10-factor scoring → 0-100 base.
-Trade Confidence Score scaling → 0-1000.
+Trade Confidence Score scaling → 0-100 (converted from 0-1000 on 2026-07-08).
 
 Founder's original 6 criteria (trend, momentum, MACD, volume, breakout,
 candle) preserved. New: BB position, VWAP alignment, market alignment,
@@ -50,7 +50,7 @@ class MarketContext:
 @dataclass
 class Score:
     score: int                                   # 0..100
-    tcs: int                                     # 0..1000
+    tcs: int                                     # 0..100 (one scale everywhere, 2026-07-08)
     detected_patterns: list[str] = field(default_factory=list)
     breakdown: dict[str, float] = field(default_factory=dict)
     dominant_pattern: Optional[str] = None
@@ -398,7 +398,7 @@ def _rr_points(rr_ratio: "Optional[float]") -> float:
 
 def scale_to_tcs(score_100: int, ctx: MarketContext,
                  rr_ratio: "Optional[float]" = None) -> int:
-    """Translate 0-100 pattern score into 0-1000 Trade Confidence Score.
+    """Translate the 0-100 pattern score into the FINAL 0-100 TCS.
 
     Allocation (from TREZO_PATTERN_ENGINE.md section 4):
       - Technical (pattern):    300 max  - from score_100
@@ -429,4 +429,5 @@ def scale_to_tcs(score_100: int, ctx: MarketContext,
         market += 20.0
 
     total = technical + options + fundamental + rr + market
-    return max(0, min(1000, int(round(total))))
+    # 2026-07-08 (Mike): ONE scale everywhere -- TCS is now 0-100.
+    return max(0, min(100, int(round(total / 10.0))))

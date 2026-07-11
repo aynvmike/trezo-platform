@@ -59,7 +59,7 @@ class PatternDetectionAgent(Agent):
     tick_interval_seconds = 180  # Throttled 2026-06-05 (was 60) to cut API load
 
     # TCS at/above this triggers a signal.
-    signal_threshold: int = 700
+    signal_threshold: int = 70   # 0-100 scale
 
     # Fallback watchlist - used only when there are no users / no
     # per-user watchlist data to scan.
@@ -347,7 +347,7 @@ class PatternDetectionAgent(Agent):
                                     ev["user_id"] = user_id
                                 out.append(AgentMessage(
                                     agent=self.name, kind="strategy_change",
-                                    confidence=pick.tcs / 1000.0, payload=ev,
+                                    confidence=pick.tcs / 100.0, payload=ev,
                                 ))
                             else:
                                 # Suppressed - keep prev pick, emit a 'held' info
@@ -366,7 +366,7 @@ class PatternDetectionAgent(Agent):
                                     held_ev["user_id"] = user_id
                                 out.append(AgentMessage(
                                     agent=self.name, kind="strategy_held",
-                                    confidence=prev_tcs / 1000.0, payload=held_ev,
+                                    confidence=prev_tcs / 100.0, payload=held_ev,
                                 ))
 
                     if pick.tcs > summary["max_tcs"]:
@@ -433,7 +433,7 @@ class PatternDetectionAgent(Agent):
                             payload["urgency"] = "low"
                         out.append(AgentMessage(
                             agent=self.name, kind="signal",
-                            confidence=pick.tcs / 1000.0, payload=payload,
+                            confidence=pick.tcs / 100.0, payload=payload,
                         ))
                 except Exception as e:  # noqa: BLE001
                     out.append(AgentMessage(
