@@ -1430,6 +1430,18 @@ class _StockTrimReq(BaseModel):
     reason: str = "user_trim"
 
 
+@app.get("/goal/today", tags=["paper"])
+async def goal_today(user_id: str | None = None):
+    """The agents' daily income goal (Mike 2026-07-13): the paycheck-ladder
+    rung for the current account size plus today's realized progress."""
+    try:
+        from app.paper.daily_goal import goal_state
+        st = await goal_state(user_id)
+        return {"available": True, **st}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @app.get("/activity/today", tags=["paper"])
 async def activity_today(limit: int = 14):
     """Today's agent decision trail for the UI (2026-07-02): the Overview

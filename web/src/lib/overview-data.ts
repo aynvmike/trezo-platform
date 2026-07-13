@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { fetchAlpacaSnapshot, type AlpacaPosition } from "@/lib/alpaca-snapshot";
 import type { OverviewData, OVLayer, OVActivity } from "@/components/dashboard/overview-view-redesign";
+import type { HeroGoal } from "@/components/dashboard/woven-basket-hero";
 
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
 
@@ -16,6 +17,29 @@ async function fetchAgentActivity(): Promise<OVActivity | null> {
     const j = (await r.json()) as OVActivity & { available?: boolean };
     if (!j || j.available === false) return null;
     return { total: j.total ?? 0, counts: j.counts ?? {}, last: j.last ?? [] };
+  } catch {
+    return null;
+  }
+}
+
+/** The agents' daily income goal (Mike 2026-07-13) -- paycheck ladder rung
+ *  for the account size + today's realized progress toward it. */
+async function fetchDailyGoal(): Promise<HeroGoal | null> {
+  try {
+    const r = await fetch(`${AGENTS_BASE}/goal/today`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as HeroGoal & { available?: boolean };
+    if (!j || j.available === false) return null;
+    return {
+      goal: j.goal ?? 50,
+      label: j.label ?? "grind",
+      realized: j.realized ?? 0,
+      hit: !!j.hit,
+      pct: j.pct ?? 0,
+    };
   } catch {
     return null;
   }
@@ -82,7 +106,7 @@ function layerOf(assetType: string, strategy: string): number {
 export async function buildOverviewData(userId: string): Promise<OverviewData> {
   const supabase = createClient();
   const sinceIso = new Date(Date.now() - 7 * 864e5).toISOString();
-  const [accountRes, openRes, closedRes, alpaca, activity, optRes] = await Promise.all([
+  const [accountRes, openRes, closedRes, alpaca, activity, goalInfo, optRes] = await Promise.all([
     supabase.from("paper_accounts").select("*").eq("user_id", userId).maybeSingle(),
     supabase
       .from("paper_positions")
@@ -97,6 +121,7 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
       .gte("exit_at", sinceIso),
     fetchAlpacaSnapshot(),
     fetchAgentActivity(),
+    fetchDailyGoal(),
     supabase
       .from("options_positions")
       .select("underlying, strategy, option_type, strike, contracts, expiration")
@@ -181,5 +206,5 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
   }
   const weekPnl = week.reduce((s, x) => s + x.v, 0);
 
-  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf, activity };
+  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf, activity, goal: goalInfo };
 }

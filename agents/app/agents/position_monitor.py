@@ -72,6 +72,20 @@ async def _step_check(pid: str, user_id, run: float,
     at0, gap, max_n, cool = _step_params()
     if at0_override is not None:
         at0 = float(at0_override)
+    # Daily-goal nudge (Mike 2026-07-13): if the day's paycheck is still
+    # short after 2 PM ET, take the first bank a touch EARLIER (85% of the
+    # usual trigger). Never later, never bigger risk -- the goal only ever
+    # tightens behavior.
+    try:
+        from datetime import datetime as _dgt
+        from datetime import timezone as _dgz
+        if 18 <= _dgt.now(_dgz.utc).hour <= 21:
+            from app.paper.daily_goal import goal_state as _dgs
+            _g = await _dgs(user_id)
+            if not _g.get("hit"):
+                at0 = at0 * 0.85
+    except Exception:  # noqa: BLE001
+        pass
     st = _step_state.get(pid)
     if st is None:
         n0 = 0

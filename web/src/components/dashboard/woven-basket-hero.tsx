@@ -13,6 +13,7 @@
  */
 
 export type HeroLayer = { id: number; name: string; status: string; pnl: number };
+export type HeroGoal = { goal: number; label: string; realized: number; hit: boolean; pct: number };
 
 const SAMPLE: HeroLayer[] = [
   { id: 1, name: "Crypto", status: "active", pnl: 417.5 },
@@ -36,7 +37,7 @@ const SHELL_ACCENTS = [
   { c: "168 85 247", rx: 62, ry: 210, dur: 14 }, // violet (Layer 8 — Forex)
 ];
 
-export function WovenBasketHero({ layers }: { layers?: HeroLayer[] }) {
+export function WovenBasketHero({ layers, goal }: { layers?: HeroLayer[]; goal?: HeroGoal | null }) {
   const L = layers && layers.length ? layers : SAMPLE;
   const total = L.reduce((s, l) => s + l.pnl, 0);
   const active = L.filter((l) => l.status === "active").length;
@@ -128,6 +129,18 @@ export function WovenBasketHero({ layers }: { layers?: HeroLayer[] }) {
               <div className="font-mono text-[18px] font-medium text-[rgb(var(--foreground))]">{active}/{L.length}</div>
               <div className="text-[10px] tracking-wide text-[rgb(var(--muted-foreground))]">ACTIVE</div>
             </div>
+            {goal ? (
+              <div title={"Daily income goal (" + goal.label + ") -- realized vs target. The rung climbs with account size."}>
+                <div className={"font-mono text-[18px] font-medium " + (goal.hit ? "text-emerald-500" : "text-[rgb(var(--foreground))]")}>
+                  {(goal.realized < 0 ? "-$" : "$") + Math.abs(goal.realized).toFixed(0)}
+                  <span className="text-[12px] text-[rgb(var(--muted-foreground))]">{" / $" + goal.goal.toFixed(0)}</span>
+                </div>
+                <div className="mt-1 h-1 w-24 overflow-hidden rounded-full bg-[rgb(var(--muted))]">
+                  <div className="h-full rounded-full" style={{ width: goal.pct + "%", background: goal.hit ? "rgb(16 185 129)" : "rgb(var(--primary))" }} />
+                </div>
+                <div className="text-[10px] tracking-wide text-[rgb(var(--muted-foreground))]">{"DAILY GOAL \u00b7 " + goal.label.toUpperCase()}</div>
+              </div>
+            ) : null}
             <div className="ml-auto flex gap-1.5">
               {L.map((l) => (
                 <div

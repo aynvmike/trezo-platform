@@ -495,13 +495,41 @@ class RiskManagerAgent(Agent):
         except Exception:  # noqa: BLE001
             outcome_delta = 0
 
+        # Daily-goal discipline (Mike 2026-07-13): once today's paycheck
+        # is banked, new entries get PICKIER (+5 TCS) -- protect the day.
+        # The goal never loosens anything; being behind changes nothing here.
+        goal_bump = 0
+        goal_reason = ""
+        try:
+            from app.paper.daily_goal import goal_state, mark_goal_hit_once
+            _gs = await goal_state(message.payload.get("user_id"))
+            if _gs.get("hit"):
+                goal_bump = 5
+                goal_reason = ", goal-banked +5"
+                if mark_goal_hit_once(message.payload.get("user_id")):
+                    try:
+                        from app.agents.activity_log import record as _grec
+                        _grec("daily_goal_hit", "ACCOUNT",
+                              reason=(f"daily goal ${_gs['goal']:.0f} "
+                                      f"({_gs['label']}) reached -- realized "
+                                      f"${_gs['realized']:.2f}; new entries "
+                                      "get pickier (+5 TCS) for the rest of "
+                                      "the day"),
+                              extra={"window": "day"})
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            goal_bump = 0
+
         # The confidence bar can be raised by the current regime posture,
-        # the cycle-aware bump, and (opt-in) the per-strategy outcome nudge.
-        effective_min_tcs = min_tcs + scope.tcs_bump + cycle_bump + outcome_delta
+        # the cycle-aware bump, the per-strategy outcome nudge, and the
+        # banked-paycheck bump.
+        effective_min_tcs = (min_tcs + scope.tcs_bump + cycle_bump
+                             + outcome_delta + goal_bump)
         if tcs < effective_min_tcs:
             extra = (
-                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason})"
-                if scope.tcs_bump or cycle_bump or outcome_delta
+                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason})"
+                if scope.tcs_bump or cycle_bump or outcome_delta or goal_bump
                 else ""
             )
             return [self._veto(

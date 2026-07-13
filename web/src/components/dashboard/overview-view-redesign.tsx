@@ -1,4 +1,4 @@
-import { WovenBasketHero, type HeroLayer } from "@/components/dashboard/woven-basket-hero";
+import { WovenBasketHero, type HeroLayer, type HeroGoal } from "@/components/dashboard/woven-basket-hero";
 import { DepthTilt } from "@/components/dashboard/depth-tilt";
 
 export type OVLayer = {
@@ -33,6 +33,7 @@ export type OverviewData = {
   stale: boolean;
   asOf: string | null;
   activity?: OVActivity | null;
+  goal?: HeroGoal | null;
 };
 
 const SAMPLE: OverviewData = {
@@ -180,7 +181,7 @@ export function OverviewViewRedesign({ data }: { data?: OverviewData }) {
         </div>
       ) : null}
 
-      <DepthTilt><WovenBasketHero layers={heroLayers} /></DepthTilt>
+      <DepthTilt><WovenBasketHero layers={heroLayers} goal={d.goal} /></DepthTilt>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Kpi label="Portfolio Value" value={money0(d.portfolioValue)} sub="All layers combined" pill={!d.live ? "Sample" : d.agentsOnline ? "Live" : d.stale ? "Last known" : "Offline"} pillClass={!d.live ? "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]" : d.agentsOnline ? "text-emerald-500 bg-emerald-500/10" : d.stale ? "text-amber-500 bg-amber-500/10" : "text-red-500 bg-red-500/10"} />
