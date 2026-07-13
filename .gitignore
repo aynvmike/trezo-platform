@@ -110,3 +110,4 @@ db/.supabase-cache/
 # Uncomment these if you keep planning notes you don't want in git:
 # TREZO_PROJECT/private/
 # *.private.md
+\n# ---- Agents knowledge library (books stay local; scripts/build_library.py rebuilds) ----\nagents/knowledge/library/\n

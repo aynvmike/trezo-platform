@@ -1080,6 +1080,21 @@ class RiskManagerAgent(Agent):
                                   "setup collapses; daily kill-switch caps the "
                                   "book at -3%"),
             }
+            # Playbook grounding (Mike 2026-07-13): one cited line from
+            # the local knowledge library so the trade carries the craft
+            # from Mike's books, not just the math. Local search, no cost.
+            try:
+                from app.knowledge.library import search as _ksearch
+                _khits = _ksearch(
+                    f"{_sname} {direction} {_pat_t} entry exit risk stop",
+                    k=1)
+                if _khits:
+                    _kh = _khits[0]
+                    approve_payload["thesis"]["playbook_note"] = (
+                        f"{_kh['source']} (p.{_kh['page']}): "
+                        + _kh["text"][:180])
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 from app.agents.activity_log import record as _arec
                 _arec("thesis", ticker, tcs=int(tcs), strategy=strategy,

@@ -1430,6 +1430,18 @@ class _StockTrimReq(BaseModel):
     reason: str = "user_trim"
 
 
+@app.get("/knowledge/search", tags=["paper"])
+async def knowledge_search(q: str, k: int = 3):
+    """Search the agents' local trading-knowledge library (Mike 2026-07-13).
+    Books live in agents/knowledge/library/; scripts/build_library.py adds
+    the manifest titles and indexes anything Mike drops in the folder."""
+    try:
+        from app.knowledge.library import search, stats
+        return {"available": True, "results": search(q, k=k), **stats()}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @app.get("/goal/today", tags=["paper"])
 async def goal_today(user_id: str | None = None):
     """The agents' daily income goal (Mike 2026-07-13): the paycheck-ladder
