@@ -378,10 +378,17 @@ async def submit_crypto_order(
         "qty": str(qty),
     }
     try:
-        order = await _post("/v2/orders", body, token=token)
-        if isinstance(order, dict) and order.get("id"):
-            return order, None
-        return None, f"unexpected_response: {str(order)[:200]}"
+        resp, perr = await _post("/v2/orders", body, token=token)
+        if perr:
+            return None, perr
+        if isinstance(resp, dict) and resp.get("id"):
+            return resp, None
+        # 2026-07-13: _post returns (json, error) -- the old code compared
+        # the whole TUPLE to a dict, so every ACCEPTED crypto order was
+        # mislabelled a broker reject. The engine then retried (stacking
+        # real fills at Alpaca with no book row) and the false rejects
+        # tripped the session kill-switch. Found via the 3x ETH orphan.
+        return None, f"unexpected_response: {str(resp)[:200]}"
     except Exception as e:  # noqa: BLE001
         return None, str(e)[:200]
 
