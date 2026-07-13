@@ -29,6 +29,53 @@ MANIFEST = [
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.abspath(os.path.join(HERE, "..", "knowledge", "library"))
 
+# Local research that ALSO belongs in the library (Mike 2026-07-13 #2):
+# the QuantConnect algorithm write-ups and the distilled external
+# research. Every .txt/.md/.py/.cs file in these folders is mirrored
+# into the library on each run (images/binaries skipped), so Mike can
+# keep dropping material in either place.
+EXTRA_DIRS = [
+    ("qc", os.path.abspath(os.path.join(
+        HERE, "..", "..", "..", "Quantconnect"))),
+    ("research", os.path.abspath(os.path.join(
+        HERE, "..", "..", "..", "TREZO_PROJECT", "06_external_research"))),
+]
+TEXT_EXTS = (".txt", ".md", ".py", ".cs")
+SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
+
+
+def mirror_extras() -> int:
+    n = 0
+    for prefix, root in EXTRA_DIRS:
+        if not os.path.isdir(root):
+            print(f"  (extra source not found, skipping: {root})")
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in TEXT_EXTS:
+                    continue
+                src = os.path.join(dirpath, fn)
+                try:
+                    if os.path.getsize(src) > 3_000_000:
+                        continue
+                    base = (os.path.splitext(fn)[0].strip().lower()
+                            .replace(" ", "-"))
+                    dst = os.path.join(LIB, f"{prefix}--{base}.txt")
+                    if (os.path.exists(dst) and
+                            os.path.getmtime(dst) >= os.path.getmtime(src)):
+                        continue
+                    raw = open(src, encoding="utf-8",
+                               errors="ignore").read()
+                    with open(dst, "w", encoding="utf-8") as f:
+                        f.write(raw)
+                    n += 1
+                    print(f"  mirrored [{prefix}] {fn}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"  !! mirror failed for {fn}: {str(e)[:100]}")
+    return n
+
 
 def fetch(name: str, url: str) -> str:
     pdf = os.path.join(LIB, name + ".pdf")
@@ -73,6 +120,9 @@ def main() -> None:
             fetch(name, url)
         except Exception as e:  # noqa: BLE001
             print(f"  !! download failed for {name}: {str(e)[:140]}")
+    mirrored = mirror_extras()
+    if mirrored:
+        print(f"  {mirrored} local research file(s) joined the library")
     for fn in sorted(os.listdir(LIB)):
         if fn.lower().endswith(".pdf"):
             try:
