@@ -42,6 +42,8 @@ PAIR_MAP = {
     "BTC": "XBTUSD", "XBT": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD",
     "XRP": "XRPUSD", "XLM": "XLMUSD", "ADA": "ADAUSD", "ALGO": "ALGOUSD",
     "DOT": "DOTUSD", "ATOM": "ATOMUSD",
+    # 2026-07-13: liquid majors (XDG = Kraken code for Doge).
+    "DOGE": "XDGUSD", "LTC": "LTCUSD", "LINK": "LINKUSD", "AVAX": "AVAXUSD",
 }
 SUPPORTED = frozenset(PAIR_MAP.keys())
 

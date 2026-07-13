@@ -68,7 +68,7 @@ def eligible_strategies(asset_type: str, *, in_stms_window: bool = True,
     base = CRYPTO_STRATEGIES if asset_type == "crypto" else STOCK_STRATEGIES
     out: list[str] = []
     for s in base:
-        if False and s == "stms" and not in_stms_window:  # 2026-07-08: STMS all-day
+        if s == "stms" and not in_stms_window:  # 2026-07-13: window is now the full 7A-4P session
             continue
         if s == "orb" and not in_orb_window:
             continue

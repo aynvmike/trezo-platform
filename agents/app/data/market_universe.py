@@ -160,6 +160,15 @@ async def expanded_scan_pool(watchlist_tickers: list[str],
         pool.append(sym)
         watch_added += 1
 
+    # Sector Compass bias (2026-07-13): the day's leading sector ETFs
+    # ride near the front so scanners look where the market is moving.
+    lead_added = 0
+    for sym in list(SECTOR_BIAS.get("leaders") or [])[:3]:
+        if sym not in seen and len(pool) < limit:
+            seen.add(sym)
+            pool.append(sym)
+            lead_added += 1
+
     extra_added = 0
     if len(pool) < limit:
         extra = await market_wide_candidates(limit=limit)
@@ -172,6 +181,64 @@ async def expanded_scan_pool(watchlist_tickers: list[str],
     breakdown = {
         "watchlist": watch_added,
         "market_wide": extra_added,
+        "sector_leaders": lead_added,
         "total": len(pool),
     }
     return pool, breakdown
+
+# --- Sector Compass (2026-07-13, Mike) --------------------------------
+# The industry read on three clocks: every day the agents get the
+# 3-day industry movers, Mondays add the weekly (5-day) view, and
+# every ~21 days a monthly market update. ops_watchdog refreshes it
+# once per day; the result lands in the activity log (Mike-visible),
+# in agent memory (recallable for strategy planning), and the leading
+# sector ETFs ride near the front of every scan pool so the scanners
+# look where the market is actually moving.
+SECTOR_ETFS: dict[str, str] = {
+    "XLK": "Technology", "XLF": "Financials", "XLE": "Energy",
+    "XLV": "Health Care", "XLI": "Industrials", "XLY": "Consumer Disc",
+    "XLP": "Consumer Staples", "XLU": "Utilities", "XLB": "Materials",
+    "XLRE": "Real Estate", "XLC": "Communications", "SMH": "Semiconductors",
+    "XBI": "Biotech", "GDX": "Gold Miners",
+}
+
+# Latest compass result, module-shared. expanded_scan_pool() reads it.
+SECTOR_BIAS: dict = {"as_of": "", "leaders": [], "laggards": [], "windows": {}}
+
+
+async def sector_compass() -> dict:
+    """Rank the sector ETFs by 3/5/21-trading-day percent moves.
+
+    Returns {"3d": [(sym, pct), ...ranked], "5d": ..., "21d": ...} and
+    refreshes SECTOR_BIAS with the 3-day leaders/laggards. Fail-open:
+    any symbol that will not fetch is simply skipped.
+    """
+    from app.data.candles import fetch_stock_candles
+    closes: dict[str, list[float]] = {}
+    for sym in SECTOR_ETFS:
+        try:
+            cs = await fetch_stock_candles(sym)
+            if cs and len(cs) >= 22:
+                closes[sym] = [float(c.close) for c in cs]
+        except Exception:  # noqa: BLE001
+            continue
+    windows: dict[str, list] = {}
+    for label, n in (("3d", 3), ("5d", 5), ("21d", 21)):
+        moves = []
+        for sym, cl in closes.items():
+            if len(cl) > n and cl[-1 - n]:
+                try:
+                    moves.append(
+                        (sym, round((cl[-1] / cl[-1 - n] - 1.0) * 100.0, 2)))
+                except Exception:  # noqa: BLE001
+                    continue
+        moves.sort(key=lambda x: x[1], reverse=True)
+        windows[label] = moves
+    if windows.get("3d"):
+        import datetime as _dt
+        SECTOR_BIAS["as_of"] = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        SECTOR_BIAS["leaders"] = [s for s, _ in windows["3d"][:3]]
+        SECTOR_BIAS["laggards"] = [s for s, _ in windows["3d"][-3:]]
+        SECTOR_BIAS["windows"] = windows
+    return windows
+

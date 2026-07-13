@@ -42,6 +42,13 @@ COIN_PARAMS: dict[str, dict[str, float]] = {
     "ETH": {"stop_pct": 0.025, "target_pct": 0.05},
     "SOL": {"stop_pct": 0.04,  "target_pct": 0.08},
     "BTC": {"stop_pct": 0.025, "target_pct": 0.05},
+    # 2026-07-13 (Mike): liquid majors added so the crypto desk sees more
+    # of the market -- volatility-scaled stops/targets, fee gate applies.
+    "DOGE": {"stop_pct": 0.05,  "target_pct": 0.09},
+    "LTC":  {"stop_pct": 0.035, "target_pct": 0.07},
+    "LINK": {"stop_pct": 0.04,  "target_pct": 0.08},
+    "DOT":  {"stop_pct": 0.04,  "target_pct": 0.08},
+    "AVAX": {"stop_pct": 0.045, "target_pct": 0.09},
 }
 # Layer the ISO 20022-aligned cluster on top, tier-defaulted.
 for _sym in ISO20022_SYMBOLS:
@@ -53,7 +60,8 @@ for _sym in ISO20022_SYMBOLS:
 # ISO 20022-aligned cluster. Mike's per-stock strategy preference
 # applies - the scanner can flip strategy per coin without flipping
 # the whole universe.
-CRYPTO_WATCHLIST: list[str] = ["ETH", "SOL"] + ISO20022_SYMBOLS
+CRYPTO_WATCHLIST: list[str] = (["ETH", "SOL", "DOGE", "LTC", "LINK", "DOT", "AVAX"]
+                               + ISO20022_SYMBOLS)  # majors widened 2026-07-13
 
 
 # HODL — long-horizon accumulate-and-hold (Mike 2026-06-13). The

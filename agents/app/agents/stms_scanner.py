@@ -48,7 +48,7 @@ class STMSScannerAgent(Agent):
                 agent=self.name, kind="info",
                 payload={"note": "STMS strategy disabled in Bot Tuning settings."},
             )]
-        if False and not is_trading_window():  # 2026-07-08 Mike: STMS runs ALL DAY -- only ORB keeps a time window
+        if not is_trading_window():  # 2026-07-13 Mike: STMS runs the FULL session (7 AM-4 PM ET); only ORB keeps a short window
             return [AgentMessage(
                 agent=self.name, kind="info",
                 payload={"note": "Outside STMS trading window (7-11 AM ET). Scanner idle."},

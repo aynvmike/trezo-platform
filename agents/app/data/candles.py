@@ -34,6 +34,12 @@ COIN_MAP: dict[str, str] = {
     "BTC": "bitcoin",
     # ISO 20022-aligned cluster - see app/data/iso20022_coins.py
     **_ISO20022_COIN_MAP,
+    # Liquid majors added 2026-07-13 (CoinGecko ids; Kraken serves them live).
+    "DOGE": "dogecoin",
+    "LTC": "litecoin",
+    "LINK": "chainlink",
+    "DOT": "polkadot",
+    "AVAX": "avalanche-2",
 }
 
 # Period string -> approximate trading-day count.

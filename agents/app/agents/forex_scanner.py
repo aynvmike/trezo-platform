@@ -25,7 +25,8 @@ import time as _time
 from .base import Agent, AgentMessage
 
 # Query names data/forex.py accepts (Kraken pair codes).
-FOREX_WATCHLIST = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+FOREX_WATCHLIST = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
+                   "USDCHF", "EURGBP", "EURJPY", "EURCAD", "EURAUD"]  # +5 crosses 2026-07-13
 
 _ATR_STOP_MULT = 1.0    # stop  = 1.0x 4h-ATR%
 _ATR_TARGET_MULT = 1.2  # target= 1.2x 4h-ATR%

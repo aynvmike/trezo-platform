@@ -51,18 +51,19 @@ FLOAT_MAX_MILLIONS  = 20.0   # small-float screen: under 20M shares
 
 
 def is_trading_window(now: Optional[datetime] = None) -> bool:
-    """STMS trades 7-11 AM US Eastern, weekdays only.
+    """STMS trades 7:00 AM - 4:00 PM US Eastern, weekdays (Mike 2026-07-13).
 
-    Naive approximation using UTC: 7-11 AM ET = 11:00-15:00 UTC in EST,
-    12:00-16:00 UTC in EDT. We accept the slightly-wider 11:00-15:30 UTC
-    window so DST transitions don't surprise us. Phase 6c can do proper
-    timezone-aware handling with `zoneinfo`.
+    Pre-market hour through the closing bell -- the full session, same
+    idea as Pattern Detection, just gated to market hours because
+    small-cap momentum is meaningless on a closed tape. Naive UTC
+    approximation: 7 AM-4 PM ET = 11:00-20:00 UTC in EDT, 12:00-21:00
+    UTC in EST; we accept the union 11:00-21:00 so DST never surprises us.
     """
     now = now or datetime.now(timezone.utc)
     if now.weekday() >= 5:        # Sat=5, Sun=6
         return False
     h = now.hour + now.minute / 60.0
-    return 11.0 <= h <= 16.0
+    return 11.0 <= h <= 21.0
 
 
 # ---- Candidate evaluation -------------------------------------------------

@@ -22,6 +22,13 @@ FOREX_MAJORS: dict[str, str] = {
     "USDJPY": "USDJPY",
     "AUDUSD": "AUDUSD",
     "USDCAD": "USDCAD",
+    # 2026-07-13 (Mike): five liquid crosses so the forex desk trains on
+    # more than the majors. All carried on Kraken public OHLC.
+    "USDCHF": "USDCHF",
+    "EURGBP": "EURGBP",
+    "EURJPY": "EURJPY",
+    "EURCAD": "EURCAD",
+    "EURAUD": "EURAUD",
 }
 
 _KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"

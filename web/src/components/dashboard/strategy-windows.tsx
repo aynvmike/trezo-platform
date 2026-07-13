@@ -30,11 +30,11 @@ const WINDOWS: WindowSpec[] = [
   },
   {
     name: "STMS (small-cap momentum)",
-    short: "7:00 – 11:00 AM ET",
+    short: "7:00 AM – 4:00 PM ET",
     startHourEt: 7,
-    endHourEt: 11,
+    endHourEt: 16,
     weekdayOnly: true,
-    note: "Catches the morning gainers ($1–$20, +10% on 5x volume). Includes pre-market hour."
+    note: "Catches small-cap movers ($1–$20, +10% on 5x volume) from the pre-market hour through the close — full session since 7/13."
   },
   {
     name: "ORB (opening range breakout)",

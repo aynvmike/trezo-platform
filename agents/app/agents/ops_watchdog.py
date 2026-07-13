@@ -158,6 +158,50 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                     except Exception:  # noqa: BLE001
                         pass
+                # Sector Compass (2026-07-13, Mike): daily industry read --
+                # 3-day movers every day, weekly (5d) view on Mondays, and
+                # a monthly market update roughly every 21 days. Lands in
+                # the activity log + agent memory so strategy planning has
+                # a direction beyond the watchlist.
+                try:
+                    from app.agents.activity_log import record as _srec
+                    from app.data.market_universe import sector_compass
+                    _w = await sector_compass()
+
+                    def _fmt(rows):
+                        return ", ".join(
+                            f"{s} {p:+.1f}%" for s, p in rows)
+                    if _w.get("3d"):
+                        _srec("sector_compass", "MARKET",
+                              reason=("3-day industry movers -- leading: "
+                                      f"{_fmt(_w['3d'][:3])} | lagging: "
+                                      f"{_fmt(_w['3d'][-3:])}"),
+                              extra={"window": "3d"})
+                    if _d.today().weekday() == 0 and _w.get("5d"):
+                        _srec("sector_compass", "MARKET",
+                              reason=("weekly industry read -- leading: "
+                                      f"{_fmt(_w['5d'][:3])} | lagging: "
+                                      f"{_fmt(_w['5d'][-3:])}"),
+                              extra={"window": "5d"})
+                    if _d.today().toordinal() % 21 == 0 and _w.get("21d"):
+                        _srec("sector_compass", "MARKET",
+                              reason=("monthly market update (21-day) -- "
+                                      f"leading: {_fmt(_w['21d'][:3])} | "
+                                      f"lagging: {_fmt(_w['21d'][-3:])}"),
+                              extra={"window": "21d"})
+                    try:
+                        from app.memory.mem0_client import get_memory as _gmm
+                        if _w.get("3d"):
+                            _gmm().queue_note(
+                                "ops_watchdog",
+                                ("sector compass 3d: up "
+                                 + _fmt(_w["3d"][:3]) + "; down "
+                                 + _fmt(_w["3d"][-3:])),
+                                ticker="MARKET")
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             pass
         try:
