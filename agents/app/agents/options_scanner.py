@@ -1549,9 +1549,13 @@ class OptionsScannerAgent(Agent):
             candles = await fetch_candles_for(underlying, "stock")
             if not candles:
                 continue
-            for builder in (build_long_call, build_bull_call_spread,
+            from app.strategies.options_strategies import (
+                build_bear_call_spread, build_butterfly, build_long_put,
+            )
+            for builder in (build_long_call, build_long_put,
+                            build_bull_call_spread, build_bear_call_spread,
                             build_cash_secured_put, build_bull_put_spread,
-                            build_iron_condor):
+                            build_iron_condor, build_butterfly):
                 play = builder(underlying, candles)
                 if not play:
                     continue
@@ -1567,6 +1571,7 @@ class OptionsScannerAgent(Agent):
                 # what was suppressed and adjust thresholds.
                 is_premium_sell = play.direction == "income" or play.strategy in (
                     "cash_secured_put", "bull_put_spread", "iron_condor",
+                    "bear_call_spread",
                 )
                 is_scalp = play.strategy in ("iron_condor",) or (
                     play.direction == "income" and play.contracts <= 3

@@ -217,6 +217,122 @@ def build_bull_put_spread(underlying: str, candles: list[Candle],
     )
 
 
+def build_bear_call_spread(underlying: str, candles: list[Candle],
+                           contracts: int = 1) -> Optional[OptionsPlay]:
+    """A credit spread for a falling or capped market — sell a call, buy a
+    higher call as the wing (Mike 2026-07-14: the full options menu)."""
+    if len(candles) < 22:
+        return None
+    spot = float(candles[-1].close)
+    if spot <= 0:
+        return None
+    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    short_strike = round(spot * 1.05, 2)     # sell call ~5% OTM
+    long_strike = round(spot * 1.10, 2)      # buy call ~10% OTM (the wing)
+    short_q = theoretical_price("call", spot, short_strike, TARGET_DTE, iv)
+    long_q = theoretical_price("call", spot, long_strike, TARGET_DTE, iv)
+    net_credit = (short_q.premium - long_q.premium) * 100 * contracts
+    if net_credit <= 0:
+        return None
+    width = (long_strike - short_strike) * 100 * contracts
+    legs = [_leg("sell", "call", short_q), _leg("buy", "call", long_q)]
+    return OptionsPlay(
+        underlying=underlying.upper(),
+        strategy="bear_call_spread",
+        direction="income",
+        expiration=_exp(),
+        contracts=contracts,
+        net_premium_usd=round(net_credit, 2),
+        max_loss_usd=round(width - net_credit, 2),
+        max_gain_usd=round(net_credit, 2),
+        modeled_iv=short_q.iv,
+        legs=legs,
+        notes=f"Sell {short_strike} call / buy {long_strike} call. Keep the "
+              f"credit if {underlying.upper()} stays below {short_strike}; "
+              f"the long wing caps the loss (this is how a 'naked call' "
+              f"thesis is expressed with DEFINED risk).",
+        **_net_greeks(legs, contracts),
+    )
+
+
+def build_long_put(underlying: str, candles: list[Candle],
+                   contracts: int = 1) -> Optional[OptionsPlay]:
+    """Buy a put — the defined-risk bearish play (max loss = the debit)."""
+    if len(candles) < 22:
+        return None
+    spot = float(candles[-1].close)
+    if spot <= 0:
+        return None
+    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    strike = round(spot * 0.98, 2)           # just under the money
+    q = theoretical_price("put", spot, strike, TARGET_DTE, iv)
+    debit = q.premium * 100 * contracts
+    if debit <= 0:
+        return None
+    legs = [_leg("buy", "put", q)]
+    return OptionsPlay(
+        underlying=underlying.upper(),
+        strategy="long_put",
+        direction="bearish",
+        expiration=_exp(),
+        contracts=contracts,
+        net_premium_usd=round(-debit, 2),
+        max_loss_usd=round(debit, 2),
+        max_gain_usd=round((strike - 0) * 100 * contracts - debit, 2),
+        modeled_iv=q.iv,
+        legs=legs,
+        notes=f"Buy the {strike} put. Profits as {underlying.upper()} falls; "
+              f"breakeven {round(strike - q.premium, 2)}; the debit is the "
+              f"whole risk.",
+        **_net_greeks(legs, contracts),
+    )
+
+
+def build_butterfly(underlying: str, candles: list[Candle],
+                    contracts: int = 1) -> Optional[OptionsPlay]:
+    """Long call butterfly — buy 1 lower call, sell 2 middle calls, buy 1
+    upper call. A cheap pin-the-price play: max profit lands when the
+    stock closes AT the middle strike at expiry (Mike 2026-07-14)."""
+    if len(candles) < 22:
+        return None
+    spot = float(candles[-1].close)
+    if spot <= 0:
+        return None
+    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    lo = round(spot * 0.97, 2)
+    mid = round(spot, 2)
+    hi = round(spot * 1.03, 2)
+    ql = theoretical_price("call", spot, lo, TARGET_DTE, iv)
+    qm = theoretical_price("call", spot, mid, TARGET_DTE, iv)
+    qh = theoretical_price("call", spot, hi, TARGET_DTE, iv)
+    debit = (ql.premium - 2 * qm.premium + qh.premium) * 100 * contracts
+    if debit <= 0:
+        return None                     # a butterfly should always cost a bit
+    legs = [
+        _leg("buy", "call", ql),
+        _leg("sell", "call", qm),
+        _leg("sell", "call", qm),
+        _leg("buy", "call", qh),
+    ]
+    max_gain = (mid - lo) * 100 * contracts - debit
+    return OptionsPlay(
+        underlying=underlying.upper(),
+        strategy="butterfly",
+        direction="neutral",
+        expiration=_exp(),
+        contracts=contracts,
+        net_premium_usd=round(-debit, 2),
+        max_loss_usd=round(debit, 2),
+        max_gain_usd=round(max_gain, 2),
+        modeled_iv=qm.iv,
+        legs=legs,
+        notes=f"Butterfly {lo}/{mid}/{hi}: buy the wings, sell 2x the body. "
+              f"Max profit if {underlying.upper()} pins {mid} at expiry; "
+              f"risk is only the small debit.",
+        **_net_greeks(legs, contracts),
+    )
+
+
 def build_iron_condor(underlying: str, candles: list[Candle],
                       contracts: int = 1) -> Optional[OptionsPlay]:
     """A bull put spread + a bear call spread — a range-bound credit play."""
