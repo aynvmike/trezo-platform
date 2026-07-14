@@ -1,0 +1,26 @@
+[[page 1]]
+TREZO OPTIONS STRATEGY FORMULAS (agent reference, 2026-07-14). All formulas are per contract of 100 shares; multiply by contract count. Credit = money collected when opening; debit = money paid. The harvest rule applies to every short-premium position: buy it back once 60 percent or more of the maximum profit is earned, or 35 percent inside five days to expiry. Never hold short premium into expiration week for the last few dollars.
+
+CASH-SECURED PUT (income, bullish-neutral). Sell a put below the market with cash reserved for assignment. Max gain = the credit. Max loss = (strike - 0) x 100 - credit if the stock went to zero; practical risk = strike minus spot at expiry. Breakeven = strike - premium. Collateral = strike x 100. Use when happy to own the stock lower; the Wheel entry leg. Trezo status: LIVE (wheel auto-fire, posture-scaled limits).
+
+COVERED CALL (income, on 100 held shares). Sell a call above cost basis on shares already owned. Max gain = (strike - basis) x 100 + credit. Max loss = the stock itself falling (the call credit cushions it). Breakeven on the shares = basis - premium. Use after assignment; the Wheel exit leg. Trezo status: LIVE (wheel_cc fires when 100+ shares are held).
+
+LONG CALL (directional bullish, defined risk). Buy a call. Max loss = the debit, full stop. Max gain = unlimited above breakeven. Breakeven = strike + premium. Delta ~0.45-0.55 near the money; theta works against the position every day, which is why Trezo exits at +40 percent profit, -50 percent loss, or 3 days to expiry, whichever first. Trezo status: LIVE (directional lane on the sector generals).
+
+LONG PUT (directional bearish, defined risk). Buy a put. Max loss = the debit. Max gain = (strike x 100) - debit if the stock went to zero. Breakeven = strike - premium. Same exits as the long call. Trezo status: LIVE (directional lane).
+
+[[page 2]]
+BULL CALL SPREAD (directional bullish, cheaper than a long call). Buy a call, sell a higher call. Net debit. Max loss = the debit. Max gain = (upper strike - lower strike) x 100 - debit. Breakeven = lower strike + net debit. Use when bullish but wanting the sold leg to pay for part of the ticket. Trezo status: PROPOSAL (ideas feed computes it; multi-leg executor is the next build).
+
+BULL PUT SPREAD (income, bullish-neutral, defined risk). Sell a put, buy a lower put wing. Net credit. Max gain = the credit. Max loss = (short strike - long strike) x 100 - credit. Breakeven = short strike - credit per share. This is the defined-risk cousin of the cash-secured put: less collateral, capped downside. Trezo status: PROPOSAL.
+
+BEAR CALL SPREAD (income, bearish-neutral, defined risk). Sell a call, buy a higher call wing. Net credit. Max gain = the credit. Max loss = (long strike - short strike) x 100 - credit. Breakeven = short strike + credit per share. IMPORTANT: this is how a naked-call thesis is expressed with DEFINED risk. Trezo status: PROPOSAL.
+
+IRON CONDOR (income, range-bound markets). Bull put spread + bear call spread on the same expiry: sell a put and a call near the expected range, buy wings outside both. Net credit. Max gain = the total credit (stock finishes between the short strikes). Max loss = wing width x 100 - credit (only one side can lose). Breakevens = short put - credit and short call + credit. Best in choppy or low-volatility regimes -- exactly when the regime playbook favors mean reversion. Trezo status: PROPOSAL.
+
+BUTTERFLY (neutral pin play, tiny debit). Buy 1 lower call, sell 2 middle calls, buy 1 upper call (equal wing widths). Net debit, usually small. Max loss = the debit. Max gain = (middle - lower strike) x 100 - debit, earned if the stock closes exactly at the middle strike at expiry. Use when expecting the price to sit still; cheap lottery ticket on stillness. Trezo status: PROPOSAL.
+
+[[page 3]]
+NAKED CALL (uncovered short call) -- KNOWN, NOT TRADED. Sell a call with no shares and no wing. Max gain = the credit. Max loss = UNLIMITED (the stock can rise without bound); margin calls compound the damage. Alpaca's approval ladder tops out at Level 3 (defined-risk spreads) and does not offer uncovered calls to retail accounts at any level -- and Trezo would not take unlimited-risk positions on a small account anyway. The bear call spread above expresses the same opinion with a hard ceiling on the loss, which is why it exists.
+
+EXIT DOCTRINE (Mike's rules, platform-wide): short premium harvests at 60 percent of max profit (or 35 percent inside 5 DTE); low contract counts target 30-50 percent, high counts take 15 percent; the drawback ladder tightens at 39 -> 30 -> 25 percent giveback; long options exit at +40 percent / -50 percent / DTE 3. Collateral for all short puts stays inside the posture-scaled wheel allowance. One thesis per position, written before entry; if the reason for the trade is gone, the trade is gone.
