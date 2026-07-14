@@ -393,6 +393,44 @@ async def submit_crypto_order(
         return None, str(e)[:200]
 
 
+async def submit_mleg_order(
+    legs: list[dict],
+    qty: int = 1,
+    limit_price: Optional[float] = None,
+    time_in_force: str = "day",
+    token: Optional["UserToken"] = None,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Submit a MULTI-LEG options order (spread / condor / butterfly) as
+    ONE ticket (Mike 2026-07-14: trade the whole Level-3 menu). Each leg:
+    {"symbol": OCC, "ratio_qty": int, "side": "buy"|"sell",
+     "position_intent": "buy_to_open"|"sell_to_open"|"buy_to_close"|
+     "sell_to_close"}. limit_price is the NET price per spread:
+    positive = debit paid, negative = credit received (Alpaca mleg
+    convention)."""
+    if not legs or len(legs) < 2:
+        return None, "mleg needs at least 2 legs"
+    body: dict = {
+        "order_class": "mleg",
+        "qty": str(int(qty)),
+        "type": "limit" if limit_price is not None else "market",
+        "time_in_force": time_in_force,
+        "legs": [{
+            "symbol": str(l["symbol"]).upper(),
+            "ratio_qty": str(int(l.get("ratio_qty", 1))),
+            "side": str(l["side"]).lower(),
+            "position_intent": str(l["position_intent"]).lower(),
+        } for l in legs],
+    }
+    if limit_price is not None:
+        body["limit_price"] = str(round(float(limit_price), 2))
+    resp, perr = await _post("/v2/orders", body, token=token)
+    if perr:
+        return None, perr
+    if isinstance(resp, dict) and resp.get("id"):
+        return resp, None
+    return None, f"unexpected_response: {str(resp)[:200]}"
+
+
 async def submit_bracket_order(
     symbol: str,
     qty: float,

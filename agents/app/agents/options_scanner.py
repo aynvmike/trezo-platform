@@ -170,6 +170,7 @@ class OptionsScannerAgent(Agent):
     _last_rescore: float = 0.0
     _harvested: set = set()      # option-row ids already sent a harvest order
     _long_fired: set = set()     # 'L:SYM:date' one-shot guard for long entries
+    _spread_fired: set = set()   # 'S:date' one-new-spread-per-day guard
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
@@ -436,12 +437,189 @@ class OptionsScannerAgent(Agent):
         longs = await self._run_directional(client)
         out.extend(longs)
 
+        # --- 6. SPREADS: defined-risk multi-leg, one ticket at Alpaca ------
+        spreads = await self._run_spreads(client)
+        out.extend(spreads)
+
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",
                                     payload={"note": "Options scan complete — no actions."}))
         return out
 
     # ----------------------------------------------------------------------
+
+    async def _run_spreads(self, client) -> list[AgentMessage]:
+        """DEFINED-RISK MULTI-LEG (Mike 2026-07-14: "I would like for the
+        agents to be able to trade them"): a credit spread WITH the trend
+        on the strongest general, or an iron condor on SPY when the tape
+        is quiet. Fired as ONE ticket at Alpaca (order_class=mleg,
+        needs options approval Level 3).
+
+        Guardrails: max loss per spread <= TREZO_SPREAD_RISK_USD ($150 --
+        the wings ARE the stop), at most TREZO_SPREAD_OPEN (1) open at a
+        time, one NEW spread per day, the credit must be worth >= ~22% of
+        the wing, and the market must be open. Kill switch TREZO_SPREADS=0.
+        Exits v1: spreads are built to be HELD -- expiry settles them and
+        the wings cap the loss; the hourly re-score skips multi-leg rows
+        so it never prices one leg as the whole position."""
+        import os as _oso
+        out: list[AgentMessage] = []
+        if _oso.getenv("TREZO_SPREADS", "1") != "1":
+            return out
+        uid = _oso.getenv("TREZO_PRIMARY_USER_ID", "")
+        if not uid:
+            return out
+        today_s = date.today().isoformat()
+        if f"S:{today_s}" in OptionsScannerAgent._spread_fired:
+            return out
+        try:
+            from app.brokers.alpaca import (
+                alpaca_configured, get_account, get_clock, submit_mleg_order,
+            )
+            if not alpaca_configured():
+                return out
+            clock = await get_clock()
+            if not clock or not clock.get("is_open"):
+                return out
+            acct = await get_account()
+            if int(getattr(acct, "options_approved_level", 0) or 0) < 3:
+                return out          # spreads need Level 3
+            if await _user_halted(client, uid):
+                return out
+            _risk_cap = float(_oso.getenv("TREZO_SPREAD_RISK_USD", "150"))
+            _max_open = int(_oso.getenv("TREZO_SPREAD_OPEN", "1"))
+
+            def _q_open():
+                return (client.table("options_positions")
+                        .select("id, strategy").eq("user_id", uid)
+                        .eq("status", "open")
+                        .in_("strategy", ["bull_put_spread",
+                                          "bear_call_spread", "iron_condor",
+                                          "butterfly", "bull_call_spread"])
+                        .execute())
+            _open = (await asyncio.to_thread(_q_open)).data or []
+            if len(_open) >= _max_open:
+                return out
+
+            # Pick the play: ride the leading general when it is moving;
+            # sell the quiet range on SPY when nothing is.
+            try:
+                from app.data.market_universe import SECTOR_BIAS
+                gens = list(SECTOR_BIAS.get("generals") or [])
+            except Exception:  # noqa: BLE001
+                gens = []
+            play = None
+            if gens:
+                g0 = max(gens, key=lambda x: abs(float(x.get("d3") or 0)))
+                try:
+                    d3 = float(g0.get("d3") or 0)
+                except Exception:  # noqa: BLE001
+                    d3 = 0.0
+                sym0 = str(g0.get("sym") or "").upper()
+                if sym0 and abs(d3) >= 2.5:
+                    cnd = await fetch_candles_for(sym0, "stock")
+                    if cnd:
+                        if d3 > 0:
+                            play = build_bull_put_spread(sym0, cnd)
+                        else:
+                            from app.strategies.options_strategies import (
+                                build_bear_call_spread as _bcs,
+                            )
+                            play = _bcs(sym0, cnd)
+            if play is None:
+                cnd = await fetch_candles_for("SPY", "stock")
+                if cnd:
+                    play = build_iron_condor("SPY", cnd)
+            if not play:
+                return out
+
+            # Quality gates: worth-the-wing credit, capped max loss.
+            _credit0 = float(play.net_premium_usd or 0)
+            _wing0 = _credit0 + float(play.max_loss_usd or 0)
+            if _credit0 <= 0 or _wing0 <= 0 or (_credit0 / _wing0) < 0.22:
+                return out
+            if float(play.max_loss_usd or 0) > _risk_cap:
+                return out
+
+            # Resolve every modeled leg to a REAL listed contract, live-priced.
+            from app.brokers.alpaca_data import live_option_pick
+            mlegs: list[dict] = []
+            seen_occ: dict[str, int] = {}
+            net = 0.0
+            for leg in play.legs:
+                pk = await live_option_pick(
+                    play.underlying, str(leg.get("type")),
+                    float(leg.get("strike") or 0), str(play.expiration))
+                if not pk:
+                    return out
+                sgn = 1.0 if str(leg.get("action")) == "sell" else -1.0
+                net += sgn * float(pk.premium)
+                occ = str(pk.occ)
+                if occ in seen_occ:
+                    mlegs[seen_occ[occ]]["ratio_qty"] += 1
+                    continue
+                seen_occ[occ] = len(mlegs)
+                mlegs.append({
+                    "symbol": occ, "ratio_qty": 1,
+                    "side": str(leg.get("action")),
+                    "position_intent": ("sell_to_open"
+                                        if str(leg.get("action")) == "sell"
+                                        else "buy_to_open"),
+                })
+            if len(mlegs) < 2:
+                return out
+            if net <= 0.05:
+                return out          # live quotes must still pay a credit
+
+            # Limit gives 2% toward the fill; negative = net credit (mleg).
+            limit = round(-(net * 0.98), 2)
+            OptionsScannerAgent._spread_fired.add(f"S:{today_s}")
+            order, err = await submit_mleg_order(mlegs, qty=1,
+                                                 limit_price=limit)
+            from app.agents.activity_log import record as _arec
+            if err or not order:
+                _arec("option_spread_blocked", play.underlying,
+                      reason=f"{play.strategy} not placed: {str(err)[:110]}",
+                      extra={"user_id": uid})
+                return out
+            _short_leg = next((l for l in play.legs
+                               if str(l.get("action")) == "sell"),
+                              play.legs[0])
+
+            def _ins():
+                return client.table("options_positions").insert({
+                    "user_id": uid,
+                    "underlying": play.underlying,
+                    "strategy": play.strategy,
+                    "direction": play.direction,
+                    "option_type": str(_short_leg.get("type") or "put"),
+                    "strike": float(_short_leg.get("strike") or 0),
+                    "expiration": str(play.expiration),
+                    "contracts": 1,
+                    "net_premium_usd": round(net * 100.0, 2),
+                    "legs": play.legs,
+                    "notes": (f"Placed via Alpaca (mleg): {play.strategy} -- "
+                              f"live net credit ${net * 100:.0f}; max loss "
+                              f"capped by the wings. "
+                              f"{str(play.notes or '')[:130]}"),
+                }).execute()
+            await asyncio.to_thread(_ins)
+            _arec("option_spread_open", play.underlying,
+                  strategy=play.strategy,
+                  reason=(f"{play.strategy} opened as ONE ticket -- net "
+                          f"credit ~${net * 100:.0f}, max loss "
+                          f"${float(play.max_loss_usd):.0f} (the wings are "
+                          f"the stop)"),
+                  extra={"user_id": uid})
+            out.append(AgentMessage(
+                agent=self.name, kind="execute",
+                payload={"user_id": uid, "event": "spread_open",
+                         "underlying": play.underlying,
+                         "strategy": play.strategy,
+                         "net_credit_usd": round(net * 100, 2)}))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     async def _run_directional(self, client) -> list[AgentMessage]:
         """LONG calls/puts on the strongest sector GENERALS (Mike 2026-07-14:
@@ -494,7 +672,13 @@ class OptionsScannerAgent(Agent):
                 return out
             _held = {str(x.get("underlying") or "").upper() for x in _open}
             today_s = date.today().isoformat()
-            for g in gens[:8]:
+            # Mike 2026-07-14: he buys on VOLATILITY and VOLUME -- the
+            # day-trade lens. Strongest absolute movers first (puts need
+            # the down-leaders as much as calls need the up-leaders).
+            _gens_ranked = sorted(
+                gens[:10],
+                key=lambda x: -abs(float(x.get("d3") or 0)))
+            for g in _gens_ranked:
                 sym = str(g.get("sym") or "").upper()
                 try:
                     d3 = float(g.get("d3") or 0)
@@ -508,6 +692,18 @@ class OptionsScannerAgent(Agent):
                 spot = float(cnd[-1].close) if cnd else 0.0
                 if spot <= 0:
                     continue
+                # Volume confirmation: yesterday's tape must run at least
+                # 1.2x its 20-day average -- conviction, not drift.
+                try:
+                    _vols = [float(c.volume or 0) for c in cnd[-21:]]
+                    _v_avg = (sum(_vols[:-1]) / max(len(_vols) - 1, 1)
+                              if len(_vols) >= 10 else 0.0)
+                    _v_ratio = (_vols[-1] / _v_avg) if _v_avg > 0 else 1.0
+                except Exception:  # noqa: BLE001
+                    _v_ratio = 1.0
+                if _v_ratio < float(_oso.getenv(
+                        "TREZO_LONG_OPT_VOL_RATIO", "1.2")):
+                    continue
                 opt_type = "call" if d3 > 0 else "put"
                 from datetime import timedelta as _tdl
                 target_exp = (date.today() + _tdl(days=30)).isoformat()
@@ -517,11 +713,17 @@ class OptionsScannerAgent(Agent):
                     continue
                 prem = float(getattr(pick, "premium", 0) or 0)
                 debit = prem * 100.0
-                if prem <= 0 or debit > min(_cap_usd, 0.03 * max(_eq, 1.0)):
+                _budget = min(_cap_usd, 0.03 * max(_eq, 1.0))
+                if prem <= 0 or debit > _budget:
                     continue
+                # Multi-contract when the budget covers cheap contracts
+                # (Mike: 3 contracts x $15 profit = the day's 1%) -- the
+                # 15% fast-take in the re-score needs the count.
+                _ctn = max(1, min(int(_oso.getenv("TREZO_LONG_OPT_CT_MAX", "3")),
+                                  int(_budget // max(debit, 1.0))))
                 OptionsScannerAgent._long_fired.add(_ck)
                 order, err = await submit_option_order(
-                    str(pick.occ), 1, "buy", time_in_force="day",
+                    str(pick.occ), _ctn, "buy", time_in_force="day",
                     limit_price=round(prem * 1.05, 2))
                 from app.agents.activity_log import record as _arec
                 if err or not order:
@@ -539,8 +741,8 @@ class OptionsScannerAgent(Agent):
                         "option_type": ot,
                         "strike": float(pk.strike),
                         "expiration": str(pk.expiration),
-                        "contracts": 1,
-                        "net_premium_usd": -round(db, 2),
+                        "contracts": _ctn,
+                        "net_premium_usd": -round(db * _ctn, 2),
                         "legs": [{"action": "buy", "type": ot,
                                   "strike": float(pk.strike),
                                   "premium": float(pk.premium)}],
@@ -550,10 +752,11 @@ class OptionsScannerAgent(Agent):
                     }).execute()
                 await asyncio.to_thread(_ins)
                 _arec("option_long_open", sym, strategy=f"long_{opt_type}",
-                      reason=(f"bought 1 {opt_type.upper()} {pick.strike:g} "
+                      reason=(f"bought {_ctn} {opt_type.upper()} {pick.strike:g} "
                               f"exp {str(pick.expiration)[:10]} at "
-                              f"~{prem:.2f} (${debit:.0f} max risk) -- "
-                              f"{sym} leading its sector {d3:+.1f}% over 3d"),
+                              f"~{prem:.2f} (${debit * _ctn:.0f} max risk) -- "
+                              f"{sym} moving {d3:+.1f}% 3d on {_v_ratio:.1f}x "
+                              f"volume"),
                       extra={"user_id": uid})
                 out.append(AgentMessage(
                     agent=self.name, kind="execute",
@@ -598,7 +801,7 @@ class OptionsScannerAgent(Agent):
                         client.table("options_positions")
                         .select("id, user_id, underlying, strategy, "
                                 "option_type, strike, contracts, "
-                                "net_premium_usd, expiration")
+                                "net_premium_usd, expiration, legs")
                         .eq("status", "open")
                         .gt("expiration", today)
                         .execute()
@@ -612,6 +815,11 @@ class OptionsScannerAgent(Agent):
                         _exp = str(lr.get("expiration") or "")
                         _credit = float(lr.get("net_premium_usd") or 0)
                         _ct = int(lr.get("contracts") or 1)
+                        # Multi-leg rows (spreads/condors/flies) are
+                        # expiry-managed -- the wings ARE the stop, and
+                        # pricing one leg as the whole would lie.
+                        if isinstance(lr.get("legs"), list) and len(lr.get("legs") or []) > 1:
+                            continue
                         if not _u or _strike <= 0 or len(_exp) < 10:
                             continue
                         _cnd = await fetch_candles_for(_u, "stock")
@@ -682,9 +890,15 @@ class OptionsScannerAgent(Agent):
                                                   f"{_exp[:10]} to bank ~{(1.0 - _ratio) * 100:.0f}% "
                                                   f"of the premium early"))
                                 else:
-                                    if (_ratio >= 1.40 or _ratio <= 0.50
+                                    # Mike 2026-07-14: with several contracts
+                                    # on, take the QUICK 15% and redeploy --
+                                    # 3 contracts x $15 is the day's 1%.
+                                    _tp = (1.15 if _ct >= int(_oso.getenv(
+                                        "TREZO_OPT_FAST_CT", "3")) else 1.40)
+                                    if (_ratio >= _tp or _ratio <= 0.50
                                             or _dte <= 3):
-                                        _why = ("+40% target hit" if _ratio >= 1.40
+                                        _why = (f"+{(_tp - 1) * 100:.0f}% target hit"
+                                                if _ratio >= _tp
                                                 else ("-50% cut" if _ratio <= 0.50
                                                       else "DTE<=3 time exit"))
                                         _fire = ("sell",
