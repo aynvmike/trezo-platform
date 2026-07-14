@@ -67,21 +67,23 @@ export type RegimePlay = {
   favor: string[];
   reduce: string[];
   pause: string[];
+  /** Live but on a higher bar + half size (never fully off) — Mike 7/14. */
+  probation?: string[];
 };
 
 export const REGIME_PLAYBOOK: Record<string, RegimePlay> = {
   trending_up: { summary: "Broad uptrend — let winners run, lean into strength.",
     favor: ["trend", "momentum", "breakout"], reduce: ["mean_reversion"], pause: [] },
   trending_down: { summary: "Sustained downtrend — defend capital, avoid catching knives.",
-    favor: ["arbitrage"], reduce: ["trend", "mean_reversion"], pause: ["momentum", "breakout", "income"] },
+    favor: ["arbitrage"], reduce: ["trend", "mean_reversion"], pause: ["momentum", "income"], probation: ["breakout"] },
   choppy: { summary: "Directionless chop — fade extremes, distrust breakouts.",
-    favor: ["mean_reversion", "arbitrage"], reduce: ["trend", "momentum"], pause: ["breakout"] },
+    favor: ["mean_reversion", "arbitrage"], reduce: ["trend", "momentum"], pause: [], probation: ["breakout"] },
   high_volatility: { summary: "Elevated volatility — size down, widen stops, be selective.",
-    favor: ["event_driven"], reduce: ["trend", "momentum", "mean_reversion"], pause: ["breakout"] },
+    favor: ["event_driven"], reduce: ["trend", "momentum", "mean_reversion"], pause: [], probation: ["breakout"] },
   low_volatility: { summary: "Calm, low-volatility market — favor income and clean trends.",
     favor: ["income", "volatility", "trend"], reduce: [], pause: [] },
   risk_off: { summary: "Risk-off — capital preservation first; only market-neutral edges.",
-    favor: ["arbitrage"], reduce: ["trend"], pause: ["momentum", "breakout", "event_driven", "income"] }
+    favor: ["arbitrage"], reduce: ["trend"], pause: ["momentum", "event_driven", "income"], probation: ["breakout"] }
 };
 
 export const REGIME_LABEL: Record<string, string> = {

@@ -168,6 +168,15 @@ async def expanded_scan_pool(watchlist_tickers: list[str],
             seen.add(sym)
             pool.append(sym)
             lead_added += 1
+    # ...and the GENERALS of those sectors (Mike 2026-07-14): the biggest
+    # names of the leading industries, queued for strategy evaluation so
+    # every scanner sees what the market leaders are doing.
+    for g in list(SECTOR_BIAS.get("generals") or [])[:4]:
+        _gsym = g.get("sym") if isinstance(g, dict) else None
+        if _gsym and _gsym not in seen and len(pool) < limit:
+            seen.add(_gsym)
+            pool.append(_gsym)
+            lead_added += 1
 
     extra_added = 0
     if len(pool) < limit:
@@ -202,8 +211,20 @@ SECTOR_ETFS: dict[str, str] = {
     "XBI": "Biotech", "GDX": "Gold Miners",
 }
 
+# The GENERALS (Mike 2026-07-14): the biggest names of each industry --
+# "see what the market industry leaders are doing so the agents can be
+# prepared to enter the trades for the strategies they fit."
+SECTOR_GENERALS: dict[str, list[str]] = {
+    "XLK": ["AAPL", "MSFT"], "XLF": ["JPM", "V"], "XLE": ["XOM", "CVX"],
+    "XLV": ["LLY", "UNH"], "XLI": ["CAT", "GE"], "XLY": ["AMZN", "HD"],
+    "XLP": ["PG", "COST"], "XLU": ["NEE", "DUK"], "XLB": ["LIN", "FCX"],
+    "XLRE": ["PLD", "AMT"], "XLC": ["GOOGL", "META"],
+    "SMH": ["NVDA", "AVGO"], "XBI": ["VRTX", "REGN"], "GDX": ["NEM", "GOLD"],
+}
+
 # Latest compass result, module-shared. expanded_scan_pool() reads it.
-SECTOR_BIAS: dict = {"as_of": "", "leaders": [], "laggards": [], "windows": {}}
+SECTOR_BIAS: dict = {"as_of": "", "leaders": [], "laggards": [],
+                     "generals": [], "windows": {}}
 
 
 async def sector_compass() -> dict:
@@ -240,5 +261,24 @@ async def sector_compass() -> dict:
         SECTOR_BIAS["leaders"] = [s for s, _ in windows["3d"][:3]]
         SECTOR_BIAS["laggards"] = [s for s, _ in windows["3d"][-3:]]
         SECTOR_BIAS["windows"] = windows
+        # Generals of the LEADING sectors: 1-day and 3-day moves, so the
+        # agents know what the industry leaders are doing right now.
+        gens: list[dict] = []
+        for etf in SECTOR_BIAS["leaders"][:3]:
+            for sym in SECTOR_GENERALS.get(etf, [])[:2]:
+                try:
+                    cs = await fetch_stock_candles(sym)
+                    cl = [float(c.close) for c in cs] if cs else []
+                    if len(cl) >= 4 and cl[-2] and cl[-4]:
+                        gens.append({
+                            "sym": sym, "sector": etf,
+                            "d1": round((cl[-1] / cl[-2] - 1.0) * 100.0, 2),
+                            "d3": round((cl[-1] / cl[-4] - 1.0) * 100.0, 2),
+                        })
+                except Exception:  # noqa: BLE001
+                    continue
+        gens.sort(key=lambda g: -g["d3"])
+        SECTOR_BIAS["generals"] = gens
+        windows["generals"] = gens
     return windows
 

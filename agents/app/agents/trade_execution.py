@@ -604,6 +604,22 @@ class TradeExecutionAgent(Agent):
                                        notional_usd=round(_maxq * market_price, 2))
             except Exception:  # noqa: BLE001
                 pass
+        # Probation half-size (Mike 2026-07-14): the regime playbook keeps
+        # breakout LIVE in rough weather but at reduced size. Risk Manager
+        # sets size_scale on the approval; we honor it here.
+        if plan.ok:
+            try:
+                _ss = float((source_payload or {}).get("size_scale") or 0)
+                if 0.0 < _ss < 1.0:
+                    import dataclasses as _dcs
+                    _q2 = plan.quantity * _ss
+                    if str(asset_type or "stock") not in ("crypto", "forex"):
+                        _q2 = max(1.0, float(int(_q2)))
+                    plan = _dcs.replace(
+                        plan, quantity=_q2,
+                        notional_usd=round(_q2 * market_price, 2))
+            except Exception:  # noqa: BLE001
+                pass
         force_min = int(source_payload.get("force_min_qty") or 0)
         if not plan.ok and force_min >= 1 and acct.buying_power >= market_price:
             from app.paper.sizing import SizingPlan as _SP, account_tier as _at

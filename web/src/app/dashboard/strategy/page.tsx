@@ -175,9 +175,10 @@ export default async function StrategyPage() {
           </h2>
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-5 text-sm text-weave-600 leading-relaxed">
             <p className="mb-3">{play.summary}</p>
-            <div className="grid sm:grid-cols-3 gap-3">
+            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
               <PlayCol label="Favor" tone="good" families={play.favor} />
               <PlayCol label="Trade smaller" tone="warn" families={play.reduce} />
+              <PlayCol label="Probation — half size" tone="warn" families={play.probation ?? []} />
               <PlayCol label="Pause" tone="bad" families={play.pause} />
             </div>
           </div>

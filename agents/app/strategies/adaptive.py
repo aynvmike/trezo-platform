@@ -23,7 +23,7 @@ from app.strategies import library
 # --- Guardrails (hard caps) ------------------------------------------
 MIN_STOP_MULTIPLIER = 0.5     # stops may be tightened at most 50%
 MAX_STOP_MULTIPLIER = 1.0     # never loosened beyond the strategy baseline
-MAX_TCS_BUMP = 150            # the confidence bar may be raised at most +150
+MAX_TCS_BUMP = 15             # at most +15 on the 0-100 TCS scale (rescaled 2026-07-14)
 MAX_FLAGGED_TICKERS = 20
 FLAG_TTL_MINUTES = 24 * 60    # a flagged ticker clears after 24h by default
 POSTURE_TTL_MINUTES = 6 * 60  # a regime posture is re-evaluated within 6h
@@ -44,13 +44,16 @@ TREZO_STRATEGY_FAMILY: dict[str, str] = {
 
 # Per-regime posture: (stop multiplier, TCS bump). Tighter + higher in
 # rougher regimes; baseline in calm uptrends.
+# 2026-07-14: converted to the 0-100 TCS scale (missed in the 7/11 sweep --
+# the old 1000-scale numbers were adding +25..+150 to a 0-100 bar and
+# strangling entries in any non-trending regime).
 _REGIME_POSTURE: dict[str, tuple[float, int]] = {
-    "trending_up":     (1.00,   0),
-    "low_volatility":  (1.00,   0),
-    "choppy":          (0.85,  25),
-    "trending_down":   (0.75,  50),
-    "high_volatility": (0.70,  75),
-    "risk_off":        (0.60, 150),
+    "trending_up":     (1.00,  0),
+    "low_volatility":  (1.00,  0),
+    "choppy":          (0.85,  3),
+    "trending_down":   (0.75,  5),
+    "high_volatility": (0.70,  8),
+    "risk_off":        (0.60, 15),
 }
 
 # Event types worth flagging a ticker over.
@@ -97,7 +100,7 @@ class ScopeAdjustment:
 def regime_posture(read) -> ScopeAdjustment:
     """Translate a RegimeRead into the market-wide posture adjustment."""
     regime = getattr(read, "regime", "choppy")
-    stop_mult, tcs_bump = _REGIME_POSTURE.get(regime, (0.85, 25))
+    stop_mult, tcs_bump = _REGIME_POSTURE.get(regime, (0.85, 3))
     stop_mult = _clamp(stop_mult, MIN_STOP_MULTIPLIER, MAX_STOP_MULTIPLIER)
     tcs_bump = int(_clamp(tcs_bump, 0, MAX_TCS_BUMP))
 

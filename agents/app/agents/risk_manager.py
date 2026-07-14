@@ -426,6 +426,26 @@ class RiskManagerAgent(Agent):
                 ticker, tcs,
                 f"Strategy '{strategy}' paused by Adaptive Scope [{scope.regime}]")]
 
+        # Breakout PROBATION (Mike 2026-07-14: "I would like for it to be
+        # active -- it helps with the opening of the market"). Probation
+        # families are never blocked: they pay a +10 confidence bar and
+        # trade HALF size while the regime lasts. Awareness without blackout.
+        probation_bump = 0
+        probation_note = ""
+        try:
+            from app.strategies.adaptive import TREZO_STRATEGY_FAMILY as _famm
+            from app.strategies.library import playbook_for as _pbf
+            _play = _pbf(str(getattr(scope, "regime", "") or ""))
+            _prob = set(getattr(_play, "probation", ()) or ()) if _play else set()
+            if _prob:
+                _fam = (_famm.get(strategy)
+                        or _famm.get(strategy.split("_")[0]))
+                if _fam in _prob:
+                    probation_bump = 10
+                    probation_note = f", {_fam} probation +10 half-size"
+        except Exception:  # noqa: BLE001
+            probation_bump = 0
+
         # Flagged ticker - a recent material event on this name.
         if ticker in scope.flagged_tickers:
             return [self._veto(
@@ -525,11 +545,12 @@ class RiskManagerAgent(Agent):
         # the cycle-aware bump, the per-strategy outcome nudge, and the
         # banked-paycheck bump.
         effective_min_tcs = (min_tcs + scope.tcs_bump + cycle_bump
-                             + outcome_delta + goal_bump)
+                             + outcome_delta + goal_bump + probation_bump)
         if tcs < effective_min_tcs:
             extra = (
-                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason})"
-                if scope.tcs_bump or cycle_bump or outcome_delta or goal_bump
+                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note})"
+                if (scope.tcs_bump or cycle_bump or outcome_delta
+                        or goal_bump or probation_bump)
                 else ""
             )
             return [self._veto(
@@ -763,6 +784,10 @@ class RiskManagerAgent(Agent):
             "reason": f"TCS {tcs} clears threshold; {direction} bias [{strategy}]",
             "accumulation": accumulation_add,
         }
+        if probation_bump:
+            approve_payload["size_scale"] = 0.5
+            approve_payload["reason"] += (
+                f"; probation: bar +10, HALF size [{scope.regime}]")
         # Adaptive Scope can tighten stops in rougher regimes.
         if stop_pct is not None:
             tightened = round(float(stop_pct) * scope.stop_multiplier, 4)

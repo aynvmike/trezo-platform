@@ -385,6 +385,11 @@ class RegimePlay:
     favor: tuple[str, ...]    # families to lean into
     reduce: tuple[str, ...]   # families to trade at reduced size
     pause: tuple[str, ...]    # families to stop entering
+    # Mike 2026-07-14: breakout NEVER fully pauses ("it helps with the
+    # opening of the market and gives the trades a foundation"). Families
+    # on PROBATION stay live but pay +10 TCS and trade HALF size while
+    # the regime lasts.
+    probation: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -403,21 +408,24 @@ REGIME_PLAYBOOK: dict[str, RegimePlay] = {
         summary="Sustained downtrend — defend capital, avoid catching knives.",
         favor=("arbitrage",),
         reduce=("trend", "mean_reversion"),
-        pause=("momentum", "breakout", "income"),
+        pause=("momentum", "income"),
+        probation=("breakout",),
     ),
     "choppy": RegimePlay(
         regime="choppy",
         summary="Directionless chop — fade extremes, distrust breakouts.",
         favor=("mean_reversion", "arbitrage"),
         reduce=("trend", "momentum"),
-        pause=("breakout",),
+        pause=(),
+        probation=("breakout",),
     ),
     "high_volatility": RegimePlay(
         regime="high_volatility",
         summary="Elevated volatility — size down, widen stops, be selective.",
         favor=("event_driven",),
         reduce=("trend", "momentum", "mean_reversion"),
-        pause=("breakout",),
+        pause=(),
+        probation=("breakout",),
     ),
     "low_volatility": RegimePlay(
         regime="low_volatility",
@@ -431,7 +439,8 @@ REGIME_PLAYBOOK: dict[str, RegimePlay] = {
         summary="Risk-off — capital preservation first; only market-neutral edges.",
         favor=("arbitrage",),
         reduce=("trend",),
-        pause=("momentum", "breakout", "event_driven", "income"),
+        pause=("momentum", "event_driven", "income"),
+        probation=("breakout",),
     ),
 }
 

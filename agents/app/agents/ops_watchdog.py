@@ -177,6 +177,15 @@ class OpsWatchdogAgent(Agent):
                                       f"{_fmt(_w['3d'][:3])} | lagging: "
                                       f"{_fmt(_w['3d'][-3:])}"),
                               extra={"window": "3d"})
+                    _gen = (_w.get("generals") or [])[:5]
+                    if _gen:
+                        _srec("sector_compass", "MARKET",
+                              reason=("generals of the leading sectors -- "
+                                      + ", ".join(
+                                          f"{g['sym']} {g['d1']:+.1f}% today"
+                                          f" ({g['d3']:+.1f}% 3d)"
+                                          for g in _gen)),
+                              extra={"window": "generals"})
                     if _d.today().weekday() == 0 and _w.get("5d"):
                         _srec("sector_compass", "MARKET",
                               reason=("weekly industry read -- leading: "
