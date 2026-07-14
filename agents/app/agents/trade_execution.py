@@ -337,7 +337,11 @@ class TradeExecutionAgent(Agent):
         try:
             import os as _os
             _s = (strategy or "").lower()
-            if _s.startswith(("scalp", "orb", "stms")):
+            # 2026-07-14 (Mike): crypto and forex round-trip the same day
+            # too -- their capital should be as flexible as the stock
+            # intraday lanes, not pinched by held-position conservatism.
+            if (_s.startswith(("scalp", "orb", "stms"))
+                    or str(mt) in ("crypto", "forex")):
                 _ov = float(_os.getenv("TREZO_INTRADAY_OVERFLOW_PCT", "0.25"))
                 budget = budget * (1.0 + max(0.0, _ov))
         except Exception:  # noqa: BLE001

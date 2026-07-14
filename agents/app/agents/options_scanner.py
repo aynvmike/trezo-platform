@@ -496,22 +496,34 @@ class OptionsScannerAgent(Agent):
             _eq = float(getattr(acct, "equity", 0) or 0)
             if int(getattr(acct, "options_approved_level", 0) or 0) < 2:
                 return out
-            # PDT budget: never spend the last day-trade slot.
-            if (_eq < 25000
-                    and int(getattr(acct, "daytrade_count", 0) or 0) >= 3):
+            # PDT: FINRA ELIMINATED the pattern-day-trader rule and the
+            # $25k minimum effective 2026-06-04 (SEC approved 2026-04-14);
+            # only the standard $2k margin-account floor remains. Brokers
+            # may phase in until Oct 2027, so we follow the BROKER: gate
+            # on the margin floor here, and if Alpaca still rejects a day
+            # trade during its phase-in, that reject (caught below) stands
+            # the lane down for the rest of the day.
+            _pdt_floor = float(_oso.getenv("TREZO_PDT_MIN_EQUITY", "2000"))
+            if _eq < _pdt_floor:
                 if f"pdt:{today_s}" not in OptionsScannerAgent._day_fired:
                     OptionsScannerAgent._day_fired.add(f"pdt:{today_s}")
                     from app.agents.activity_log import record as _arec
                     _arec("option_day_skip", "ACCOUNT",
-                          reason=("same-day options paused: 3 day trades "
-                                  "already used this 5-session window "
-                                  "(PDT budget, account under $25k)"),
+                          reason=(f"same-day options paused: equity "
+                                  f"${_eq:,.0f} under the ${_pdt_floor:,.0f} "
+                                  f"margin floor"),
                           extra={"user_id": uid})
+                return out
+            if f"pdtstop:{today_s}" in OptionsScannerAgent._day_fired:
                 return out
             if await _user_halted(client, uid):
                 return out
-            _budget = min(float(_oso.getenv("TREZO_DAY_OPT_USD", "100")),
-                          0.025 * max(_eq, 1.0))
+            # Flexible capital (Mike 2026-07-14): same-day trades give the
+            # money back the same session, so they breathe wider than the
+            # held-position caps -- $300 or 8% of equity by default.
+            _budget = min(float(_oso.getenv("TREZO_DAY_OPT_USD", "300")),
+                          float(_oso.getenv("TREZO_DAY_OPT_PCT", "0.08"))
+                          * max(_eq, 1.0))
             _max_open = int(_oso.getenv("TREZO_DAY_OPT_OPEN", "1"))
             _max_day = int(_oso.getenv("TREZO_DAY_OPT_PER_DAY", "2"))
             _min_mv = float(_oso.getenv("TREZO_DAY_OPT_MIN_MOVE", "0.008"))
@@ -581,13 +593,30 @@ class OptionsScannerAgent(Agent):
             debit = prem * 100.0
             if prem <= 0 or debit > _budget:
                 return out
-            _ctn = max(1, min(2, int(_budget // max(debit, 1.0))))
+            # Profit-probability screen (Mike 2026-07-14: "not cheap or
+            # expensive but the profit probability that can be recovered
+            # in the shortest time"): the ITM-lean strike keeps delta
+            # responsive, and sub-dime / dust premium (< 0.4% of spot) is
+            # lottery-grade -- low odds of a FAST +30%, so it is skipped.
+            if prem < max(0.10, 0.004 * spot):
+                return out
+            # The BUDGET is the cap, not an arbitrary contract count.
+            _ctn = max(1, min(int(_oso.getenv("TREZO_DAY_OPT_CT_MAX", "10")),
+                              int(_budget // max(debit, 1.0))))
             OptionsScannerAgent._day_fired.add(f"D:{today_s}:{sym}")
             order, err = await submit_option_order(
                 str(pick.occ), _ctn, "buy", time_in_force="day",
                 limit_price=round(prem * 1.05, 2))
             from app.agents.activity_log import record as _arec
             if err or not order:
+                _el = str(err or "").lower()
+                if any(t in _el for t in ("pattern day", "day trade", "pdt")):
+                    OptionsScannerAgent._day_fired.add(f"pdtstop:{today_s}")
+                    _arec("option_day_skip", "ACCOUNT",
+                          reason=("broker still enforces day-trade limits "
+                                  "(PDT phase-in) -- same-day lane stands "
+                                  "down for today"),
+                          extra={"user_id": uid})
                 _arec("option_day_blocked", sym,
                       reason=(f"same-day {opt_type} not placed: "
                               f"{str(err)[:100]}"),
@@ -911,7 +940,7 @@ class OptionsScannerAgent(Agent):
                 # Multi-contract when the budget covers cheap contracts
                 # (Mike: 3 contracts x $15 profit = the day's 1%) -- the
                 # 15% fast-take in the re-score needs the count.
-                _ctn = max(1, min(int(_oso.getenv("TREZO_LONG_OPT_CT_MAX", "3")),
+                _ctn = max(1, min(int(_oso.getenv("TREZO_LONG_OPT_CT_MAX", "10")),
                                   int(_budget // max(debit, 1.0))))
                 OptionsScannerAgent._long_fired.add(_ck)
                 order, err = await submit_option_order(
