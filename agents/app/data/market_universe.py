@@ -171,7 +171,7 @@ async def expanded_scan_pool(watchlist_tickers: list[str],
     # ...and the GENERALS of those sectors (Mike 2026-07-14): the biggest
     # names of the leading industries, queued for strategy evaluation so
     # every scanner sees what the market leaders are doing.
-    for g in list(SECTOR_BIAS.get("generals") or [])[:4]:
+    for g in list(SECTOR_BIAS.get("generals") or [])[:6]:
         _gsym = g.get("sym") if isinstance(g, dict) else None
         if _gsym and _gsym not in seen and len(pool) < limit:
             seen.add(_gsym)
@@ -214,12 +214,24 @@ SECTOR_ETFS: dict[str, str] = {
 # The GENERALS (Mike 2026-07-14): the biggest names of each industry --
 # "see what the market industry leaders are doing so the agents can be
 # prepared to enter the trades for the strategies they fit."
+# Mike 2026-07-14: "top 10 leaders -- so many companies can take over a
+# sector position; just two keeps the agents narrow." Ten generals per
+# sector; the compass measures the leading sectors' full benches daily.
 SECTOR_GENERALS: dict[str, list[str]] = {
-    "XLK": ["AAPL", "MSFT"], "XLF": ["JPM", "V"], "XLE": ["XOM", "CVX"],
-    "XLV": ["LLY", "UNH"], "XLI": ["CAT", "GE"], "XLY": ["AMZN", "HD"],
-    "XLP": ["PG", "COST"], "XLU": ["NEE", "DUK"], "XLB": ["LIN", "FCX"],
-    "XLRE": ["PLD", "AMT"], "XLC": ["GOOGL", "META"],
-    "SMH": ["NVDA", "AVGO"], "XBI": ["VRTX", "REGN"], "GDX": ["NEM", "GOLD"],
+    "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "ACN"],
+    "XLF": ["JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "SCHW", "BLK", "AXP"],
+    "XLE": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "WMB"],
+    "XLV": ["LLY", "UNH", "JNJ", "ABBV", "MRK", "TMO", "ABT", "AMGN", "PFE", "ISRG"],
+    "XLI": ["CAT", "GE", "HON", "UNP", "RTX", "BA", "DE", "LMT", "UPS", "ETN"],
+    "XLY": ["AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "BKNG", "TJX", "CMG"],
+    "XLP": ["PG", "COST", "WMT", "KO", "PEP", "PM", "MDLZ", "CL", "TGT", "KMB"],
+    "XLU": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "XEL", "ED", "PCG"],
+    "XLB": ["LIN", "APD", "SHW", "FCX", "ECL", "NEM", "DOW", "DD", "NUE", "VMC"],
+    "XLRE": ["PLD", "AMT", "EQIX", "CCI", "PSA", "O", "SPG", "WELL", "DLR", "AVB"],
+    "XLC": ["GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS", "CHTR", "EA"],
+    "SMH": ["NVDA", "TSM", "AVGO", "ASML", "AMD", "QCOM", "TXN", "INTC", "MU", "AMAT"],
+    "XBI": ["VRTX", "REGN", "GILD", "BIIB", "MRNA", "ALNY", "SRPT", "INCY", "EXEL", "NBIX"],
+    "GDX": ["NEM", "GOLD", "AEM", "WPM", "FNV", "KGC", "AU", "RGLD", "HL", "PAAS"],
 }
 
 # Latest compass result, module-shared. expanded_scan_pool() reads it.
@@ -265,7 +277,7 @@ async def sector_compass() -> dict:
         # agents know what the industry leaders are doing right now.
         gens: list[dict] = []
         for etf in SECTOR_BIAS["leaders"][:3]:
-            for sym in SECTOR_GENERALS.get(etf, [])[:2]:
+            for sym in SECTOR_GENERALS.get(etf, [])[:10]:
                 try:
                     cs = await fetch_stock_candles(sym)
                     cl = [float(c.close) for c in cs] if cs else []

@@ -168,6 +168,8 @@ def _occ_match(occ: str, underlying: str, opt_type: str, strike: float,
 
 class OptionsScannerAgent(Agent):
     _last_rescore: float = 0.0
+    _harvested: set = set()      # option-row ids already sent a harvest order
+    _long_fired: set = set()     # 'L:SYM:date' one-shot guard for long entries
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
@@ -430,12 +432,138 @@ class OptionsScannerAgent(Agent):
         ideas = await self._options_ideas()
         out.extend(ideas)
 
+        # --- 5. DIRECTIONAL: long calls/puts on the leading generals -------
+        longs = await self._run_directional(client)
+        out.extend(longs)
+
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",
                                     payload={"note": "Options scan complete — no actions."}))
         return out
 
     # ----------------------------------------------------------------------
+
+    async def _run_directional(self, client) -> list[AgentMessage]:
+        """LONG calls/puts on the strongest sector GENERALS (Mike 2026-07-14:
+        "trade all level 3 option contracts, not just cash-secured puts").
+
+        Defined-risk premium buying, deliberately tight:
+          - candidates: SECTOR_BIAS generals moving >= 2.5% over 3 days
+          - 1 contract, ~ATM, ~30 DTE, debit capped at TREZO_LONG_OPT_USD
+            (default $120) AND 3% of equity -- the debit IS the max loss
+          - at most TREZO_LONG_OPT_OPEN (2) long options open at once,
+            one shot per underlying per day, one new entry per tick
+          - exits live in the hourly re-score: +40% harvest, -50% cut,
+            and always out by DTE <= 3 (no expiry roulette)
+        Kill switch: TREZO_LONG_OPTIONS=0."""
+        import os as _oso
+        out: list[AgentMessage] = []
+        if _oso.getenv("TREZO_LONG_OPTIONS", "1") != "1":
+            return out
+        try:
+            from app.data.market_universe import SECTOR_BIAS
+            gens = list(SECTOR_BIAS.get("generals") or [])
+        except Exception:  # noqa: BLE001
+            gens = []
+        if not gens:
+            return out
+        try:
+            from app.brokers.alpaca import (
+                alpaca_configured, get_account, submit_option_order,
+            )
+            if not alpaca_configured():
+                return out
+            acct = await get_account()
+            _eq = float(getattr(acct, "equity", 0) or 0)
+            if int(getattr(acct, "options_approved_level", 0) or 0) < 2:
+                return out      # long options need approval level >= 2
+            uid = _oso.getenv("TREZO_PRIMARY_USER_ID", "")
+            if not uid or await _user_halted(client, uid):
+                return out
+            _cap_usd = float(_oso.getenv("TREZO_LONG_OPT_USD", "120"))
+            _max_open = int(_oso.getenv("TREZO_LONG_OPT_OPEN", "2"))
+            _min_d3 = float(_oso.getenv("TREZO_LONG_OPT_MIN_D3", "2.5"))
+
+            def _q_open():
+                return (client.table("options_positions")
+                        .select("id, underlying")
+                        .eq("user_id", uid).eq("status", "open")
+                        .like("strategy", "long_%").execute())
+            _open = (await asyncio.to_thread(_q_open)).data or []
+            if len(_open) >= _max_open:
+                return out
+            _held = {str(x.get("underlying") or "").upper() for x in _open}
+            today_s = date.today().isoformat()
+            for g in gens[:8]:
+                sym = str(g.get("sym") or "").upper()
+                try:
+                    d3 = float(g.get("d3") or 0)
+                except Exception:  # noqa: BLE001
+                    continue
+                _ck = f"L:{sym}:{today_s}"
+                if (not sym or sym in _held or abs(d3) < _min_d3
+                        or _ck in OptionsScannerAgent._long_fired):
+                    continue
+                cnd = await fetch_candles_for(sym, "stock")
+                spot = float(cnd[-1].close) if cnd else 0.0
+                if spot <= 0:
+                    continue
+                opt_type = "call" if d3 > 0 else "put"
+                from datetime import timedelta as _tdl
+                target_exp = (date.today() + _tdl(days=30)).isoformat()
+                from app.brokers.alpaca_data import live_option_pick
+                pick = await live_option_pick(sym, opt_type, spot, target_exp)
+                if not pick:
+                    continue
+                prem = float(getattr(pick, "premium", 0) or 0)
+                debit = prem * 100.0
+                if prem <= 0 or debit > min(_cap_usd, 0.03 * max(_eq, 1.0)):
+                    continue
+                OptionsScannerAgent._long_fired.add(_ck)
+                order, err = await submit_option_order(
+                    str(pick.occ), 1, "buy", time_in_force="day",
+                    limit_price=round(prem * 1.05, 2))
+                from app.agents.activity_log import record as _arec
+                if err or not order:
+                    _arec("option_long_blocked", sym,
+                          reason=f"long {opt_type} not placed: {str(err)[:100]}",
+                          extra={"user_id": uid})
+                    continue
+
+                def _ins(s=sym, ot=opt_type, pk=pick, db=debit, dd=d3):
+                    return client.table("options_positions").insert({
+                        "user_id": uid,
+                        "underlying": s,
+                        "strategy": f"long_{ot}",
+                        "direction": "long",
+                        "option_type": ot,
+                        "strike": float(pk.strike),
+                        "expiration": str(pk.expiration),
+                        "contracts": 1,
+                        "net_premium_usd": -round(db, 2),
+                        "legs": [{"action": "buy", "type": ot,
+                                  "strike": float(pk.strike),
+                                  "premium": float(pk.premium)}],
+                        "notes": (f"Long {ot} on sector general ({dd:+.1f}% "
+                                  f"3d). Placed via Alpaca. Exits: +40% "
+                                  f"harvest / -50% cut / DTE<=3."),
+                    }).execute()
+                await asyncio.to_thread(_ins)
+                _arec("option_long_open", sym, strategy=f"long_{opt_type}",
+                      reason=(f"bought 1 {opt_type.upper()} {pick.strike:g} "
+                              f"exp {str(pick.expiration)[:10]} at "
+                              f"~{prem:.2f} (${debit:.0f} max risk) -- "
+                              f"{sym} leading its sector {d3:+.1f}% over 3d"),
+                      extra={"user_id": uid})
+                out.append(AgentMessage(
+                    agent=self.name, kind="execute",
+                    payload={"user_id": uid, "event": "long_option_open",
+                             "underlying": sym, "occ": str(pick.occ),
+                             "debit_usd": round(debit, 2)}))
+                break   # one new long option per tick, by design
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     async def _settle_expired(self, client) -> list[AgentMessage]:
         today = date.today().isoformat()
@@ -521,6 +649,63 @@ class OptionsScannerAgent(Agent):
                                       + (" -- RISK: thesis deteriorating"
                                          if _risk else " -- healthy")),
                               extra={"user_id": str(lr.get("user_id"))})
+                        # EARLY PREMIUM HARVEST (Mike 2026-07-14: "collect
+                        # the premium and avoid having to wait for the end
+                        # of the contract"). Short premium that has already
+                        # earned most of its credit gets bought back NOW:
+                        # >=60% of max profit any time, or >=35% inside 5
+                        # DTE. Real limit order at the live quote; the
+                        # reconcile pass books the exact realized P&L when
+                        # the leg clears. Long options exit here too:
+                        # +40% harvest, -50% cut, always out by DTE<=3.
+                        try:
+                            import os as _oso
+                            _strat_l = str(lr.get("strategy") or "")
+                            _short = not _strat_l.startswith("long_")
+                            _hk = f"h:{lr.get('id')}"
+                            _fresh = _hk not in OptionsScannerAgent._harvested
+                            if _fresh and _ratio is not None and _prem_now:
+                                _fire = None
+                                if _short:
+                                    _h_at = float(_oso.getenv(
+                                        "TREZO_OPT_HARVEST_AT", "0.40"))
+                                    _h_dte = int(_oso.getenv(
+                                        "TREZO_OPT_HARVEST_DTE", "5"))
+                                    _h_da = float(_oso.getenv(
+                                        "TREZO_OPT_HARVEST_DTE_AT", "0.65"))
+                                    if (_ratio <= _h_at
+                                            or (_dte <= _h_dte
+                                                and _ratio <= _h_da)):
+                                        _fire = ("buy",
+                                                 round(max(0.01, float(_prem_now)) * 1.05, 2),
+                                                 (f"buying back {_otype.upper()} {_strike:g} exp "
+                                                  f"{_exp[:10]} to bank ~{(1.0 - _ratio) * 100:.0f}% "
+                                                  f"of the premium early"))
+                                else:
+                                    if (_ratio >= 1.40 or _ratio <= 0.50
+                                            or _dte <= 3):
+                                        _why = ("+40% target hit" if _ratio >= 1.40
+                                                else ("-50% cut" if _ratio <= 0.50
+                                                      else "DTE<=3 time exit"))
+                                        _fire = ("sell",
+                                                 round(max(0.01, float(_prem_now)) * 0.95, 2),
+                                                 (f"selling to close {_otype.upper()} {_strike:g} "
+                                                  f"exp {_exp[:10]} -- {_why}"))
+                                if _fire:
+                                    OptionsScannerAgent._harvested.add(_hk)
+                                    from app.brokers.alpaca import submit_option_order as _soo
+                                    _o2, _e2 = await _soo(
+                                        _occ, _ct, _fire[0],
+                                        time_in_force="day",
+                                        limit_price=_fire[1])
+                                    _arec("option_harvest", _u,
+                                          strategy=_strat_l,
+                                          reason=(_fire[2] + f" (limit {_fire[1]:.2f})"
+                                                  if not _e2 else
+                                                  f"harvest order failed: {str(_e2)[:90]}"),
+                                          extra={"user_id": str(lr.get("user_id"))})
+                        except Exception:  # noqa: BLE001
+                            pass
                         if _risk:
                             out.append(AgentMessage(
                                 agent=self.name, kind="alert",
@@ -655,14 +840,53 @@ class OptionsScannerAgent(Agent):
                     if matched:
                         continue
                 # No match at the broker -> close it as Reconciled.
-                def _sync_close(rid=r["id"]):
+                # 2026-07-14 (Mike saw a wall of $0 rows): recover the TRUE
+                # exit instead of booking zero. Find the closing fill at
+                # Alpaca for this OCC and book credit-vs-debit properly:
+                # short premium -> credit kept minus the buy-back cost;
+                # long options -> sale proceeds minus the debit paid.
+                realized = 0.0
+                exit_note = " · Reconciled — not present at broker."
+                try:
+                    _credit = float(r.get("net_premium_usd") or 0)
+                    _ctr = int(r.get("contracts") or 1)
+                    _is_long = str(r.get("strategy") or "").startswith("long_")
+                    _occ_r = (f"{str(r['underlying']).upper()}"
+                              f"{str(r['expiration'])[2:4]}{str(r['expiration'])[5:7]}"
+                              f"{str(r['expiration'])[8:10]}"
+                              f"{'C' if str(r['option_type']).lower().startswith('c') else 'P'}"
+                              f"{int(round(float(r['strike']) * 1000)):08d}")
+                    from app.brokers.alpaca import get_recent_closed_orders as _grco
+                    _fills = await _grco(_occ_r, token=token, limit=8)
+                    for f in _fills:
+                        if str(f.get("status", "")) != "filled":
+                            continue
+                        _px = float(f.get("filled_avg_price") or 0)
+                        if _px <= 0:
+                            continue
+                        _amt = _px * 100.0 * _ctr
+                        _side = str(f.get("side", ""))
+                        if _is_long and _side.startswith("sell"):
+                            realized = round(_amt - abs(_credit), 2)
+                            exit_note = (f" · Sold to close at {_px:.2f} -> "
+                                         f"realized ${realized:+.2f}.")
+                            break
+                        if (not _is_long) and _side.startswith("buy"):
+                            realized = round(_credit - _amt, 2)
+                            exit_note = (f" · Bought back at {_px:.2f} -> "
+                                         f"realized ${realized:+.2f}.")
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+
+                def _sync_close(rid=r["id"], pnl=realized, en=exit_note):
                     return (
                         client.table("options_positions")
                         .update({
                             "status": "closed_manual",
-                            "realized_pnl_usd": 0.0,
+                            "realized_pnl_usd": pnl,
                             "closed_at": "now()",
-                            "notes": (notes + " · Reconciled — not present at broker.").strip(" ·"),
+                            "notes": (notes + en).strip(" ·"),
                         })
                         .eq("id", rid)
                         .execute()
