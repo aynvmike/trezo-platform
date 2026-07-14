@@ -33,6 +33,101 @@ from app.paper.engine import close_position, check_and_lock_profit
 # many steps it already banked (exit_reason='profit_step').
 _step_state: dict[str, dict] = {}
 
+# --- SAME-DAY options manager (Mike 2026-07-14) -----------------------
+# The options scanner ticks every 30 minutes -- far too slow for a
+# 0-DTE round trip. This runs on Position Monitor's 60-second heart:
+# +30% is taken the moment it prints, a -25% reversal is sold without
+# hoping ("it reverses way too fast to hope of a comeback"), and
+# nothing is held past 3:45 PM ET.
+_day_opt_last: float = 0.0
+_day_opt_done: set = set()
+
+
+async def _manage_day_options() -> None:
+    global _day_opt_last
+    import os as _os2
+    import time as _t2
+    if (_t2.time() - _day_opt_last) < 55.0:
+        return
+    _day_opt_last = _t2.time()
+    try:
+        from app.runtime.settings import _supabase as _sb
+        client = _sb()
+        if client is None:
+            return
+        import asyncio as _aio
+
+        def _q():
+            return (client.table("options_positions")
+                    .select("id, user_id, underlying, option_type, strike, "
+                            "contracts, net_premium_usd, expiration")
+                    .eq("status", "open").eq("strategy", "option_day")
+                    .limit(4).execute())
+        rows = (await _aio.to_thread(_q)).data or []
+        if not rows:
+            return
+        from datetime import datetime as _dt2
+        from datetime import timezone as _tz2
+        _now = _dt2.now(_tz2.utc)
+        _h = _now.hour + _now.minute / 60.0
+        _force = _h >= 19.75      # 3:45 PM EDT (safely early in EST too)
+        _tp = 1.0 + float(_os2.getenv("TREZO_DAY_OPT_TP", "0.30"))
+        _cut = 1.0 - float(_os2.getenv("TREZO_DAY_OPT_CUT", "0.25"))
+        for r in rows:
+            rid = str(r.get("id"))
+            if rid in _day_opt_done:
+                continue
+            u = str(r.get("underlying") or "").upper()
+            strike = float(r.get("strike") or 0)
+            ct = int(r.get("contracts") or 1)
+            otype = str(r.get("option_type") or "call").lower()
+            exp = str(r.get("expiration") or "")
+            entry = (abs(float(r.get("net_premium_usd") or 0))
+                     / (100.0 * max(ct, 1)))
+            if not u or strike <= 0 or len(exp) < 10 or entry <= 0:
+                continue
+            occ = (f"{u}{exp[2:4]}{exp[5:7]}{exp[8:10]}"
+                   f"{'C' if otype.startswith('c') else 'P'}"
+                   f"{int(round(strike * 1000)):08d}")
+            from app.brokers.alpaca_data import get_option_quote
+            prem = await get_option_quote(occ)
+            if not prem or prem <= 0:
+                if not _force:
+                    continue
+                prem = entry          # force-close blind if the quote is gone
+            ratio = float(prem) / entry
+            why = None
+            if ratio >= _tp:
+                why = (f"+{(_tp - 1) * 100:.0f}% fast take -- "
+                       f"banked the quick move")
+            elif ratio <= _cut:
+                why = (f"-{(1 - _cut) * 100:.0f}% reversal cut -- it "
+                       f"reverses too fast to hope for a comeback")
+            elif _force:
+                why = "3:45 ET force-close -- same-day trades never sleep over"
+            if not why:
+                continue
+            _day_opt_done.add(rid)
+            from app.brokers.alpaca import submit_option_order
+            _o, _e = await submit_option_order(
+                occ, ct, "sell", time_in_force="day",
+                limit_price=round(max(0.01, float(prem)) * 0.95, 2))
+            try:
+                from app.agents.activity_log import record as _rec2
+                _rec2("option_day_exit", u, strategy="option_day",
+                      reason=((f"selling {ct} {otype.upper()} {strike:g} at "
+                               f"~{float(prem):.2f} ({ratio:.2f}x entry) -- "
+                               f"{why}")
+                              if not _e else
+                              f"same-day exit order failed: {str(_e)[:90]}"),
+                      extra={"user_id": str(r.get("user_id"))})
+            except Exception:  # noqa: BLE001
+                pass
+            if _e:
+                _day_opt_done.discard(rid)   # retry on the next pass
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _step_profile(notional: float) -> tuple[float, float]:
     """(first-step trigger, bank fraction) for one position. BIG positions
@@ -496,6 +591,11 @@ class PositionMonitorAgent(Agent):
     _did_initial_reconcile: bool = False
 
     async def tick(self) -> list[AgentMessage]:
+        # Same-day options ride a 60-second leash (Mike 2026-07-14).
+        try:
+            await _manage_day_options()
+        except Exception:  # noqa: BLE001
+            pass
         # Task #32: every 30 min, sync Trezo's open stock positions against
         # Alpaca truth. Catches manual closes / phantoms within 30 min.
         type(self)._recon_tick_counter += 1

@@ -171,6 +171,7 @@ class OptionsScannerAgent(Agent):
     _harvested: set = set()      # option-row ids already sent a harvest order
     _long_fired: set = set()     # 'L:SYM:date' one-shot guard for long entries
     _spread_fired: set = set()   # 'S:date' one-new-spread-per-day guard
+    _day_fired: set = set()      # 'D:date:SYM' same-day entry guards
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
@@ -441,12 +442,195 @@ class OptionsScannerAgent(Agent):
         spreads = await self._run_spreads(client)
         out.extend(spreads)
 
+        # --- 7. SAME-DAY options: morning gamma, managed on a 60s leash ----
+        dayopts = await self._run_same_day(client)
+        out.extend(dayopts)
+
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",
                                     payload={"note": "Options scan complete — no actions."}))
         return out
 
     # ----------------------------------------------------------------------
+
+    async def _run_same_day(self, client) -> list[AgentMessage]:
+        """SAME-DAY OPTIONS (Mike 2026-07-14: bought early enough, an
+        ITM/ATM contract often pays +30% fast -- and if it reverses you
+        SELL, because "it reverses way too fast to hope of a comeback").
+
+        Entries MORNING ONLY (~9:35-11:30 ET); exits live in Position
+        Monitor on its 60-second tick (+30% fast take, -25% reversal cut,
+        force-close 3:45 ET -- never hold into the close). Theta is
+        accepted consciously: this lane rents GAMMA, and either it pays
+        early or we leave. Strikes lean ITM/ATM so delta stays honest.
+        PDT-aware: under $25k equity the 3-day-trades-per-5-sessions
+        budget is shared with the stock scalps -- this lane never spends
+        the last slot. Kill switch TREZO_DAY_OPTIONS=0."""
+        import os as _oso
+        out: list[AgentMessage] = []
+        if _oso.getenv("TREZO_DAY_OPTIONS", "1") != "1":
+            return out
+        uid = _oso.getenv("TREZO_PRIMARY_USER_ID", "")
+        if not uid:
+            return out
+        today_s = date.today().isoformat()
+        try:
+            from datetime import datetime as _dtn
+            from datetime import timezone as _tzn
+            _now = _dtn.now(_tzn.utc)
+            _h = _now.hour + _now.minute / 60.0
+            # ~9:35-11:30 ET: 13.58-15.5 UTC in EDT, 14.58-16.5 in EST --
+            # accept the union (DST-naive, same approach as STMS).
+            if not (13.58 <= _h <= 16.5):
+                return out
+            from app.brokers.alpaca import (
+                alpaca_configured, get_account, get_clock,
+                submit_option_order,
+            )
+            if not alpaca_configured():
+                return out
+            clock = await get_clock()
+            if not clock or not clock.get("is_open"):
+                return out
+            acct = await get_account()
+            _eq = float(getattr(acct, "equity", 0) or 0)
+            if int(getattr(acct, "options_approved_level", 0) or 0) < 2:
+                return out
+            # PDT budget: never spend the last day-trade slot.
+            if (_eq < 25000
+                    and int(getattr(acct, "daytrade_count", 0) or 0) >= 3):
+                if f"pdt:{today_s}" not in OptionsScannerAgent._day_fired:
+                    OptionsScannerAgent._day_fired.add(f"pdt:{today_s}")
+                    from app.agents.activity_log import record as _arec
+                    _arec("option_day_skip", "ACCOUNT",
+                          reason=("same-day options paused: 3 day trades "
+                                  "already used this 5-session window "
+                                  "(PDT budget, account under $25k)"),
+                          extra={"user_id": uid})
+                return out
+            if await _user_halted(client, uid):
+                return out
+            _budget = min(float(_oso.getenv("TREZO_DAY_OPT_USD", "100")),
+                          0.025 * max(_eq, 1.0))
+            _max_open = int(_oso.getenv("TREZO_DAY_OPT_OPEN", "1"))
+            _max_day = int(_oso.getenv("TREZO_DAY_OPT_PER_DAY", "2"))
+            _min_mv = float(_oso.getenv("TREZO_DAY_OPT_MIN_MOVE", "0.008"))
+
+            def _q_open():
+                return (client.table("options_positions")
+                        .select("id").eq("user_id", uid)
+                        .eq("status", "open")
+                        .eq("strategy", "option_day").execute())
+            _openr = (await asyncio.to_thread(_q_open)).data or []
+            if len(_openr) >= _max_open:
+                return out
+            _fired_today = [k for k in OptionsScannerAgent._day_fired
+                            if k.startswith(f"D:{today_s}:")]
+            if len(_fired_today) >= _max_day:
+                return out
+            # Candidates: index ETFs first (true same-day expiries), then
+            # the sector generals -- ranked by TODAY's move + volume pace.
+            try:
+                from app.data.market_universe import SECTOR_BIAS
+                _gs = [str(g.get("sym") or "").upper()
+                       for g in (SECTOR_BIAS.get("generals") or [])]
+            except Exception:  # noqa: BLE001
+                _gs = []
+            cands = ["SPY", "QQQ"] + [s for s in _gs if s][:8]
+            scored = []
+            for sym in cands:
+                if f"D:{today_s}:{sym}" in OptionsScannerAgent._day_fired:
+                    continue
+                cnd = await fetch_candles_for(sym, "stock")
+                if not cnd or len(cnd) < 22:
+                    continue
+                spot = float(cnd[-1].close)
+                prev = float(cnd[-2].close)
+                if spot <= 0 or prev <= 0:
+                    continue
+                mv = spot / prev - 1.0
+                try:
+                    _vols = [float(c.volume or 0) for c in cnd[-21:]]
+                    _v_avg = sum(_vols[:-1]) / max(len(_vols) - 1, 1)
+                    _pace = (_vols[-1] / _v_avg) if _v_avg > 0 else 0.0
+                except Exception:  # noqa: BLE001
+                    _pace = 0.0
+                if abs(mv) >= _min_mv and _pace >= 0.4:
+                    scored.append((abs(mv), mv, _pace, sym, spot))
+            if not scored:
+                return out
+            scored.sort(reverse=True)
+            _, mv, _pace, sym, spot = scored[0]
+            opt_type = "call" if mv > 0 else "put"
+            # ITM-lean strike (Mike: "In the Money or directly at the
+            # line") -- a touch of intrinsic keeps delta honest.
+            strike = round(spot * (0.995 if opt_type == "call" else 1.005), 2)
+            from app.brokers.alpaca_data import live_option_pick
+            pick = await live_option_pick(sym, opt_type, strike, today_s)
+            if not pick:
+                return out
+            _dte_v = 99
+            try:
+                _dte_v = (date.fromisoformat(str(pick.expiration)[:10])
+                          - date.today()).days
+            except Exception:  # noqa: BLE001
+                pass
+            if _dte_v > 5:
+                return out          # this lane trades SHORT-dated only
+            prem = float(getattr(pick, "premium", 0) or 0)
+            debit = prem * 100.0
+            if prem <= 0 or debit > _budget:
+                return out
+            _ctn = max(1, min(2, int(_budget // max(debit, 1.0))))
+            OptionsScannerAgent._day_fired.add(f"D:{today_s}:{sym}")
+            order, err = await submit_option_order(
+                str(pick.occ), _ctn, "buy", time_in_force="day",
+                limit_price=round(prem * 1.05, 2))
+            from app.agents.activity_log import record as _arec
+            if err or not order:
+                _arec("option_day_blocked", sym,
+                      reason=(f"same-day {opt_type} not placed: "
+                              f"{str(err)[:100]}"),
+                      extra={"user_id": uid})
+                return out
+
+            def _ins():
+                return client.table("options_positions").insert({
+                    "user_id": uid,
+                    "underlying": sym,
+                    "strategy": "option_day",
+                    "direction": "long",
+                    "option_type": opt_type,
+                    "strike": float(pick.strike),
+                    "expiration": str(pick.expiration),
+                    "contracts": _ctn,
+                    "net_premium_usd": -round(debit * _ctn, 2),
+                    "legs": [{"action": "buy", "type": opt_type,
+                              "strike": float(pick.strike),
+                              "premium": prem}],
+                    "notes": (f"SAME-DAY rule (Mike): +30% fast take, -25% "
+                              f"reversal cut, force-close 3:45 ET; theta "
+                              f"accepted -- gamma pays early or we leave. "
+                              f"Entry move {mv * 100:+.1f}%, volume pace "
+                              f"{_pace:.1f}x, DTE {_dte_v}. "
+                              f"Placed via Alpaca."),
+                }).execute()
+            await asyncio.to_thread(_ins)
+            _arec("option_day_open", sym, strategy="option_day",
+                  reason=(f"bought {_ctn} same-day {opt_type.upper()} "
+                          f"{pick.strike:g} (DTE {_dte_v}) at ~{prem:.2f} "
+                          f"(${debit * _ctn:.0f} max risk) -- {sym} moving "
+                          f"{mv * 100:+.1f}% on {_pace:.1f}x volume pace; "
+                          f"morning-only entry"),
+                  extra={"user_id": uid})
+            out.append(AgentMessage(
+                agent=self.name, kind="execute",
+                payload={"user_id": uid, "event": "option_day_open",
+                         "underlying": sym, "occ": str(pick.occ),
+                         "debit_usd": round(debit * _ctn, 2)}))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     async def _run_spreads(self, client) -> list[AgentMessage]:
         """DEFINED-RISK MULTI-LEG (Mike 2026-07-14: "I would like for the
