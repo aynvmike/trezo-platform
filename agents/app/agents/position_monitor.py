@@ -399,6 +399,15 @@ async def _maybe_trail_stock_profit(r: dict, price: float) -> float | None:
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
+    # Broker-held rows: the ratchet must move the REAL stop leg too
+    # (Mike 2026-07-14: a DB-only trail protects nothing at Alpaca).
+    try:
+        if str(r.get("broker") or "") == "alpaca":
+            from app.paper.leg_sync import resync_alpaca_legs
+            await resync_alpaca_legs(
+                r, why=f"profit trail ratcheted the stop to {new_stop:.2f}")
+    except Exception:  # noqa: BLE001
+        pass
     return new_stop
 
 

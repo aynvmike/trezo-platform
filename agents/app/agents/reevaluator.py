@@ -299,7 +299,13 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
             return None
 
         # ---- 3) Lower an unrealistic target so it can exit green ---------
-        if lower_on and stale and cur_target is not None:
+        # 2026-07-14 (Mike, the RBLX morning): a REVERSAL now also
+        # triggers the reprice -- not just staleness. When the trade is
+        # giving back its peak and the target sits far away, the sell
+        # comes down to a reachable price instead of watching the move
+        # walk away from it.
+        if (lower_on and (stale or giveback >= TIGHTEN_GIVEBACK)
+                and cur_target is not None):
             far = ((cur_target - price) / price) if is_long else ((price - cur_target) / price)
             if far > TARGET_FAR_PCT:
                 if is_long:
@@ -314,6 +320,13 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                               f"instead of round-tripping.")
                     await _persist(r.get("id"), target_price=new_t)
                     r["target_price"] = new_t
+                    # Push the reprice to the BROKER (Mike 2026-07-14:
+                    # DB-side lowers left the stale sell at Alpaca).
+                    try:
+                        from app.paper.leg_sync import resync_alpaca_legs
+                        await resync_alpaca_legs(r, why=reason[:110])
+                    except Exception:  # noqa: BLE001
+                        pass
                     _last_action[pid] = now
                     await _log(emit, agent_name, user_id, ticker, "lower_target", reason)
                     return {"target": new_t}
@@ -334,6 +347,12 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                           f"to cut the loss sooner.")
                 await _persist(r.get("id"), stop_price=new_s)
                 r["stop_price"] = new_s
+                # Push the tightened stop to the BROKER too.
+                try:
+                    from app.paper.leg_sync import resync_alpaca_legs
+                    await resync_alpaca_legs(r, why=reason[:110])
+                except Exception:  # noqa: BLE001
+                    pass
                 _last_action[pid] = now
                 await _log(emit, agent_name, user_id, ticker, "tighten_stop", reason)
                 return {"stop": new_s}
