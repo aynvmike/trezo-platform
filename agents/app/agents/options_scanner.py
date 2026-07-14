@@ -457,8 +457,10 @@ class OptionsScannerAgent(Agent):
 
         Guardrails: max loss per spread <= TREZO_SPREAD_RISK_USD ($150 --
         the wings ARE the stop), at most TREZO_SPREAD_OPEN (1) open at a
-        time, one NEW spread per day, the credit must be worth >= ~22% of
-        the wing, and the market must be open. Kill switch TREZO_SPREADS=0.
+        time, one NEW spread per day, the credit must be real DOLLARS
+        toward the daily goal (TREZO_SPREAD_MIN_CREDIT, default $20;
+        10% pennies-vs-wing floor), and the market must be open. Kill
+        switch TREZO_SPREADS=0.
         Exits v1: spreads are built to be HELD -- expiry settles them and
         the wings cap the loss; the hourly re-score skips multi-leg rows
         so it never prices one leg as the whole position."""
@@ -533,10 +535,16 @@ class OptionsScannerAgent(Agent):
             if not play:
                 return out
 
-            # Quality gates: worth-the-wing credit, capped max loss.
+            # Mike 2026-07-14: "the credit has to be worth the PROFIT,
+            # not the 22 percent." The gate is DOLLARS toward the daily
+            # goal (>= TREZO_SPREAD_MIN_CREDIT, default $20 -- a real
+            # bite of the $50 rung), with only a pennies-vs-wing sanity
+            # floor (10%) underneath so the math is never broker-bait.
             _credit0 = float(play.net_premium_usd or 0)
             _wing0 = _credit0 + float(play.max_loss_usd or 0)
-            if _credit0 <= 0 or _wing0 <= 0 or (_credit0 / _wing0) < 0.22:
+            _min_credit = float(_oso.getenv("TREZO_SPREAD_MIN_CREDIT", "20"))
+            if (_credit0 < _min_credit or _wing0 <= 0
+                    or (_credit0 / _wing0) < 0.10):
                 return out
             if float(play.max_loss_usd or 0) > _risk_cap:
                 return out
@@ -568,8 +576,8 @@ class OptionsScannerAgent(Agent):
                 })
             if len(mlegs) < 2:
                 return out
-            if net <= 0.05:
-                return out          # live quotes must still pay a credit
+            if net * 100.0 < _min_credit * 0.8:
+                return out          # live quotes must still pay real dollars
 
             # Limit gives 2% toward the fill; negative = net credit (mleg).
             limit = round(-(net * 0.98), 2)
@@ -870,10 +878,10 @@ class OptionsScannerAgent(Agent):
                             import os as _oso
                             _strat_l = str(lr.get("strategy") or "")
                             _short = not _strat_l.startswith("long_")
-                            _hk = f"h:{lr.get('id')}"
+                            _hk = f"h:{lr.get('id')}:{_ct}"
                             _fresh = _hk not in OptionsScannerAgent._harvested
                             if _fresh and _ratio is not None and _prem_now:
-                                _fire = None
+                                _fire = None      # (side, limit, reason, qty)
                                 if _short:
                                     _h_at = float(_oso.getenv(
                                         "TREZO_OPT_HARVEST_AT", "0.40"))
@@ -888,28 +896,85 @@ class OptionsScannerAgent(Agent):
                                                  round(max(0.01, float(_prem_now)) * 1.05, 2),
                                                  (f"buying back {_otype.upper()} {_strike:g} exp "
                                                   f"{_exp[:10]} to bank ~{(1.0 - _ratio) * 100:.0f}% "
-                                                  f"of the premium early"))
+                                                  f"of the premium early"),
+                                                 _ct)
                                 else:
-                                    # Mike 2026-07-14: with several contracts
-                                    # on, take the QUICK 15% and redeploy --
-                                    # 3 contracts x $15 is the day's 1%.
-                                    _tp = (1.15 if _ct >= int(_oso.getenv(
-                                        "TREZO_OPT_FAST_CT", "3")) else 1.40)
-                                    if (_ratio >= _tp or _ratio <= 0.50
-                                            or _dte <= 3):
-                                        _why = (f"+{(_tp - 1) * 100:.0f}% target hit"
-                                                if _ratio >= _tp
-                                                else ("-50% cut" if _ratio <= 0.50
-                                                      else "DTE<=3 time exit"))
+                                    # GOAL-AWARE take-profit (Mike 2026-07-14:
+                                    # "I go for the daily goal of making money
+                                    # instead of a percentage"). The percent
+                                    # needed falls out of the math: dollars
+                                    # still needed for the day divided by what
+                                    # this position controls. More contracts
+                                    # means a smaller percent finishes the job.
+                                    _cost = abs(float(_credit) or 0.0)
+                                    _tp_min = float(_oso.getenv(
+                                        "TREZO_OPT_TP_MIN", "0.10"))
+                                    _tp_max = float(_oso.getenv(
+                                        "TREZO_OPT_TP_MAX", "0.40"))
+                                    _tp = 1.0 + _tp_max
+                                    try:
+                                        from app.paper.daily_goal import (
+                                            goal_state as _dgs2,
+                                        )
+                                        _g2 = await _dgs2(lr.get("user_id"))
+                                        _need = max(
+                                            0.0,
+                                            float(_g2.get("goal") or 0)
+                                            - float(_g2.get("realized") or 0))
+                                        if _cost > 0 and _need > 0:
+                                            _tp = 1.0 + max(
+                                                _tp_min,
+                                                min(_tp_max, _need / _cost))
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    # GREEK-TURN rule (Mike): a green trade
+                                    # whose underlying turns against it gets
+                                    # banked -- take the profit, go find the
+                                    # next one.
+                                    _turn = False
+                                    try:
+                                        if (_cnd and len(_cnd) >= 2
+                                                and float(_cnd[-2].close) > 0):
+                                            _d1 = (_spot
+                                                   / float(_cnd[-2].close)) - 1.0
+                                            _against = (-_d1
+                                                        if _otype.startswith("c")
+                                                        else _d1)
+                                            _turn = bool(_ratio >= 1.05
+                                                         and _against >= 0.005)
+                                    except Exception:  # noqa: BLE001
+                                        _turn = False
+                                    if (_ratio >= _tp or _turn
+                                            or _ratio <= 0.50 or _dte <= 3):
+                                        # STEP-DOWN (Mike): with several
+                                        # contracts, bank the ROI first; the
+                                        # rest reaches for a higher percent on
+                                        # the next step. Cuts, time-outs and
+                                        # Greek turns exit in FULL.
+                                        _qty = _ct
+                                        if (_ct >= 2 and _ratio >= _tp
+                                                and not _turn and _ratio > 0.50
+                                                and _dte > 3):
+                                            _qty = max(1, (_ct + 1) // 2)
+                                        _why = (f"+{(_tp - 1) * 100:.0f}% goal-aware target"
+                                                if _ratio >= _tp else
+                                                ("Greeks turning -- banking the green"
+                                                 if _turn else
+                                                 ("-50% cut" if _ratio <= 0.50
+                                                  else "DTE<=3 time exit")))
+                                        _step_t = (f" (step-down: {_qty} of {_ct})"
+                                                   if _qty < _ct else "")
                                         _fire = ("sell",
                                                  round(max(0.01, float(_prem_now)) * 0.95, 2),
-                                                 (f"selling to close {_otype.upper()} {_strike:g} "
-                                                  f"exp {_exp[:10]} -- {_why}"))
+                                                 (f"selling {_qty}/{_ct} {_otype.upper()} "
+                                                  f"{_strike:g} exp {_exp[:10]} -- "
+                                                  f"{_why}{_step_t}"),
+                                                 _qty)
                                 if _fire:
                                     OptionsScannerAgent._harvested.add(_hk)
                                     from app.brokers.alpaca import submit_option_order as _soo
                                     _o2, _e2 = await _soo(
-                                        _occ, _ct, _fire[0],
+                                        _occ, int(_fire[3]), _fire[0],
                                         time_in_force="day",
                                         limit_price=_fire[1])
                                     _arec("option_harvest", _u,
@@ -918,6 +983,61 @@ class OptionsScannerAgent(Agent):
                                                   if not _e2 else
                                                   f"harvest order failed: {str(_e2)[:90]}"),
                                           extra={"user_id": str(lr.get("user_id"))})
+                                    # Step-down bookkeeping: shrink the open
+                                    # row, book the sold slice at the limit
+                                    # (conservative -- a sell fills at limit
+                                    # or better).
+                                    if ((not _e2) and (not _short)
+                                            and int(_fire[3]) < _ct):
+                                        try:
+                                            _n = int(_fire[3])
+                                            _keep = _ct - _n
+                                            _entry_ps = float(_entry_prem or 0)
+                                            _slice_pnl = round(
+                                                (float(_fire[1]) - _entry_ps)
+                                                * 100.0 * _n, 2)
+
+                                            def _shrink(rid=lr.get("id"),
+                                                        k=_keep,
+                                                        ep=_entry_ps):
+                                                return (client
+                                                        .table("options_positions")
+                                                        .update({
+                                                            "contracts": k,
+                                                            "net_premium_usd":
+                                                                -round(ep * 100.0 * k, 2),
+                                                        })
+                                                        .eq("id", rid)
+                                                        .execute())
+                                            await asyncio.to_thread(_shrink)
+
+                                            def _slice(n=_n, ep=_entry_ps,
+                                                       pnl=_slice_pnl,
+                                                       lim=float(_fire[1])):
+                                                return (client
+                                                        .table("options_positions")
+                                                        .insert({
+                                                            "user_id": lr.get("user_id"),
+                                                            "underlying": _u,
+                                                            "strategy": _strat_l,
+                                                            "direction": "long",
+                                                            "option_type": _otype,
+                                                            "strike": _strike,
+                                                            "expiration": _exp,
+                                                            "contracts": n,
+                                                            "net_premium_usd":
+                                                                -round(ep * 100.0 * n, 2),
+                                                            "status": "closed_partial",
+                                                            "realized_pnl_usd": pnl,
+                                                            "closed_at": "now()",
+                                                            "notes": (f"Step-down: sold {n} of "
+                                                                      f"{_ct} at ~{lim:.2f}; ROI "
+                                                                      f"banked, remainder reaches "
+                                                                      f"for more."),
+                                                        }).execute())
+                                            await asyncio.to_thread(_slice)
+                                        except Exception:  # noqa: BLE001
+                                            pass
                         except Exception:  # noqa: BLE001
                             pass
                         if _risk:
