@@ -102,9 +102,71 @@ async def trigger_direct(name: str):
     return st.snapshot()
 
 
+_LAB_SCAN_CACHE: dict = {}
+
+
+@app.get("/lab/scan", tags=["backtest"])
+async def lab_scan(scope: str = "market", sector: str = "", limit: int = 24):
+    """Market / industry scan for the Strategy Lab (Mike 2026-07-14): hunt
+    beyond the watchlists -- the whole market or one industry -- and save
+    the picks straight into a custom watchlist. Returns movers with 1-day
+    and 3-day moves plus volume pace, and the sector menu for the UI."""
+    import time as _t
+    from app.data.candles import fetch_stock_candles
+    from app.data.market_universe import (
+        SECTOR_ETFS, SECTOR_GENERALS, market_wide_candidates,
+    )
+    key = f"{scope}:{(sector or '').upper()}:{int(limit)}"
+    hit = _LAB_SCAN_CACHE.get(key)
+    if hit and (_t.time() - hit[0]) < 600:
+        return hit[1]
+    syms: list[str] = []
+    if sector and sector.upper() in SECTOR_GENERALS:
+        syms = [sector.upper()] + list(SECTOR_GENERALS[sector.upper()])
+    else:
+        for _etf, names in SECTOR_GENERALS.items():
+            syms.extend(names[:3])
+        try:
+            movers = await market_wide_candidates(limit=30)
+            syms.extend(movers or [])
+        except Exception:  # noqa: BLE001
+            pass
+    seen: set = set()
+    ordered: list[str] = []
+    for s in syms:
+        u = (s or "").upper()
+        if u and u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    out = []
+    for sym in ordered[: max(5, min(int(limit), 40))]:
+        try:
+            cs = await fetch_stock_candles(sym)
+            if not cs or len(cs) < 22:
+                continue
+            cl = [float(c.close) for c in cs]
+            d1 = (cl[-1] / cl[-2] - 1.0) * 100.0 if cl[-2] else 0.0
+            d3 = ((cl[-1] / cl[-4] - 1.0) * 100.0
+                  if len(cl) > 4 and cl[-4] else 0.0)
+            vols = [float(c.volume or 0) for c in cs[-21:]]
+            va = sum(vols[:-1]) / max(len(vols) - 1, 1)
+            vr = (vols[-1] / va) if va > 0 else 0.0
+            out.append({"symbol": sym, "price": round(cl[-1], 2),
+                        "d1": round(d1, 2), "d3": round(d3, 2),
+                        "volume_ratio": round(vr, 2)})
+        except Exception:  # noqa: BLE001
+            continue
+    out.sort(key=lambda x: -abs(x["d3"]))
+    resp = {"available": True, "scope": scope, "sector": (sector or None),
+            "results": out,
+            "sectors": [{"etf": k, "name": v} for k, v in SECTOR_ETFS.items()]}
+    _LAB_SCAN_CACHE[key] = (_t.time(), resp)
+    return resp
+
+
 @app.get("/backtest", tags=["backtest"])
 async def backtest_endpoint(symbol: str, strategy: str = "default",
-                            tcs_threshold: int = 700, period: str = "2y",
+                            tcs_threshold: int = 70, period: str = "2y",
                             stop_pct: float = 0.05, target_pct: float = 0.10):
     """Replay a symbol's history through Trezo's scoring and report the
     win rate, profit factor, drawdown and trade log (#121).
@@ -141,7 +203,7 @@ async def backtest_endpoint(symbol: str, strategy: str = "default",
 
 
 @app.get("/backtest/compare", tags=["backtest"])
-async def backtest_compare_endpoint(symbol: str, tcs_threshold: int = 700,
+async def backtest_compare_endpoint(symbol: str, tcs_threshold: int = 70,
                                     period: str = "2y", stop_pct: float = 0.05,
                                     target_pct: float = 0.10):
     """Run every directional strategy over a symbol's history and report

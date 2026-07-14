@@ -24,7 +24,7 @@ export async function GET(request: Request) {
 
   const { searchParams } = new URL(request.url);
   const symbol = (searchParams.get("symbol") ?? "").trim().toUpperCase();
-  const tcs = searchParams.get("tcs_threshold") ?? "700";
+  const tcs = searchParams.get("tcs_threshold") ?? "70";
   const stopPct = searchParams.get("stop_pct") ?? "0.05";
   const targetPct = searchParams.get("target_pct") ?? "0.10";
   if (!symbol) {

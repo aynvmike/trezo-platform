@@ -200,15 +200,17 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
   );
   const [compareAll, setCompareAll] = useState(true);
   const [symbol, setSymbol] = useState("");
-  const [watchlistId, setWatchlistId] = useState(() => {
+  // Mike 2026-07-14: merge watchlists -- pick several, or ALL at once.
+  const [selIds, setSelIds] = useState<string[]>(() => {
     const seeded =
       watchlists.find((w) => w.is_default && w.tickers.length > 0) ??
       watchlists.find((w) => w.tickers.length > 0) ??
       watchlists[0];
-    return seeded?.id ?? "";
+    return seeded ? [seeded.id] : [];
   });
+  const [allLists, setAllLists] = useState(false);
   const [strategy, setStrategy] = useState("default");
-  const [tcs, setTcs] = useState(650);
+  const [tcs, setTcs] = useState(65);
   const [stopPct, setStopPct] = useState(5);
   const [targetPct, setTargetPct] = useState(10);
   // Starting capital for the P&L display tiles below each result. The
@@ -297,15 +299,35 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
   }
 
   async function runWatchlist() {
-    const wl = watchlists.find((w) => w.id === watchlistId);
-    if (!wl) {
-      setError("Pick a watchlist to backtest.");
+    const chosen = allLists
+      ? watchlists
+      : watchlists.filter((w) => selIds.includes(w.id));
+    if (chosen.length === 0) {
+      setError("Pick at least one watchlist to backtest.");
       return;
     }
-    // Options are not directional stop/target trades — skip them.
-    const testable = wl.tickers.filter((t) => t.asset_type !== "option");
+    // Merge + dedupe across every chosen list. Options are not
+    // directional stop/target trades — skip them.
+    const seen = new Set<string>();
+    const testable: { ticker: string; asset_type: string }[] = [];
+    for (const w of chosen) {
+      for (const t of w.tickers) {
+        if (t.asset_type === "option") continue;
+        const u = t.ticker.toUpperCase();
+        if (!seen.has(u)) {
+          seen.add(u);
+          testable.push(t);
+        }
+      }
+    }
+    const wl = {
+      name:
+        chosen.length === 1
+          ? chosen[0].name
+          : `Merged — ${chosen.length} lists`
+    };
     if (testable.length === 0) {
-      setError("That watchlist has no stocks or crypto to backtest.");
+      setError("Those watchlists have no stocks or crypto to backtest.");
       return;
     }
     setLoading(true);
@@ -376,10 +398,16 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
     cancelRef.current = true;
   }
 
-  const selectedList = watchlists.find((w) => w.id === watchlistId);
-  const selectedCount = selectedList
-    ? selectedList.tickers.filter((t) => t.asset_type !== "option").length
-    : 0;
+  const mergedForCount = allLists
+    ? watchlists
+    : watchlists.filter((w) => selIds.includes(w.id));
+  const selectedCount = (() => {
+    const s = new Set<string>();
+    for (const w of mergedForCount)
+      for (const t of w.tickers)
+        if (t.asset_type !== "option") s.add(t.ticker.toUpperCase());
+    return s.size;
+  })();
 
   const runLabel = (() => {
     if (loading) return "Running…";
@@ -462,20 +490,42 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
             </div>
           ) : (
             <div className="space-y-1 col-span-2 sm:col-span-1">
-              <Label htmlFor="bt-watchlist">Watchlist</Label>
-              <select
-                id="bt-watchlist"
-                value={watchlistId}
-                onChange={(e) => setWatchlistId(e.target.value)}
-                className="flex h-10 w-full rounded-md border border-weave-200 bg-white px-3 py-2 text-sm text-weave-800 focus:outline-none focus:ring-2 focus:ring-weave-500"
-              >
-                {watchlists.length === 0 && <option value="">No watchlists</option>}
+              <Label>Watchlists (merged)</Label>
+              <div className="rounded-md border border-weave-200 bg-white px-3 py-2 space-y-1 max-h-36 overflow-auto">
+                <label className="flex items-center gap-2 text-sm font-medium text-weave-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allLists}
+                    onChange={(e) => setAllLists(e.target.checked)}
+                  />
+                  <span>All watchlists at once</span>
+                </label>
                 {watchlists.map((w) => (
-                  <option key={w.id} value={w.id}>
-                    {w.name} ({w.tickers.length})
-                  </option>
+                  <label
+                    key={w.id}
+                    className={cn(
+                      "flex items-center gap-2 text-sm text-weave-700 cursor-pointer",
+                      allLists && "opacity-50"
+                    )}
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={allLists}
+                      checked={selIds.includes(w.id)}
+                      onChange={(e) =>
+                        setSelIds((p) =>
+                          e.target.checked
+                            ? [...p, w.id]
+                            : p.filter((x) => x !== w.id)
+                        )
+                      }
+                    />
+                    <span>
+                      {w.name} ({w.tickers.length})
+                    </span>
+                  </label>
                 ))}
-              </select>
+              </div>
             </div>
           )}
           <div className="space-y-1 col-span-2 sm:col-span-1">

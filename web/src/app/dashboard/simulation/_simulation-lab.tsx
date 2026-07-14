@@ -155,7 +155,7 @@ export function SimulationLab({ watchlists }: { watchlists: Watchlist[] }) {
   const [watchlistId, setWatchlistId] = useState(initialId);
   const [days, setDays] = useState(7);
   const [equity, setEquity] = useState(10_000);
-  const [tcs, setTcs] = useState(650);
+  const [tcs, setTcs] = useState(65);
   const [compareAll, setCompareAll] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

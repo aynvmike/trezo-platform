@@ -11,6 +11,7 @@ import { PatternsBoard } from "@/app/dashboard/patterns/_patterns-board";
 import { BacktestRunner } from "@/app/dashboard/backtest/_backtest-runner";
 import { SimulationLab } from "@/app/dashboard/simulation/_simulation-lab";
 import { StrategyLabTabs } from "./_tabs";
+import { MarketScanPanel } from "@/app/dashboard/simulation/_market-scan";
 
 export const dynamic = "force-dynamic";
 
@@ -33,6 +34,27 @@ export default async function StrategyLabPage({
   const watchlists = await listWatchlistsWithTickers(user.id);
   const symbols = items.map((i) => i.ticker);
 
+  // Live Patterns follows the PORTFOLIO (Mike 2026-07-14): chart what the
+  // book actually holds right now; fall back to the watchlist when flat.
+  const { data: openPos } = await supabase
+    .from("paper_positions")
+    .select("ticker, asset_type")
+    .eq("user_id", user.id)
+    .eq("status", "open");
+  const { data: openOpt } = await supabase
+    .from("options_positions")
+    .select("underlying")
+    .eq("user_id", user.id)
+    .eq("status", "open");
+  const held = Array.from(
+    new Set([
+      ...(openPos ?? [])
+        .filter((p) => p.asset_type !== "forex")
+        .map((p) => String(p.ticker).toUpperCase()),
+      ...(openOpt ?? []).map((o) => String(o.underlying).toUpperCase())
+    ])
+  );
+
   const raw = (searchParams?.tab || "patterns").toLowerCase();
   const tab: Tab =
     raw === "backtest" || raw === "simulation" ? (raw as Tab) : "patterns";
@@ -48,7 +70,7 @@ export default async function StrategyLabPage({
       <StrategyLabTabs />
 
       {tab === "patterns" && (
-        <PatternsTab listName={list.name} symbols={symbols} />
+        <PatternsTab listName={list.name} symbols={symbols} held={held} />
       )}
       {tab === "backtest" && <BacktestTab watchlists={watchlists} />}
       {tab === "simulation" && <SimulationTab watchlists={watchlists} />}
@@ -56,33 +78,49 @@ export default async function StrategyLabPage({
   );
 }
 
-function PatternsTab({ listName, symbols }: { listName: string; symbols: string[] }) {
+function PatternsTab({ listName, symbols, held }: { listName: string; symbols: string[]; held: string[] }) {
+  const showHeld = held.length > 0;
+  const show = showHeld ? held : symbols;
   return (
     <section className="space-y-6">
       <p className="beginner-only text-sm text-weave-600 leading-relaxed">
-        The bot scans your{" "}
-        <span className="font-medium text-weave-800">{listName}</span>{" "}
-        watchlist for 12 candlestick patterns across multiple timeframes,
-        scoring each ticker from 0 to 1000. Higher means a stronger setup;
-        each card shows a snapshot of the price action it scored.
+        {showHeld ? (
+          <>
+            Showing the{" "}
+            <span className="font-medium text-weave-800">
+              {held.length} position{held.length === 1 ? "" : "s"} the
+              portfolio holds right now
+            </span>{" "}
+            — the bot re-scores 12 candlestick patterns across multiple
+            timeframes on every name it is actually in (0 to 100). When the
+            book is flat this falls back to your {listName} watchlist.
+          </>
+        ) : (
+          <>
+            The portfolio is flat, so the bot scans your{" "}
+            <span className="font-medium text-weave-800">{listName}</span>{" "}
+            watchlist for 12 candlestick patterns across multiple timeframes,
+            scoring each ticker from 0 to 100.
+          </>
+        )}
       </p>
-      <PatternsBoard symbols={symbols} />
+      <PatternsBoard symbols={show} />
       <Disclosure title="How the score breaks down">
         <div className="space-y-4">
           <div className="space-y-1">
-            <p className="font-medium text-weave-800">The outer score (TCS, 0–1000)</p>
+            <p className="font-medium text-weave-800">The outer score (TCS, 0–100)</p>
             <ul className="list-disc list-inside space-y-0.5">
-              <li><span className="font-medium">Technical / pattern (300 max)</span> — the 10 factors below plus a multi-timeframe confluence bonus.</li>
-              <li><span className="font-medium">Options environment (250 max)</span> — IV rank in the 30–60 sweet spot gives full credit.</li>
-              <li><span className="font-medium">Fundamental / event (200 max)</span> — a news catalyst today.</li>
-              <li><span className="font-medium">Risk/reward (150 max)</span> — bracket vs the stop/target.</li>
-              <li><span className="font-medium">Market conditions (100 max)</span> — SPY trend + confluence width.</li>
+              <li><span className="font-medium">Technical / pattern (30 max)</span> — the 10 factors below plus a multi-timeframe confluence bonus.</li>
+              <li><span className="font-medium">Options environment (25 max)</span> — IV rank in the 30–60 sweet spot gives full credit.</li>
+              <li><span className="font-medium">Fundamental / event (20 max)</span> — a news catalyst today.</li>
+              <li><span className="font-medium">Risk/reward (15 max)</span> — bracket vs the stop/target.</li>
+              <li><span className="font-medium">Market conditions (10 max)</span> — SPY trend + confluence width.</li>
             </ul>
           </div>
           <p className="text-weave-500 text-xs">
-            A TCS around 600 means roughly 60% of the available factors
-            are firing. A TCS of 700+ means a broad, multi-factor agreement,
-            which is why that&apos;s the live-trade threshold.
+            A TCS around 60 means roughly 60% of the available factors are
+            firing; 70+ is broad multi-factor agreement. The live-trade bar
+            is your Bot Tuning threshold plus any regime bump.
           </p>
         </div>
       </Disclosure>
@@ -118,6 +156,7 @@ function SimulationTab({ watchlists }: { watchlists: { id: string; name: string;
         trades that would have fired. When a ticker looks good you can
         promote it straight into Core Winners.
       </p>
+      <MarketScanPanel />
       <SimulationLab watchlists={watchlists} />
       <p className="beginner-only text-xs text-weave-500 leading-relaxed">
         Each trade is sized as a fixed fraction (25%) of the starting
