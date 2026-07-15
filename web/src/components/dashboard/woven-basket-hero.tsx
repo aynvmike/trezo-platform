@@ -13,7 +13,7 @@
  */
 
 export type HeroLayer = { id: number; name: string; status: string; pnl: number };
-export type HeroGoal = { goal: number; label: string; realized: number; hit: boolean; pct: number };
+export type HeroGoal = { goal: number; label: string; realized: number; hit: boolean; pct: number; week_goal?: number | null; week_realized?: number | null };
 
 const SAMPLE: HeroLayer[] = [
   { id: 1, name: "Crypto", status: "active", pnl: 417.5 },
@@ -139,6 +139,11 @@ export function WovenBasketHero({ layers, goal }: { layers?: HeroLayer[]; goal?:
                   <div className="h-full rounded-full" style={{ width: goal.pct + "%", background: goal.hit ? "rgb(16 185 129)" : "rgb(var(--primary))" }} />
                 </div>
                 <div className="text-[10px] tracking-wide text-[rgb(var(--muted-foreground))]">{"DAILY GOAL \u00b7 " + goal.label.toUpperCase()}</div>
+                {goal.week_realized != null && goal.week_goal ? (
+                  <div className="mt-0.5 text-[10px] text-[rgb(var(--muted-foreground))]" title="The weekly cushion: surplus days cover the short ones.">
+                    {"week " + (goal.week_realized < 0 ? "-$" : "$") + Math.abs(goal.week_realized).toFixed(0) + " of $" + goal.week_goal.toFixed(0)}
+                  </div>
+                ) : null}
               </div>
             ) : null}
             <div className="ml-auto flex gap-1.5">

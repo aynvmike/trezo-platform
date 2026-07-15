@@ -39,6 +39,8 @@ async function fetchDailyGoal(): Promise<HeroGoal | null> {
       realized: j.realized ?? 0,
       hit: !!j.hit,
       pct: j.pct ?? 0,
+      week_goal: j.week_goal ?? null,
+      week_realized: j.week_realized ?? null,
     };
   } catch {
     return null;
