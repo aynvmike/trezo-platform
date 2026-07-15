@@ -83,11 +83,26 @@ export async function ExitAdvisorAlerts() {
   if (alerts.length === 0) return null;
 
   return (
-    <section className="space-y-2">
+    <section
+      className={
+        // Mike 2026-07-15: the alert stack was pushing the Trading page a
+        // full screen down. On wide displays it now FLOATS as a pinned,
+        // scrollable card on the right rail (sharing the "what's
+        // happening" role with the activity ticker); on smaller screens
+        // it stays inline but scrolls INSIDE a capped card instead of
+        // growing the page.
+        "space-y-2 " +
+        "min-[1900px]:fixed min-[1900px]:right-5 min-[1900px]:top-24 " +
+        "min-[1900px]:w-[350px] min-[1900px]:z-40 min-[1900px]:rounded-2xl " +
+        "min-[1900px]:border min-[1900px]:border-weave-200 " +
+        "min-[1900px]:bg-white/95 min-[1900px]:backdrop-blur " +
+        "min-[1900px]:shadow-lg min-[1900px]:p-3"
+      }
+    >
       <h2 className="text-xs font-medium uppercase tracking-widest text-weave-500">
-        Exit advisor — needs your eyes
+        Exit advisor — needs your eyes ({alerts.length})
       </h2>
-      <div className="space-y-2">
+      <div className="space-y-2 max-h-[38vh] min-[1900px]:max-h-[64vh] overflow-y-auto pr-1">
         {alerts.map((a) => {
           const tone =
             a.severity === "urgent"
