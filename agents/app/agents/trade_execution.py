@@ -343,6 +343,27 @@ class TradeExecutionAgent(Agent):
             if (_s.startswith(("scalp", "orb", "stms"))
                     or str(mt) in ("crypto", "forex")):
                 _ov = float(_os.getenv("TREZO_INTRADAY_OVERFLOW_PCT", "0.25"))
+                # SURGE days (Mike 2026-07-14): when the generals run on
+                # heavy volume, the fast lanes stretch +50% -- catch the
+                # wave, sell by the rules, recycle the capital.
+                try:
+                    from app.data.market_universe import surge_day
+                    if surge_day():
+                        _ov = max(_ov, float(_os.getenv(
+                            "TREZO_SURGE_OVERFLOW_PCT", "0.50")))
+                        import datetime as _dtm
+                        _tdy = _dtm.date.today().isoformat()
+                        if getattr(surge_day, "_logged", "") != _tdy:
+                            surge_day._logged = _tdy  # type: ignore[attr-defined]
+                            from app.agents.activity_log import record as _arec
+                            _arec("pocket_surge", "MARKET",
+                                  reason=("hot-volume day: fast-lane pockets "
+                                          "stretched +50% (surge overflow) -- "
+                                          "catch the wave, sell by the rules, "
+                                          "recycle"),
+                                  extra={})
+                except Exception:  # noqa: BLE001
+                    pass
                 budget = budget * (1.0 + max(0.0, _ov))
         except Exception:  # noqa: BLE001
             pass

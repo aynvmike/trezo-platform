@@ -239,6 +239,27 @@ SECTOR_BIAS: dict = {"as_of": "", "leaders": [], "laggards": [],
                      "generals": [], "windows": {}}
 
 
+def surge_day() -> bool:
+    """True when the leading sectors' generals run HOT: median volume
+    pace >= 1.4x average AND mean |1-day| move >= 1.0%. Mike 2026-07-14:
+    "the market has been seeing multiple raises in volume across a few
+    stocks... the variability can be increased to use a variable of 50
+    percent more so it can catch the volume increases." On these days
+    trade_execution widens the fast-lane pocket overflow to
+    TREZO_SURGE_OVERFLOW_PCT (default +50%)."""
+    try:
+        gens = list(SECTOR_BIAS.get("generals") or [])
+        vps = sorted(float(g.get("vp") or 0) for g in gens if g.get("vp"))
+        if len(vps) < 4:
+            return False
+        med = vps[len(vps) // 2]
+        avg_d1 = (sum(abs(float(g.get("d1") or 0)) for g in gens)
+                  / max(len(gens), 1))
+        return med >= 1.4 and avg_d1 >= 1.0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def sector_compass() -> dict:
     """Rank the sector ETFs by 3/5/21-trading-day percent moves.
 
@@ -282,10 +303,13 @@ async def sector_compass() -> dict:
                     cs = await fetch_stock_candles(sym)
                     cl = [float(c.close) for c in cs] if cs else []
                     if len(cl) >= 4 and cl[-2] and cl[-4]:
+                        _v = [float(c.volume or 0) for c in cs[-21:]]
+                        _va = sum(_v[:-1]) / max(len(_v) - 1, 1)
                         gens.append({
                             "sym": sym, "sector": etf,
                             "d1": round((cl[-1] / cl[-2] - 1.0) * 100.0, 2),
                             "d3": round((cl[-1] / cl[-4] - 1.0) * 100.0, 2),
+                            "vp": round((_v[-1] / _va) if _va > 0 else 0.0, 2),
                         })
                 except Exception:  # noqa: BLE001
                     continue

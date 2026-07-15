@@ -645,6 +645,7 @@ export function BacktestRunner({ watchlists }: { watchlists: Watchlist[] }) {
           order={ranList.order}
           compare={ranList.compare}
           rows={rows}
+          startingCapital={startingCapital}
           expanded={expanded}
           onToggle={(t) => setExpanded((cur) => (cur === t ? null : t))}
         />
@@ -751,6 +752,7 @@ function WatchlistResults({
   order,
   compare,
   rows,
+  startingCapital,
   expanded,
   onToggle
 }: {
@@ -758,9 +760,16 @@ function WatchlistResults({
   order: string[];
   compare: boolean;
   rows: Record<string, RowState>;
+  startingCapital: number;
   expanded: string | null;
   onToggle: (t: string) => void;
 }) {
+  // "Teach the agents" — the structured results already persist to
+  // backtest_runs (the per-stock selector reads them); this also writes
+  // the standouts into shared agent memory (Mike 2026-07-14).
+  const [teaching, setTeaching] = useState(false);
+  const [taught, setTaught] = useState<number | null>(null);
+  const [teachErr, setTeachErr] = useState<string | null>(null);
   const done = order.filter((t) => {
     const s = rows[t]?.status;
     return s === "ok" || s === "error";
@@ -804,6 +813,39 @@ function WatchlistResults({
 
   const running = done < order.length;
 
+  // Capital story (Mike 2026-07-14: "not showing the total picture such
+  // as starting capital and ending capital") — equal-weight the basket.
+  const endingCapital = startingCapital * (1 + avgReturn / 100);
+
+  async function teach() {
+    setTeaching(true);
+    setTeachErr(null);
+    try {
+      const payload = {
+        name: listName,
+        rows: okViews.map((x) => ({
+          symbol: x.t,
+          strategy: x.view.strat.strategy,
+          return_pct: x.view.strat.total_return_pct,
+          win_rate: x.view.strat.win_rate,
+          trades: x.view.strat.trades
+        }))
+      };
+      const r = await fetch("/api/lab/teach", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const body = (await r.json()) as { ok?: boolean; noted?: number; error?: string };
+      if (body.error || !body.ok) setTeachErr(body.error ?? "Teach failed.");
+      else setTaught(body.noted ?? 0);
+    } catch {
+      setTeachErr("The agents service could not be reached.");
+    } finally {
+      setTeaching(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div>
@@ -816,7 +858,12 @@ function WatchlistResults({
       </div>
 
       {okViews.length > 0 && (
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-5">
+          <Metric
+            label="Capital story"
+            value={`$${Math.round(startingCapital).toLocaleString()} → $${Math.round(endingCapital).toLocaleString()}`}
+            tone={endingCapital >= startingCapital ? "good" : "bad"}
+          />
           <Metric
             label="Average return"
             value={`${avgReturn >= 0 ? "+" : ""}${avgReturn.toFixed(1)}%`}
@@ -847,6 +894,29 @@ function WatchlistResults({
             value={worst ? `${worst.t}  ${fmtPct(worst.v)}` : "—"}
             tone="bad"
           />
+        </div>
+      )}
+
+      {!running && compare && okViews.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            size="sm"
+            onClick={teach}
+            disabled={teaching || taught !== null}
+          >
+            {teaching
+              ? "Teaching…"
+              : taught !== null
+                ? `Taught — ${taught} memory notes written`
+                : "Teach the agents this run"}
+          </Button>
+          <p className="text-xs text-weave-500 max-w-xl">
+            Every run already lands in the backtest history the per-stock
+            selector reads (net-loss strategies get dropped, winners break
+            ties). This button also writes the standouts into shared agent
+            memory so they recall them on the next scan.
+          </p>
+          {teachErr && <p className="text-xs text-red-600">{teachErr}</p>}
         </div>
       )}
 

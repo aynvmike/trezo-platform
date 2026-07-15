@@ -102,6 +102,61 @@ async def trigger_direct(name: str):
     return st.snapshot()
 
 
+@app.post("/lab/teach", tags=["backtest"])
+async def lab_teach(payload: dict):
+    """Push a Strategy Lab run into the agents' SHARED MEMORY (Mike
+    2026-07-14: "upload this for the agents' memory"). The structured
+    half already happens automatically -- every lab run lands in
+    backtest_runs, which the per-stock selector reads (net-loss
+    strategies are dropped, history breaks ties). This adds the
+    narrative half: compact Mem0 notes the agents RECALL when they next
+    look at these tickers, plus one visible activity line."""
+    try:
+        rows = list((payload or {}).get("rows") or [])[:60]
+        name = str((payload or {}).get("name") or "lab run")[:60]
+        if not rows:
+            return {"ok": False, "error": "no rows"}
+        from app.memory import get_memory
+        mem = get_memory()
+        noted = 0
+        for r in sorted(rows,
+                        key=lambda x: -float(x.get("return_pct") or 0))[:20]:
+            sym = str(r.get("symbol") or "").upper()
+            strat = str(r.get("strategy") or "?")
+            ret = float(r.get("return_pct") or 0)
+            wr = float(r.get("win_rate") or 0)
+            tr = int(r.get("trades") or 0)
+            if not sym:
+                continue
+            try:
+                mem.queue_note(
+                    "strategy_lab",
+                    (f"lab[{name}]: {sym} best={strat} ret {ret:+.1f}% "
+                     f"win {wr * 100:.0f}% ({tr} trades)"),
+                    ticker=sym)
+                noted += 1
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            from app.agents.activity_log import record as _arec
+            _tops = sorted(rows,
+                           key=lambda x: -float(x.get("return_pct") or 0))[:3]
+            _arec("lab_teach", "MARKET",
+                  reason=(f"Strategy Lab run '{name}' taught to the agents: "
+                          f"{len(rows)} symbols in backtest history + "
+                          f"{noted} memory notes. Standouts: "
+                          + ", ".join(
+                              f"{t.get('symbol')} "
+                              f"{float(t.get('return_pct') or 0):+.0f}% "
+                              f"({t.get('strategy')})" for t in _tops)),
+                  extra={})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "noted": noted, "rows": len(rows)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+
+
 _LAB_SCAN_CACHE: dict = {}
 
 
@@ -157,6 +212,28 @@ async def lab_scan(scope: str = "market", sector: str = "", limit: int = 24):
         except Exception:  # noqa: BLE001
             continue
     out.sort(key=lambda x: -abs(x["d3"]))
+    # News sentiment lens (Mike 2026-07-14: "news sentiment ... can also
+    # play a role in the market") -- 2-day keyword sentiment on the
+    # leaders, from the same Finnhub pass the Market Sentiment agent uses.
+    try:
+        from app.data.news import assess, fetch_company_news
+        for row in out[:12]:
+            try:
+                items = await fetch_company_news(row["symbol"], days=2)
+                row["news_n"] = len(items or [])
+                if not items:
+                    continue
+                scores = [float(assess(it).sentiment_score or 0)
+                          for it in items[:8]]
+                avg = sum(scores) / max(len(scores), 1)
+                row["news_score"] = round(avg, 2)
+                row["news_sent"] = ("bullish" if avg >= 0.15
+                                    else "bearish" if avg <= -0.15
+                                    else "neutral")
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
     resp = {"available": True, "scope": scope, "sector": (sector or None),
             "results": out,
             "sectors": [{"etf": k, "name": v} for k, v in SECTOR_ETFS.items()]}

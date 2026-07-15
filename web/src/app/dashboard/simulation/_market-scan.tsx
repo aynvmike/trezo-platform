@@ -20,6 +20,8 @@ type ScanRow = {
   d1: number;
   d3: number;
   volume_ratio: number;
+  news_n?: number;
+  news_sent?: "bullish" | "bearish" | "neutral";
 };
 type ScanResp = {
   error?: string;
@@ -163,6 +165,7 @@ export function MarketScanPanel() {
                   <th className="py-2 pr-4">Today</th>
                   <th className="py-2 pr-4">3-day</th>
                   <th className="py-2 pr-4">Volume vs avg</th>
+                  <th className="py-2 pr-4">News (2d)</th>
                 </tr>
               </thead>
               <tbody>
@@ -191,6 +194,23 @@ export function MarketScanPanel() {
                       {r.d3.toFixed(1)}%
                     </td>
                     <td className="py-1.5 pr-4">{r.volume_ratio.toFixed(1)}x</td>
+                    <td className="py-1.5 pr-4">
+                      {r.news_sent ? (
+                        <span
+                          className={
+                            r.news_sent === "bullish"
+                              ? "text-emerald-600"
+                              : r.news_sent === "bearish"
+                                ? "text-red-600"
+                                : "text-weave-500"
+                          }
+                        >
+                          {r.news_sent} ({r.news_n})
+                        </span>
+                      ) : (
+                        <span className="text-weave-400">—</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
