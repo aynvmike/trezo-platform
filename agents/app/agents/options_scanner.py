@@ -173,6 +173,7 @@ class OptionsScannerAgent(Agent):
     _spread_fired: set = set()   # 'S:date' one-new-spread-per-day guard
     _day_fired: set = set()      # 'D:date:SYM' same-day entry guards
     _short_low: dict = {}        # row id -> lowest premium ratio seen (short legs)
+    _short_step: dict = {}       # row id -> ratio at which the last step fired
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
@@ -1111,47 +1112,77 @@ class OptionsScannerAgent(Agent):
                                         "TREZO_OPT_HARVEST_DTE_AT", "0.65"))
                                     _step_at = float(_oso.getenv(
                                         "TREZO_OPT_STEP_AT", "0.50"))
-                                    _step2_at = float(_oso.getenv(
-                                        "TREZO_OPT_STEP2_AT", "0.35"))
+                                    _step_gap = float(_oso.getenv(
+                                        "TREZO_OPT_STEP_GAP", "0.10"))
+                                    _exhaust = float(_oso.getenv(
+                                        "TREZO_OPT_EXHAUST", "0.08"))
                                     _rid = str(lr.get("id"))
                                     _lowmap = OptionsScannerAgent._short_low
+                                    _stepmap = OptionsScannerAgent._short_step
                                     _low = min(float(_lowmap.get(_rid, _ratio)),
                                                float(_ratio))
                                     _lowmap[_rid] = _low
+                                    # Volatility buffer (Mike's 5/8 rule):
+                                    # calm tape ~5%, wild tape ~8%.
+                                    _buf = 0.05
+                                    try:
+                                        _cls = [float(c.close)
+                                                for c in (_cnd or [])[-15:]]
+                                        if len(_cls) >= 10:
+                                            _rets = [abs(_cls[i] / _cls[i - 1] - 1.0)
+                                                     for i in range(1, len(_cls))]
+                                            _dv = sum(_rets) / len(_rets)
+                                            _buf = max(0.05, min(0.08,
+                                                       0.05 + (_dv - 0.008) * (0.03 / 0.017)))
+                                    except Exception:  # noqa: BLE001
+                                        _buf = 0.05
                                     _qty_s = _ct
                                     _why_s = None
                                     if _ct >= 2:
-                                        # STEP 1 at 50% earned: half out.
-                                        # STEP 2 at 65% earned: the rest.
-                                        if _ratio <= _step2_at:
-                                            _why_s = (f"step 2: ~{(1 - _ratio) * 100:.0f}% "
-                                                      f"of max profit earned -- closing out")
-                                        elif _ratio <= (1.0 - _step_at):
+                                        # STEP OUT (Mike 2026-07-15): half at
+                                        # 50% earned; each NEXT step demands
+                                        # ~10pts more profit than the last;
+                                        # the remainder reaches for 65% PLUS
+                                        # with NO ceiling -- the ratcheting
+                                        # 5/8 floor catches the drawdown
+                                        # before the last contracts give it
+                                        # back. Only exhaustion (~92%) or
+                                        # DTE ends the ride by rule.
+                                        _prev = _stepmap.get(_rid)
+                                        _next_th = ((1.0 - _step_at)
+                                                    if _prev is None
+                                                    else float(_prev) - _step_gap)
+                                        if (_prev is not None
+                                                and _ratio >= _low + _buf):
+                                            _why_s = (f"profit floor: premium re-inflated "
+                                                      f"{(_ratio - _low) * 100:.0f}pts off its low "
+                                                      f"(vol buffer {_buf * 100:.0f}%) -- banking the "
+                                                      f"remaining {_ct} before the giveback grows")
+                                        elif _ratio <= _exhaust:
+                                            _why_s = (f"~{(1 - _ratio) * 100:.0f}% of max profit "
+                                                      f"earned -- the tail is not worth the risk")
+                                        elif _ratio <= _next_th:
                                             _qty_s = max(1, (_ct + 1) // 2)
-                                            _why_s = (f"step 1: ~{(1 - _ratio) * 100:.0f}% "
-                                                      f"earned -- banking half, rest reaches")
+                                            _stepmap[_rid] = float(_ratio)
+                                            _why_s = (f"step-out: ~{(1 - _ratio) * 100:.0f}% "
+                                                      f"earned -- banking {_qty_s}, the rest "
+                                                      f"reaches higher under the {_buf * 100:.0f}% floor")
                                     else:
-                                        if _ratio <= _h_at:
+                                        if _rid in _stepmap and _ratio >= _low + _buf:
+                                            _why_s = (f"profit floor: last contract's premium "
+                                                      f"re-inflated {(_ratio - _low) * 100:.0f}pts "
+                                                      f"off its low (vol buffer {_buf * 100:.0f}%) "
+                                                      f"-- banking it")
+                                        elif _rid not in _stepmap and _ratio <= _h_at:
                                             _why_s = (f"~{(1 - _ratio) * 100:.0f}% of max "
                                                       f"profit earned (60% rule)")
+                                        elif _ratio <= _exhaust:
+                                            _why_s = (f"~{(1 - _ratio) * 100:.0f}% earned -- "
+                                                      f"the tail is not worth the risk")
                                         elif _low <= float(_oso.getenv(
                                                 "TREZO_OPT_FLOOR_ARM", "0.45")):
-                                            # Armed: profit floor sized by the
-                                            # underlying's realized volatility.
-                                            _buf = 0.05
-                                            try:
-                                                _cls = [float(c.close)
-                                                        for c in (_cnd or [])[-15:]]
-                                                if len(_cls) >= 10:
-                                                    _rets = [abs(_cls[i] / _cls[i - 1] - 1.0)
-                                                             for i in range(1, len(_cls))]
-                                                    _dv = sum(_rets) / len(_rets)
-                                                    # ~0.8%/day calm -> 5%;
-                                                    # ~2.5%/day wild -> 8%.
-                                                    _buf = max(0.05, min(0.08,
-                                                               0.05 + (_dv - 0.008) * (0.03 / 0.017)))
-                                            except Exception:  # noqa: BLE001
-                                                _buf = 0.05
+                                            # Armed: the shared 5/8 vol
+                                            # buffer guards the win.
                                             if _ratio >= _low + _buf:
                                                 _why_s = (f"profit floor hit: premium re-inflated "
                                                           f"{(_ratio - _low) * 100:.0f}pts off its low "
