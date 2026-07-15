@@ -40,6 +40,24 @@ async def resync_alpaca_legs(row: dict, new_stop=None, new_target=None,
         if not (alpaca_configured() and sym and qty > 0
                 and stop_p > 0 and tgt_p > stop_p):
             return False, "bad inputs"
+        # BROKER-TRUTH qty (2026-07-15, the PYPL 4-share incident): a TP
+        # leg can PARTIALLY FILL in the same breath the resync cancels it
+        # -- the row's quantity is then stale and an OCO for the old size
+        # gets refused, leaving the remainder naked. Protect what the
+        # broker actually holds.
+        try:
+            from app.brokers.alpaca import get_positions
+            _live = await get_positions(token=None)
+            _bq = 0.0
+            for _p in _live or []:
+                if str(_p.get("symbol", "")).upper() == sym:
+                    _bq = abs(float(_p.get("qty") or 0))
+                    break
+            if _bq <= 0:
+                return False, "no shares at the broker (closed mid-dance)"
+            qty = min(qty, _bq)
+        except Exception:  # noqa: BLE001
+            pass
         _n, err = await cancel_open_orders_for(sym)
         if err:
             return False, f"cancel failed: {err}"
@@ -51,6 +69,27 @@ async def resync_alpaca_legs(row: dict, new_stop=None, new_target=None,
         o, oerr = await submit_oco_sell(sym, qty, limit_price=round(tgt_p, 2),
                                         stop_price=round(stop_p, 2))
         if oerr or not o:
+            # PROTECTION FIRST (2026-07-15): when the OCO is refused, a
+            # plain stop still guards the shares -- never leave them
+            # naked because the fancier order was rejected.
+            try:
+                from app.brokers.alpaca import submit_stop_sell
+                o2, e2 = await submit_stop_sell(sym, qty, stop_p)
+                from app.agents.activity_log import record as _rec
+                if o2 and not e2:
+                    _rec("legs_resynced", sym,
+                         reason=(f"OCO refused ({str(oerr)[:60]}) -- "
+                                 f"protection-first STOP placed at "
+                                 f"{stop_p:.2f} for {qty:g} shares"),
+                         extra={"user_id": str(row.get("user_id") or "")})
+                    return True, "stop-only"
+                _rec("legs_naked_alert", sym,
+                     reason=(f"exit legs could NOT be re-armed (OCO: "
+                             f"{str(oerr)[:60]}; stop: {str(e2)[:60]}) -- "
+                             f"POSITION MAY BE UNPROTECTED"),
+                     extra={"user_id": str(row.get("user_id") or "")})
+            except Exception:  # noqa: BLE001
+                pass
             return False, f"OCO re-arm failed: {oerr}"
         try:
             from app.agents.activity_log import record as _rec

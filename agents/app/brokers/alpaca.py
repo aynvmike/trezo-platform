@@ -552,6 +552,21 @@ async def submit_market_sell(
     })
 
 
+async def submit_stop_sell(
+    symbol: str, qty: float, stop_price: float,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Plain GTC stop sell — the protection-first fallback when an OCO is
+    refused (2026-07-15, the PYPL naked-4 incident)."""
+    return await _post("/v2/orders", {
+        "symbol": symbol.upper(),
+        "qty": str(qty),
+        "side": "sell",
+        "type": "stop",
+        "stop_price": str(round(float(stop_price), 2)),
+        "time_in_force": "gtc",
+    })
+
+
 async def submit_oco_sell(
     symbol: str, qty: float, limit_price: float, stop_price: float,
 ) -> tuple[Optional[dict], Optional[str]]:
