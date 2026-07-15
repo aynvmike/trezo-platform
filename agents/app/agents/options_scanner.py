@@ -172,6 +172,7 @@ class OptionsScannerAgent(Agent):
     _long_fired: set = set()     # 'L:SYM:date' one-shot guard for long entries
     _spread_fired: set = set()   # 'S:date' one-new-spread-per-day guard
     _day_fired: set = set()      # 'D:date:SYM' same-day entry guards
+    _short_low: dict = {}        # row id -> lowest premium ratio seen (short legs)
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
 
@@ -1096,21 +1097,77 @@ class OptionsScannerAgent(Agent):
                             if _fresh and _ratio is not None and _prem_now:
                                 _fire = None      # (side, limit, reason, qty)
                                 if _short:
+                                    # Mike 2026-07-15: multi-contract short
+                                    # premium STEPS out from 50% of max
+                                    # profit; a single leg holds for 60% but
+                                    # carries a VOLATILITY-SIZED profit
+                                    # floor (5% calm / 8% wild) so a quick
+                                    # re-inflation cannot take the win back.
                                     _h_at = float(_oso.getenv(
                                         "TREZO_OPT_HARVEST_AT", "0.40"))
                                     _h_dte = int(_oso.getenv(
                                         "TREZO_OPT_HARVEST_DTE", "5"))
                                     _h_da = float(_oso.getenv(
                                         "TREZO_OPT_HARVEST_DTE_AT", "0.65"))
-                                    if (_ratio <= _h_at
-                                            or (_dte <= _h_dte
-                                                and _ratio <= _h_da)):
+                                    _step_at = float(_oso.getenv(
+                                        "TREZO_OPT_STEP_AT", "0.50"))
+                                    _step2_at = float(_oso.getenv(
+                                        "TREZO_OPT_STEP2_AT", "0.35"))
+                                    _rid = str(lr.get("id"))
+                                    _lowmap = OptionsScannerAgent._short_low
+                                    _low = min(float(_lowmap.get(_rid, _ratio)),
+                                               float(_ratio))
+                                    _lowmap[_rid] = _low
+                                    _qty_s = _ct
+                                    _why_s = None
+                                    if _ct >= 2:
+                                        # STEP 1 at 50% earned: half out.
+                                        # STEP 2 at 65% earned: the rest.
+                                        if _ratio <= _step2_at:
+                                            _why_s = (f"step 2: ~{(1 - _ratio) * 100:.0f}% "
+                                                      f"of max profit earned -- closing out")
+                                        elif _ratio <= (1.0 - _step_at):
+                                            _qty_s = max(1, (_ct + 1) // 2)
+                                            _why_s = (f"step 1: ~{(1 - _ratio) * 100:.0f}% "
+                                                      f"earned -- banking half, rest reaches")
+                                    else:
+                                        if _ratio <= _h_at:
+                                            _why_s = (f"~{(1 - _ratio) * 100:.0f}% of max "
+                                                      f"profit earned (60% rule)")
+                                        elif _low <= float(_oso.getenv(
+                                                "TREZO_OPT_FLOOR_ARM", "0.45")):
+                                            # Armed: profit floor sized by the
+                                            # underlying's realized volatility.
+                                            _buf = 0.05
+                                            try:
+                                                _cls = [float(c.close)
+                                                        for c in (_cnd or [])[-15:]]
+                                                if len(_cls) >= 10:
+                                                    _rets = [abs(_cls[i] / _cls[i - 1] - 1.0)
+                                                             for i in range(1, len(_cls))]
+                                                    _dv = sum(_rets) / len(_rets)
+                                                    # ~0.8%/day calm -> 5%;
+                                                    # ~2.5%/day wild -> 8%.
+                                                    _buf = max(0.05, min(0.08,
+                                                               0.05 + (_dv - 0.008) * (0.03 / 0.017)))
+                                            except Exception:  # noqa: BLE001
+                                                _buf = 0.05
+                                            if _ratio >= _low + _buf:
+                                                _why_s = (f"profit floor hit: premium re-inflated "
+                                                          f"{(_ratio - _low) * 100:.0f}pts off its low "
+                                                          f"(vol buffer {_buf * 100:.0f}%) -- banking "
+                                                          f"~{(1 - _ratio) * 100:.0f}% before the "
+                                                          f"giveback grows")
+                                    if not _why_s and (_dte <= _h_dte
+                                                       and _ratio <= _h_da):
+                                        _why_s = (f"DTE {_dte}: ~{(1 - _ratio) * 100:.0f}% "
+                                                  f"earned inside the final week")
+                                    if _why_s:
                                         _fire = ("buy",
                                                  round(max(0.01, float(_prem_now)) * 1.05, 2),
-                                                 (f"buying back {_otype.upper()} {_strike:g} exp "
-                                                  f"{_exp[:10]} to bank ~{(1.0 - _ratio) * 100:.0f}% "
-                                                  f"of the premium early"),
-                                                 _ct)
+                                                 (f"buying back {_qty_s}/{_ct} {_otype.upper()} "
+                                                  f"{_strike:g} exp {_exp[:10]} -- {_why_s}"),
+                                                 _qty_s)
                                 else:
                                     # GOAL-AWARE take-profit (Mike 2026-07-14:
                                     # "I go for the daily goal of making money
@@ -1200,25 +1257,31 @@ class OptionsScannerAgent(Agent):
                                     # row, book the sold slice at the limit
                                     # (conservative -- a sell fills at limit
                                     # or better).
-                                    if ((not _e2) and (not _short)
-                                            and int(_fire[3]) < _ct):
+                                    if (not _e2) and int(_fire[3]) < _ct:
                                         try:
                                             _n = int(_fire[3])
                                             _keep = _ct - _n
                                             _entry_ps = float(_entry_prem or 0)
+                                            # Long slice: proceeds - debit.
+                                            # Short slice: credit - buy-back.
                                             _slice_pnl = round(
-                                                (float(_fire[1]) - _entry_ps)
+                                                ((_entry_ps - float(_fire[1]))
+                                                 if _short else
+                                                 (float(_fire[1]) - _entry_ps))
                                                 * 100.0 * _n, 2)
+
+                                            _sgn = 1.0 if _short else -1.0
 
                                             def _shrink(rid=lr.get("id"),
                                                         k=_keep,
-                                                        ep=_entry_ps):
+                                                        ep=_entry_ps,
+                                                        sg=_sgn):
                                                 return (client
                                                         .table("options_positions")
                                                         .update({
                                                             "contracts": k,
                                                             "net_premium_usd":
-                                                                -round(ep * 100.0 * k, 2),
+                                                                round(sg * ep * 100.0 * k, 2),
                                                         })
                                                         .eq("id", rid)
                                                         .execute())
@@ -1226,20 +1289,22 @@ class OptionsScannerAgent(Agent):
 
                                             def _slice(n=_n, ep=_entry_ps,
                                                        pnl=_slice_pnl,
-                                                       lim=float(_fire[1])):
+                                                       lim=float(_fire[1]),
+                                                       sg=_sgn):
                                                 return (client
                                                         .table("options_positions")
                                                         .insert({
                                                             "user_id": lr.get("user_id"),
                                                             "underlying": _u,
                                                             "strategy": _strat_l,
-                                                            "direction": "long",
+                                                            "direction": ("income" if sg > 0
+                                                                          else "long"),
                                                             "option_type": _otype,
                                                             "strike": _strike,
                                                             "expiration": _exp,
                                                             "contracts": n,
                                                             "net_premium_usd":
-                                                                -round(ep * 100.0 * n, 2),
+                                                                round(sg * ep * 100.0 * n, 2),
                                                             "status": "closed_partial",
                                                             "realized_pnl_usd": pnl,
                                                             "closed_at": "now()",
