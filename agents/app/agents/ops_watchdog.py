@@ -109,6 +109,7 @@ _BOOT_AT = datetime.now(timezone.utc)
 
 
 _JANITOR_DAY = ""   # daily agent_messages purge marker (2026-07-07)
+_ALERT_ACK_HOUR = ""  # hourly stale-advisory auto-ack marker (2026-07-15)
 
 
 class OpsWatchdogAgent(Agent):
@@ -211,6 +212,48 @@ class OpsWatchdogAgent(Agent):
                         pass
                 except Exception:  # noqa: BLE001
                     pass
+        except Exception:  # noqa: BLE001
+            pass
+        # Auto-clear stale advisories (Mike 2026-07-15: "on auto, this
+        # popup should not linger -- it should go to a system log and be
+        # held on the backend for audits"). Non-urgent exit-advisor
+        # alerts older than 2h get acknowledged_at stamped hourly -- the
+        # rows STAY in the table as the audit trail; only the screen
+        # forgets them. Urgent alerts are never auto-cleared.
+        try:
+            global _ALERT_ACK_HOUR
+            from datetime import datetime as _adt
+            from datetime import timedelta as _atd
+            from datetime import timezone as _atz
+            _hr = _adt.now(_atz.utc).strftime("%Y-%m-%dT%H")
+            if _ALERT_ACK_HOUR != _hr:
+                _ALERT_ACK_HOUR = _hr
+                from app.runtime.settings import _supabase as _asb
+                _acl = _asb()
+                if _acl is not None:
+                    _cut2 = (_adt.now(_atz.utc)
+                             - _atd(hours=2)).isoformat()
+
+                    def _ack():
+                        return (_acl.table("exit_advisor_alerts")
+                                .update({"acknowledged_at": "now()"})
+                                .is_("acknowledged_at", "null")
+                                .neq("severity", "urgent")
+                                .lt("raised_at", _cut2)
+                                .execute())
+                    import asyncio as _aio2
+                    _res = await _aio2.to_thread(_ack)
+                    _nacked = len(getattr(_res, "data", None) or [])
+                    if _nacked:
+                        try:
+                            from app.agents.activity_log import record as _aar
+                            _aar("alert_autoclear", "SYSTEM",
+                                 reason=(f"{_nacked} stale non-urgent "
+                                         f"advisories auto-cleared from the "
+                                         f"screen (kept in the audit table)"),
+                                 extra={})
+                        except Exception:  # noqa: BLE001
+                            pass
         except Exception:  # noqa: BLE001
             pass
         try:

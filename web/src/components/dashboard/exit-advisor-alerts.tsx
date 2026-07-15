@@ -68,6 +68,11 @@ export async function ExitAdvisorAlerts() {
   } = await supabase.auth.getUser();
   if (!user) return null;
 
+  // Mike 2026-07-15 ("on auto everything this popup should not linger"):
+  // URGENT alerts (account in danger / agents down) always show; routine
+  // advisories only while FRESH -- after 45 minutes they live on in the
+  // backend audit table (plus the activity log) instead of the screen.
+  const freshCutoff = new Date(Date.now() - 45 * 60 * 1000).toISOString();
   const { data: rows } = await supabase
     .from("exit_advisor_alerts")
     .select(
@@ -75,6 +80,7 @@ export async function ExitAdvisorAlerts() {
     )
     .eq("user_id", user.id)
     .is("acknowledged_at", null)
+    .or(`severity.eq.urgent,raised_at.gte.${freshCutoff}`)
     .order("severity", { ascending: false })
     .order("raised_at", { ascending: false })
     .limit(10);
@@ -100,7 +106,9 @@ export async function ExitAdvisorAlerts() {
       }
     >
       <h2 className="text-xs font-medium uppercase tracking-widest text-weave-500">
-        Exit advisor — needs your eyes ({alerts.length})
+        {alerts.some((a) => a.severity === "urgent")
+          ? `Exit advisor — needs your eyes (${alerts.length})`
+          : `Recent advisories (${alerts.length}) · auto-clears; full history kept for audit`}
       </h2>
       <div className="space-y-2 max-h-[38vh] min-[1900px]:max-h-[64vh] overflow-y-auto pr-1">
         {alerts.map((a) => {
