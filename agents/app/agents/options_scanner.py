@@ -131,6 +131,29 @@ async def _user_has_alpaca(user_id: str) -> bool:
         return False
 
 
+async def _multi_day_break() -> int:
+    """Days the market stays CLOSED after today's session (2 = normal
+    weekend, 3+ = holiday weekend, 0 = tomorrow trades). Mike 2026-07-15:
+    theta and IV move across multi-day breaks -- short-dated longs held
+    into one bleed with no chance to react, so the re-score banks them
+    in the afternoon before the break."""
+    try:
+        from datetime import datetime as _d2
+        from app.brokers.alpaca import get_clock
+        c = await get_clock()
+        if not c:
+            return 0
+        nxt = str(c.get("next_open") or "")[:10]
+        today = str(c.get("timestamp") or "")[:10]
+        if not nxt or not today:
+            return 0
+        gap = (_d2.fromisoformat(nxt).date()
+               - _d2.fromisoformat(today).date()).days
+        return max(0, gap - 1)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _occ_match(occ: str, underlying: str, opt_type: str, strike: float,
                expiration: str) -> bool:
     """Best-effort match between an OCC symbol and a modeled row.
@@ -173,6 +196,7 @@ class OptionsScannerAgent(Agent):
     _spread_fired: set = set()   # 'S:date' one-new-spread-per-day guard
     _day_fired: set = set()      # 'D:date:SYM' same-day entry guards
     _short_low: dict = {}        # row id -> lowest premium ratio seen (short legs)
+    _short_low_at: dict = {}     # row id -> (low, unix ts when it last improved)
     _short_step: dict = {}       # row id -> ratio at which the last step fired
     name = "options_scanner"
     tick_interval_seconds = 1800  # every 30 minutes
@@ -1030,6 +1054,14 @@ class OptionsScannerAgent(Agent):
                         .execute()
                     )
                 _live = (await asyncio.to_thread(_sync_open_live)).data or []
+                # Weekend/holiday theta guard (Mike 2026-07-15): active in
+                # the afternoon before a multi-day break.
+                _brk_days = await _multi_day_break() if _live else 0
+                from datetime import datetime as _wgd
+                from datetime import timezone as _wgz
+                _wg_h = (_wgd.now(_wgz.utc).hour
+                         + _wgd.now(_wgz.utc).minute / 60.0)
+                _wk_guard = _brk_days >= 2 and _wg_h >= 18.0
                 for lr in _live[:12]:
                     try:
                         _u = str(lr.get("underlying") or "").upper()
@@ -1122,6 +1154,17 @@ class OptionsScannerAgent(Agent):
                                     _low = min(float(_lowmap.get(_rid, _ratio)),
                                                float(_ratio))
                                     _lowmap[_rid] = _low
+                                    # Stalled-premium tracking (Mike
+                                    # 2026-07-15: collect early "when there
+                                    # is a lengthy pause in trade").
+                                    import time as _tt
+                                    _lowat = OptionsScannerAgent._short_low_at
+                                    _pl = _lowat.get(_rid)
+                                    if _pl is None or _low < float(_pl[0]) - 0.01:
+                                        _lowat[_rid] = (_low, _tt.time())
+                                    _stall_d = ((_tt.time()
+                                                 - float(_lowat[_rid][1]))
+                                                / 86400.0)
                                     # Volatility buffer (Mike's 5/8 rule):
                                     # calm tape ~5%, wild tape ~8%.
                                     _buf = 0.05
@@ -1193,6 +1236,16 @@ class OptionsScannerAgent(Agent):
                                                        and _ratio <= _h_da):
                                         _why_s = (f"DTE {_dte}: ~{(1 - _ratio) * 100:.0f}% "
                                                   f"earned inside the final week")
+                                    if (not _why_s
+                                            and _ratio <= float(_oso.getenv(
+                                                "TREZO_OPT_STALL_RATIO", "0.55"))
+                                            and _dte >= 10
+                                            and _stall_d >= float(_oso.getenv(
+                                                "TREZO_OPT_STALL_DAYS", "3"))):
+                                        _why_s = (f"premium stalled: ~{(1 - _ratio) * 100:.0f}% "
+                                                  f"earned but no progress in "
+                                                  f"{_stall_d:.0f} days with {_dte} DTE left "
+                                                  f"-- freeing the collateral to work elsewhere")
                                     if _why_s:
                                         _fire = ("buy",
                                                  round(max(0.01, float(_prem_now)) * 1.05, 2),
@@ -1245,7 +1298,8 @@ class OptionsScannerAgent(Agent):
                                                          and _against >= 0.005)
                                     except Exception:  # noqa: BLE001
                                         _turn = False
-                                    if (_ratio >= _tp or _turn
+                                    _wk_exit = bool(_wk_guard and _dte <= 7)
+                                    if (_ratio >= _tp or _turn or _wk_exit
                                             or _ratio <= 0.50 or _dte <= 3):
                                         # STEP-DOWN (Mike): with several
                                         # contracts, bank the ROI first; the
@@ -1261,8 +1315,12 @@ class OptionsScannerAgent(Agent):
                                                 if _ratio >= _tp else
                                                 ("Greeks turning -- banking the green"
                                                  if _turn else
-                                                 ("-50% cut" if _ratio <= 0.50
-                                                  else "DTE<=3 time exit")))
+                                                 (f"weekend theta guard: market closed "
+                                                  f"{_brk_days} day(s) next -- banking "
+                                                  f"before the bleed"
+                                                  if _wk_exit else
+                                                  ("-50% cut" if _ratio <= 0.50
+                                                   else "DTE<=3 time exit"))))
                                         _step_t = (f" (step-down: {_qty} of {_ct})"
                                                    if _qty < _ct else "")
                                         _fire = ("sell",

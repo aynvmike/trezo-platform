@@ -41,6 +41,102 @@ _step_state: dict[str, dict] = {}
 # nothing is held past 3:45 PM ET.
 _day_opt_last: float = 0.0
 _day_opt_done: set = set()
+_GAP_DAY = ""   # open-bell gap audit marker (Mike 2026-07-15)
+
+
+async def _gap_check_open_bell() -> None:
+    """Open-bell GAP AUDIT (Mike 2026-07-15: "when the price gaps up or
+    down we need a way to make sure the agents deal with it"). Runs once
+    per day in the first half hour: every held stock is checked against
+    yesterday's close. Gap DOWN >= 3% that has NOT breached the stop ->
+    tighten the stop to ~2% under the open and push it to the broker
+    (cap further bleed). Gap UP -> the trail ratchets the lock and the
+    TP limit fills at the better price; we log the read either way so
+    the audit trail shows the gap was SEEN and handled."""
+    global _GAP_DAY
+    from datetime import date as _g_d
+    from datetime import datetime as _g_dt
+    from datetime import timezone as _g_tz
+    now = _g_dt.now(_g_tz.utc)
+    h = now.hour + now.minute / 60.0
+    if not (13.5 <= h <= 14.2):
+        return
+    today = _g_d.today().isoformat()
+    if _GAP_DAY == today:
+        return
+    _GAP_DAY = today
+    try:
+        import asyncio as _aio
+        import os as _go
+        from app.runtime.settings import _supabase as _sb
+        client = _sb()
+        if client is None:
+            return
+
+        def _q():
+            return (client.table("paper_positions")
+                    .select("id, ticker, user_id, side, quantity, "
+                            "entry_price, stop_price, target_price, "
+                            "asset_type, broker")
+                    .eq("status", "open").eq("asset_type", "stock")
+                    .execute())
+        rows = (await _aio.to_thread(_q)).data or []
+        thr = float(_go.getenv("TREZO_GAP_ALERT_PCT", "0.03"))
+        from app.agents.activity_log import record as _grec
+        for r in rows[:12]:
+            try:
+                cnd = await fetch_candles_for(str(r["ticker"]), "stock")
+                if not cnd or len(cnd) < 2:
+                    continue
+                prev = float(cnd[-2].close)
+                cur = float(cnd[-1].close)
+                if prev <= 0 or cur <= 0:
+                    continue
+                gap = cur / prev - 1.0
+                if abs(gap) < thr:
+                    continue
+                uid = str(r.get("user_id") or "")
+                if gap <= -thr and str(r.get("side") or "long") == "long":
+                    stop = float(r.get("stop_price") or 0)
+                    new_s = round(cur * 0.98, 4)
+                    if stop and cur > stop and new_s > stop:
+                        def _upd(rid=r["id"], ns=new_s):
+                            return (client.table("paper_positions")
+                                    .update({"stop_price": ns})
+                                    .eq("id", rid).execute())
+                        await _aio.to_thread(_upd)
+                        r["stop_price"] = new_s
+                        try:
+                            if str(r.get("broker") or "") == "alpaca":
+                                from app.paper.leg_sync import (
+                                    resync_alpaca_legs,
+                                )
+                                await resync_alpaca_legs(
+                                    r, why=(f"gap-down {gap * 100:.1f}% at "
+                                            f"the open -- stop tightened"))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _grec("gap_check", str(r["ticker"]),
+                              reason=(f"gapped DOWN {gap * 100:.1f}% at the "
+                                      f"open -- stop tightened to "
+                                      f"{new_s:.2f} to cap further bleed"),
+                              extra={"user_id": uid})
+                    else:
+                        _grec("gap_check", str(r["ticker"]),
+                              reason=(f"gapped DOWN {gap * 100:.1f}% at the "
+                                      f"open -- existing stop stands; the "
+                                      f"broker fills at market if touched"),
+                              extra={"user_id": uid})
+                elif gap >= thr:
+                    _grec("gap_check", str(r["ticker"]),
+                          reason=(f"gapped UP {gap * 100:.1f}% at the open "
+                                  f"-- trail ratchets the lock; the TP "
+                                  f"limit fills at the better price"),
+                          extra={"user_id": uid})
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _manage_day_options() -> None:
@@ -603,6 +699,11 @@ class PositionMonitorAgent(Agent):
         # Same-day options ride a 60-second leash (Mike 2026-07-14).
         try:
             await _manage_day_options()
+        except Exception:  # noqa: BLE001
+            pass
+        # Open-bell gap audit (Mike 2026-07-15) -- once per day.
+        try:
+            await _gap_check_open_bell()
         except Exception:  # noqa: BLE001
             pass
         # Task #32: every 30 min, sync Trezo's open stock positions against
