@@ -174,7 +174,14 @@ class RiskManagerAgent(Agent):
         # Now a set dedupes naturally; Position Monitor calls
         # forget_ticker(t) when a position closes so re-buys ARE
         # allowed after the existing trade exits.
-        self._recent_approvals: set[str] = set()
+        # 2026-07-15 (Mike's quiet afternoon): set -> dict of
+        # ticker -> approved-at epoch (0.0 = seeded from an open
+        # position). Slots SELF-HEAL: _prune_approvals frees any entry
+        # whose ticker has no open row and whose approval is stale --
+        # leaked slots (silent execute deaths, close paths that never
+        # message us) can no longer suffocate the desk at the cap.
+        self._recent_approvals: dict[str, float] = {}
+        self._last_prune: float = 0.0
         # Patched 2026-06-10 (Mike's WMT 52-share incident): seed
         # open positions into the dedup set on first message so a
         # restart-while-positions-open doesn't re-stack.
@@ -203,7 +210,57 @@ class RiskManagerAgent(Agent):
             for row in (res.data or []):
                 t = (row.get("ticker") or "").strip().upper()
                 if t:
-                    self._recent_approvals.add(t)
+                    self._recent_approvals[t] = 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _prune_approvals(self) -> None:
+        """SELF-HEALING for the open-signal cap (Mike 2026-07-15: the
+        afternoon went quiet at ~50% deployed -- every veto said
+        'Open-signal cap reached (10)' while leaked slots sat on
+        tickers with no position behind them, AAL among them). A slot
+        may be held only while (a) the ticker still has an OPEN
+        position row, or (b) the approval is younger than
+        TREZO_APPROVAL_TTL_H (2h) and may still be executing.
+        Everything else is a leak and gets freed. Runs at most every
+        10 minutes; never raises."""
+        import os as _pr_os
+        import time as _pr_t
+        now = _pr_t.time()
+        if now - self._last_prune < 600.0:
+            return
+        self._last_prune = now
+        try:
+            from app.runtime.persistence import _client
+            client = _client()
+            if client is None:
+                return
+            import asyncio as _pr_aio
+
+            def _fetch():
+                return (client.table("paper_positions")
+                        .select("ticker").eq("status", "open").execute())
+            res = await _pr_aio.to_thread(_fetch)
+            open_tk = {(r.get("ticker") or "").strip().upper()
+                       for r in (res.data or [])}
+            ttl = float(_pr_os.getenv("TREZO_APPROVAL_TTL_H", "2")) * 3600.0
+            before = len(self._recent_approvals)
+            self._recent_approvals = {
+                t: ts for t, ts in self._recent_approvals.items()
+                if t in open_tk or (ts > 0 and (now - ts) < ttl)
+            }
+            freed = before - len(self._recent_approvals)
+            if freed > 0:
+                try:
+                    from app.agents.activity_log import record as _rec
+                    _rec("approval_slots_freed", "SYSTEM",
+                         reason=(f"{freed} leaked approval slot(s) freed "
+                                 f"-- no open position and no in-flight "
+                                 f"execution behind them (the open-signal "
+                                 f"cap self-heals)"),
+                         extra={})
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -211,7 +268,7 @@ class RiskManagerAgent(Agent):
         """Position Monitor calls this when a position closes, allowing
         a fresh approval on the same ticker. If the ticker was never in
         the set, the discard is a silent no-op."""
-        self._recent_approvals.discard(ticker.upper())
+        self._recent_approvals.pop(ticker.upper(), None)
 
     async def _account_equity(self, user_id) -> float:
         """Best-effort account equity (cash + vault) for per-coin cap
@@ -325,6 +382,7 @@ class RiskManagerAgent(Agent):
         # while positions are already open doesn't re-stack the ticker
         # via fresh signals.
         await self._seed_open_positions()
+        await self._prune_approvals()
 
         # Approve-without-fill release (2026-06-11). Found live: SOFI was
         # approved at 9:16/9:29 ET pre-open, Trade Execution skipped it
@@ -769,7 +827,8 @@ class RiskManagerAgent(Agent):
             if coin_veto:
                 return [self._veto(ticker, tcs, coin_veto)]
 
-        self._recent_approvals.add(ticker.upper())
+        import time as _apt
+        self._recent_approvals[ticker.upper()] = _apt.time()
         # Patched 2026-06-05 (Task #47): propagate user_id into the
         # approve payload so persistence + trace panel can attribute
         # per-user instead of falling through to NULL.
