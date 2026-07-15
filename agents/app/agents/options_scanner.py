@@ -1340,16 +1340,20 @@ class OptionsScannerAgent(Agent):
                 .select("id, user_id, underlying, strategy, option_type, "
                         "strike, expiration, contracts, notes")
                 .eq("status", "open")
-                .in_("strategy", ["wheel_csp", "wheel_cc"])
                 .execute()
             )
         rows = (await asyncio.to_thread(_sync_open)).data or []
-        if not rows:
-            return out
+        # 2026-07-15: no early return on empty -- the ADOPT pass below must
+        # run even when the books hold nothing (that is exactly the broken
+        # state it heals: broker holds an option, books show none).
 
         by_user: dict[str, list[dict]] = {}
         for r in rows:
             by_user.setdefault(str(r["user_id"]), []).append(r)
+        import os as _osr
+        _prim = _osr.getenv("TREZO_PRIMARY_USER_ID", "")
+        if _prim and _prim not in by_user:
+            by_user[_prim] = []
 
         for user_id, user_rows in by_user.items():
             # Skip users with no live Alpaca connection (and no env-key
@@ -1368,11 +1372,35 @@ class OptionsScannerAgent(Agent):
             try:
                 broker_options = await get_option_positions(token=token)
             except Exception:  # noqa: BLE001
-                broker_options = []
+                broker_options = None
+            if broker_options is None:
+                # 2026-07-15 (the F-put disease): a FAILED fetch used to
+                # read as "no options at the broker" and closed every row.
+                # Absence of evidence is not evidence of absence -- skip.
+                continue
             broker_occ = [str(p.get("symbol", "")) for p in broker_options]
+
+            # OCC of every open row (any strategy) -- the adopt pass must
+            # never duplicate a position some other lane already tracks.
+            row_occs: set = set()
+            for _rr in user_rows:
+                try:
+                    _e0 = str(_rr.get("expiration") or "")
+                    row_occs.add(
+                        f"{str(_rr.get('underlying') or '').upper()}"
+                        f"{_e0[2:4]}{_e0[5:7]}{_e0[8:10]}"
+                        f"{'C' if str(_rr.get('option_type') or '').lower().startswith('c') else 'P'}"
+                        f"{int(round(float(_rr.get('strike') or 0) * 1000)):08d}")
+                except Exception:  # noqa: BLE001
+                    continue
 
             closed_count = 0
             for r in user_rows:
+                # Close logic is for the Wheel lanes only; other option
+                # strategies are managed by their own exits.
+                if str(r.get("strategy") or "") not in ("wheel_csp",
+                                                        "wheel_cc"):
+                    continue
                 # If the row was placed via the new place-leg flow it has
                 # 'Placed via Alpaca' in its notes — leave those alone for
                 # the broker to manage. Anything else is a modeled phantom.
@@ -1426,6 +1454,23 @@ class OptionsScannerAgent(Agent):
                 except Exception:  # noqa: BLE001
                     pass
 
+                if (not broker_occ) and realized == 0.0 \
+                        and "Reconciled" in exit_note:
+                    # Broker returned ZERO options while this row is open
+                    # and no closing fill exists -- likely a transient API
+                    # gap. HOLD the row instead of closing on no evidence.
+                    try:
+                        from app.agents.activity_log import record as _hrec
+                        _hrec("reconcile_hold", r["underlying"],
+                              reason=("kept open: broker options came back "
+                                      "empty and no closing fill was found "
+                                      "-- not closing on absence of "
+                                      "evidence"),
+                              extra={"user_id": user_id})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+
                 def _sync_close(rid=r["id"], pnl=realized, en=exit_note):
                     return (
                         client.table("options_positions")
@@ -1453,6 +1498,80 @@ class OptionsScannerAgent(Agent):
                         "closed_count": closed_count,
                     },
                 ))
+
+            # ADOPT the other direction (Mike 2026-07-15: the F 12.5 put
+            # lived at Alpaca for NINE DAYS with no book row, so the Wheel
+            # card showed nothing). Any broker option with no open row
+            # becomes a tracked row -- UI, harvest, settle and realized
+            # accounting all see it again.
+            adopted = 0
+            for p in broker_options:
+                try:
+                    occ = str(p.get("symbol", "") or "").upper()
+                    if len(occ) < 16 or occ in row_occs:
+                        continue
+                    strike = int(occ[-8:]) / 1000.0
+                    cp = occ[-9]
+                    ymd = occ[-15:-9]
+                    und = occ[:-15]
+                    if not (und.isalpha() and cp in ("C", "P")
+                            and ymd.isdigit()):
+                        continue
+                    exp = f"20{ymd[0:2]}-{ymd[2:4]}-{ymd[4:6]}"
+                    qty = float(p.get("qty") or 0)
+                    if qty == 0:
+                        continue
+                    avg = abs(float(p.get("avg_entry_price") or 0))
+                    ct = int(abs(qty))
+                    short = qty < 0
+                    otype = "put" if cp == "P" else "call"
+                    strat = ("wheel_csp" if short and cp == "P"
+                             else "wheel_cc" if short
+                             else f"long_{otype}")
+                    prem = (round(avg * 100 * ct, 2) if short
+                            else -round(avg * 100 * ct, 2))
+
+                    def _ins(u=und, st=strat, ot=otype, k=strike, e=exp,
+                             c=ct, pr=prem, uid=user_id):
+                        return client.table("options_positions").insert({
+                            "user_id": uid,
+                            "underlying": u,
+                            "strategy": st,
+                            "direction": ("income" if st.startswith("wheel")
+                                          else "long"),
+                            "option_type": ot,
+                            "strike": k,
+                            "expiration": e,
+                            "contracts": c,
+                            "net_premium_usd": pr,
+                            "legs": [{"action": "sell" if pr > 0 else "buy",
+                                      "type": ot, "strike": k,
+                                      "premium": round(abs(pr) / (100 * c), 4)}],
+                            "notes": ("Adopted from the broker by reconcile "
+                                      "-- position existed at Alpaca with "
+                                      "no book row. Placed via Alpaca."),
+                        }).execute()
+                    await asyncio.to_thread(_ins)
+                    adopted += 1
+                    try:
+                        from app.agents.activity_log import record as _adr
+                        _adr("option_adopted", und,
+                             reason=(f"adopted {('short ' if short else '')}"
+                                     f"{otype} {strike:g} exp {exp} x{ct} "
+                                     f"from the broker -- it had no book "
+                                     f"row (the invisible-position fix)"),
+                             extra={"user_id": user_id})
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    continue
+            if adopted:
+                out.append(AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={"user_id": user_id, "event": "reconcile",
+                             "note": (f"Adopted {adopted} broker option "
+                                      f"position(s) that had no book row."),
+                             "adopted": adopted}))
         return out
 
     async def _wheel_auto_fire(
