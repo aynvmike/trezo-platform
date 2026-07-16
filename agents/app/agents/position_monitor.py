@@ -42,6 +42,119 @@ _step_state: dict[str, dict] = {}
 _day_opt_last: float = 0.0
 _day_opt_done: set = set()
 _GAP_DAY = ""   # open-bell gap audit marker (Mike 2026-07-15)
+_PRE_BREAK_DAY = ""   # pre-holiday review marker (Mike 2026-07-16)
+
+
+async def _pre_break_review() -> None:
+    """PRE-HOLIDAY REVIEW (Mike 2026-07-16): before every multi-day
+    market close, re-evaluate what is held. His rule, encoded: if the
+    plan would need a quick sale right after the break without time to
+    re-evaluate, sell BEFORE the break -- unless the position is a
+    long-term lane. Long-term lanes (hodl/dca/dividend/kindrip/wheel)
+    ride; short-horizon stock positions ride ONLY with profit locked
+    (stop >= entry); green-but-unprotected ones get their stop raised
+    to breakeven (+ broker resync); red ones close into the break.
+    Crypto trades 24/7 and is exempt. Every decision logs a
+    `preholiday_review` line. Runs once, 2:00-3:45 PM ET on the eve."""
+    global _PRE_BREAK_DAY
+    from datetime import date as _pb_d
+    from datetime import datetime as _pb_dt
+    from datetime import timezone as _pb_tz
+    now = _pb_dt.now(_pb_tz.utc)
+    h = now.hour + now.minute / 60.0
+    if not (18.0 <= h <= 19.75):
+        return
+    today = _pb_d.today().isoformat()
+    if _PRE_BREAK_DAY == today:
+        return
+    try:
+        from app.agents.options_scanner import _multi_day_break
+        brk = await _multi_day_break()
+    except Exception:  # noqa: BLE001
+        brk = 0
+    _PRE_BREAK_DAY = today
+    if brk < 2:
+        return
+    try:
+        import asyncio as _aio
+        from app.runtime.settings import _supabase as _sb
+        client = _sb()
+        if client is None:
+            return
+
+        def _q():
+            return (client.table("paper_positions")
+                    .select("id, ticker, user_id, side, quantity, "
+                            "entry_price, stop_price, target_price, "
+                            "asset_type, broker, strategy")
+                    .eq("status", "open").execute())
+        rows = (await _aio.to_thread(_q)).data or []
+        from app.agents.activity_log import record as _rec
+        LONG_TERM = ("hodl", "dca", "dividend", "kindrip", "wheel")
+        for r in rows[:20]:
+            try:
+                tk = str(r.get("ticker") or "")
+                uid = str(r.get("user_id") or "")
+                strat = str(r.get("strategy") or "").lower()
+                if str(r.get("asset_type") or "stock") == "crypto":
+                    continue      # 24/7 market -- no closed-day gap risk
+                if any(k in strat for k in LONG_TERM):
+                    _rec("preholiday_review", tk,
+                         reason=(f"market closed {brk} day(s) next -- "
+                                 f"long-term lane ({strat}) rides the "
+                                 f"break by design"),
+                         extra={"user_id": uid})
+                    continue
+                entry = float(r.get("entry_price") or 0)
+                stop = float(r.get("stop_price") or 0)
+                cnd = await fetch_candles_for(tk, "stock")
+                px = float(cnd[-1].close) if cnd else 0.0
+                if px <= 0 or entry <= 0:
+                    continue
+                if stop >= entry:
+                    _rec("preholiday_review", tk,
+                         reason=(f"rides the {brk}-day break with profit "
+                                 f"locked (stop {stop:.2f} >= entry "
+                                 f"{entry:.2f}) -- a gap cannot turn it "
+                                 f"into a loss"),
+                         extra={"user_id": uid})
+                elif px > entry:
+                    def _upd(rid=r["id"], ns=round(entry, 4)):
+                        return (client.table("paper_positions")
+                                .update({"stop_price": ns})
+                                .eq("id", rid).execute())
+                    await _aio.to_thread(_upd)
+                    r["stop_price"] = round(entry, 4)
+                    try:
+                        if str(r.get("broker") or "") == "alpaca":
+                            from app.paper.leg_sync import (
+                                resync_alpaca_legs,
+                            )
+                            await resync_alpaca_legs(
+                                r, why="pre-break: stop raised to breakeven")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _rec("preholiday_review", tk,
+                         reason=(f"green but unprotected into a {brk}-day "
+                                 f"break -- stop raised to breakeven "
+                                 f"({entry:.2f})"),
+                         extra={"user_id": uid})
+                else:
+                    def _cls(rid=r["id"]):
+                        return (client.table("paper_positions")
+                                .update({"close_requested": True})
+                                .eq("id", rid).execute())
+                    await _aio.to_thread(_cls)
+                    _rec("preholiday_review", tk,
+                         reason=(f"red short-horizon position into a "
+                                 f"{brk}-day break -- selling before the "
+                                 f"close: no time to re-evaluate right "
+                                 f"after (Mike's rule)"),
+                         extra={"user_id": uid})
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _gap_check_open_bell() -> None:
@@ -706,6 +819,11 @@ class PositionMonitorAgent(Agent):
             await _gap_check_open_bell()
         except Exception:  # noqa: BLE001
             pass
+        # Pre-holiday position review (Mike 2026-07-16) -- break's eve.
+        try:
+            await _pre_break_review()
+        except Exception:  # noqa: BLE001
+            pass
         # Task #32: every 30 min, sync Trezo's open stock positions against
         # Alpaca truth. Catches manual closes / phantoms within 30 min.
         type(self)._recon_tick_counter += 1
@@ -862,6 +980,15 @@ class PositionMonitorAgent(Agent):
                         _tl = await _maybe_ladder_stop(r, price_c, SWING_PROFIT_LADDER)
                         if _tl is not None:
                             stop_c = _tl
+                        # Mike 2026-07-16 (the ETH 33%-giveback alert):
+                        # between ladder rungs the giveback could eat most
+                        # of a run. The CONTINUOUS profit-lock trail from
+                        # the stock side now ratchets crypto stops too --
+                        # locks (1 - 30%) of the peak gain, never lowers,
+                        # so a pullback still books ~70% of the best gain.
+                        _tt = await _maybe_trail_stock_profit(r, price_c)
+                        if _tt is not None and (stop_c is None or _tt > stop_c):
+                            stop_c = _tt
                     elif r["side"] == "long" and "dca" in _strat_a:
                         from app.strategies.crypto import DCA_PROFIT_LADDER
                         _td = await _maybe_ladder_stop(r, price_c, DCA_PROFIT_LADDER)

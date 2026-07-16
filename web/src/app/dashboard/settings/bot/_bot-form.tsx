@@ -248,7 +248,7 @@ export function BotTuningForm({ initial, liveEquity }: { initial: Settings; live
   const [state, formAction] = useFormState(saveBotSettings, initialState);
 
   const s: NonNullable<Settings> = initial ?? {
-    tcs_threshold: 700, max_open_positions: 3, consecutive_loss_limit: 3,
+    tcs_threshold: 70, max_open_positions: 3, consecutive_loss_limit: 3,
     risk_per_trade_pct: 0.05, default_stop_pct: 0.05, default_target_pct: 0.1,
     pattern_enabled: true, stms_enabled: true, extended_enabled: true, crypto_enabled: true,
     autonomy_mode: "guarded", account_posture: "auto",
@@ -362,7 +362,7 @@ export function BotTuningForm({ initial, liveEquity }: { initial: Settings; live
 
       <section className="space-y-6">
         <h2 className="font-medium text-weave-800">Risk Manager</h2>
-        <Slider name="tcs_threshold" label="Signal confidence threshold (TCS)" hint="The minimum Trade Confidence Score (0-1000) a signal needs before Risk Manager will approve it. Higher = fewer, stronger trades." min={300} max={1000} step={10} defaultValue={s.tcs_threshold} format={(v) => String(v)} />
+        <Slider name="tcs_threshold" label="Signal confidence threshold (TCS)" hint="The minimum Trade Confidence Score (0-100) a signal needs before Risk Manager will approve it. Higher = fewer, stronger trades. 50 is the standard bar; 70+ is very selective." min={30} max={95} step={1} defaultValue={Math.min(95, s.tcs_threshold > 100 ? Math.round(s.tcs_threshold / 10) : s.tcs_threshold)} format={(v) => String(v)} />
         <Slider name="max_open_positions" label="Maximum open positions" hint="How many positions the bot may hold at once. Caps your exposure across all strategies." min={1} max={20} step={1} defaultValue={s.max_open_positions} format={(v) => String(v)} />
         <Slider name="consecutive_loss_limit" label="Losing-streak limit" hint="How many losing trades in a row before the bot pauses for the day. Conservative is around 3, aggressive around 7." min={2} max={10} step={1} defaultValue={s.consecutive_loss_limit} format={(v) => String(v)} />
       </section>

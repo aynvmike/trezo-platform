@@ -124,7 +124,9 @@ def _supabase():
 
 def _from_row(r: dict) -> BotSettings:
     return BotSettings(
-        tcs_threshold=int(r.get("tcs_threshold", 70)),
+        tcs_threshold=(lambda _v: int(round(_v / 10.0))
+                       if _v > 100 else int(_v))(
+            float(r.get("tcs_threshold", 70) or 70)),  # old-scale writes self-heal (2026-07-16)
         max_open_positions=int(r.get("max_open_positions", 3)),
         consecutive_loss_limit=int(r.get("consecutive_loss_limit", 3)),
         risk_per_trade_pct=float(r.get("risk_per_trade_pct", 0.05)),

@@ -81,7 +81,7 @@ export async function BotSettingsPanel({ userId }: { userId: string }) {
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <Tile label="Signal TCS" value={String(s.tcs_threshold ?? 700)} />
+        <Tile label="Signal TCS" value={String(s.tcs_threshold ?? 70)} />
         <Tile
           label="Risk / trade"
           value={`${((Number(s.risk_per_trade_pct ?? 0.05)) * 100).toFixed(2)}%`}
