@@ -212,6 +212,54 @@ async def get_wheel_universe(user_id: Optional[str]) -> list[WheelCandidate]:
         y = DIVIDEND_YIELDS.get(sym, 0.02)
         seen[sym] = WheelCandidate(ticker=sym, source="seed", yield_pct=y)
 
+    # 1b) MARKET-SCAN additions (Mike 2026-07-16: "expand it further --
+    # I do not want to limit... scan a few industry winners as well").
+    # The leading sectors' generals and the day's most-actives join the
+    # bench when their CSP collateral could actually FIT this account
+    # (strike ~5% under spot -> reserve = strike x 100 <= the growth
+    # allowance, 25% of equity). No dividend gate here: evaluate_csp
+    # judges the premium on merit; source='market' shows provenance.
+    try:
+        from app.data.market_universe import (
+            SECTOR_BIAS, market_wide_candidates,
+        )
+        market_names: list[str] = []
+        for g in (SECTOR_BIAS.get("generals") or []):
+            _s = str(g.get("sym") or "").upper()
+            if _s:
+                market_names.append(_s)
+        try:
+            _movers = await market_wide_candidates(limit=20)
+            market_names.extend(str(m).upper() for m in (_movers or []))
+        except Exception:  # noqa: BLE001
+            pass
+        _ceiling = 0.0
+        try:
+            from app.paper.allocation import effective_equity
+            _eq = await effective_equity(user_id) if user_id else 0.0
+            _ceiling = ((_eq * 0.25) / 100.0) / 0.95 if _eq > 0 else 0.0
+        except Exception:  # noqa: BLE001
+            _ceiling = 0.0
+        _added = 0
+        for _sym in market_names:
+            if not _sym or _sym in seen or _added >= 15:
+                continue
+            if _ceiling > 0:
+                try:
+                    from app.data.candles import fetch_stock_candles
+                    _cs = await fetch_stock_candles(_sym)
+                    _spot = float(_cs[-1].close) if _cs else 0.0
+                except Exception:  # noqa: BLE001
+                    _spot = 0.0
+                if _spot <= 0 or _spot > _ceiling:
+                    continue
+            seen[_sym] = WheelCandidate(
+                ticker=_sym, source="market_wide",
+                yield_pct=DIVIDEND_YIELDS.get(_sym, 0.0))
+            _added += 1
+    except Exception:  # noqa: BLE001
+        pass
+
     # 2) Watchlist additions (only when we have a user_id and Supabase)
     client = _supabase()
     if client and user_id:

@@ -579,6 +579,23 @@ class OptionsScannerAgent(Agent):
             except Exception:  # noqa: BLE001
                 _gs = []
             cands = ["SPY", "QQQ"] + [s for s in _gs if s][:8]
+            # Mike 2026-07-16: never limit the hunt to a short list --
+            # the market-wide movers pool (most-actives + gainers +
+            # losers, hour-rotating) joins the same-day scan.
+            try:
+                from app.data.market_universe import market_wide_candidates
+                _mv = await market_wide_candidates(limit=20)
+                cands += [str(m) for m in (_mv or []) if m]
+            except Exception:  # noqa: BLE001
+                pass
+            _seen_c: set = set()
+            _cd: list[str] = []
+            for _c in cands:
+                _u = str(_c).upper()
+                if _u and _u not in _seen_c:
+                    _seen_c.add(_u)
+                    _cd.append(_u)
+            cands = _cd[:24]
             scored = []
             for sym in cands:
                 _sym_ct = len([k for k in OptionsScannerAgent._day_fired
