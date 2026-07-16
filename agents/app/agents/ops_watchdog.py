@@ -159,6 +159,23 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                     except Exception:  # noqa: BLE001
                         pass
+                # Knowledge drop-folder sweep (Mike 2026-07-16): anything
+                # dropped into C:\Trezo\Quantconnect (or the external-
+                # research folder) joins the library within a day -- no
+                # script run needed. The library reindexes itself when
+                # the folder changes.
+                try:
+                    from app.knowledge.library import sweep_local_sources
+                    _swept = sweep_local_sources()
+                    if _swept:
+                        from app.agents.activity_log import record as _krec
+                        _krec("library_sweep", "SYSTEM",
+                              reason=(f"{_swept} new/updated file(s) from "
+                                      f"the drop-folders joined the "
+                                      f"knowledge library"),
+                              extra={})
+                except Exception:  # noqa: BLE001
+                    pass
                 # Sector Compass (2026-07-13, Mike): daily industry read --
                 # 3-day movers every day, weekly (5d) view on Mondays, and
                 # a monthly market update roughly every 21 days. Lands in

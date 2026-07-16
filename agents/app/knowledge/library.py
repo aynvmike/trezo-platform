@@ -27,6 +27,62 @@ _INDEX: list[dict] = []
 _SIG: tuple = ()
 _LAST_BUILD = 0.0
 
+# Persisted index (Mike 2026-07-16): the tokenized index is saved next
+# to the texts, so restarts load it instantly instead of re-parsing
+# every book. Rebuilt automatically whenever the folder changes.
+INDEX_FILE = os.path.join(LIB_DIR, "_index.json")
+
+# Mike's DROP-FOLDERS (2026-07-16: "can I just add stuff into the quant
+# folder to help with the knowledge?" -- yes). ops_watchdog sweeps these
+# daily; scripts/build_library.py sweeps them on demand. Text-like files
+# mirror straight in; PDFs need one run of the build script (pypdf).
+SOURCE_DIRS = [
+    ("qc", os.path.abspath(os.path.join(
+        _here, "..", "..", "..", "..", "Quantconnect"))),
+    ("research", os.path.abspath(os.path.join(
+        _here, "..", "..", "..", "..", "TREZO_PROJECT",
+        "06_external_research"))),
+]
+TEXT_EXTS = (".txt", ".md", ".py", ".cs")
+SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
+
+
+def sweep_local_sources() -> int:
+    """Mirror the drop-folders into the library. Returns files copied.
+    Never raises; skips oversized (>3MB) and unchanged files."""
+    n = 0
+    try:
+        os.makedirs(LIB_DIR, exist_ok=True)
+        for prefix, root in SOURCE_DIRS:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+                for fn in filenames:
+                    if os.path.splitext(fn)[1].lower() not in TEXT_EXTS:
+                        continue
+                    src = os.path.join(dirpath, fn)
+                    try:
+                        if os.path.getsize(src) > 3_000_000:
+                            continue
+                        base = (os.path.splitext(fn)[0].strip().lower()
+                                .replace(" ", "-"))
+                        dst = os.path.join(LIB_DIR, f"{prefix}--{base}.txt")
+                        if (os.path.exists(dst)
+                                and os.path.getmtime(dst)
+                                >= os.path.getmtime(src)):
+                            continue
+                        raw = open(src, encoding="utf-8",
+                                   errors="ignore").read()
+                        with open(dst, "w", encoding="utf-8") as f:
+                            f.write(raw)
+                        n += 1
+                    except Exception:  # noqa: BLE001
+                        continue
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
 _word = re.compile(r"[a-z][a-z\-']+")
 
 
@@ -52,6 +108,21 @@ def _build() -> None:
     sig = _folder_sig()
     if sig == _SIG and _INDEX:
         return
+    # Fast path: load the persisted index when it matches the folder.
+    try:
+        import json as _j
+        if os.path.exists(INDEX_FILE):
+            with open(INDEX_FILE, encoding="utf-8") as f:
+                data = _j.load(f)
+            if (tuple(tuple(x) for x in (data.get("sig") or ())) == sig
+                    and data.get("chunks")):
+                _INDEX = [{"source": c["source"], "page": c["page"],
+                           "text": c["text"], "toks": set(c["toks"])}
+                          for c in data["chunks"]]
+                _SIG, _LAST_BUILD = sig, time.time()
+                return
+    except Exception:  # noqa: BLE001
+        pass
     idx: list[dict] = []
     for fn, _, _ in sig:
         path = os.path.join(LIB_DIR, fn)
@@ -76,6 +147,17 @@ def _build() -> None:
                 idx.append({"source": title, "page": page,
                             "text": chunk, "toks": set(_tok(chunk))})
     _INDEX, _SIG, _LAST_BUILD = idx, sig, time.time()
+    # Persist for instant loads after restarts.
+    try:
+        import json as _j
+        with open(INDEX_FILE, "w", encoding="utf-8") as f:
+            _j.dump({"sig": [list(x) for x in sig],
+                     "chunks": [{"source": c["source"], "page": c["page"],
+                                 "text": c["text"],
+                                 "toks": sorted(c["toks"])}
+                                for c in idx]}, f)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def search(query: str, k: int = 3) -> list[dict]:
