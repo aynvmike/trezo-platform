@@ -1151,7 +1151,12 @@ class OptionsScannerAgent(Agent):
                             import os as _oso
                             _strat_l = str(lr.get("strategy") or "")
                             _short = not _strat_l.startswith("long_")
-                            _hk = f"h:{lr.get('id')}:{_ct}"
+                            # Key includes the DATE (2026-07-16: the F-put
+                            # harvest limit EXPIRED unfilled and the one-shot
+                            # guard blocked any retry until a restart) -- an
+                            # unfilled harvest re-arms the next day.
+                            _hk = (f"h:{lr.get('id')}:{_ct}:"
+                                   f"{date.today().isoformat()}")
                             _fresh = _hk not in OptionsScannerAgent._harvested
                             if _fresh and _ratio is not None and _prem_now:
                                 _fire = None      # (side, limit, reason, qty)
