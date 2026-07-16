@@ -58,6 +58,12 @@ WHEEL_WATCHLIST = [
     "F", "T", "KMI", "VZ", "MO", "INTC",
     # Tier C - mid-cap dividends
     "PFE", "KHC", "CSCO", "BMY", "KEY", "HPQ",
+    # Tier D - small-account collateral fits (Mike 2026-07-16: "why is
+    # Ford the only put?" -- because at ~$5k equity the 25% wheel
+    # allowance (~$1.2k) only covered F's $1,250 collateral. These
+    # liquid, income-tilted names keep the bench wider than one stock
+    # until the account grows into Tiers A-C).
+    "AGNC", "NOK", "VALE", "KGC", "PSEC",
 ]
 
 # Target days-to-expiry for each new option (≈ monthly cycle).

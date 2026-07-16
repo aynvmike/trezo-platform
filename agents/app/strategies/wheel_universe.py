@@ -198,9 +198,17 @@ async def get_wheel_universe(user_id: Optional[str]) -> list[WheelCandidate]:
     if hit and (now - hit[1]) < _CACHE_TTL_SECONDS:
         return hit[0]
 
-    # 1) Seed list (always present)
+    # 1) Seed list (always present). Rotated by the calendar day
+    # (Mike 2026-07-16): the scan used to walk the list in a FIXED
+    # order, so with one CSP slot the first affordable name (F) won
+    # every single cycle. Rotation gives every affordable name a turn.
+    from datetime import date as _rot_d
+    _seed = list(WHEEL_WATCHLIST)
+    if _seed:
+        _r = _rot_d.today().toordinal() % len(_seed)
+        _seed = _seed[_r:] + _seed[:_r]
     seen: dict[str, WheelCandidate] = {}
-    for sym in WHEEL_WATCHLIST:
+    for sym in _seed:
         y = DIVIDEND_YIELDS.get(sym, 0.02)
         seen[sym] = WheelCandidate(ticker=sym, source="seed", yield_pct=y)
 

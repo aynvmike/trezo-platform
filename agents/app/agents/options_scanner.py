@@ -550,8 +550,12 @@ class OptionsScannerAgent(Agent):
             _budget = min(float(_oso.getenv("TREZO_DAY_OPT_USD", "300")),
                           float(_oso.getenv("TREZO_DAY_OPT_PCT", "0.08"))
                           * max(_eq, 1.0))
-            _max_open = int(_oso.getenv("TREZO_DAY_OPT_OPEN", "1"))
-            _max_day = int(_oso.getenv("TREZO_DAY_OPT_PER_DAY", "2"))
+            # PDT is gone (2026-06-04) -- capacity follows Mike's call:
+            # up to 2 concurrent same-day positions, 4 entries/day, and a
+            # symbol may be re-entered once after its first trade closes.
+            _max_open = int(_oso.getenv("TREZO_DAY_OPT_OPEN", "2"))
+            _max_day = int(_oso.getenv("TREZO_DAY_OPT_PER_DAY", "4"))
+            _max_sym = int(_oso.getenv("TREZO_DAY_OPT_PER_SYM", "2"))
             _min_mv = float(_oso.getenv("TREZO_DAY_OPT_MIN_MOVE", "0.008"))
 
             def _q_open():
@@ -577,7 +581,9 @@ class OptionsScannerAgent(Agent):
             cands = ["SPY", "QQQ"] + [s for s in _gs if s][:8]
             scored = []
             for sym in cands:
-                if f"D:{today_s}:{sym}" in OptionsScannerAgent._day_fired:
+                _sym_ct = len([k for k in OptionsScannerAgent._day_fired
+                               if k.startswith(f"D:{today_s}:{sym}#")])
+                if _sym_ct >= _max_sym:
                     continue
                 cnd = await fetch_candles_for(sym, "stock")
                 if not cnd or len(cnd) < 22:
@@ -629,7 +635,10 @@ class OptionsScannerAgent(Agent):
             # The BUDGET is the cap, not an arbitrary contract count.
             _ctn = max(1, min(int(_oso.getenv("TREZO_DAY_OPT_CT_MAX", "10")),
                               int(_budget // max(debit, 1.0))))
-            OptionsScannerAgent._day_fired.add(f"D:{today_s}:{sym}")
+            _sym_ct2 = len([k for k in OptionsScannerAgent._day_fired
+                            if k.startswith(f"D:{today_s}:{sym}#")])
+            OptionsScannerAgent._day_fired.add(
+                f"D:{today_s}:{sym}#{_sym_ct2 + 1}")
             order, err = await submit_option_order(
                 str(pick.occ), _ctn, "buy", time_in_force="day",
                 limit_price=round(prem * 1.05, 2))
