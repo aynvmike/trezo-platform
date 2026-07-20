@@ -164,6 +164,8 @@ class RiskManagerAgent(Agent):
     # slider drives the gate. The dead constant is gone on purpose.
     MAX_OPEN_SIGNALS = 3
     DEFAULT_PCT_OF_ACCOUNT = 0.02
+    # Cached broker snapshot for the margin-territory gate (60s TTL).
+    _margin_snap: dict = {"ts": 0.0, "cash": None, "equity": None}
 
     def __init__(self) -> None:
         # Patched 2026-06-04 stacking fix: set, not deque(maxlen=8).
@@ -599,16 +601,72 @@ class RiskManagerAgent(Agent):
         except Exception:  # noqa: BLE001
             goal_bump = 0
 
+        # Margin-territory gate (Mike 2026-07-17): agents may dip into
+        # margin buying power -- but leverage multiplies BOTH directions,
+        # so it must be earned. When broker cash thins below
+        # TREZO_MARGIN_CASH_FRACTION of equity (default 15% -- roughly
+        # one position's notional), the next stock entry is margin
+        # territory and the bar rises +TREZO_MARGIN_TCS_BUMP (default 8)
+        # on top of every other bump. Crypto/forex exempt (no margin at
+        # the venue; the engine keeps them cash-only). Snapshot cached
+        # 60s; fail-open with no bump -- the engine's deployment ceiling
+        # (TREZO_MAX_DEPLOY_X x equity) still caps exposure.
+        leverage_bump = 0
+        leverage_note = ""
+        try:
+            from app.data.candles import COIN_MAP as _CM_LEV
+            _lev_exempt = (
+                ticker.upper() in _CM_LEV
+                or str(message.payload.get("asset_type") or "").lower()
+                in ("forex", "crypto")
+            )
+        except Exception:  # noqa: BLE001
+            _lev_exempt = False
+        if not _lev_exempt:
+            try:
+                import time as _lvt
+                _snap = type(self)._margin_snap
+                if _lvt.time() - float(_snap.get("ts") or 0) > 60:
+                    from app.brokers.alpaca import (
+                        get_account, alpaca_configured,
+                    )
+                    if alpaca_configured():
+                        _acct = await get_account()
+                        if _acct:
+                            _snap["cash"] = float(_acct.get("cash") or 0)
+                            _snap["equity"] = float(_acct.get("equity") or 0)
+                            _snap["ts"] = _lvt.time()
+                _lc, _le = _snap.get("cash"), _snap.get("equity")
+                if _lc is not None and _le and _le > 0:
+                    try:
+                        _lfrac = float(os.getenv(
+                            "TREZO_MARGIN_CASH_FRACTION", "0.15"))
+                    except (TypeError, ValueError):
+                        _lfrac = 0.15
+                    if _lc < _le * _lfrac:
+                        try:
+                            leverage_bump = int(float(os.getenv(
+                                "TREZO_MARGIN_TCS_BUMP", "8")))
+                        except (TypeError, ValueError):
+                            leverage_bump = 8
+                        leverage_note = (
+                            f", margin territory +{leverage_bump} "
+                            f"(cash ${_lc:,.0f} < {_lfrac:.0%} of "
+                            f"${_le:,.0f} equity)")
+            except Exception:  # noqa: BLE001
+                leverage_bump = 0
+
         # The confidence bar can be raised by the current regime posture,
-        # the cycle-aware bump, the per-strategy outcome nudge, and the
-        # banked-paycheck bump.
+        # the cycle-aware bump, the per-strategy outcome nudge, the
+        # banked-paycheck bump, and the margin-territory bump.
         effective_min_tcs = (min_tcs + scope.tcs_bump + cycle_bump
-                             + outcome_delta + goal_bump + probation_bump)
+                             + outcome_delta + goal_bump + probation_bump
+                             + leverage_bump)
         if tcs < effective_min_tcs:
             extra = (
-                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note})"
+                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note}{leverage_note})"
                 if (scope.tcs_bump or cycle_bump or outcome_delta
-                        or goal_bump or probation_bump)
+                        or goal_bump or probation_bump or leverage_bump)
                 else ""
             )
             return [self._veto(
@@ -843,6 +901,12 @@ class RiskManagerAgent(Agent):
             "reason": f"TCS {tcs} clears threshold; {direction} bias [{strategy}]",
             "accumulation": accumulation_add,
         }
+        if leverage_bump:
+            # Ledger-separable: leveraged entries carry the tag so the
+            # outcome loop can judge leverage on its own record.
+            approve_payload["leveraged"] = True
+            approve_payload["reason"] += (
+                f"; margin territory, bar was +{leverage_bump}")
         if probation_bump:
             approve_payload["size_scale"] = 0.5
             approve_payload["reason"] += (

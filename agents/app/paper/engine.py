@@ -186,6 +186,23 @@ async def open_position(
             risk_pct = min(float(risk_pct), max(_rp, 0.0005))
         except Exception:  # noqa: BLE001
             pass
+    # Margin allowance (Mike 2026-07-17): stock entries may spend past
+    # cash into margin, bounded by a closed form: with a long book,
+    # deployed = equity - cash, so per-entry spendable =
+    # cash + (TREZO_MAX_DEPLOY_X - 1) x equity keeps total deployment
+    # under TREZO_MAX_DEPLOY_X x equity (default 1.25x) with no broker
+    # call -- as margin gets used cash goes negative and the allowance
+    # self-shrinks to zero at the ceiling. Crypto/forex stay cash-only
+    # (no margin at the venue). The Risk Manager charges +8 TCS while
+    # entries sit in margin territory: leverage is earned, never default.
+    _spend = cash
+    if asset_type not in ("crypto", "forex"):
+        try:
+            import os as _osm
+            _deploy_x = float(_osm.getenv("TREZO_MAX_DEPLOY_X", "1.25"))
+        except (TypeError, ValueError):
+            _deploy_x = 1.25
+        _spend = cash + max(_deploy_x - 1.0, 0.0) * max(equity, 0.0)
     plan = plan_position(
         equity=equity,
         entry_price=fill_price,
@@ -193,7 +210,7 @@ async def open_position(
         target_price=target_price,
         risk_pct=risk_pct,
         asset_type=asset_type,
-        buying_power=(min(cash, max_notional) if max_notional is not None else cash),
+        buying_power=(min(_spend, max_notional) if max_notional is not None else _spend),
     )
     if not plan.ok:
         return FillResult(ok=False, error=plan.reject_reason or "Sizing rejected the trade")

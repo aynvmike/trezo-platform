@@ -86,16 +86,42 @@ class WheelLeg:
     modeled_iv: float
     cash_secured_usd: float  # for CSP: strike * 100 * contracts
     live: bool = False       # True when priced from a live options quote
+    decay_projected: bool = False  # True when the CSP strike came from the decay projection (Rulebook 5.4)
 
 
 def _expiration(dte: int = TARGET_DTE) -> str:
     return (date.today() + timedelta(days=dte)).isoformat()
 
 
+# --- Rulebook 5.4 / 5.5 (2026-07-17, from Mike's real AIYY lesson) --------
+RECOVERY_DISTRESS = 0.15      # 15%+ below basis = recovery-mode evaluation
+RECOVERY_MIN_CREDIT = 10.0    # minimum dollars per write worth the cap
+DECAYER_MONTHLY = -0.02       # trailing bleed of -2%/mo or worse = decayer
+
+
+def decay_rate_monthly(candles: list[Candle]) -> float:
+    """Trailing price drift per 30 calendar days (negative = decayer).
+
+    Measured over ~3 months of trading days so a reverse split's
+    cosmetic level never reads as support - the drift is the truth
+    (Rulebook 5.2). Returns 0.0 when there is too little history."""
+    if len(candles) < 45:
+        return 0.0
+    window = min(len(candles), 63)
+    a = float(candles[-window].close)
+    b = float(candles[-1].close)
+    if a <= 0 or b <= 0:
+        return 0.0
+    cal_days = window * 7.0 / 5.0
+    return ((b / a) - 1.0) * (30.0 / cal_days)
+
+
 def evaluate_csp(
     underlying: str,
     candles: list[Candle],
     contracts: int = 1,
+    decay_monthly: float = 0.0,
+    dte: int = TARGET_DTE,
 ) -> Optional[WheelLeg]:
     """Build a cash-secured put for `underlying` from current candles."""
     if len(candles) < 22:
@@ -106,7 +132,17 @@ def evaluate_csp(
 
     iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
     strike = round(spot * (1 - CSP_OTM), 2)
-    q: OptionQuote = theoretical_price("put", spot, strike, TARGET_DTE, iv)
+    _dp = False
+    # Rulebook 5.4 - enter through the put. On a decaying name the
+    # quote is cosmetic; project the trailing monthly bleed over the
+    # contract's life (25% safety margin) and place the strike at or
+    # below where the decay lands, never above it.
+    if decay_monthly <= DECAYER_MONTHLY:
+        projected = spot * (1.0 + decay_monthly * (dte / 30.0) * 1.25)
+        if 0 < projected < strike:
+            strike = round(projected, 2)
+            _dp = True
+    q: OptionQuote = theoretical_price("put", spot, strike, dte, iv)
 
     credit = q.premium * 100 * contracts
     if credit <= 0:
@@ -117,12 +153,13 @@ def evaluate_csp(
         leg="csp",
         option_type="put",
         strike=strike,
-        expiration=_expiration(),
+        expiration=_expiration(dte),
         contracts=contracts,
         premium_per_share=q.premium,
         credit_usd=round(credit, 2),
         modeled_iv=q.iv,
         cash_secured_usd=round(strike * 100 * contracts, 2),
+        decay_projected=_dp,
     )
 
 
@@ -132,6 +169,7 @@ def evaluate_cc(
     cost_basis: float,
     contracts: int = 1,
     days_until_exdiv: Optional[int] = None,
+    dte: int = TARGET_DTE,
 ) -> Optional[WheelLeg]:
     """Build a covered call above the holder's cost basis.
 
@@ -156,11 +194,11 @@ def evaluate_cc(
     otm = CC_OTM
     if (
         days_until_exdiv is not None
-        and 0 <= days_until_exdiv <= TARGET_DTE
+        and 0 <= days_until_exdiv <= dte
     ):
         otm = CC_OTM * 1.5
     strike = round(max(spot * (1 + otm), cost_basis * 1.01), 2)
-    q: OptionQuote = theoretical_price("call", spot, strike, TARGET_DTE, iv)
+    q: OptionQuote = theoretical_price("call", spot, strike, dte, iv)
 
     credit = q.premium * 100 * contracts
     if credit <= 0:
@@ -171,7 +209,62 @@ def evaluate_cc(
         leg="cc",
         option_type="call",
         strike=strike,
-        expiration=_expiration(),
+        expiration=_expiration(dte),
+        contracts=contracts,
+        premium_per_share=q.premium,
+        credit_usd=round(credit, 2),
+        modeled_iv=q.iv,
+        cash_secured_usd=0.0,
+    )
+
+
+def evaluate_cc_recovery(
+    underlying: str,
+    candles: list[Candle],
+    cost_basis: float,
+    contracts: int = 1,
+    decay_monthly: float = 0.0,
+    days_until_exdiv: Optional[int] = None,
+    dte: int = TARGET_DTE,
+) -> Optional[WheelLeg]:
+    """Rulebook 5.5 - the arithmetic gate for UNDERWATER holdings.
+
+    No symbol bans, ever. A recovery-mode covered call may sit BELOW
+    cost basis, but only when the math clears:
+      1. OTM only - strike above spot, so assignment (strike + premium
+         + income already collected) strictly beats selling at today's
+         mark. ATM/ITM writes on an underwater hold are forbidden.
+      2. Income pace beats decay pace - premium per month must exceed
+         the trailing monthly bleed on the lot, or the hole never
+         closes and the write is refused.
+      3. Premium non-trivial - at least $10 and 0.2% of lot value.
+    The caller logs the recovery ledger; the ledger decides continuation.
+    """
+    if len(candles) < 22:
+        return None
+    spot = float(candles[-1].close)
+    if spot <= 0 or cost_basis <= 0:
+        return None
+    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    otm = CC_OTM
+    if days_until_exdiv is not None and 0 <= days_until_exdiv <= dte:
+        otm = CC_OTM * 1.5
+    strike = round(spot * (1 + otm), 2)   # above SPOT - not basis
+    q: OptionQuote = theoretical_price("call", spot, strike, dte, iv)
+    credit = q.premium * 100 * contracts
+    lot_value = spot * 100 * contracts
+    if credit < max(RECOVERY_MIN_CREDIT, lot_value * 0.002):
+        return None                        # gate 3: not worth the cap
+    income_month = credit * (30.0 / max(dte, 7))
+    decay_month = abs(min(decay_monthly, 0.0)) * lot_value
+    if decay_month > 0 and income_month <= decay_month:
+        return None                        # gate 2: decay outruns income
+    return WheelLeg(
+        underlying=underlying.upper(),
+        leg="cc",
+        option_type="call",
+        strike=strike,
+        expiration=_expiration(dte),
         contracts=contracts,
         premium_per_share=q.premium,
         credit_usd=round(credit, 2),
@@ -207,4 +300,5 @@ async def refine_csp_live(leg: WheelLeg) -> WheelLeg:
         modeled_iv=leg.modeled_iv,
         cash_secured_usd=round(lo.strike * 100 * leg.contracts, 2),
         live=True,
+        decay_projected=getattr(leg, "decay_projected", False),
     )

@@ -75,6 +75,7 @@ MIN_BANK_PROFIT = _num("TREZO_REEVAL_MIN_BANK_PROFIT", 0.005)
 AVGDOWN_TRIGGER = _num("TREZO_REEVAL_AVGDOWN_TRIGGER", 0.08)
 
 _last_action: dict[str, float] = {}
+_shadow_at: dict[str, float] = {}   # reprice-shadow log throttle (7/20)
 _hb_at: dict[str, float] = {}   # visibility heartbeat throttle (7/1)
 
 
@@ -307,6 +308,38 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         if (lower_on and (stale or giveback >= TIGHTEN_GIVEBACK)
                 and cur_target is not None):
             far = ((cur_target - price) / price) if is_long else ((price - cur_target) / price)
+            # SHADOW MODE (Mike 2026-07-20): the 8% far-trigger looked
+            # dead at this account size (7 of 9 round-trippers in the
+            # last 30d sat UNDER it) -- but the knob does not move
+            # without data. Log what a tighter trigger WOULD have done,
+            # change nothing, and let the week's ledger decide.
+            _sh_far = _num("TREZO_REEVAL_SHADOW_FAR_PCT", 0.03)
+            if _sh_far < TARGET_FAR_PCT and _sh_far < far <= TARGET_FAR_PCT:
+                _shk = f"sh:{pid}"
+                if now - _shadow_at.get(_shk, 0.0) > 6 * 3600:
+                    _shadow_at[_shk] = now
+                    if is_long:
+                        _sh_t = round(max(entry * (1 + MIN_BANK_PROFIT),
+                                          price * (1 + TARGET_REACH_BAND)), 4)
+                    else:
+                        _sh_t = round(min(entry * (1 - MIN_BANK_PROFIT),
+                                          price * (1 - TARGET_REACH_BAND)), 4)
+                    try:
+                        from app.agents.activity_log import record as _shrec
+                        _shrec("reprice_shadow", ticker,
+                               strategy=str(r.get("strategy") or ""),
+                               reason=(f"SHADOW: target {_pf(cur_target)} sits "
+                                       f"{far * 100:.1f}% away (under the live "
+                                       f"{TARGET_FAR_PCT * 100:.0f}% trigger); a "
+                                       f"{_sh_far * 100:.0f}% trigger would have "
+                                       f"lowered it to {_pf(_sh_t)}"),
+                               extra={"position_id": str(r.get("id")),
+                                      "price": price,
+                                      "would_target": _sh_t,
+                                      "cur_target": cur_target,
+                                      "far_pct": round(far * 100, 2)})
+                    except Exception:  # noqa: BLE001
+                        pass
             if far > TARGET_FAR_PCT:
                 if is_long:
                     new_t = round(max(entry * (1 + MIN_BANK_PROFIT), price * (1 + TARGET_REACH_BAND)), 4)

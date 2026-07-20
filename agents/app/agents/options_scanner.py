@@ -37,7 +37,33 @@ from app.memory import get_memory, AgentDecision
 from app.learning.recall_helpers import recall_decision_context
 from app.strategies.wheel import (
     WHEEL_WATCHLIST, evaluate_csp, evaluate_cc, refine_csp_live,
+    evaluate_cc_recovery, decay_rate_monthly, RECOVERY_DISTRESS,
+    TARGET_DTE as WHEEL_TARGET_DTE,
 )
+
+
+def _wheel_dte_pick() -> int:
+    """Posture-aware target DTE for new wheel/overlay legs (Mike
+    2026-07-20: 'if it is that far out we are missing on valuable
+    information'). The auto-fire gate caps growth accounts at 21 DTE,
+    but legs were built at TARGET_DTE=30 and the live pick landed on
+    the ~32-DTE monthly -- benching the whole wheel between monthly
+    cycles. Target just under the posture cap instead, so weekly
+    expirations qualify. Env override TREZO_WHEEL_MAX_DTE respected."""
+    import os
+    _caps = {"growth": 21, "balanced": 35, "income": 45}
+    cap = 21
+    try:
+        from app.runtime.settings import get_bot_settings as _g
+        _p = str(getattr(_g(), "account_posture", "auto") or "auto")
+        cap = _caps.get(_p, 21)
+    except Exception:  # noqa: BLE001
+        cap = 21
+    try:
+        cap = int(float(os.getenv("TREZO_WHEEL_MAX_DTE", str(cap))))
+    except (TypeError, ValueError):
+        pass
+    return max(7, min(WHEEL_TARGET_DTE, cap - 1))
 from app.strategies.options_strategies import (
     build_long_call,
     build_bull_call_spread,
@@ -455,6 +481,10 @@ class OptionsScannerAgent(Agent):
         # --- 3. WHEEL: open CSPs where missing -----------------------------
         opened = await self._run_wheel(client)
         out.extend(opened)
+
+        # --- 3b. CC OVERLAY: Rulebook 5.5 arithmetic-gate covered calls ----
+        overlay = await self._run_cc_overlay(client)
+        out.extend(overlay)
 
         # --- 4. Options-strategy IDEAS (suggestions only) ------------------
         ideas = await self._options_ideas()
@@ -2129,6 +2159,159 @@ class OptionsScannerAgent(Agent):
             },
         )
 
+    # ------------------------------------------------------------------
+    # CC OVERLAY - Rulebook 5.5 (2026-07-17, from Mike's real AIYY
+    # lesson). Covered calls against ANY 100-share stock lot at the
+    # broker - wheel-assigned or not. The arithmetic gate replaces
+    # symbol bans: an underwater hold (spot 15%+ below basis) may
+    # still be written, but OTM-only and only when premium pace beats
+    # decay pace. The recovery ledger is logged on every write; the
+    # ledger, not opinion, decides continuation.
+    # Capacity: 1 new write per user per day; never on a name that
+    # already has an open option row (no stacking); wheel cooldowns
+    # shared so broker rejects are not hammered.
+    _overlay_day: dict[str, str] = {}
+
+    async def _run_cc_overlay(self, client) -> list[AgentMessage]:
+        out: list[AgentMessage] = []
+        today = date.today().isoformat()
+
+        def _sync_users():
+            return client.table("paper_accounts").select("user_id").execute()
+
+        users = [u["user_id"] for u in
+                 ((await asyncio.to_thread(_sync_users)).data or [])]
+        for user_id in users:
+            if self._overlay_day.get(user_id) == today:
+                continue  # one new overlay write per day per user
+            if not await _user_has_alpaca(user_id):
+                continue
+            try:
+                from app.brokers.alpaca import get_positions, UserToken
+                from app.integrations.web_tokens import get_user_broker_token
+                bt = await get_user_broker_token(user_id, "alpaca")
+                if not bt:
+                    continue
+                token = UserToken(bt.access_token)
+                broker = await get_positions(token)
+            except Exception:  # noqa: BLE001
+                continue
+            stocks = []
+            for bp in broker or []:
+                try:
+                    if (bp.get("asset_class") or "us_equity") != "us_equity":
+                        continue
+                    if float(bp.get("qty") or 0) >= 100:
+                        stocks.append(bp)
+                except Exception:  # noqa: BLE001
+                    continue
+            for bp in stocks:
+                sym = (bp.get("symbol") or "").upper()
+                qty = int(float(bp.get("qty") or 0))
+                basis = float(bp.get("avg_entry_price") or 0)
+                if not sym or len(sym) > 6 or basis <= 0:
+                    continue
+                lots = qty // 100
+                if lots <= 0:
+                    continue
+
+                # Never stack premium: any open option row on the name
+                # (wheel, overlay, or directional) blocks a new write.
+                def _sync_open(uid=user_id, sm=sym):
+                    return (
+                        client.table("options_positions").select("id")
+                        .eq("user_id", uid).eq("underlying", sm)
+                        .eq("status", "open").execute()
+                    )
+                if (await asyncio.to_thread(_sync_open)).data:
+                    continue
+                if _wheel_in_cooldown(user_id, sym, "wheel_cc"):
+                    continue
+
+                candles = await fetch_candles_for(sym, "stock")
+                if not candles:
+                    continue
+                spot = float(candles[-1].close)
+                if spot <= 0:
+                    continue
+                dm = decay_rate_monthly(candles)
+                underwater = spot <= basis * (1.0 - RECOVERY_DISTRESS)
+                _ov_dte = _wheel_dte_pick()
+                if underwater:
+                    leg = evaluate_cc_recovery(
+                        sym, candles, basis,
+                        contracts=lots, decay_monthly=dm, dte=_ov_dte)
+                    mode = "recovery"
+                else:
+                    leg = evaluate_cc(sym, candles, basis,
+                                      contracts=lots, dte=_ov_dte)
+                    mode = "standard"
+                if not leg:
+                    continue
+
+                # Recovery ledger (Rulebook 5.5) - the arithmetic that
+                # allowed this write. TARGET_DTE is ~30d, so credit per
+                # cycle ~= income per month.
+                hole = round(max((basis - spot) * qty, 0.0), 2)
+                income_mo = round(leg.credit_usd * (30.0 / max(_ov_dte, 7)), 2)
+                decay_mo = round(abs(min(dm, 0.0)) * spot * qty, 2)
+                months = (round(hole / max(income_mo - decay_mo, 1e-9), 1)
+                          if hole > 0 and income_mo > decay_mo else None)
+                note = (
+                    f"CC overlay ({mode}, Rulebook 5.5) on {sym}: "
+                    f"{lots} call(s) at ${leg.strike:.2f} vs spot "
+                    f"${spot:.2f}, basis ${basis:.2f}, "
+                    f"~${leg.credit_usd:.0f} credit. Ledger: hole "
+                    f"${hole:.0f}, income ~${income_mo:.0f}/mo, decay "
+                    f"~${decay_mo:.0f}/mo"
+                    + (f", projected close ~{months} mo." if months
+                       else ".")
+                )
+
+                from app.runtime.settings import get_bot_settings
+                cfg = get_bot_settings(user_id)
+                halted = await _user_halted(client, user_id)
+                if cfg.wheel_auto_execute and not halted:
+                    fired = await self._wheel_auto_fire(
+                        user_id=user_id, underlying=sym, leg=leg,
+                        strategy="wheel_cc",
+                        priced=("Live-quoted"
+                                if getattr(leg, "live", False)
+                                else "Modeled"),
+                    )
+                    if fired is not None:
+                        ev = (fired.payload or {}).get("event")
+                        if ev in ("wheel_auto_blocked",
+                                  "wheel_auto_tracking_failed"):
+                            _wheel_set_cooldown(user_id, sym, "wheel_cc")
+                        else:
+                            self._overlay_day[user_id] = today
+                        fired.payload["overlay"] = True
+                        fired.payload["overlay_note"] = note
+                        out.append(fired)
+                        break  # one per day - stop scanning this user
+                    _wheel_set_cooldown(user_id, sym, "wheel_cc")
+                    continue
+
+                # Suggestion path (auto-execute off, or halted).
+                out.append(AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={
+                        "user_id": user_id,
+                        "event": "cc_overlay_suggestion",
+                        "underlying": sym,
+                        "strategy": "wheel_cc",
+                        "mode": mode,
+                        "strike": leg.strike,
+                        "expiration": leg.expiration,
+                        "credit_usd": leg.credit_usd,
+                        "note": note,
+                    },
+                ))
+                self._overlay_day[user_id] = today
+                break
+        return out
+
     async def _run_wheel(self, client) -> list[AgentMessage]:
         # Every user with a paper account participates in the Wheel.
         def _sync_users():
@@ -2206,10 +2389,14 @@ class OptionsScannerAgent(Agent):
                         underlying, candles,
                         float(last.get("strike") or 0),
                         days_until_exdiv=cycle_days_to_exdiv,
+                        dte=_wheel_dte_pick(),
                     )
                     strategy = "wheel_cc"
                 else:
-                    leg = evaluate_csp(underlying, candles)
+                    leg = evaluate_csp(
+                        underlying, candles,
+                        decay_monthly=decay_rate_monthly(candles),
+                        dte=_wheel_dte_pick())
                     if leg:
                         leg = await refine_csp_live(leg)
                     strategy = "wheel_csp"
@@ -2217,6 +2404,10 @@ class OptionsScannerAgent(Agent):
                     continue
 
                 priced = "Live-quoted" if getattr(leg, "live", False) else "Modeled"
+                if getattr(leg, "decay_projected", False):
+                    # Rulebook 5.4: strike came from the decay projection,
+                    # not the standard OTM offset. Visible in every note.
+                    priced += " decay-projected"
 
                 # Has this user connected Alpaca? When YES, behavior splits
                 # on the wheel_auto_execute bot setting:
