@@ -42,10 +42,32 @@ function agoLabel(iso: string): string {
   if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + "h ago";
   return Math.floor(ms / 86_400_000) + "d ago";
 }
+async function fetchForexQuotes(symbols: string[]): Promise<Record<string, number>> {
+  // Live spot for forex pairs from Kraken's public ticker (the same venue
+  // the agents' forex data comes from). Fail-quiet: a miss just leaves the
+  // card without a live price, exactly as before.
+  const out: Record<string, number> = {};
+  await Promise.all(symbols.map(async (sym) => {
+    try {
+      const res = await fetch(
+        `https://api.kraken.com/0/public/Ticker?pair=${encodeURIComponent(sym)}`,
+        { next: { revalidate: 10 } },
+      );
+      if (!res.ok) return;
+      const j = (await res.json()) as { result?: Record<string, { c?: string[] }> };
+      const first = j.result ? Object.values(j.result)[0] : undefined;
+      const px = first?.c?.[0] != null ? Number(first.c[0]) : NaN;
+      if (Number.isFinite(px) && px > 0) out[sym] = px;
+    } catch { /* price stays unavailable */ }
+  }));
+  return out;
+}
+
 function layerFor(assetType: string, strategy: string): { layer: number; name: string } {
   const a = (assetType || "").toLowerCase();
   const s = (strategy || "").toLowerCase();
   if (a === "crypto") return { layer: 1, name: "Crypto" };
+  if (a === "forex") return { layer: 6, name: "Forex" };
   if (a === "option" || a === "options") return { layer: 3, name: "Options" };
   if (s.startsWith("wheel") || s.includes("dividend")) return { layer: 5, name: "Wheel" };
   if (s.startsWith("extended")) return { layer: 4, name: "Extended" };
@@ -74,6 +96,7 @@ const STRATEGY_THESIS: Record<string, string> = {
   pattern: "Technical pattern setup — held toward target while the pattern stays valid.",
   extended: "Multi-day swing — held across sessions toward a larger target.",
   hodl: "Patient accumulation — held with a catastrophe stop, trailing up once it runs.",
+  forex_swing: "Forex swing — a currency-pair move held toward its target with a hard stop; prices move in fractions of a cent, so the position is sized in units.",
   swing: "Crypto swing — held toward target with step-ladder profit locks.",
   dca: "Dollar-cost accumulation — building the position in steps toward target.",
   dividend: "Income position — held to capture the distribution.",
@@ -88,7 +111,9 @@ function thesisFor(strategy: string, assetType: string): string {
   return "Held on its entry thesis, working toward its target.";
 }
 function pxFmt(n: number): string {
-  return n >= 1000 ? "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : "$" + n.toFixed(2);
+  if (n >= 1000) return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (n < 2) return "$" + n.toFixed(4); // forex pairs + sub-$2 names move in fractions of a cent
+  return "$" + n.toFixed(2);
 }
 function planText(side: string, entry: number, current: number | null, target: number | null, stop: number | null): string {
   const isLong = side !== "SHORT";
@@ -164,6 +189,12 @@ export default async function PaperPage() {
   const account = accountRes.data as Record<string, number> | null;
   const open = (openRes.data ?? []) as OpenPos[];
   const closed = (closedRes.data ?? []) as ClosedPos[];
+  const fxSymbols = open
+    .filter((p) => (p.asset_type ?? "").toLowerCase() === "forex")
+    .map((p) => String(p.ticker).toUpperCase());
+  const fxQuotes: Record<string, number> = fxSymbols.length
+    ? await fetchForexQuotes(fxSymbols)
+    : {};
   const alpacaActive = !!(alpaca?.configured && alpaca?.account);
   const agentsOnline = alpaca !== null && !alpaca.stale;
   const snapshotStale = !!alpaca?.stale;
@@ -190,18 +221,32 @@ export default async function PaperPage() {
     if (ap) matchedSymbols.add(String(ap.symbol).toUpperCase());
     const sideU = String(p.side ?? "").toUpperCase();
     const entryN = Number(p.entry_price ?? 0);
-    const curN = ap ? Number(ap.current_price) : null;
+    const isLong = sideU !== "SHORT";
+    const isFx = (p.asset_type ?? "").toLowerCase() === "forex";
+    const fxPx = isFx ? (fxQuotes[String(p.ticker).toUpperCase()] ?? null) : null;
+    const fxQty = Number(p.quantity ?? 0);
+    const fxPnl = isFx && fxPx != null && entryN > 0
+      ? (isLong ? fxPx - entryN : entryN - fxPx) * fxQty
+      : null;
+    const curN = ap ? Number(ap.current_price) : fxPx;
     const stopN = p.stop_price != null ? Number(p.stop_price) : null;
     const targetN = p.target_price != null ? Number(p.target_price) : null;
-    const isLong = sideU !== "SHORT";
     const locked = stopN != null && entryN > 0 && (isLong ? stopN > entryN : stopN < entryN);
     return {
       id: p.id, ticker: p.ticker, side: sideU,
       layer: name, chip: layer, entry: entryN, qty: Number(p.quantity ?? 0),
       current: curN,
-      pnl: ap ? Number(ap.unrealized_pl) : null,
-      pct: ap ? Number(ap.unrealized_plpc) * 100 : null,
-      flag: ap ? ("live" as const) : ((p.asset_type ?? "").toLowerCase() === "crypto" ? ("modeled" as const) : ("unconfirmed" as const)),
+      pnl: ap ? Number(ap.unrealized_pl) : fxPnl,
+      pct: ap
+        ? Number(ap.unrealized_plpc) * 100
+        : (fxPnl != null && entryN > 0 && fxQty > 0
+            ? (fxPnl / (entryN * fxQty)) * 100
+            : null),
+      flag: ap
+        ? ("live" as const)
+        : ((p.asset_type ?? "").toLowerCase() === "crypto" || isFx
+            ? ("modeled" as const)
+            : ("unconfirmed" as const)),
       stop: stopN, target: targetN,
       heldSince: p.entry_at ? agoLabel(p.entry_at) : undefined,
       why: thesisFor(p.strategy ?? "", p.asset_type ?? ""),
