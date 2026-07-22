@@ -120,6 +120,52 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             if sym:
                 alpaca_by_sym[sym] = p
 
+        # OVERSELL GUARD (Mike 2026-07-22, the DRAM -2 incident): the
+        # stock book is LONG-ONLY. A negative stock quantity at the
+        # broker means stale exit orders double-sold (a GTC leg filled
+        # after a partial had already sold shares). Cover it right away
+        # -- closing a short IS the buy -- unless a cover buy is
+        # already in flight, and raise a loud line either way.
+        for _sym_neg in list(alpaca_by_sym.keys()):
+            try:
+                _q_neg = float(alpaca_by_sym[_sym_neg].get("qty") or 0)
+            except (TypeError, ValueError):
+                continue
+            if _q_neg >= 0:
+                continue
+            _st_n = "skipped"
+            try:
+                from app.brokers.alpaca import _get as _araw
+                _oo = await _araw(
+                    f"/v2/orders?status=open&symbols={_sym_neg}") or []
+                _buy_inflight = any(
+                    isinstance(_o, dict) and str(_o.get("side")) == "buy"
+                    for _o in _oo)
+            except Exception:  # noqa: BLE001
+                _buy_inflight = False
+            if not _buy_inflight:
+                try:
+                    from app.agents.position_monitor import (
+                        _throttled_liquidate,
+                    )
+                    _res_n, _st_n = await _throttled_liquidate(
+                        _sym_neg, "stock")
+                except Exception:  # noqa: BLE001
+                    _st_n = "error"
+            else:
+                _st_n = "cover already in flight"
+            try:
+                from app.agents.activity_log import record as _arec_n
+                _arec_n("oversell_covered", _sym_neg,
+                        reason=(f"LONG-ONLY book showed {_q_neg:g} at the "
+                                f"broker (stale exits double-sold); "
+                                f"buy-to-cover: {_st_n}"),
+                        extra={"user_id": str(user_id), "qty": _q_neg})
+            except Exception:  # noqa: BLE001
+                pass
+            # Never reconcile a short as if it were a long row.
+            alpaca_by_sym.pop(_sym_neg, None)
+
         # Trust a "broker doesn't list this symbol" signal as a real
         # close ONLY when the fetch succeeded AND returned >=1 stock
         # position. An empty list or a swallowed error must not

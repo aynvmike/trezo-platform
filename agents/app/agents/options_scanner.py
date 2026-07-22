@@ -1967,11 +1967,35 @@ class OptionsScannerAgent(Agent):
                             float(x.get("strike") or 0) * 100.0
                             * int(x.get("contracts") or 1)
                             for x in _open_csp)
+                        # BROKER-TRUTH merge (2026-07-22): Monday's four
+                        # CSPs fired minutes apart -- each gate query ran
+                        # before the prior fire's tracking row landed, so
+                        # every check saw zero open. The broker's own
+                        # short puts are the truth the DB cannot lag:
+                        # count them too and take the stricter view.
+                        _brk_csp_n = 0
+                        _brk_coll = 0.0
+                        try:
+                            from app.brokers.alpaca import (
+                                get_option_positions as _gop,
+                            )
+                            for _bp in (await _gop() or []):
+                                _occ = str(_bp.get("symbol") or "")
+                                _bq = float(_bp.get("qty") or 0)
+                                if (len(_occ) > 15 and _occ[-9] == "P"
+                                        and _bq < 0):
+                                    _brk_csp_n += int(abs(_bq))
+                                    _brk_coll += ((int(_occ[-8:]) / 1000.0)
+                                                  * 100.0 * abs(_bq))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _eff_csp_n = max(len(_open_csp), _brk_csp_n)
+                        _eff_coll = max(_held_coll, _brk_coll)
                         # Concurrent-CSP gate (posture-scaled).
-                        if len(_open_csp) >= _max_csp:
+                        if _eff_csp_n >= _max_csp:
                             from app.agents.activity_log import record as _arecc
                             _arecc("wheel_limit", underlying,
-                                   reason=(f"CSP skipped: {len(_open_csp)} already "
+                                   reason=(f"CSP skipped: {_eff_csp_n} already "
                                            f"open = the {_post}-posture max "
                                            f"({_max_csp}) - capital stays free "
                                            f"for the growth lanes"),
@@ -1981,13 +2005,13 @@ class OptionsScannerAgent(Agent):
                                 payload={"user_id": user_id,
                                          "event": "wheel_limit",
                                          "underlying": underlying,
-                                         "reason": f"open CSPs {len(_open_csp)} >= {_max_csp} ({_post})",
+                                         "reason": f"open CSPs {_eff_csp_n} >= {_max_csp} ({_post})",
                                          "routed_via": routed})
-                        if _held_coll + collateral > _cap_pct * _eq:
+                        if _eff_coll + collateral > _cap_pct * _eq:
                             try:
                                 from app.agents.activity_log import record as _arec
                                 _arec("wheel_collateral_cap", underlying,
-                                      reason=(f"CSP skipped: ${_held_coll:,.0f} already "
+                                      reason=(f"CSP skipped: ${_eff_coll:,.0f} already "
                                               f"reserved + ${collateral:,.0f} new would pass "
                                               f"{_cap_pct * 100:.0f}% of equity (${_eq:,.0f}) "
                                               f"- other lanes keep their buying power"),
