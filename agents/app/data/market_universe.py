@@ -60,7 +60,13 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
     def _clean(sym: str) -> bool:
         # Drop warrants/units/odd share classes ("KRSP.WS", "ABC-U") --
         # they wasted scan slots and always died at the gates (2026-07-02).
-        return sym.isalpha() and 1 <= len(sym) <= 5
+        # 2026-07-22: plain-suffix SPAC warrants too -- the RNWWW/FGIWW/
+        # PRENW flood: five letters ending in W is the warrant naming
+        # convention, and none of them had data on any venue. A naming-
+        # convention condition, not a symbol list.
+        if not (sym.isalpha() and 1 <= len(sym) <= 5):
+            return False
+        return not (len(sym) == 5 and sym.endswith("W"))
 
     try:
         from app.brokers.alpaca_data import get_market_movers, get_most_actives

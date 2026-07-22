@@ -18,6 +18,26 @@ import httpx
 
 from app.patterns import Candle
 
+# --- Bad-symbol rest list (Mike 2026-07-22: "so many actions fail...
+# this seems like it is just wasting api requests"). The movers /
+# most-actives screeners surface names with NO data on our venues
+# (SPAC warrants, OTC leftovers, delistings). Without memory, every
+# scan cycle re-paid two network trips per dead name (Alpaca miss +
+# Yahoo fail) and yfinance screamed two log lines each. Evidence-based
+# and SELF-EXPIRING -- never a static ban: a symbol with no daily data
+# anywhere rests for TREZO_BAD_SYMBOL_TTL_H (default 24h), then gets a
+# fresh chance automatically.
+import os as _os_bs
+import time as _time_bs
+import logging as _logging_bs
+
+_log_bs = _logging_bs.getLogger("trezo.candles")
+_NO_DATA: dict[str, float] = {}
+try:
+    _NO_DATA_TTL_S = float(_os_bs.getenv("TREZO_BAD_SYMBOL_TTL_H", "24")) * 3600.0
+except (TypeError, ValueError):
+    _NO_DATA_TTL_S = 24 * 3600.0
+
 
 # CoinGecko ids — the core layer-1 picks plus the ISO 20022-aligned
 # coin cluster (Mike 2026-05-31). Building on the ISO 20022 payments
@@ -218,6 +238,10 @@ def _yfinance_candles(symbol: str, period: str, interval: str) -> list[Candle]:
         import yfinance as yf
     except ImportError:
         return []
+    # yfinance logs two loud lines per missing symbol ("Failed to get
+    # ticker...", "$X: possibly delisted") -- misses become ONE
+    # rest-list line of ours instead, so its logger stays quiet.
+    _logging_bs.getLogger("yfinance").setLevel(_logging_bs.CRITICAL)
     try:
         df = yf.Ticker(symbol).history(
             period=period, interval=interval, auto_adjust=False)
@@ -250,6 +274,12 @@ async def fetch_stock_candles(
     Daily bars: Alpaca first (reliable, keys already configured), then
     yfinance as a fallback. Intraday intervals go straight to yfinance.
     """
+    sym_u = symbol.upper()
+    _rest = _NO_DATA.get(sym_u)
+    if _rest is not None:
+        if _time_bs.time() < _rest:
+            return []              # resting: known no-data symbol
+        _NO_DATA.pop(sym_u, None)  # TTL over -- fresh chance
     if interval == "1d":
         try:
             from app.brokers.alpaca_data import (
@@ -270,7 +300,15 @@ async def fetch_stock_candles(
     # Yahoo rate-limit stalls could freeze the whole bot. to_thread
     # matches the docstring's promise ("caller runs it in a thread").
     import asyncio as _asyncio
-    return await _asyncio.to_thread(_yfinance_candles, symbol, period, interval)
+    candles = await _asyncio.to_thread(
+        _yfinance_candles, symbol, period, interval)
+    if not candles and interval == "1d":
+        _NO_DATA[sym_u] = _time_bs.time() + _NO_DATA_TTL_S
+        _log_bs.info(
+            "%s: no daily data at Alpaca or Yahoo -- resting the symbol "
+            "for %.0fh (self-expiring; it retries after that)",
+            sym_u, _NO_DATA_TTL_S / 3600.0)
+    return candles
 
 
 async def fetch_candles_for(
