@@ -60,8 +60,10 @@ for _sym in ISO20022_SYMBOLS:
 # ISO 20022-aligned cluster. Mike's per-stock strategy preference
 # applies - the scanner can flip strategy per coin without flipping
 # the whole universe.
-CRYPTO_WATCHLIST: list[str] = (["ETH", "SOL", "DOGE", "LTC", "LINK", "DOT", "AVAX"]
+CRYPTO_WATCHLIST: list[str] = (["BTC", "ETH", "SOL", "DOGE", "LTC", "LINK", "DOT", "AVAX"]
                                + ISO20022_SYMBOLS)  # majors widened 2026-07-13
+# BTC added 2026-07-23 (Mike: "from bitcoin to XRP") -- it had COIN_PARAMS
+# from day one but was never put on the scan list.
 
 
 # HODL — long-horizon accumulate-and-hold (Mike 2026-06-13). The
@@ -255,6 +257,35 @@ SWING_VOL_MIN = _envf("TREZO_CRYPTO_SWING_VOL_MIN", 0.8)
 DCA_RSI_MAX = _envf("TREZO_CRYPTO_DCA_RSI_MAX", 40)
 
 
+def _vol_ratio_live(candles: list[Candle]) -> tuple[float, float]:
+    """Last-bar volume ratio, PRO-RATED for the still-filling candle.
+
+    Mike 2026-07-23 ("no crypto trades in days... even while the market
+    is open around this hour"): the last candle is PARTIAL -- in the
+    early hours it holds only a fraction of its period's volume, so the
+    old last/avg read chronically scored overnight tape as dead (0.07-
+    0.27 at 3 AM vs 0.5+ mid-morning) and quietly benched a 24/7 lane
+    every night. Compare instead against what the AVERAGE candle would
+    have accumulated by the same elapsed fraction of its period.
+    Granularity-agnostic (Kraken 4h bars or CoinGecko daily). Falls
+    back to the raw ratio if timestamps are unusable."""
+    last_vol = candles[-1].volume
+    avg_vol = avg_volume(candles[:-1], 20)
+    if avg_vol <= 0:
+        return 0.0, avg_vol
+    frac = 1.0
+    try:
+        from datetime import datetime as _dtv, timezone as _tzv
+        if len(candles) >= 3:
+            period = (candles[-1].timestamp - candles[-2].timestamp).total_seconds()
+            if period > 0:
+                elapsed = (_dtv.now(_tzv.utc) - candles[-1].timestamp).total_seconds()
+                frac = max(0.08, min(elapsed / period, 1.0))
+    except Exception:  # noqa: BLE001
+        frac = 1.0
+    return (last_vol / (avg_vol * frac)), avg_vol
+
+
 def indicators(candles: list[Candle]) -> dict:
     """The raw read each mode is judged on -- RSI, Bollinger width %, last-bar
     volume ratio -- so the scanner can SHOW why a coin did or did not fire."""
@@ -263,9 +294,7 @@ def indicators(candles: list[Candle]) -> dict:
     cl = closes(candles)
     rsi_now = rsi(cl, 14)[-1]
     bb_w = _bb_width_pct(cl)
-    last_vol = candles[-1].volume
-    avg_vol = avg_volume(candles[:-1], 20)
-    vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
+    vol_ratio, avg_vol = _vol_ratio_live(candles)
     return {
         "rsi": round(rsi_now, 1),
         "bb_width_pct": round(bb_w, 2),
@@ -291,9 +320,7 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
     rsi_now = rsi(cl, 14)[-1]
     bb_w = _bb_width_pct(cl)
 
-    last_vol = candles[-1].volume
-    avg_vol = avg_volume(candles[:-1], 20)
-    vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
+    vol_ratio, avg_vol = _vol_ratio_live(candles)
 
     base = COIN_PARAMS[sym]
 

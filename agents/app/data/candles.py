@@ -122,6 +122,28 @@ async def fetch_kraken_ohlc(symbol: str, interval_minutes: int = 1440) -> list[C
 
 
 async def fetch_crypto_ohlc(symbol: str, days: int = 30) -> list[Candle]:
+    """Rest-listed wrapper (2026-07-23): a coin with no OHLC anywhere --
+    Kraken AND CoinGecko empty, the XYO case -- rests for the same
+    self-expiring TTL as dead stocks instead of re-failing on every
+    scan and every executor price lookup, forever."""
+    sym_u = symbol.upper()
+    _key = "C:" + sym_u
+    _rest = _NO_DATA.get(_key)
+    if _rest is not None:
+        if _time_bs.time() < _rest:
+            return []
+        _NO_DATA.pop(_key, None)   # TTL over -- fresh chance
+    out = await _fetch_crypto_ohlc_raw(symbol, days)
+    if not out:
+        _NO_DATA[_key] = _time_bs.time() + _NO_DATA_TTL_S
+        _log_bs.info(
+            "%s: no crypto OHLC at Kraken or CoinGecko -- resting the "
+            "coin for %.0fh (self-expiring)",
+            sym_u, _NO_DATA_TTL_S / 3600.0)
+    return out
+
+
+async def _fetch_crypto_ohlc_raw(symbol: str, days: int = 30) -> list[Candle]:
     """Daily OHLC candles for a crypto symbol. Prefers LIVE Kraken public OHLC
     (real exchange prices + volume) for coins Kraken lists; falls back to
     CoinGecko for the rest (crypto Part 3, 2026-06-13)."""

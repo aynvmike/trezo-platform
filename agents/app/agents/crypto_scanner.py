@@ -37,6 +37,20 @@ class CryptoScannerAgent(Agent):
         # too — the user's slider drives everything.
         _cfg = get_bot_settings()
         tcs_floor = int(_cfg.tcs_threshold or self.MIN_TCS)
+        # Coverage-mode alignment (Mike 2026-07-23: "did we break the
+        # crypto agents?"). The Risk Manager honors TREZO_COVERAGE_TCS
+        # (40) in coverage mode, but this pre-filter ran at the raw
+        # slider floor (50) -- 41-49 crypto signals died HERE, so
+        # coverage mode never worked for crypto at all. Mirror the risk
+        # manager's exact logic; it remains the enforcement point (fee
+        # gate, regime bumps, pockets all still apply downstream).
+        import os as _os_cv
+        if _os_cv.getenv("TREZO_COVERAGE_MODE", "0") != "0":
+            try:
+                tcs_floor = min(tcs_floor, int(float(
+                    _os_cv.getenv("TREZO_COVERAGE_TCS", "40"))))
+            except (TypeError, ValueError):
+                tcs_floor = min(tcs_floor, 40)
         if not _cfg.crypto_enabled:
             # Patched 2026-06-05: surface clearly so Mike can spot it
             # in the trace panel. If Bot Tuning has crypto_enabled=False
