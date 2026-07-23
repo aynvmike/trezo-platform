@@ -467,6 +467,18 @@ class RiskManagerAgent(Agent):
                               int(float(os.getenv("TREZO_COVERAGE_TCS", "40"))))
             except (TypeError, ValueError):
                 min_tcs = min(int(min_tcs), 40)
+        # Crypto floor (Mike 2026-07-23): crypto_* strategies run at
+        # trezo_crypto_tcs_floor (Settings/.env, default 35) when that
+        # is below the slider -- otherwise 35-49 signals the scanner
+        # now emits would die here at 50. Fee gate, regime bumps, and
+        # pockets still apply on top.
+        try:
+            if str(strategy or "").lower().startswith("crypto"):
+                from app.config import get_settings as _gs_cf
+                min_tcs = min(int(min_tcs), int(getattr(
+                    _gs_cf(), "trezo_crypto_tcs_floor", 35)))
+        except Exception:  # noqa: BLE001
+            pass
         max_open = cfg.max_open_positions
 
         # Adaptive Scope - the news/regime self-tuner (Phase 7.5). The Risk

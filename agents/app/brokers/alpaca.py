@@ -26,6 +26,10 @@ LIVE_BASE_URL = "https://api.alpaca.markets"
 class AlpacaAccount:
     equity: float
     last_equity: float
+    # USD actually spendable on CRYPTO (non-marginable). Options
+    # collateral pledges drain this to 0 while margin BP can still
+    # read positive -- crypto orders 403 unless THIS bucket has money.
+    non_marginable_buying_power: float = 0.0
     cash: float
     buying_power: float
     currency: str
@@ -185,6 +189,7 @@ async def get_account(token: Optional["UserToken"] = None) -> Optional[AlpacaAcc
     return AlpacaAccount(
         equity=_f("equity"),
         last_equity=_f("last_equity"),
+        non_marginable_buying_power=_f("non_marginable_buying_power"),
         cash=_f("cash"),
         buying_power=_f("buying_power"),
         currency=str(data.get("currency") or "USD"),

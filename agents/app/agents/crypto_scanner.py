@@ -37,20 +37,20 @@ class CryptoScannerAgent(Agent):
         # too — the user's slider drives everything.
         _cfg = get_bot_settings()
         tcs_floor = int(_cfg.tcs_threshold or self.MIN_TCS)
-        # Coverage-mode alignment (Mike 2026-07-23: "did we break the
-        # crypto agents?"). The Risk Manager honors TREZO_COVERAGE_TCS
-        # (40) in coverage mode, but this pre-filter ran at the raw
-        # slider floor (50) -- 41-49 crypto signals died HERE, so
-        # coverage mode never worked for crypto at all. Mirror the risk
-        # manager's exact logic; it remains the enforcement point (fee
-        # gate, regime bumps, pockets all still apply downstream).
-        import os as _os_cv
-        if _os_cv.getenv("TREZO_COVERAGE_MODE", "0") != "0":
-            try:
-                tcs_floor = min(tcs_floor, int(float(
-                    _os_cv.getenv("TREZO_COVERAGE_TCS", "40"))))
-            except (TypeError, ValueError):
-                tcs_floor = min(tcs_floor, 40)
+        # Crypto floor via Settings (Mike 2026-07-23: "lower it to 35
+        # and see what the agents do" -- his frame: crypto = stocks,
+        # just more liquid; tighter per-coin stops justify the lower
+        # bar). NOTE the earlier os.getenv coverage read never saw
+        # agents/.env (this app loads .env through pydantic Settings
+        # ONLY), which is why scan details kept showing floor 50.
+        # The Risk Manager applies the same floor for crypto_*; the
+        # fee-aware edge gate still judges every entry.
+        try:
+            from app.config import get_settings as _gs_cf
+            tcs_floor = min(tcs_floor, int(getattr(
+                _gs_cf(), "trezo_crypto_tcs_floor", 35)))
+        except Exception:  # noqa: BLE001
+            pass
         if not _cfg.crypto_enabled:
             # Patched 2026-06-05: surface clearly so Mike can spot it
             # in the trace panel. If Bot Tuning has crypto_enabled=False

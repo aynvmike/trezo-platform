@@ -841,6 +841,34 @@ class TradeExecutionAgent(Agent):
         risk_pct = source_payload.get("risk_pct_override")
         if risk_pct is None:
             risk_pct = get_bot_settings().risk_per_trade_pct
+        # Crypto spends NON-MARGINABLE USD at Alpaca (2026-07-23: six
+        # approvals died as HTTP 403 "insufficient balance for USD,
+        # available: 0" while options collateral pledged every dollar,
+        # and the rejects tripped the session kill-switch). Check the
+        # right bucket BEFORE the broker does: when the USD wallet is
+        # collateral-locked, skip cleanly -- one visible line, no 403
+        # storm, no kill-switch trips.
+        _crypto_usd = float(getattr(
+            acct, "non_marginable_buying_power", 0.0) or 0.0)
+        if _crypto_usd < 25.0:
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("crypto_skip_no_usd", ticker, strategy=strategy,
+                      reason=(f"crypto entry skipped: USD wallet "
+                              f"collateral-locked at the broker "
+                              f"(available ${_crypto_usd:,.2f}); frees as "
+                              f"option collateral releases"),
+                      extra={"user_id": str(user_id)})
+            except Exception:  # noqa: BLE001
+                pass
+            return [AgentMessage(
+                agent=self.name, kind="info",
+                payload={"user_id": user_id, "ticker": ticker,
+                         "event": "crypto_skip_no_usd",
+                         "note": (f"{ticker}: crypto entry skipped -- USD "
+                                  f"wallet collateral-locked "
+                                  f"(${_crypto_usd:,.2f} available)")},
+            )]
         plan = plan_position(
             equity=acct.equity,
             entry_price=market_price,
@@ -848,7 +876,7 @@ class TradeExecutionAgent(Agent):
             target_price=target_price,
             risk_pct=float(risk_pct),
             asset_type="crypto",
-            buying_power=min(acct.buying_power, remaining),
+            buying_power=min(_crypto_usd, remaining),
         )
         if plan.ok and (source_payload or {}).get("coverage_trade"):
             try:

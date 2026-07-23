@@ -7,6 +7,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # Crypto confidence floor (Mike 2026-07-23: "lower it to 35 and
+    # see what the agents do"). Applied by the crypto scanner AND the
+    # Risk Manager for crypto_* strategies; the fee-aware edge gate
+    # still judges every entry. Lives in Settings because this app
+    # loads agents/.env through pydantic ONLY -- bare os.getenv reads
+    # miss it (the earlier coverage-floor read failed exactly there).
+    trezo_crypto_tcs_floor: int = 35
+
     # Service
     env: str = "development"
     # Trading mode - "paper" (default) or "live".
