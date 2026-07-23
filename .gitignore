@@ -116,3 +116,4 @@ agents/knowledge/library/
 
 # ---- Runtime agent logs (never snapshot) ----
 logs/
+agents/app/data/crypto_discovered.json

@@ -56,6 +56,16 @@ PAIR_MAP = {
 SUPPORTED = frozenset(PAIR_MAP.keys())
 
 
+def register_pair(symbol: str, pair: str) -> None:
+    """Runtime pair registration for DISCOVERED coins (expander,
+    2026-07-23). Keeps SUPPORTED in sync so routing checks see them."""
+    global SUPPORTED
+    sym = (symbol or "").upper().strip()
+    if sym and pair:
+        PAIR_MAP[sym] = pair
+        SUPPORTED = frozenset(PAIR_MAP.keys())
+
+
 @dataclass
 class ExchangeConfig:
     exchange: str = "kraken"

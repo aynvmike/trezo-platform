@@ -65,11 +65,44 @@ class CryptoScannerAgent(Agent):
             )]
 
         out: list[AgentMessage] = []
+
+        # Agent-driven universe expander (Mike 2026-07-23: "crypto =
+        # stocks, just more liquid"). Throttled inside (default 6h);
+        # the first tick after a restart also re-hydrates pair/param
+        # registries for previously discovered coins. Discovery only
+        # decides what gets LOOKED AT -- every gate still applies.
+        _disc: dict = {}
+        try:
+            from app.data.crypto_discovery import run_discovery
+            _disc = await run_discovery()
+        except Exception:  # noqa: BLE001
+            _disc = {}
+        if _disc.get("added") or _disc.get("removed"):
+            out.append(AgentMessage(
+                agent=self.name, kind="info",
+                payload={
+                    "event": "crypto_universe_update",
+                    "added": _disc.get("added") or [],
+                    "removed": _disc.get("removed") or [],
+                    "note": (
+                        "Crypto universe updated by the expander: "
+                        f"+[{','.join(_disc.get('added') or []) or 'none'}] "
+                        f"-[{','.join(_disc.get('removed') or []) or 'none'}] "
+                        "(conditions: USD spot at Kraken, 24h notional >= "
+                        "floor, real range; retire under half-floor)"),
+                }))
+
         scanned = 0
         triggered = 0
         detail: list[dict] = []  # per-coin why-it-did/didn't-fire (observability)
 
-        for coin in CRYPTO_WATCHLIST:
+        try:
+            import asyncio as _aio_u
+            from app.strategies.crypto import get_crypto_universe
+            _universe = await _aio_u.to_thread(get_crypto_universe)
+        except Exception:  # noqa: BLE001
+            _universe = list(CRYPTO_WATCHLIST)
+        for coin in _universe:
             try:
                 candles = await fetch_candles_for(coin, "crypto")
                 if not candles:

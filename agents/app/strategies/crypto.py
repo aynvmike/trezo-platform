@@ -56,6 +56,19 @@ for _sym in ISO20022_SYMBOLS:
     if _p is not None and _sym not in COIN_PARAMS:
         COIN_PARAMS[_sym] = _p
 
+
+def ensure_coin_params(symbol: str, tier: str = "c") -> None:
+    """Runtime params for DISCOVERED coins (expander, 2026-07-23) --
+    tier defaults from the ISO registry so thin names get wide stops."""
+    try:
+        from app.data.iso20022_coins import TIER_DEFAULT_PARAMS
+        sym = (symbol or "").upper().strip()
+        if sym and sym not in COIN_PARAMS:
+            COIN_PARAMS[sym] = dict(
+                TIER_DEFAULT_PARAMS.get(tier, TIER_DEFAULT_PARAMS["c"]))
+    except Exception:  # noqa: BLE001
+        pass
+
 # Default scanning universe. Hand-curated majors first, then the
 # ISO 20022-aligned cluster. Mike's per-stock strategy preference
 # applies - the scanner can flip strategy per coin without flipping
@@ -167,6 +180,21 @@ def is_accumulation_strategy(strategy: str | None) -> bool:
     return False
 
 
+def _union_discovered(seed: list[str]) -> list[str]:
+    """2026-07-23: fold in the expander's enrolled coins. (The
+    watchlist_tickers table this union was designed for never existed
+    in this deployment -- the DB path always fell back -- so the
+    file-backed expander is the real expansion mechanism.)"""
+    try:
+        from app.data.crypto_discovery import discovered_symbols
+        for d in discovered_symbols():
+            if d not in seed:
+                seed.append(d)
+    except Exception:  # noqa: BLE001
+        pass
+    return seed
+
+
 def get_crypto_universe(user_id=None) -> list[str]:
     """Task #50 (2026-06-05): expandable crypto universe.
 
@@ -179,7 +207,7 @@ def get_crypto_universe(user_id=None) -> list[str]:
         from app.runtime.persistence import _client
         client = _client()
         if not client:
-            return list(CRYPTO_WATCHLIST)
+            return _union_discovered(list(CRYPTO_WATCHLIST))
         q = client.table("watchlist_tickers").select("ticker").eq("asset_type", "crypto")
         if user_id:
             q = q.eq("user_id", user_id)
@@ -193,9 +221,9 @@ def get_crypto_universe(user_id=None) -> list[str]:
         for e in extras:
             if e not in seed:
                 seed.append(e)
-        return seed
+        return _union_discovered(seed)
     except Exception:  # noqa: BLE001
-        return list(CRYPTO_WATCHLIST)
+        return _union_discovered(list(CRYPTO_WATCHLIST))
 
 
 @dataclass
