@@ -44,6 +44,14 @@ PAIR_MAP = {
     "DOT": "DOTUSD", "ATOM": "ATOMUSD",
     # 2026-07-13: liquid majors (XDG = Kraken code for Doge).
     "DOGE": "XDGUSD", "LTC": "LTCUSD", "LINK": "LINKUSD", "AVAX": "AVAXUSD",
+    # 2026-07-23: ISO-cluster pairs verified live on Kraken this session --
+    # they were in KRAKEN_TRADABLE but missing HERE, so fetch_kraken_ohlc
+    # returned None for them and they scanned VOLUME-BLIND off CoinGecko
+    # (has_volume false). Also fixes XYO's no-data loop (Kraken becomes
+    # its OHLC source). Plus PYTH on the Nasdaq/Pyth Data Marketplace
+    # news (Mike 2026-07-23).
+    "HBAR": "HBARUSD", "QNT": "QNTUSD", "XDC": "XDCUSD", "XYO": "XYOUSD",
+    "PYTH": "PYTHUSD",
 }
 SUPPORTED = frozenset(PAIR_MAP.keys())
 

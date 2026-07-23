@@ -132,6 +132,25 @@ ISO20022_COINS: list[CoinMeta] = [
             "Trezo treats this as a high-volatility candidate."
         ),
     ),
+    # 2026-07-23 (Mike, on the Nasdaq news): PYTH is not ISO 20022
+    # messaging per se -- it is the institutional DATA-rails cousin of
+    # the same adoption thesis. Nasdaq now publishes TotalView
+    # depth-of-book through the Pyth Data Marketplace (announced
+    # 2026-06-30), alongside the U.S. Dept. of Commerce, Tradeweb,
+    # Kalshi, SGX, and OTC Markets. Same awareness framing as the rest
+    # of this registry: knowledge, not endorsement; risk rules per-coin.
+    CoinMeta(
+        symbol="PYTH",
+        coingecko_id="pyth-network",
+        name="Pyth Network",
+        project="Pyth / Douro Labs",
+        liquidity_tier="b",
+        role_blurb=(
+            "Institutional market-data oracle -- 'the price layer.' "
+            "Nasdaq publishes TotalView depth-of-book through Pyth's "
+            "marketplace; U.S. Commerce Dept, Tradeweb, SGX also publish."
+        ),
+    ),
 ]
 
 
@@ -172,8 +191,8 @@ def is_iso20022_aligned(symbol: str) -> bool:
 # orders once crypto live-trading is enabled. IOTA has NO Kraken pair -> it
 # stays MODELED-ONLY (no live order attempts). Re-verify if the list shifts.
 KRAKEN_TRADABLE: frozenset = frozenset(
-    {"XRP", "XLM", "ALGO", "HBAR", "QNT", "XDC", "XYO"}
-)
+    {"XRP", "XLM", "ALGO", "HBAR", "QNT", "XDC", "XYO", "PYTH"}
+)  # PYTH pair verified live 2026-07-23
 
 
 def is_kraken_tradable(symbol: str) -> bool:
