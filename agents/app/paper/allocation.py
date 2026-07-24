@@ -26,7 +26,7 @@ from typing import Optional
 from app.config import get_settings
 
 
-POSTURES = ("growth", "balanced", "income")
+POSTURES = ("growth", "balanced", "income", "velocity")
 MARKET_TYPES = ("crypto", "stocks", "options", "income", "forex")
 
 # Per-posture split of equity across market types (fractions, sum to 1.0).
@@ -36,6 +36,14 @@ POSTURE_SPLIT: dict[str, dict[str, float]] = {
     "growth":   {"crypto": 0.32, "stocks": 0.42, "options": 0.10, "income": 0.10, "forex": 0.06},
     "balanced": {"crypto": 0.18, "stocks": 0.32, "options": 0.20, "income": 0.25, "forex": 0.05},
     "income":   {"crypto": 0.09, "stocks": 0.18, "options": 0.20, "income": 0.48, "forex": 0.05},
+    # VELOCITY (Mike 2026-07-24): "prioritize the trades that can be
+    # settled in a day, the 24-hour market, and things that are liquid
+    # so we can reach a daily profit goal." Capital cycles instead of
+    # parking: 24/7 lanes (crypto+forex = 48%) and fast option cycles
+    # (same-day lane + weekly wheel) weighted first; multi-day stock
+    # swings get the smallest share they've ever had. Opt-in only via
+    # the account_posture setting -- auto never picks it.
+    "velocity": {"crypto": 0.40, "stocks": 0.22, "options": 0.22, "income": 0.08, "forex": 0.08},
 }
 
 # How each posture leans on realized gains.
@@ -43,12 +51,14 @@ POSTURE_PROFIT_MODE = {
     "growth": "compound",       # keep gains working in the account
     "balanced": "balanced",
     "income": "lock_heavy",     # move gains to the vault sooner
+    "velocity": "compound",     # daily gains stay working -- velocity IS the point
 }
 
 POSTURE_SUMMARY = {
     "growth": "Smaller account — growth focus: build the balance up, lean into the higher-return layers.",
     "balanced": "Mid-size account — balanced: capital spread across growth and income.",
     "income": "Larger account — income focus: tilt to the Wheel and Dividends layers, preserve capital.",
+    "velocity": "Daily-income focus: 24/7 markets and same-day cycles weighted first; capital re-cycles daily instead of parking.",
 }
 
 
@@ -165,7 +175,7 @@ def build_allocation(
     else:
         posture, source = default_posture(equity), "auto"
 
-    split = POSTURE_SPLIT[posture]
+    split = POSTURE_SPLIT.get(posture, POSTURE_SPLIT["growth"])
     budgets = {mt: round(equity * split[mt], 2) for mt in MARKET_TYPES}
 
     if overrides:

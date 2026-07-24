@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # miss it (the earlier coverage-floor read failed exactly there).
     trezo_crypto_tcs_floor: int = 35
 
+    # Wheel max DTE override (0 = posture default). Velocity posture
+    # already targets ~9 DTE; this pins it explicitly if ever needed.
+    trezo_wheel_max_dte: int = 0
+
     # Service
     env: str = "development"
     # Trading mode - "paper" (default) or "live".

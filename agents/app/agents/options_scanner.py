@@ -51,7 +51,7 @@ def _wheel_dte_pick() -> int:
     cycles. Target just under the posture cap instead, so weekly
     expirations qualify. Env override TREZO_WHEEL_MAX_DTE respected."""
     import os
-    _caps = {"growth": 21, "balanced": 35, "income": 45}
+    _caps = {"growth": 21, "balanced": 35, "income": 45, "velocity": 10}
     cap = 21
     try:
         from app.runtime.settings import get_bot_settings as _g
@@ -59,11 +59,20 @@ def _wheel_dte_pick() -> int:
         cap = _caps.get(_p, 21)
     except Exception:  # noqa: BLE001
         cap = 21
+    # Settings-first override (2026-07-24): os.getenv NEVER sees
+    # agents/.env in this app -- pydantic Settings is the only path.
+    try:
+        from app.config import get_settings as _gs_w
+        _ov = int(getattr(_gs_w(), "trezo_wheel_max_dte", 0) or 0)
+        if _ov > 0:
+            cap = _ov
+    except Exception:  # noqa: BLE001
+        pass
     try:
         cap = int(float(os.getenv("TREZO_WHEEL_MAX_DTE", str(cap))))
     except (TypeError, ValueError):
         pass
-    return max(7, min(WHEEL_TARGET_DTE, cap - 1))
+    return max(5, min(WHEEL_TARGET_DTE, cap - 1))
 from app.strategies.options_strategies import (
     build_long_call,
     build_bull_call_spread,
@@ -1910,7 +1919,11 @@ class OptionsScannerAgent(Agent):
                     # income postures. Env overrides trump posture defaults.
                     _limits = {"growth": (0.25, 1, 21),
                                "balanced": (0.40, 2, 35),
-                               "income": (0.50, 3, 45)}
+                               "income": (0.50, 3, 45),
+                               # velocity (Mike 2026-07-24): weekly-cycle
+                               # wheel -- short DTE, credit turns over
+                               # every week instead of parking a month.
+                               "velocity": (0.25, 2, 10)}
                     try:
                         from app.paper.allocation import default_posture
                         from app.runtime.settings import get_bot_settings as _gbs
