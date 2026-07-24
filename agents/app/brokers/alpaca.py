@@ -26,10 +26,6 @@ LIVE_BASE_URL = "https://api.alpaca.markets"
 class AlpacaAccount:
     equity: float
     last_equity: float
-    # USD actually spendable on CRYPTO (non-marginable). Options
-    # collateral pledges drain this to 0 while margin BP can still
-    # read positive -- crypto orders 403 unless THIS bucket has money.
-    non_marginable_buying_power: float = 0.0
     cash: float
     buying_power: float
     currency: str
@@ -42,6 +38,13 @@ class AlpacaAccount:
     # can actually fire.
     options_approved_level: int = 0
     options_trading_level: int = 0
+    # USD actually spendable on CRYPTO (non-marginable). Options
+    # collateral pledges drain this to 0 while margin BP can still
+    # read positive -- crypto orders 403 unless THIS bucket has money.
+    # (2026-07-24 HOTFIX: this field MUST live in the defaulted tail --
+    # placing it above 'cash' broke the dataclass at import and took
+    # down every alpaca-touching path for a morning.)
+    non_marginable_buying_power: float = 0.0
     # Account identity (2026-06-16): lets the bot prove WHICH Alpaca
     # account it is bound to and never silently trade the wrong one.
     account_number: str = ""
