@@ -582,7 +582,41 @@ async def _maybe_trail_stock_profit(r: dict, price: float) -> float | None:
         entry = float(r.get("entry_price") or 0)
     except (TypeError, ValueError):
         return None
-    new_stop = trailing_profit_stop(entry, price, side, STOCK_TRAIL_MIN_GAIN, STOCK_TRAIL_GIVEBACK)
+    # TRAIL FROM THE PEAK, NOT THE LAST TICK (Mike 2026-07-27: "it held
+    # the ETH trade too long... it was a winning trade").
+    # Post-mortem, ETH 7/13-7/17: entry $1,772.06, peak $1,940.59
+    # (+$67.47), exited on the trail at $1,856.36 for +$33.75 -- HALF the
+    # peak gain surrendered on a winner. Cause: this trail measured the
+    # gain from the price the monitor happened to observe on a 60s tick,
+    # so a peak that printed between ticks was never priced in. The row
+    # ALREADY stores peak_price; it just was not being used here. Trail
+    # from max(peak_price, price) so the lock reflects the best the trade
+    # actually reached. On that ETH trade the stop would have sat at
+    # $1,890.03 = +$47.23 instead of +$33.75.
+    _anchor = price
+    try:
+        _pk = float(r.get("peak_price") or 0)
+        if _pk > 0:
+            _anchor = max(price, _pk) if side == "long" else min(price, _pk)
+    except (TypeError, ValueError):
+        _anchor = price
+    new_stop = trailing_profit_stop(entry, _anchor, side, STOCK_TRAIL_MIN_GAIN, STOCK_TRAIL_GIVEBACK)
+    # A peak-anchored stop cannot be WRITTEN above the live price for a
+    # long (below for a short) -- the broker would reject it and a
+    # modeled row would fire instantly. But that case is exactly the one
+    # Mike cares about: the giveback ALREADY happened between ticks, and
+    # the doctrine is "the profit lock is the key". So instead of
+    # silently holding, tuck the stop just under the live price and let
+    # the normal stop-check bank it on the next pass -- every exit still
+    # flows through the tested liquidation path.
+    if new_stop is not None:
+        _edge = float(os.getenv("TREZO_TRAIL_BANK_EDGE", "0.0015"))
+        if side == "long" and new_stop >= price:
+            _bank = round(price * (1.0 - _edge), 4)
+            new_stop = _bank if _bank > entry else None
+        elif side == "short" and new_stop <= price:
+            _bank = round(price * (1.0 + _edge), 4)
+            new_stop = _bank if (_bank < entry and entry > 0) else None
     if new_stop is None:
         return None
     try:
