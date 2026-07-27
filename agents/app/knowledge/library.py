@@ -160,8 +160,48 @@ def _build() -> None:
         pass
 
 
+# Passage-quality filter (Mike 2026-07-27: "make sure the process of
+# knowledge is being executed"). Audit found every approval carrying
+# the SAME hit -- a figure caption ("Figure 6.41 (continued) Another
+# example can be seen on Alcoa"). Book scans are full of captions,
+# running heads, page numbers and index lines; they match query tokens
+# but teach nothing. Score them down so real prose surfaces instead.
+_NOISE_MARKERS = (
+    "figure ", "fig.", "table ", "(continued)", "chapter ",
+    "copyright", "all rights reserved", "www.", "http",
+    "index", "contents", "isbn",
+)
+
+
+def _quality(text: str) -> float:
+    """0.0-1.0 readability weight for a passage. Prose scores high;
+    captions, headers and number-soup score low."""
+    t = (text or "").strip()
+    if len(t) < 80:
+        return 0.15
+    low = t.lower()
+    q = 1.0
+    for m in _NOISE_MARKERS:
+        if m in low[:60]:          # marker at the START = caption/header
+            q -= 0.45
+            break
+    words = t.split()
+    if words:
+        digits = sum(1 for w in words if any(ch.isdigit() for ch in w))
+        if digits / len(words) > 0.30:      # number-soup / tables
+            q -= 0.35
+    # Real teaching prose tends to contain sentence punctuation.
+    if t.count(".") < 2:
+        q -= 0.2
+    return max(0.05, min(1.0, q))
+
+
 def search(query: str, k: int = 3) -> list[dict]:
-    """Top-k passages for the query; [] when the library is empty. Never raises."""
+    """Top-k passages for the query; [] when the library is empty. Never raises.
+
+    Scoring = token overlap x passage quality, with a bonus for an exact
+    phrase hit. Quality weighting keeps figure captions and page
+    furniture from crowding out the craft (2026-07-27)."""
     try:
         _build()
         q = _tok(query)
@@ -174,14 +214,28 @@ def search(query: str, k: int = 3) -> list[dict]:
             hit = len(qs & c["toks"])
             if not hit:
                 continue
-            score = hit / float(len(qs))
+            score = (hit / float(len(qs))) * _quality(c.get("text", ""))
             if len(ql) > 8 and ql in c["text"].lower():
                 score += 1.0
             scored.append((score, c))
         scored.sort(key=lambda x: -x[0])
-        return [{"source": c["source"], "page": c["page"],
-                 "text": c["text"][:400], "score": round(s, 3)}
-                for s, c in scored[:max(1, int(k))]]
+        # Source diversity: don't return three passages from one book
+        # when the library holds sixteen (2026-07-27).
+        out, seen = [], set()
+        for s_, c in scored:
+            src = c["source"]
+            if src in seen and len(out) < max(1, int(k)):
+                continue
+            seen.add(src)
+            out.append({"source": src, "page": c["page"],
+                        "text": c["text"][:400], "score": round(s_, 3)})
+            if len(out) >= max(1, int(k)):
+                break
+        if not out and scored:
+            s_, c = scored[0]
+            out = [{"source": c["source"], "page": c["page"],
+                    "text": c["text"][:400], "score": round(s_, 3)}]
+        return out
     except Exception:  # noqa: BLE001
         return []
 

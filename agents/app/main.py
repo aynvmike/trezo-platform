@@ -1581,6 +1581,26 @@ async def knowledge_search(q: str, k: int = 3):
         return {"available": False, "error": str(e)[:200]}
 
 
+@app.get("/knowledge/proposals", tags=["knowledge"])
+async def knowledge_proposals(run: bool = False):
+    """What the agents would CHANGE (Mike 2026-07-27), from their own
+    logged evidence. `run=true` forces a detection pass now instead of
+    waiting for the daily watchdog gate. The agents never self-apply a
+    rule -- this is the argument, Mike is the decision."""
+    try:
+        from app.knowledge.proposals import open_proposals, render_doc
+        filed = None
+        if run:
+            from app.knowledge.proposal_engine import run_detectors
+            from app.runtime.settings import _supabase as _sb
+            res = await run_detectors(_sb())
+            filed = res.get("filed")
+        return {"available": True, "filed_now": filed,
+                "doc": render_doc(), "proposals": open_proposals()}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @app.get("/goal/today", tags=["paper"])
 async def goal_today(user_id: str | None = None):
     """The agents' daily income goal (Mike 2026-07-13): the paycheck-ladder

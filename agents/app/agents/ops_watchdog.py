@@ -176,6 +176,35 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                 except Exception:  # noqa: BLE001
                     pass
+                # AGENT PROPOSALS (Mike 2026-07-27): the agents read their
+                # own day -- vetoes, rejects, closed records -- and write
+                # what they believe should CHANGE into
+                # C:\Trezo\TREZO_AGENT_PROPOSALS.md. Evidence only; they
+                # never self-apply a rule. Mike reads and decides.
+                try:
+                    from app.knowledge.proposal_engine import run_detectors
+                    _pr = await run_detectors(_cl)
+                    if _pr.get("filed"):
+                        from app.agents.activity_log import record as _prec
+                        _prec("agent_proposals", "SYSTEM",
+                              reason=(f"{len(_pr['filed'])} rule-change "
+                                      f"proposal(s) written from the day's "
+                                      f"evidence: "
+                                      f"{', '.join(_pr['filed'][:4])}"),
+                              extra={"doc": _pr.get("doc")})
+                        out.append(AgentMessage(
+                            agent=self.name, kind="info",
+                            payload={"event": "agent_proposals",
+                                     "count": len(_pr["filed"]),
+                                     "keys": _pr["filed"],
+                                     "note": (
+                                         f"The agents filed "
+                                         f"{len(_pr['filed'])} proposed "
+                                         f"rule change(s) from today's "
+                                         f"evidence - see "
+                                         f"TREZO_AGENT_PROPOSALS.md")}))
+                except Exception:  # noqa: BLE001
+                    pass
                 # Sector Compass (2026-07-13, Mike): daily industry read --
                 # 3-day movers every day, weekly (5d) view on Mondays, and
                 # a monthly market update roughly every 21 days. Lands in
