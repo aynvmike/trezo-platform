@@ -589,12 +589,18 @@ class OptionsScannerAgent(Agent):
             _budget = min(float(_oso.getenv("TREZO_DAY_OPT_USD", "300")),
                           float(_oso.getenv("TREZO_DAY_OPT_PCT", "0.08"))
                           * max(_eq, 1.0))
-            # PDT is gone (2026-06-04) -- capacity follows Mike's call:
-            # up to 2 concurrent same-day positions, 4 entries/day, and a
-            # symbol may be re-entered once after its first trade closes.
-            _max_open = int(_oso.getenv("TREZO_DAY_OPT_OPEN", "2"))
-            _max_day = int(_oso.getenv("TREZO_DAY_OPT_PER_DAY", "4"))
-            _max_sym = int(_oso.getenv("TREZO_DAY_OPT_PER_SYM", "2"))
+            # PDT is gone (2026-06-04). These caps were shaped by the old
+            # 3-day-trades-per-week world and Mike 2026-07-27 called that
+            # out: "that was based on the old PDT rule, so that can change
+            # as well." Same-day trades return their capital the SAME
+            # session -- the only real limits are the budget and the
+            # quality gates, both of which still apply per entry. Raised
+            # to 3 concurrent / 8 per day / 3 per symbol; the day budget
+            # (min $300 or 8% equity) still bounds total exposure, so
+            # more entries means smaller, faster cycles -- not more risk.
+            _max_open = int(_oso.getenv("TREZO_DAY_OPT_OPEN", "3"))
+            _max_day = int(_oso.getenv("TREZO_DAY_OPT_PER_DAY", "8"))
+            _max_sym = int(_oso.getenv("TREZO_DAY_OPT_PER_SYM", "3"))
             _min_mv = float(_oso.getenv("TREZO_DAY_OPT_MIN_MOVE", "0.008"))
 
             def _q_open():
