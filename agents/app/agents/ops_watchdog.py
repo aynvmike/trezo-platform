@@ -176,6 +176,48 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                 except Exception:  # noqa: BLE001
                     pass
+                # DAILY DIGEST (Mike 2026-07-27: "why would it be a task
+                # by you and not something the agents get done?"). The
+                # engine runs 24/7; Nova's scheduled task only runs when
+                # the desktop is open. So the AGENTS compute their own
+                # day -- P&L by lane, profit factor, funnel, book state --
+                # and write TREZO_DAILY_DIGEST.md. Nova/UI only present it.
+                try:
+                    from app.knowledge.daily_digest import build_digest
+                    _eq = _cusd = 0.0
+                    try:
+                        from app.brokers.alpaca import (
+                            get_account as _ga, alpaca_configured as _ac,
+                        )
+                        if _ac():
+                            _acct = await _ga()
+                            if _acct:
+                                _eq = float(getattr(_acct, "equity", 0) or 0)
+                                _cusd = float(getattr(
+                                    _acct, "non_marginable_buying_power",
+                                    0) or 0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _dg = await build_digest(_cl, equity=_eq,
+                                             crypto_usd=_cusd)
+                    from app.agents.activity_log import record as _drec
+                    _drec("daily_digest", "SYSTEM",
+                          reason=(f"{_dg.get('date')}: "
+                                  f"${_dg.get('net_realized', 0):+.2f} "
+                                  f"realized on {_dg.get('closed', 0)} "
+                                  f"closes, PF {_dg.get('profit_factor')}, "
+                                  f"{_dg.get('open_positions')} open"),
+                          extra={"lanes": _dg.get("lanes"),
+                                 "funnel": _dg.get("funnel")})
+                    out.append(AgentMessage(
+                        agent=self.name, kind="info",
+                        payload={"event": "daily_digest", **{
+                            k: _dg.get(k) for k in
+                            ("date", "net_realized", "profit_factor",
+                             "wins", "losses", "lanes", "open_positions",
+                             "hit_floor_10", "alarm")}}))
+                except Exception:  # noqa: BLE001
+                    pass
                 # AGENT PROPOSALS (Mike 2026-07-27): the agents read their
                 # own day -- vetoes, rejects, closed records -- and write
                 # what they believe should CHANGE into

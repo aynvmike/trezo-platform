@@ -1581,6 +1581,34 @@ async def knowledge_search(q: str, k: int = 3):
         return {"available": False, "error": str(e)[:200]}
 
 
+@app.get("/knowledge/digest", tags=["knowledge"])
+async def knowledge_digest(days: int = 14, run: bool = False):
+    """The agents' own daily analytics (Mike 2026-07-27). `run=true`
+    rebuilds today's digest now instead of waiting for the daily gate.
+    History is kept so trends can be read, not just today."""
+    try:
+        from app.knowledge.daily_digest import history, build_digest
+        built = None
+        if run:
+            from app.runtime.settings import _supabase as _sb
+            eq = cusd = 0.0
+            try:
+                from app.brokers.alpaca import get_account, alpaca_configured
+                if alpaca_configured():
+                    a = await get_account()
+                    if a:
+                        eq = float(getattr(a, "equity", 0) or 0)
+                        cusd = float(getattr(
+                            a, "non_marginable_buying_power", 0) or 0)
+            except Exception:  # noqa: BLE001
+                pass
+            built = await build_digest(_sb(), equity=eq, crypto_usd=cusd)
+        return {"available": True, "today": built,
+                "history": history(days)}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @app.get("/knowledge/proposals", tags=["knowledge"])
 async def knowledge_proposals(run: bool = False):
     """What the agents would CHANGE (Mike 2026-07-27), from their own

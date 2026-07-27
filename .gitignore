@@ -119,3 +119,4 @@ logs/
 agents/app/data/crypto_discovered.json
 
 agents/app/knowledge/_proposals.json
+agents/app/knowledge/_digest_history.json
