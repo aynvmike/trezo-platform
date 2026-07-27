@@ -119,6 +119,14 @@ async def build_digest(client, equity: float = 0.0,
         "crypto_usd": round(_f(crypto_usd), 2),
     })
 
+    try:
+        from app.data.portfolio_risk import concentration_read, explain
+        _cr = concentration_read(openb)
+        out["concentration"] = _cr
+        out["concentration_note"] = explain(_cr)
+    except Exception:  # noqa: BLE001
+        pass
+
     kinds = Counter(m.get("kind") for m in msgs)
     vetoes = [m for m in msgs if m.get("kind") == "veto"]
     vr = Counter(str((m.get("payload") or {}).get("reason") or "")[:55]
@@ -195,6 +203,8 @@ def _write_doc(d: dict) -> None:
              + (" (exhausted — the 24/7 lane cannot open new positions "
                 "until collateral or a position frees)"
                 if _f(d.get("crypto_usd")) < 25 else "") + "\n")
+    if d.get("concentration_note"):
+        L.append(f"\n## Real diversification\n\n{d['concentration_note']}\n")
     f = d.get("funnel", {})
     L.append(f"\n## The machine\n\nsignals {f.get('signal')} · approvals "
              f"{f.get('approve')} · executions {f.get('execute')} · "

@@ -668,17 +668,49 @@ class RiskManagerAgent(Agent):
             except Exception:  # noqa: BLE001
                 leverage_bump = 0
 
+        # CROWDING / correlation (Mike 2026-07-27: "deeper understanding
+        # of the network and finance as a whole"). Counting positions is
+        # not measuring risk: on 7/27 the book held 14 positions but 9
+        # were crypto -- one risk factor, ~6.8 independent bets, and they
+        # fell together. Adding to an already-crowded basket now costs
+        # extra confidence (+3 at 4 open, +6 at 6, +9 at 8+), bounded
+        # like every other bump. Never a ban: a crowded lane that is
+        # earning can still trade -- it just has to be better.
+        crowding_bump_v = 0
+        crowding_note = ""
+        try:
+            from app.data.portfolio_risk import (
+                basket_of, concentration_read, crowding_bump,
+            )
+            _pr_cl = _supabase()
+            if _pr_cl is not None:
+                import asyncio as _aio_pr
+
+                def _q_book():
+                    return (_pr_cl.table("paper_positions")
+                            .select("ticker, asset_type, strategy")
+                            .eq("status", "open").limit(60).execute())
+                _bk = (await _aio_pr.to_thread(_q_book)).data or []
+                _read = concentration_read(_bk)
+                _bask = basket_of(
+                    ticker, str(message.payload.get("asset_type") or ""),
+                    strategy)
+                crowding_bump_v, crowding_note = crowding_bump(_bask, _read)
+        except Exception:  # noqa: BLE001
+            crowding_bump_v = 0
+
         # The confidence bar can be raised by the current regime posture,
         # the cycle-aware bump, the per-strategy outcome nudge, the
-        # banked-paycheck bump, and the margin-territory bump.
+        # banked-paycheck bump, the margin-territory bump, and crowding.
         effective_min_tcs = (min_tcs + scope.tcs_bump + cycle_bump
                              + outcome_delta + goal_bump + probation_bump
-                             + leverage_bump)
+                             + leverage_bump + crowding_bump_v)
         if tcs < effective_min_tcs:
             extra = (
-                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note}{leverage_note})"
+                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note}{leverage_note}{crowding_note})"
                 if (scope.tcs_bump or cycle_bump or outcome_delta
-                        or goal_bump or probation_bump or leverage_bump)
+                        or goal_bump or probation_bump or leverage_bump
+                        or crowding_bump_v)
                 else ""
             )
             return [self._veto(
@@ -913,6 +945,10 @@ class RiskManagerAgent(Agent):
             "reason": f"TCS {tcs} clears threshold; {direction} bias [{strategy}]",
             "accumulation": accumulation_add,
         }
+        if crowding_bump_v:
+            approve_payload["crowding_bump"] = crowding_bump_v
+            approve_payload["reason"] += (
+                f"; cleared a +{crowding_bump_v} crowding bar")
         if leverage_bump:
             # Ledger-separable: leveraged entries carry the tag so the
             # outcome loop can judge leverage on its own record.
