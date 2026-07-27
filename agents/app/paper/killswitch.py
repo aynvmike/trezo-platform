@@ -33,23 +33,47 @@ class _RowsumCached(Exception):
     """Internal flow control: row-truth served from cache."""
 
 
-# --- Session-scoped broker-reject counter (in-process) ----------------
-_broker_rejects = 0
+# --- Broker-reject counter on a ROLLING WINDOW (in-process) -----------
+# Mike 2026-07-27: this halt was "session"-scoped with no expiry, so
+# three rejects on Friday afternoon silenced the WHOLE weekend -- 293
+# blocked signals in the 24/7 market that is supposed to earn dailies.
+# A reject storm should pause trading briefly, not forever. Rejects now
+# AGE OUT after TREZO_BROKER_REJECT_WINDOW_MIN (default 60), so the halt
+# heals itself the same way the bad-symbol rest list expires. Same
+# philosophy as everywhere else: conditions, never permanent bans.
+import os as _os_ks
+import time as _time_ks
+
+_broker_reject_ts: list[float] = []
+
+
+def _reject_window_s() -> float:
+    try:
+        return max(60.0, float(
+            _os_ks.getenv("TREZO_BROKER_REJECT_WINDOW_MIN", "60")) * 60.0)
+    except (TypeError, ValueError):
+        return 3600.0
+
+
+def _prune_rejects() -> None:
+    cutoff = _time_ks.time() - _reject_window_s()
+    while _broker_reject_ts and _broker_reject_ts[0] < cutoff:
+        _broker_reject_ts.pop(0)
 
 
 def record_broker_reject() -> int:
-    global _broker_rejects
-    _broker_rejects += 1
-    return _broker_rejects
+    _prune_rejects()
+    _broker_reject_ts.append(_time_ks.time())
+    return len(_broker_reject_ts)
 
 
 def broker_reject_count() -> int:
-    return _broker_rejects
+    _prune_rejects()
+    return len(_broker_reject_ts)
 
 
 def reset_broker_rejects() -> None:
-    global _broker_rejects
-    _broker_rejects = 0
+    _broker_reject_ts.clear()
 
 
 # --- Session-scoped slippage tracker (2026-07-02) ---------------------
@@ -161,8 +185,10 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
 
     rj = broker_reject_count()
     if rj >= MAX_BROKER_REJECTS:
+        _mins = int(_reject_window_s() / 60)
         return KillSwitch(True, "session",
-                          f"{rj} broker order rejects this session")
+                          f"{rj} broker order rejects in the last {_mins} "
+                          f"min - trading pauses until they age out")
 
     sb = slippage_breach_count()
     if sb >= MAX_SLIPPAGE_BREACHES:

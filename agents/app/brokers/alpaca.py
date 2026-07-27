@@ -461,6 +461,22 @@ async def submit_bracket_order(
     if side not in ("buy", "sell"):
         return None, f"Invalid order side: {side}"
 
+    # Orientation guard (Mike 2026-07-27, the XLE 422 storm): Alpaca
+    # requires take_profit ABOVE stop_loss for longs and BELOW for
+    # shorts. An inverted pair used to travel all the way to the broker,
+    # come back 422, and count as a BROKER REJECT -- three of those
+    # tripped the kill-switch and silenced every lane, crypto included.
+    # Catch it locally: the caller sees a clear error, the broker never
+    # sees a bad order, and no reject is charged against the halt.
+    _tp = round(float(take_profit_price), 2)
+    _sl = round(float(stop_loss_price), 2)
+    if side == "buy" and _tp <= _sl:
+        return None, (f"Bracket rejected locally: long take-profit ${_tp} "
+                      f"must sit ABOVE stop ${_sl} (levels inverted)")
+    if side == "sell" and _tp >= _sl:
+        return None, (f"Bracket rejected locally: short take-profit ${_tp} "
+                      f"must sit BELOW stop ${_sl} (levels inverted)")
+
     body = {
         "symbol": symbol.upper(),
         "qty": str(shares),
@@ -468,8 +484,8 @@ async def submit_bracket_order(
         "type": "market",
         "time_in_force": time_in_force,
         "order_class": "bracket",
-        "take_profit": {"limit_price": round(float(take_profit_price), 2)},
-        "stop_loss": {"stop_price": round(float(stop_loss_price), 2)},
+        "take_profit": {"limit_price": _tp},
+        "stop_loss": {"stop_price": _sl},
     }
     return await _post("/v2/orders", body, token=token)
 

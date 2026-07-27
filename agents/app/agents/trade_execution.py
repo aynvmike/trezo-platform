@@ -848,6 +848,22 @@ class TradeExecutionAgent(Agent):
         # right bucket BEFORE the broker does: when the USD wallet is
         # collateral-locked, skip cleanly -- one visible line, no 403
         # storm, no kill-switch trips.
+        # Shots on goal (Mike 2026-07-27: "crypto trades are producing a
+        # way to make income in the dailies"). The 15%-of-equity
+        # concentration cap let ONE coin swallow ~$730 -- two positions
+        # emptied the wallet and the 24/7 lane went quiet until an exit.
+        # Slice the crypto pocket into TREZO_CRYPTO_MAX_CONCURRENT
+        # (default 5) equal shots instead: same capital at risk, several
+        # independent chances at a daily win, and a stop on one coin no
+        # longer benches the whole lane. Scales with the pocket, so it
+        # grows automatically as the account grows.
+        try:
+            import os as _os_cx
+            _cx_n = max(1, int(float(
+                _os_cx.getenv("TREZO_CRYPTO_MAX_CONCURRENT", "5"))))
+        except (TypeError, ValueError):
+            _cx_n = 5
+        _cx_slice = max(25.0, float(budget) / _cx_n) if budget else 1e12
         _crypto_usd = float(getattr(
             acct, "non_marginable_buying_power", 0.0) or 0.0)
         if _crypto_usd < 25.0:
@@ -876,7 +892,7 @@ class TradeExecutionAgent(Agent):
             target_price=target_price,
             risk_pct=float(risk_pct),
             asset_type="crypto",
-            buying_power=min(_crypto_usd, remaining),
+            buying_power=min(_crypto_usd, remaining, _cx_slice),
         )
         if plan.ok and (source_payload or {}).get("coverage_trade"):
             try:
