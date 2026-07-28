@@ -9,7 +9,7 @@ import {
   type TVPosition,
   type TVFeed,
 } from "@/components/dashboard/trading-view-redesign";
-import { fetchAlpacaSnapshot, type AlpacaPosition } from "@/lib/alpaca-snapshot";
+import { fetchAlpacaSnapshot, type AlpacaPosition, fetchPositionAdvice } from "@/lib/alpaca-snapshot";
 import { describeAgentMessage, agentLabel, type FeedMessage } from "@/lib/agent-message";
 import { Disclosure } from "@/components/ui/disclosure";
 import { ExitAdvisorAlerts } from "@/components/dashboard/exit-advisor-alerts";
@@ -166,7 +166,7 @@ export default async function PaperPage() {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/paper");
 
-  const [accountRes, openRes, closedRes, msgsRes, alpaca, botRes, profileRes] = await Promise.all([
+  const [accountRes, openRes, closedRes, msgsRes, alpaca, advice, botRes, profileRes] = await Promise.all([
     supabase.from("paper_accounts").select("*").eq("user_id", user.id).maybeSingle(),
     supabase
       .from("paper_positions")
@@ -182,6 +182,7 @@ export default async function PaperPage() {
       .or(`user_id.eq.${user.id},user_id.is.null`)
       .order("created_at", { ascending: false }).limit(14),
     fetchAlpacaSnapshot(),
+    fetchPositionAdvice(),
     supabase.from("bot_settings").select("auto_trade_enabled").eq("user_id", user.id).maybeSingle(),
     supabase.from("profiles").select("daily_loss_limit_usd").eq("user_id", user.id).maybeSingle(),
   ]);
@@ -247,6 +248,17 @@ export default async function PaperPage() {
         : ((p.asset_type ?? "").toLowerCase() === "crypto" || isFx
             ? ("modeled" as const)
             : ("unconfirmed" as const)),
+      // Mike 2026-07-28: asset kind at a glance + is it REALLY at the
+      // broker (13 of 18 positions were modeled-only and invisible on
+      // his Alpaca screen), plus the agents' recommendation.
+      assetKind: (((p.asset_type ?? "").toLowerCase() === "crypto")
+        ? "Crypto" : isFx ? "Forex"
+        : ((p.asset_type ?? "").toLowerCase().startsWith("option")
+            ? "Option" : "Stock")) as "Crypto" | "Stock" | "Forex" | "Option",
+      atBroker: advice[String(p.ticker).toUpperCase()]?.at_broker ?? (ap ? true : null),
+      verdict: advice[String(p.ticker).toUpperCase()]?.verdict,
+      verdictWhy: advice[String(p.ticker).toUpperCase()]?.why,
+      verdictAction: advice[String(p.ticker).toUpperCase()]?.action,
       stop: stopN, target: targetN,
       heldSince: p.entry_at ? agoLabel(p.entry_at) : undefined,
       why: thesisFor(p.strategy ?? "", p.asset_type ?? ""),

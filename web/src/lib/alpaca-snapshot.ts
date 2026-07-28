@@ -81,3 +81,45 @@ export async function fetchAlpacaSnapshot(): Promise<AlpacaSnapshot | null> {
     return null;
   }
 }
+
+// --- Agent per-position advice (Mike 2026-07-28) ---------------------
+// "I would like to start looking into getting the agents recommendations
+// in as well on what to change on certain trades or options."
+export type PositionAdvice = {
+  ticker: string;
+  lane: string;
+  verdict: "BANK" | "TIGHTEN" | "CUT" | "TRIM" | "WATCH" | "HOLD";
+  why: string;
+  action: string;
+  days_held: number;
+  at_broker: boolean | null;
+  unrealized_usd?: number;
+  unrealized_pct?: number;
+  giveback_pct?: number;
+  to_target_pct?: number | null;
+  stop_room_pct?: number | null;
+};
+
+export async function fetchPositionAdvice(): Promise<Record<string, PositionAdvice>> {
+  // Keyed by TICKER so the position cards can look theirs up directly.
+  // Fail-quiet: no advice simply means the cards render as before.
+  try {
+    const r = await fetch(`${AGENTS_BASE}/knowledge/advice`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return {};
+    const j = (await r.json()) as { positions?: PositionAdvice[] };
+    const out: Record<string, PositionAdvice> = {};
+    for (const p of j.positions ?? []) {
+      const k = String(p.ticker).toUpperCase();
+      // Keep the most urgent verdict when a name has several rows
+      // (crypto accumulation opens one row per add).
+      const rank = { BANK: 0, TIGHTEN: 1, CUT: 2, TRIM: 3, WATCH: 4, HOLD: 5 };
+      if (!out[k] || rank[p.verdict] < rank[out[k].verdict]) out[k] = p;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}

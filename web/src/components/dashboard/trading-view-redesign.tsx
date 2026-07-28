@@ -24,6 +24,31 @@ export type TVPosition = {
   why?: string;
   plan?: string;
   locked?: boolean;
+  // Agent recommendation (Mike 2026-07-28) + where the position lives.
+  verdict?: "BANK" | "TIGHTEN" | "CUT" | "TRIM" | "WATCH" | "HOLD";
+  verdictWhy?: string;
+  verdictAction?: string;
+  assetKind?: "Crypto" | "Stock" | "Forex" | "Option";
+  atBroker?: boolean | null;
+};
+
+// Verdict colours: act-now verdicts read hot, HOLD stays quiet.
+export const VERDICT_STYLE: Record<string, string> = {
+  BANK: "text-emerald-600 bg-emerald-500/15 border-emerald-500/40",
+  TIGHTEN: "text-amber-600 bg-amber-500/15 border-amber-500/40",
+  CUT: "text-red-600 bg-red-500/15 border-red-500/40",
+  TRIM: "text-sky-600 bg-sky-500/15 border-sky-500/40",
+  WATCH: "text-violet-600 bg-violet-500/15 border-violet-500/40",
+  HOLD: "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))] border-[rgb(var(--border))]",
+};
+
+// Asset kind reads at a glance -- Mike 2026-07-28: "so I can tell what is
+// going on better than trying to recognize if the item is a Stock or crypto".
+export const KIND_STYLE: Record<string, string> = {
+  Crypto: "text-orange-600 bg-orange-500/10",
+  Stock: "text-blue-600 bg-blue-500/10",
+  Forex: "text-teal-600 bg-teal-500/10",
+  Option: "text-purple-600 bg-purple-500/10",
 };
 
 export type TVFeed = {
@@ -258,10 +283,20 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
                   <td className="px-5 py-3 font-mono font-medium text-[rgb(var(--foreground))]">
                     <span className="inline-flex items-center gap-1.5">
                       {p.ticker}
-                      {p.flag === "unconfirmed" ? (
+                      {p.assetKind ? (
+                        <span title={p.assetKind} className={"rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide " + (KIND_STYLE[p.assetKind] || "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>{p.assetKind}</span>
+                      ) : null}
+                      {p.atBroker === false ? (
+                        <span title="Modeled on Trezo's paper engine using live market data — this position does NOT appear on your Alpaca screen (the venue does not list it)" className="rounded px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]">not at broker</span>
+                      ) : p.atBroker === true ? (
+                        <span title="Real order held at Alpaca — visible on your Alpaca screen" className="rounded px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-emerald-600 bg-emerald-500/10">at broker</span>
+                      ) : p.flag === "unconfirmed" ? (
                         <span title="No matching position at Alpaca — unconfirmed (a just-submitted order, a modeled fill, or a phantom row to reconcile)" className="rounded px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-amber-500 bg-amber-500/10">unconfirmed</span>
                       ) : p.flag === "modeled" ? (
                         <span title="Modeled — runs on Trezo's paper engine, not held at Alpaca" className="rounded px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]">modeled</span>
+                      ) : null}
+                      {p.verdict && p.verdict !== "HOLD" ? (
+                        <span title={p.verdictAction || ""} className={"rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide " + (VERDICT_STYLE[p.verdict] || "")}>{p.verdict}</span>
                       ) : null}
                     </span>
                   </td>
@@ -291,10 +326,17 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
                     )}
                   </td>
                 </tr>,
-                (p.why || p.plan || p.stop != null || p.target != null) ? (
+                (p.why || p.plan || p.verdict || p.stop != null || p.target != null) ? (
                   <tr key={String(p.id) + "-why"} className="border-b border-[rgb(var(--border))] last:border-0">
                     <td colSpan={8} className="px-5 pb-3 pt-0">
                       <div className="rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--muted))] px-3 py-2">
+                        {p.verdict ? (
+                          <p className="mb-1 text-[11px]">
+                            <span className={"mr-1.5 rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide " + (VERDICT_STYLE[p.verdict] || "")}>{p.verdict}</span>
+                            <span className="text-[rgb(var(--foreground))]">{p.verdictWhy}</span>
+                            {p.verdictAction ? <span className="text-[rgb(var(--muted-foreground))]"> {p.verdictAction}</span> : null}
+                          </p>
+                        ) : null}
                         {p.why ? <p className="text-[11px] text-[rgb(var(--foreground))]">{p.why}</p> : null}
                         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-[rgb(var(--muted-foreground))]">
                           {p.heldSince ? <span>Held {p.heldSince}</span> : null}
