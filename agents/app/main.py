@@ -1581,6 +1581,26 @@ async def knowledge_search(q: str, k: int = 3):
         return {"available": False, "error": str(e)[:200]}
 
 
+@app.get("/knowledge/advice", tags=["knowledge"])
+async def knowledge_advice():
+    """The agents' recommendation for every open position (Mike
+    2026-07-28): BANK / TIGHTEN / CUT / TRIM / WATCH / HOLD with the
+    reason in plain English, plus whether the position actually exists
+    at the broker or is modeled. Advice only -- the monitor's own rules
+    still do the acting."""
+    try:
+        from app.knowledge.position_advisor import advise_book
+        from app.runtime.settings import _supabase as _sb
+        recs = await advise_book(_sb())
+        counts: dict = {}
+        for r in recs:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        return {"available": True, "count": len(recs),
+                "verdicts": counts, "positions": recs}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @app.get("/knowledge/digest", tags=["knowledge"])
 async def knowledge_digest(days: int = 14, run: bool = False):
     """The agents' own daily analytics (Mike 2026-07-27). `run=true`
