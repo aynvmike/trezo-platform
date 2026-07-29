@@ -157,6 +157,20 @@ async def run_discovery(force: bool = False) -> dict:
                 continue
             pairs[base] = alt
 
+        # Broker-only (Mike 2026-07-28): never enrol a coin Alpaca
+        # cannot execute -- discovery should widen the REAL universe,
+        # not the modeled one. Alpaca lists 36 USD pairs vs the 20 the
+        # scanner watches, so this is a bigger pool, not a smaller one.
+        try:
+            from app.config import get_settings as _gs_d
+            if bool(getattr(_gs_d(), "trezo_broker_only", False)):
+                from app.brokers.alpaca import tradable_crypto_symbols
+                _ok = tradable_crypto_symbols()
+                if _ok:
+                    pairs = {b: p for b, p in pairs.items() if b in _ok}
+        except Exception:  # noqa: BLE001
+            pass
+
         from app.strategies.crypto import CRYPTO_WATCHLIST
         st = dict(load_state())
         have = set(CRYPTO_WATCHLIST) | set(st)

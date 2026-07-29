@@ -13,6 +13,18 @@ class Settings(BaseSettings):
     # still judges every entry. Lives in Settings because this app
     # loads agents/.env through pydantic ONLY -- bare os.getenv reads
     # miss it (the earlier coverage-floor read failed exactly there).
+    # BROKER-ONLY mode (Mike 2026-07-28: "limit or remove the modeled
+    # numbers since we have the data to show the actual trade when it
+    # can exist on the alpaca side... I would like more consistency").
+    # When true, lanes only trade instruments Alpaca can actually
+    # execute, so Trezo's ledger and the Alpaca screen agree. Not a
+    # strategy cut: Alpaca lists 36 USD coins, more than the 20 the
+    # scanner watches -- the universe gets BIGGER and entirely real.
+    # Forex has no Alpaca venue at all, so it pauses under this mode
+    # unless trezo_forex_modeled_ok is set.
+    trezo_broker_only: bool = True
+    trezo_forex_modeled_ok: bool = False
+
     trezo_crypto_tcs_floor: int = 35
 
     # Wheel max DTE override (0 = posture default). Velocity posture

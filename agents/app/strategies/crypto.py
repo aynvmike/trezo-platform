@@ -180,6 +180,28 @@ def is_accumulation_strategy(strategy: str | None) -> bool:
     return False
 
 
+def _broker_tradable_filter(syms: list[str]) -> list[str]:
+    """Broker-only mode (Mike 2026-07-28): keep only coins Alpaca can
+    actually execute, so every crypto row in Trezo also appears on his
+    Alpaca screen. Fails OPEN (returns the list unchanged) if the asset
+    list cannot be read -- a data hiccup must never silently empty the
+    universe."""
+    try:
+        from app.config import get_settings as _gs
+        if not bool(getattr(_gs(), "trezo_broker_only", False)):
+            return syms
+    except Exception:  # noqa: BLE001
+        return syms
+    try:
+        from app.brokers.alpaca import tradable_crypto_symbols
+        ok = tradable_crypto_symbols()
+        if not ok:
+            return syms
+        return [s for s in syms if s.upper() in ok]
+    except Exception:  # noqa: BLE001
+        return syms
+
+
 def _union_discovered(seed: list[str]) -> list[str]:
     """2026-07-23: fold in the expander's enrolled coins. (The
     watchlist_tickers table this union was designed for never existed
@@ -192,7 +214,7 @@ def _union_discovered(seed: list[str]) -> list[str]:
                 seed.append(d)
     except Exception:  # noqa: BLE001
         pass
-    return seed
+    return _broker_tradable_filter(seed)
 
 
 def get_crypto_universe(user_id=None) -> list[str]:

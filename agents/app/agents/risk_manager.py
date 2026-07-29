@@ -668,6 +668,28 @@ class RiskManagerAgent(Agent):
             except Exception:  # noqa: BLE001
                 leverage_bump = 0
 
+        # BROKER-ONLY consistency gate (Mike 2026-07-28: "I would like
+        # to have more of a consistency... the platform would not
+        # recognize the trades and leave it out of the data"). Alpaca
+        # has no forex venue, so forex rows can only ever be modeled.
+        # Under broker-only they pause -- unless trezo_forex_modeled_ok
+        # says Mike wants the lane anyway, clearly labelled.
+        try:
+            if str(message.payload.get("asset_type") or "").lower() == "forex":
+                from app.config import get_settings as _gs_bo
+                _cfg_bo = _gs_bo()
+                if (bool(getattr(_cfg_bo, "trezo_broker_only", False))
+                        and not bool(getattr(_cfg_bo,
+                                             "trezo_forex_modeled_ok", False))):
+                    return [self._veto(
+                        ticker, tcs,
+                        "Broker-only mode: Alpaca has no forex venue, so a "
+                        "forex position could only ever be modeled - it "
+                        "would never appear on the broker screen. Set "
+                        "TREZO_FOREX_MODELED_OK=true to trade it anyway.")]
+        except Exception:  # noqa: BLE001
+            pass
+
         # CROWDING / correlation (Mike 2026-07-27: "deeper understanding
         # of the network and finance as a whole"). Counting positions is
         # not measuring risk: on 7/27 the book held 14 positions but 9

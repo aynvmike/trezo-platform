@@ -683,10 +683,76 @@ async def record_external_position(
 ) -> FillResult:
     """Insert a tracking row for a position executed on an external broker
     (e.g. Alpaca). No cash math here - the broker holds the real account;
-    this row exists so Trezo's dashboard and monitor can see the position."""
+    this row exists so Trezo's dashboard and monitor can see the position.
+
+    MERGES an add into the existing open row for the same ticker+side
+    (Mike 2026-07-28: "the multiple entries of crypto should be changed
+    to show the purchase changing the average entry and cost of the
+    previous entry... such as a normal book would"). Crypto DCA used to
+    open a NEW row per add, so one coin showed up three times with three
+    entry prices -- Alpaca itself reports ONE position with a weighted
+    average, and so should Trezo. The merged row keeps the widest
+    protection of the two (lowest stop / highest target for a long) so
+    an add can never tighten a stop into the market."""
     client = _supabase()
     if not client:
         return FillResult(ok=False, error="Supabase not configured")
+
+    # --- weighted-average merge -------------------------------------
+    try:
+        def _find_open():
+            return (client.table("paper_positions")
+                    .select("id, quantity, entry_price, stop_price, "
+                            "target_price, peak_price")
+                    .eq("user_id", user_id).eq("ticker", ticker.upper())
+                    .eq("side", side).eq("status", "open")
+                    .order("entry_at", desc=False).limit(1).execute())
+        _ex = (await asyncio.to_thread(_find_open)).data or []
+    except Exception:  # noqa: BLE001
+        _ex = []
+    if _ex:
+        _row = _ex[0]
+        try:
+            _q0 = float(_row.get("quantity") or 0)
+            _e0 = float(_row.get("entry_price") or 0)
+            _q1 = float(quantity or 0)
+            _e1 = float(entry_price or 0)
+            if _q0 > 0 and _q1 > 0 and _e0 > 0 and _e1 > 0:
+                _qn = _q0 + _q1
+                _en = round(((_q0 * _e0) + (_q1 * _e1)) / _qn, 8)
+                _long = str(side).lower() == "long"
+                _s0 = float(_row.get("stop_price") or 0) or None
+                _t0 = float(_row.get("target_price") or 0) or None
+                _sn = (min(_s0, stop_price) if (_s0 and stop_price and _long)
+                       else max(_s0, stop_price) if (_s0 and stop_price)
+                       else (stop_price or _s0))
+                _tn = (max(_t0, target_price) if (_t0 and target_price and _long)
+                       else min(_t0, target_price) if (_t0 and target_price)
+                       else (target_price or _t0))
+                _patch = {"quantity": _qn, "entry_price": _en,
+                          "stop_price": _sn, "target_price": _tn}
+
+                def _do_merge():
+                    return (client.table("paper_positions")
+                            .update(_patch).eq("id", _row["id"]).execute())
+                await asyncio.to_thread(_do_merge)
+                try:
+                    from app.agents.activity_log import record as _mrec
+                    _mrec("position_merged", ticker.upper(),
+                          strategy=strategy,
+                          reason=(f"add of {_q1:g} @ ${_e1:,.4f} merged into "
+                                  f"the open position: {_q0:g} -> {_qn:g} "
+                                  f"units, average entry ${_e0:,.4f} -> "
+                                  f"${_en:,.4f} (one position, one basis - "
+                                  f"the way a broker book reads)"),
+                          extra={"user_id": str(user_id),
+                                 "position_id": str(_row.get("id"))})
+                except Exception:  # noqa: BLE001
+                    pass
+                return FillResult(ok=True, position_id=_row.get("id"),
+                                  fill_price=entry_price)
+        except Exception:  # noqa: BLE001
+            pass   # fall through to a normal insert
 
     def _sync_insert():
         return (

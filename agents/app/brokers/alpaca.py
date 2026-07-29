@@ -259,6 +259,40 @@ async def account_self_check() -> dict:
     return out
 
 
+_CRYPTO_ASSETS: dict = {"ts": 0.0, "syms": frozenset()}
+
+
+def tradable_crypto_symbols() -> frozenset:
+    """Base symbols Alpaca can trade against USD (cached 6h, sync).
+
+    Broker-only mode uses this so Trezo never opens a crypto position
+    the broker cannot hold. Returns an empty set on any failure, and
+    callers treat empty as 'unknown -> allow', so a data hiccup can
+    never silently empty the universe."""
+    import time as _t
+    import json as _j
+    import urllib.request as _u
+    if _CRYPTO_ASSETS["syms"] and (_t.time() - _CRYPTO_ASSETS["ts"]) < 21600:
+        return _CRYPTO_ASSETS["syms"]
+    try:
+        s = get_settings()
+        base = (s.alpaca_base_url or PAPER_BASE_URL).rstrip("/")
+        req = _u.Request(
+            base + "/v2/assets?asset_class=crypto&status=active",
+            headers={"APCA-API-KEY-ID": s.alpaca_api_key,
+                     "APCA-API-SECRET-KEY": s.alpaca_secret_key})
+        data = _j.load(_u.urlopen(req, timeout=20))
+        syms = frozenset(
+            str(a.get("symbol", "")).split("/")[0].upper()
+            for a in data
+            if str(a.get("symbol", "")).endswith("/USD") and a.get("tradable"))
+        if syms:
+            _CRYPTO_ASSETS.update({"ts": _t.time(), "syms": syms})
+        return syms
+    except Exception:  # noqa: BLE001
+        return _CRYPTO_ASSETS["syms"] or frozenset()
+
+
 async def get_positions(token: Optional["UserToken"] = None) -> list[dict]:
     """Open positions on the Alpaca account ([] if none / unconfigured).
     Optional `token` routes the call through the user's OAuth bearer."""
