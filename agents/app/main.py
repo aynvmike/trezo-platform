@@ -34,6 +34,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# --- Defence in depth: state-changing calls must come from this machine ---
+# Security sweep 2026-07-28. This service exposes 15 unauthenticated
+# state-changing endpoints -- /admin/manual-trade, /wheel/place-leg,
+# /paper/positions/trim, /admin/clear-session-halt and friends. They are
+# safe today only because uvicorn binds 127.0.0.1. That is one flag away
+# from being wrong (install-as-service.bat carried --host 0.0.0.0 until
+# this sweep), and a mistake there would hand anyone on the network the
+# ability to place trades. So the guarantee moves into the app itself:
+# writes are refused unless the caller is on loopback. Set
+# TREZO_API_TOKEN and send X-Trezo-Token to allow a remote caller
+# deliberately (e.g. behind a reverse proxy).
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+@app.middleware("http")
+async def _guard_state_changing(request, call_next):
+    import os as _os_g
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        host = (request.client.host if request.client else "") or ""
+        if host not in _LOOPBACK:
+            token = _os_g.getenv("TREZO_API_TOKEN", "")
+            sent = request.headers.get("x-trezo-token", "")
+            if not (token and sent and sent == token):
+                from fastapi.responses import JSONResponse
+                try:
+                    from app.agents.activity_log import record as _grec
+                    _grec("api_write_blocked", "SYSTEM",
+                          reason=(f"refused a {request.method} to "
+                                  f"{request.url.path} from {host} - this "
+                                  f"service only accepts writes from the "
+                                  f"local machine"),
+                          extra={"path": str(request.url.path)})
+                except Exception:  # noqa: BLE001
+                    pass
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Trezo only accepts state-changing "
+                                      "requests from the local machine."})
+    return await call_next(request)
+
 app.include_router(patterns_router)
 app.include_router(agents_router)
 

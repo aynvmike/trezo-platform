@@ -24,7 +24,12 @@ nssm stop %SERVICE% 2>nul
 nssm remove %SERVICE% confirm 2>nul
 
 REM Install the service
-nssm install %SERVICE% "%~dp0agents\.venv\Scripts\python.exe" "-m" "uvicorn" "app.main:app" "--host" "0.0.0.0" "--port" "8001"
+REM SECURITY (Mike 2026-07-28): --host 0.0.0.0 would publish the TRADING
+REM engine on every network interface. The agents API has 15 unauthenticated
+REM state-changing endpoints (/admin/manual-trade, /wheel/place-leg,
+REM /paper/positions/trim ...) that are safe ONLY because they answer
+REM loopback. Bind 127.0.0.1 -- the web app runs on the same machine.
+nssm install %SERVICE% "%~dp0agents\.venv\Scripts\python.exe" "-m" "uvicorn" "app.main:app" "--host" "127.0.0.1" "--port" "8001"
 nssm set %SERVICE% AppDirectory "%~dp0agents"
 nssm set %SERVICE% DisplayName "Trezo Trading Agents"
 nssm set %SERVICE% Description "Trezo Layer-by-Layer Trading Bot - FastAPI agents service"
