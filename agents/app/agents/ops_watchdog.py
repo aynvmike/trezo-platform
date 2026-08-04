@@ -165,8 +165,11 @@ class OpsWatchdogAgent(Agent):
                 # script run needed. The library reindexes itself when
                 # the folder changes.
                 try:
-                    from app.knowledge.library import sweep_local_sources
+                    from app.knowledge.library import (
+                        sweep_local_sources, sweep_report,
+                    )
                     _swept = sweep_local_sources()
+                    _srep = sweep_report()
                     if _swept:
                         from app.agents.activity_log import record as _krec
                         _krec("library_sweep", "SYSTEM",
@@ -174,6 +177,19 @@ class OpsWatchdogAgent(Agent):
                                       f"the drop-folders joined the "
                                       f"knowledge library"),
                               extra={})
+                    # Say out loud what could NOT be read (Mike 2026-08-03).
+                    # Screenshots and video are inert to the agents; silence
+                    # let him assume they had been absorbed.
+                    if _srep.get("unreadable_count"):
+                        from app.agents.activity_log import record as _urec
+                        _urec("library_unreadable", "SYSTEM",
+                              reason=(f"{_srep['unreadable_count']} file(s) "
+                                      f"in the drop-box cannot be read "
+                                      f"(images/video/audio): "
+                                      f"{', '.join(_srep['unreadable'][:5])}"
+                                      f" - add a .md note describing them "
+                                      f"and that text will be indexed"),
+                              extra={"files": _srep.get("unreadable")})
                 except Exception:  # noqa: BLE001
                     pass
                 # DAILY DIGEST (Mike 2026-07-27: "why would it be a task

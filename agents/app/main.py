@@ -1616,8 +1616,9 @@ async def knowledge_search(q: str, k: int = 3):
     Books live in agents/knowledge/library/; scripts/build_library.py adds
     the manifest titles and indexes anything Mike drops in the folder."""
     try:
-        from app.knowledge.library import search, stats
-        return {"available": True, "results": search(q, k=k), **stats()}
+        from app.knowledge.library import search, stats, sweep_report
+        return {"available": True, "results": search(q, k=k),
+                "drop_box": sweep_report(), **stats()}
     except Exception as e:  # noqa: BLE001
         return {"available": False, "error": str(e)[:200]}
 

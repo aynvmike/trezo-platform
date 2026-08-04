@@ -43,14 +43,84 @@ SOURCE_DIRS = [
         _here, "..", "..", "..", "..", "TREZO_PROJECT",
         "06_external_research"))),
 ]
-TEXT_EXTS = (".txt", ".md", ".py", ".cs")
+# Formats the sweep can READ (Mike 2026-08-03: "will the agents be able
+# to review and analyze what is in the folder being a certain type of
+# media or any type of media?"). Plain text is copied; the rest are
+# text-EXTRACTED below. Anything not listed here is skipped -- and the
+# sweep now says so out loud instead of ignoring it silently.
+TEXT_EXTS = (".txt", ".md", ".py", ".cs", ".csv", ".json", ".yaml", ".yml")
+DOC_EXTS = (".pdf", ".docx", ".epub", ".htm", ".html")
+# Media the agents cannot read on their own. Listed so the sweep can
+# REPORT them rather than pretend they do not exist -- Mike drops chart
+# screenshots into the folder and deserves to know they are inert.
+MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+              ".mp4", ".mov", ".avi", ".mkv", ".mp3", ".wav", ".m4a")
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
 
 
+def _extract_pdf(path: str) -> str:
+    try:
+        from pypdf import PdfReader
+        r = PdfReader(path)
+        return "\n".join((pg.extract_text() or "") for pg in r.pages)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_docx(path: str) -> str:
+    """Word files are a ZIP of XML -- no third-party package needed."""
+    try:
+        import zipfile
+        import re as _re
+        with zipfile.ZipFile(path) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "ignore")
+        xml = _re.sub(r"</w:p>", "\n", xml)
+        return _re.sub(r"<[^>]+>", "", xml)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_epub(path: str) -> str:
+    """EPUBs are a ZIP of XHTML -- also readable without a package."""
+    try:
+        import zipfile
+        import re as _re
+        out = []
+        with zipfile.ZipFile(path) as z:
+            for n in z.namelist():
+                if n.lower().endswith((".xhtml", ".html", ".htm")):
+                    h = z.read(n).decode("utf-8", "ignore")
+                    h = _re.sub(r"(?is)<(script|style).*?</\1>", " ", h)
+                    out.append(_re.sub(r"<[^>]+>", " ", h))
+        return "\n".join(out)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_html(path: str) -> str:
+    try:
+        import re as _re
+        h = open(path, encoding="utf-8", errors="ignore").read()
+        h = _re.sub(r"(?is)<(script|style).*?</\1>", " ", h)
+        return _re.sub(r"<[^>]+>", " ", h)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_EXTRACTORS = {".pdf": _extract_pdf, ".docx": _extract_docx,
+               ".epub": _extract_epub, ".htm": _extract_html,
+               ".html": _extract_html}
+
+
 def sweep_local_sources() -> int:
-    """Mirror the drop-folders into the library. Returns files copied.
-    Never raises; skips oversized (>3MB) and unchanged files."""
-    n = 0
+    """Mirror the drop-folders into the library. Returns files added.
+
+    Reads plain text directly and EXTRACTS text from PDF, Word, EPUB and
+    HTML (2026-08-03). Files it cannot read -- screenshots, video, audio
+    -- are counted and reported through sweep_report() rather than
+    ignored in silence, so Mike can see that a chart image he dropped in
+    is inert. Never raises; skips oversized (>8MB) and unchanged files."""
+    n, skipped = 0, []
     try:
         os.makedirs(LIB_DIR, exist_ok=True)
         for prefix, root in SOURCE_DIRS:
@@ -59,11 +129,15 @@ def sweep_local_sources() -> int:
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
                 for fn in filenames:
-                    if os.path.splitext(fn)[1].lower() not in TEXT_EXTS:
-                        continue
+                    ext = os.path.splitext(fn)[1].lower()
                     src = os.path.join(dirpath, fn)
+                    if ext in MEDIA_EXTS:
+                        skipped.append(fn)
+                        continue
+                    if ext not in TEXT_EXTS and ext not in DOC_EXTS:
+                        continue
                     try:
-                        if os.path.getsize(src) > 3_000_000:
+                        if os.path.getsize(src) > 8_000_000:
                             continue
                         base = (os.path.splitext(fn)[0].strip().lower()
                                 .replace(" ", "-"))
@@ -72,8 +146,16 @@ def sweep_local_sources() -> int:
                                 and os.path.getmtime(dst)
                                 >= os.path.getmtime(src)):
                             continue
-                        raw = open(src, encoding="utf-8",
-                                   errors="ignore").read()
+                        if ext in _EXTRACTORS:
+                            raw = _EXTRACTORS[ext](src)
+                            if len(raw.strip()) < 200:
+                                # Nothing usable came out -- a scanned
+                                # PDF, or pypdf is not installed.
+                                skipped.append(fn + " (no readable text)")
+                                continue
+                        else:
+                            raw = open(src, encoding="utf-8",
+                                       errors="ignore").read()
                         with open(dst, "w", encoding="utf-8") as f:
                             f.write(raw)
                         n += 1
@@ -81,7 +163,27 @@ def sweep_local_sources() -> int:
                         continue
     except Exception:  # noqa: BLE001
         pass
+    _LAST_SWEEP["added"] = n
+    _LAST_SWEEP["unreadable"] = skipped
     return n
+
+
+_LAST_SWEEP: dict = {"added": 0, "unreadable": []}
+
+
+def sweep_report() -> dict:
+    """What the last sweep took in, and what it had to leave behind."""
+    u = _LAST_SWEEP.get("unreadable") or []
+    return {
+        "added": _LAST_SWEEP.get("added", 0),
+        "unreadable_count": len(u),
+        "unreadable": u[:20],
+        "note": (
+            f"{len(u)} file(s) in the drop-box cannot be read by the "
+            f"agents (images, video or audio). Describe them in a .md "
+            f"or .txt note beside them and that text WILL be indexed."
+        ) if u else "Everything in the drop-box is readable.",
+    }
 
 _word = re.compile(r"[a-z][a-z\-']+")
 
