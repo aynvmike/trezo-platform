@@ -204,6 +204,17 @@ def _folder_sig() -> tuple:
         return ()
 
 
+def invalidate() -> None:
+    """Drop the cached index so the next search re-reads the folder.
+    Called after the research harvester adds notes (2026-08-03)."""
+    global _INDEX, _SIG
+    try:
+        _INDEX = []
+        _SIG = ()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _build() -> None:
     """(Re)index when the folder changed. Cheap: seconds even for books."""
     global _INDEX, _SIG, _LAST_BUILD

@@ -234,6 +234,38 @@ class OpsWatchdogAgent(Agent):
                              "hit_floor_10", "alarm")}}))
                 except Exception:  # noqa: BLE001
                     pass
+                # RESEARCH HARVEST (Mike 2026-08-03): once a week the
+                # agents go and read the open-access quant literature
+                # themselves -- arXiv q-fin -- and file distilled,
+                # fully-cited notes into the library. Extract and
+                # attribute; never mirror the papers. Knowledge informs
+                # the thesis, never the gates.
+                try:
+                    from datetime import date as _dr
+                    if _dr.today().weekday() == 0:   # Monday
+                        from app.knowledge.research_harvester import harvest
+                        _rh = await harvest()
+                        if _rh.get("stored"):
+                            from app.agents.activity_log import record as _rrec
+                            _rrec("research_harvest", "SYSTEM",
+                                  reason=(f"read {_rh['checked']} new papers, "
+                                          f"kept {_rh['stored']} relevant to "
+                                          f"how Trezo trades: "
+                                          f"{'; '.join(_rh['titles'][:3])}"),
+                                  extra={"titles": _rh.get("titles")})
+                            out.append(AgentMessage(
+                                agent=self.name, kind="info",
+                                payload={"event": "research_harvest",
+                                         "checked": _rh["checked"],
+                                         "stored": _rh["stored"],
+                                         "titles": _rh["titles"][:5],
+                                         "note": (
+                                             f"The agents read "
+                                             f"{_rh['checked']} new quant "
+                                             f"papers and kept "
+                                             f"{_rh['stored']}")}))
+                except Exception:  # noqa: BLE001
+                    pass
                 # AGENT PROPOSALS (Mike 2026-07-27): the agents read their
                 # own day -- vetoes, rejects, closed records -- and write
                 # what they believe should CHANGE into

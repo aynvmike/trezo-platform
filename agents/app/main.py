@@ -1671,6 +1671,19 @@ async def knowledge_digest(days: int = 14, run: bool = False):
         return {"available": False, "error": str(e)[:200]}
 
 
+@app.post("/knowledge/research/harvest", tags=["knowledge"])
+async def knowledge_research_harvest(force: bool = False):
+    """Pull the latest open-access quant research now (Mike 2026-08-03)
+    instead of waiting for Monday. Distilled + cited notes only -- the
+    papers themselves are never mirrored, and nothing here can move a
+    rule; that still goes through the proposals document."""
+    try:
+        from app.knowledge.research_harvester import harvest
+        return {"available": True, **(await harvest(force=force))}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @app.get("/knowledge/proposals", tags=["knowledge"])
 async def knowledge_proposals(run: bool = False):
     """What the agents would CHANGE (Mike 2026-07-27), from their own
