@@ -866,6 +866,19 @@ class TradeExecutionAgent(Agent):
         _cx_slice = max(25.0, float(budget) / _cx_n) if budget else 1e12
         _crypto_usd = float(getattr(
             acct, "non_marginable_buying_power", 0.0) or 0.0)
+        # FEE HEADROOM (Mike 2026-08-03: repeated 403s at "requested:
+        # 65.66, available: 64.35"). Sizing spent the wallet to the last
+        # cent, but Alpaca needs room for fees and price drift between
+        # the quote and the fill, so orders missed by ~2% and were
+        # rejected -- and each reject counted toward the kill-switch.
+        # Keep a small buffer back; a slightly smaller order fills,
+        # a perfectly-sized one does not.
+        try:
+            import os as _os_hr
+            _hair = float(_os_hr.getenv("TREZO_CRYPTO_USD_HAIRCUT", "0.96"))
+        except (TypeError, ValueError):
+            _hair = 0.96
+        _crypto_usd = _crypto_usd * max(0.5, min(1.0, _hair))
         if _crypto_usd < 25.0:
             try:
                 from app.agents.activity_log import record as _arec
