@@ -151,6 +151,102 @@ def distil(paper: dict) -> str:
     )
 
 
+# --- Mike's own feeds ------------------------------------------------
+# He asked "do I just add the rss code here?" -- no code. He drops feed
+# URLs into a plain text file in the SAME drop-box folder he already
+# uses for books, one per line. The agents read whatever is listed.
+FEEDS_FILENAME = "feeds.txt"
+
+_FEEDS_TEMPLATE = """# Trezo — news & research feeds
+#
+# Paste one feed address (RSS or Atom) per line. Lines starting with #
+# are notes and are ignored. The agents read these on their weekly pass,
+# keep only items that touch how Trezo actually trades, and file each
+# one with a link back to the original source.
+#
+# To add a feed: paste the address on its own line and save. Nothing
+# else to do — no restart needed.
+# To pause a feed: put a # in front of it.
+#
+# --- starter set (delete any you don't want) ---
+
+# US Federal Reserve — policy statements and speeches
+https://www.federalreserve.gov/feeds/press_all.xml
+
+# SEC — press releases and enforcement
+https://www.sec.gov/news/pressreleases.rss
+
+# arXiv quantitative finance — trading & market microstructure
+https://rss.arxiv.org/rss/q-fin.TR
+
+# arXiv quantitative finance — portfolio management
+https://rss.arxiv.org/rss/q-fin.PM
+"""
+
+
+def feeds_path() -> Path:
+    """The drop-box file Mike edits. Created with a starter set and
+    instructions the first time the harvester runs."""
+    qc = Path(__file__).resolve().parents[3] / ".." / "Quantconnect"
+    qc = qc.resolve()
+    f = qc / FEEDS_FILENAME
+    try:
+        qc.mkdir(parents=True, exist_ok=True)
+        if not f.exists():
+            f.write_text(_FEEDS_TEMPLATE, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    return f
+
+
+def read_feeds() -> list[str]:
+    try:
+        lines = feeds_path().read_text(encoding="utf-8").splitlines()
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if ln and not ln.startswith("#") and ln.lower().startswith("http"):
+            out.append(ln)
+    return out
+
+
+def parse_rss(xml_text: str) -> list[dict]:
+    """Parse RSS 2.0 or Atom into the same shape as the arXiv parser, so
+    both kinds of source flow through one pipeline."""
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:  # noqa: BLE001
+        return out
+    # RSS 2.0
+    for it in root.findall(".//item"):
+        title = _clean(it.findtext("title", ""))
+        desc = _clean(re.sub(r"<[^>]+>", " ", it.findtext("description", "") or ""))
+        link = _clean(it.findtext("link", ""))
+        date = _clean(it.findtext("pubDate", ""))[:16]
+        if title:
+            out.append({"id": link or title[:40], "title": title,
+                        "summary": desc, "published": date,
+                        "authors": [], "link": link, "categories": []})
+    # Atom
+    if not out:
+        for e in root.findall("a:entry", _NS):
+            title = _clean(e.findtext("a:title", "", _NS))
+            summ = _clean(re.sub(r"<[^>]+>", " ",
+                                 e.findtext("a:summary", "", _NS)
+                                 or e.findtext("a:content", "", _NS) or ""))
+            lk = e.find("a:link", _NS)
+            link = lk.get("href") if lk is not None else ""
+            date = _clean(e.findtext("a:updated", "", _NS))[:10]
+            if title:
+                out.append({"id": link or title[:40], "title": title,
+                            "summary": summ, "published": date,
+                            "authors": [], "link": link, "categories": []})
+    return out
+
+
 async def harvest(max_per_cat: int = 8, force: bool = False) -> dict:
     """Pull recent papers, keep the relevant unseen ones, write library
     notes. Returns a summary. Never raises."""
@@ -198,6 +294,35 @@ async def harvest(max_per_cat: int = 8, force: bool = False) -> dict:
                         out["titles"].append(p["title"][:90])
                     except Exception:  # noqa: BLE001
                         continue
+            # --- Mike's own feeds, from the drop-box file -----------
+            for url in read_feeds():
+                try:
+                    r = await client.get(url, headers={
+                        "User-Agent": "Trezo/1.0 (personal research reader)"})
+                    if r.status_code != 200:
+                        continue
+                    items = parse_rss(r.text)
+                except Exception:  # noqa: BLE001
+                    continue
+                for p_ in items[:12]:
+                    out["checked"] += 1
+                    key = "feed:" + p_["id"][:60]
+                    if key in seen:
+                        continue
+                    hits = _relevance_hits(p_["title"] + " " + p_["summary"])
+                    if len(hits) < _min_hits:
+                        continue
+                    slug = re.sub(r"[^a-z0-9]+", "-",
+                                  p_["title"].lower())[:60].strip("-")
+                    dst = lib / f"research--feed-{abs(hash(key)) % 10**8}-{slug}.txt"
+                    try:
+                        dst.write_text(distil(p_), encoding="utf-8")
+                        fresh.add(key)
+                        out["stored"] += 1
+                        out["titles"].append(p_["title"][:90])
+                    except Exception:  # noqa: BLE001
+                        continue
+
         if fresh:
             _remember(fresh)
             try:
