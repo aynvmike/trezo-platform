@@ -385,6 +385,8 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
         return CryptoSignal(
             ticker=sym, mode="swing", direction="bullish",
             stop_pct=0.05, target_pct=0.12,   # swing geometry overrides per-coin
+            # (SWING replaces rather than rescales; the guard below reports
+            #  the ratio change so an override is as visible as a rescale.)
             rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
             reason=f"SWING — BB width {bb_w:.1f}% > {SWING_BB_MIN}, RSI {rsi_now:.0f}",
         )
@@ -415,10 +417,27 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
     # volume-OPTIONAL so it is not frozen out on no-volume feeds. ---
     if (bb_w < SCALP_BB_MAX and SCALP_RSI_LO <= rsi_now <= SCALP_RSI_HI
             and (vol_ratio >= SCALP_VOL_MIN or not has_vol)):
+        # GEOMETRY GUARD (2026-08-05). These two multipliers DIFFER, so
+        # the designed 1:2 leaves here as 1:1.67. That is a real change
+        # and it went unnoticed for weeks -- the only trace was four
+        # stop-outs clustering at -1.9%. The rescale is not blocked (a
+        # reporting guard that can stop a trade is a new failure mode),
+        # but it can no longer happen quietly. Scaling both legs by the
+        # same factor would preserve the ratio.
+        _s_scalp = max(base["stop_pct"] * 0.6, 0.01)
+        _t_scalp = max(base["target_pct"] * 0.5, 0.02)
+        try:
+            from app.runtime.geometry import check_rescale
+            check_rescale(sym, "crypto_scalp",
+                          base["stop_pct"], base["target_pct"],
+                          _s_scalp, _t_scalp,
+                          note="SCALP multipliers stop x0.6, target x0.5")
+        except Exception:  # noqa: BLE001
+            pass
         return CryptoSignal(
             ticker=sym, mode="scalp", direction="bullish",
-            stop_pct=max(base["stop_pct"] * 0.6, 0.01),
-            target_pct=max(base["target_pct"] * 0.5, 0.02),
+            stop_pct=_s_scalp,
+            target_pct=_t_scalp,
             rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
             reason=f"SCALP - BB {bb_w:.1f}% range, RSI {rsi_now:.0f}, vol {vol_ratio:.1f}x.",
         )

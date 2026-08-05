@@ -6,6 +6,38 @@ import { RefreshCw, Info } from "lucide-react";
  * back to a clearly-labelled sample when it is not.
  */
 
+/**
+ * GEOMETRY -- the shape of a trade's risk and reward (Mike 2026-08-05).
+ *
+ * Reward-to-risk decides how often you have to be right to make money.
+ * At 1:2 you can lose most of your trades and still profit; below 1:1 the
+ * arithmetic is against you no matter how good the entry was. This was
+ * invisible until a rescale in the crypto scalp lane quietly turned a
+ * designed 1:2 into 1:1.67 and nobody could see it for weeks.
+ *
+ * Derived from entry/stop/target already on the row -- no new data.
+ */
+function geometryOf(entry: number, stop?: number | null, target?: number | null) {
+  if (!entry || entry <= 0 || stop == null || target == null) return null;
+  const riskPct = Math.abs(entry - stop) / entry;
+  const rewardPct = Math.abs(target - entry) / entry;
+  if (riskPct <= 0 || rewardPct <= 0) return null;
+  const rr = rewardPct / riskPct;
+  return {
+    riskPct: riskPct * 100,
+    rewardPct: rewardPct * 100,
+    rr,
+    // The break-even win rate this geometry demands. Makes the ratio concrete.
+    needWin: 100 / (1 + rr),
+    tone:
+      rr >= 2 ? "text-emerald-500"
+      : rr >= 1.5 ? "text-[rgb(var(--muted-foreground))]"
+      : rr >= 1 ? "text-amber-500"
+      : "text-red-500",
+    label: rr >= 2 ? "healthy" : rr >= 1.5 ? "workable" : rr >= 1 ? "thin" : "upside down",
+  };
+}
+
 export type TVPosition = {
   id: string | number;
   ticker: string;
@@ -342,6 +374,17 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
                           {p.heldSince ? <span>Held {p.heldSince}</span> : null}
                           {p.stop != null ? <span>Stop {price(p.stop)}</span> : null}
                           {p.target != null ? <span>Target {price(p.target)}</span> : null}
+                          {(() => {
+                            const g = geometryOf(p.entry, p.stop, p.target);
+                            return g ? (
+                              <span
+                                className={g.tone}
+                                title={`Risk ${g.riskPct.toFixed(1)}% to make ${g.rewardPct.toFixed(1)}%. At 1:${g.rr.toFixed(2)} you need to be right about ${g.needWin.toFixed(0)}% of the time just to break even.`}
+                              >
+                                Geometry 1:{g.rr.toFixed(2)} ({g.label})
+                              </span>
+                            ) : null;
+                          })()}
                           {p.locked ? <span className="text-emerald-500">● Profit locked</span> : null}
                         </div>
                         {p.plan ? <p className="mt-1 text-[11px] text-[rgb(var(--muted-foreground))]">{p.plan}</p> : null}
