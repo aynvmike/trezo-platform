@@ -1706,6 +1706,30 @@ async def knowledge_proposals(run: bool = False):
         return {"available": False, "error": str(e)[:200]}
 
 
+@app.get("/learning/rule_replay", tags=["knowledge"])
+async def learning_rule_replay(user_id: str | None = None, days: int = 30,
+                               interval_minutes: int = 60):
+    """Mike 2026-08-05: the banked ledger cannot judge an exit rule that
+    was never the intended one. This re-runs every closed crypto trade
+    over its REAL forward price path under each candidate rule -- the
+    live +0.63% exit, the designed target, a floor-then-trail, and a
+    step ladder -- and writes the comparison to TREZO_RULE_REPLAY.md.
+    Entries are held fixed; only the exit rule varies."""
+    try:
+        from app.learning.rule_replay import replay, render
+        from app.runtime.settings import _primary_user_id as _puid
+        uid = user_id or _puid() or ""
+        if not uid:
+            return {"ok": False, "error": "no user id -- pass ?user_id= or set TREZO_PRIMARY_USER_ID"}
+        res = await replay(uid, days=days, interval_minutes=interval_minutes)
+        if not res.get("ok"):
+            return res
+        res["doc_path"] = render(res)
+        return res
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:300]}
+
+
 @app.get("/goal/today", tags=["paper"])
 async def goal_today(user_id: str | None = None):
     """The agents' daily income goal (Mike 2026-07-13): the paycheck-ladder
