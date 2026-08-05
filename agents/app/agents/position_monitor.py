@@ -757,6 +757,21 @@ async def _alpaca_profit_step(r, price: float,
     remaining = qty_total - slice_qty
     if slice_qty < 1 or remaining < 1:
         return False, "too small to split"
+    # 0) SESSION GATE (2026-08-05). Equity bracket legs cannot be
+    #    cancelled while the market is shut, so every overnight attempt
+    #    failed at step 1 and retried forever: 47 identical aborts on
+    #    PYPL at 03:00 ET in a single night, 78% of every abort ever
+    #    logged. The profit was never taken because the harvest kept
+    #    running when it could not possibly succeed. Crypto is exempt --
+    #    it genuinely trades 24/7.
+    _is_crypto = str(r.get("asset_type") or "").lower() == "crypto"
+    if not _is_crypto:
+        try:
+            from app.agents.ops_watchdog import _us_market_open
+            if not _us_market_open():
+                return False, "market closed - step harvest deferred to the open"
+        except Exception:  # noqa: BLE001
+            pass
     # 1) Release the shares: cancel bracket legs (cancel-legs-first,
     #    6/12 lesson) and VERIFY they are gone before selling anything.
     _n, err = await cancel_open_orders_for(sym)
@@ -768,6 +783,14 @@ async def _alpaca_profit_step(r, price: float,
         if left == []:
             break
         await asyncio.sleep(0.7)
+    # get_open_orders_for returns None when the CALL ITSELF failed, and
+    # [] only when the broker confirmed there is nothing open. `if left:`
+    # treated None as falsy, so a failed check read as "all clear" and
+    # the sell proceeded without ever verifying the legs were gone --
+    # the exact naked-shares outcome the 6/12 cancel-legs-first rule
+    # exists to prevent. An unverifiable check must abort, not assume.
+    if left is None:
+        return False, "could not verify legs were cancelled - aborted untouched"
     if left:
         return False, "legs did not cancel - aborted untouched"
     # 2) Sell the slice at market.
