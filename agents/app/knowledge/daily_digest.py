@@ -63,7 +63,8 @@ async def build_digest(client, equity: float = 0.0,
 
     def _closed():
         return (client.table("paper_positions")
-                .select("ticker, asset_type, strategy, realized_pnl_usd, status")
+                .select("ticker, asset_type, strategy, realized_pnl_usd, status, "
+                        "entry_price, stop_price, quantity")
                 .neq("status", "open").gte("exit_at", since)
                 .limit(300).execute())
 
@@ -88,8 +89,23 @@ async def build_digest(client, equity: float = 0.0,
     lanes: dict[str, dict] = {}
     wins = losses = 0.0
     wn = ln = 0
+    # R-MULTIPLES (Tharp, phase 5, 2026-08-05). Dollars hide the thing that
+    # matters: a $12 crypto scalp and a $400 option are unreadable side by
+    # side, and identical in R if both made three times what they risked.
+    # R is the only unit that lets the whole book be compared at once.
+    _rs: list[float] = []
     for c in closed:
         p = _f(c.get("realized_pnl_usd"))
+        try:
+            from app.runtime.r_multiples import r_multiple, risk_from_geometry
+            _risk = risk_from_geometry(_f(c.get("entry_price")),
+                                       _f(c.get("stop_price")),
+                                       _f(c.get("quantity")))
+            _r = r_multiple(p, _risk) if _risk else None
+            if _r is not None:
+                _rs.append(_r)
+        except Exception:  # noqa: BLE001
+            pass
         ln_ = _lane(c.get("asset_type"), c.get("strategy"))
         d = lanes.setdefault(ln_, {"n": 0, "w": 0, "net": 0.0,
                                    "won": 0.0, "lost": 0.0})
@@ -110,6 +126,9 @@ async def build_digest(client, equity: float = 0.0,
         "closed": len(closed), "wins": wn, "losses": ln,
         "gross_won": round(wins, 2), "gross_lost": round(losses, 2),
         "net_realized": round(net, 2), "profit_factor": round(pf, 2),
+        "r_multiples": (lambda: (
+            __import__("app.runtime.r_multiples", fromlist=["expectancy"])
+            .expectancy(_rs) if len(_rs) >= 2 else None))(),
         "lanes": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv)
                       for kk, vv in v.items()} for k, v in lanes.items()},
         "open_positions": len(openb),
@@ -189,6 +208,30 @@ def _write_doc(d: dict) -> None:
         L.append(f"Target was ~${tgt:,.2f} (1% of ${d.get('equity'):,.2f} "
                  f"equity); the $10/day floor was "
                  f"{'CLEARED' if d.get('hit_floor_10') else 'missed'}.\n")
+    # R-MULTIPLES (Tharp, phase 5). Dollars answer "how much"; R answers
+    # "was that good", which is the question a digest should be settling.
+    _rm = d.get("r_multiples")
+    if _rm:
+        L.append("\n## In R -- the unit that makes every trade comparable\n")
+        L.append(f"An R-multiple is what a trade made divided by what it "
+                 f"risked. Risk $50 and make $150 and that is +3R, whether "
+                 f"the trade was a $12 scalp or a $400 option.\n")
+        L.append(f"- **Expectancy: {_rm['expectancy_r']:+.3f}R per trade** "
+                 f"across {_rm['trades']} trades "
+                 f"({'positive -- the system pays' if _rm['positive'] else 'NEGATIVE -- the system costs money per trade'})")
+        L.append(f"- Average win **{_rm['avg_win_r']:+.2f}R**, average loss "
+                 f"**{_rm['avg_loss_r']:+.2f}R**, win rate {_rm['win_rate_pct']}%")
+        L.append(f"- Best **{_rm['best_r']:+.2f}R**, worst "
+                 f"**{_rm['worst_r']:+.2f}R**, spread {_rm['stdev_r']:.2f}R")
+        L.append(f"- {_rm['worst_case_note']}\n")
+        _n = _rm["trades"]
+        if _n:
+            L.append(f"_At this expectancy, {_n} trades a day would return "
+                     f"about {_rm['expectancy_r'] * _n:+.2f}R daily. Tharp's "
+                     f"point is that a small edge taken often beats a large "
+                     f"one taken rarely -- expectancy is only half the "
+                     f"picture, opportunity is the other half._\n")
+
     L.append("\n## Which lane earned it\n")
     for lane, v in sorted(d.get("lanes", {}).items(),
                           key=lambda kv: -kv[1]["net"]):
