@@ -117,7 +117,8 @@ def _net(gross_gain: float, legs: int = 1) -> float:
 
 def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
               bars: list, variant: str,
-              interval_minutes: int = 60) -> dict[str, Any]:
+              interval_minutes: int = 60,
+              peak_basis: str = "high") -> dict[str, Any]:
     """Walk the price path bar by bar under one exit rule.
 
     Returns {gain, exit_reason, bars_held, ambiguous}. `gain` is NET of
@@ -181,18 +182,21 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
             banked += remaining * -eff_stop        # no rung credit: pessimistic
             return {"gain": _net(banked, max(legs, 1)),
                     "exit_reason": "stop(ambiguous)",
-                    "bars_held": i + 1, "ambiguous": True}
+                    "bars_held": i + 1, "ambiguous": True,
+                    "peak_pct": round(peak * 100, 3)}
         if stop_hit:
             banked += remaining * -eff_stop
             return {"gain": _net(banked, max(legs, 1)),
                     "exit_reason": "breakeven_floor" if eff_stop == 0.0 else "stop",
-                    "bars_held": i + 1, "ambiguous": ambiguous}
+                    "bars_held": i + 1, "ambiguous": ambiguous,
+                    "peak_pct": round(peak * 100, 3)}
 
         # ---- trail strikes before any further upside is credited ----
         if trail_hit and trail_level is not None:
             banked += remaining * trail_level
             return {"gain": _net(banked, legs + 1), "exit_reason": "trail",
-                    "bars_held": i + 1, "ambiguous": ambiguous}
+                    "bars_held": i + 1, "ambiguous": ambiguous,
+                    "peak_pct": round(peak * 100, 3)}
 
         # ---- ladder rungs fill on the way up ----
         if variant == "step_ladder":
@@ -207,19 +211,35 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
             return {"gain": _net(banked, legs + 1),
                     "exit_reason": "target" if exit_at == target_pct
                                    else "net_edge_floor",
-                    "bars_held": i + 1, "ambiguous": ambiguous}
+                    "bars_held": i + 1, "ambiguous": ambiguous,
+                    "peak_pct": round(peak * 100, 3)}
 
         if time_stop_bars is not None and (i + 1) >= time_stop_bars:
             banked += remaining * _gain(side, entry, float(b.close))
             return {"gain": _net(banked, legs + 1), "exit_reason": "time_stop",
-                    "bars_held": i + 1, "ambiguous": ambiguous}
+                    "bars_held": i + 1, "ambiguous": ambiguous,
+                    "peak_pct": round(peak * 100, 3)}
 
-        peak = max(peak, g_best)
+        # PEAK UPDATE -- last thing in the bar, so every exit above is
+        # judged against the peak from PRIOR bars only. (An edit briefly
+        # deleted this line outright; the trail then never armed in any
+        # variant and every peak reported 0.0%. The self-test caught it.)
+        #
+        # PEAK BASIS (Mike 2026-08-05): "we will have issues if it is
+        # volatile and peaks a 30 percent drawback sale." A trailing stop
+        # is resolution-sensitive: the finer the candle, the more single
+        # wicks get recorded as the peak, and a giveback measured from a
+        # wick fires on noise rather than on a real reversal.
+        # peak_basis="close" anchors the peak on closing prices, which a
+        # spike cannot inflate. "high" stays the conservative default.
+        peak = max(peak, g_best if peak_basis == "high"
+                   else _gain(side, entry, float(b.close)))
 
     if bars:
         banked += remaining * _gain(side, entry, float(bars[-1].close))
     return {"gain": _net(banked, legs + 1), "exit_reason": "unresolved",
-            "bars_held": len(bars), "ambiguous": ambiguous}
+            "bars_held": len(bars), "ambiguous": ambiguous,
+            "peak_pct": round(peak * 100, 3)}
 
 
 VARIANTS = ("as_run", "target_only", "floor_then_trail", "step_ladder",
@@ -227,7 +247,7 @@ VARIANTS = ("as_run", "target_only", "floor_then_trail", "step_ladder",
 
 
 async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
-                 max_rows: int = 300) -> dict[str, Any]:
+                 max_rows: int = 300, peak_basis: str = "high") -> dict[str, Any]:
     """Replay every closed crypto trade in the window under each rule."""
     client = _supabase()
     if not client:
@@ -350,8 +370,10 @@ async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
                "real_pnl": (float(real_pnl) if real_pnl is not None else None)}
         for v in VARIANTS:
             sim = _simulate(side, entry, stop_pct, target_pct, fwd, v,
-                            interval_minutes=interval_minutes)
+                            interval_minutes=interval_minutes,
+                            peak_basis=peak_basis)
             row[v] = {"gain_pct": round(sim["gain"] * 100, 3),
+                      "peak_pct": sim.get("peak_pct", 0.0),
                       "pnl_usd": round(sim["gain"] * entry * qty, 2),
                       "exit_reason": sim["exit_reason"],
                       "bars_held": sim["bars_held"],
@@ -359,6 +381,7 @@ async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
         trades.append(row)
 
     return {"ok": True, "days": days, "interval_minutes": interval_minutes,
+            "peak_basis": peak_basis,
             "trades": trades, "skipped": skipped,
             "summary": _summarise(trades)}
 
@@ -390,6 +413,26 @@ def _summarise(trades: list[dict]) -> dict[str, Any]:
             "profit_factor": round(gw / gl, 2) if gl > 0 else None,
             "ambiguous_trades": amb,
         }
+    # PEAK DISTRIBUTION -- Mike's question: at a finer candle, how high
+    # does a trade typically peak, and is 30% of that a sane leash?
+    peaks = sorted(t["floor_then_trail"]["peak_pct"] for t in trades
+                   if "peak_pct" in t.get("floor_then_trail", {}))
+    if peaks:
+        n = len(peaks)
+        med = peaks[n // 2]
+        avg = sum(peaks) / n
+        out["peak_profile"] = {
+            "avg_peak_pct": round(avg, 2),
+            "median_peak_pct": round(med, 2),
+            "p25_peak_pct": round(peaks[n // 4], 2),
+            "p75_peak_pct": round(peaks[(3 * n) // 4], 2),
+            "trades_that_reached_trail_arm_3pct": len([p for p in peaks if p >= 3.0]),
+            "giveback_at_median_peak_pct": round(med * TRAIL_GIVEBACK, 2),
+            "trail_exit_at_median_peak_pct": round(med * (1 - TRAIL_GIVEBACK), 2),
+        }
+    else:
+        out["peak_profile"] = {}
+
     # What happened AFTER our agent sold -- the heart of Mike's question.
     post = [t["after_our_exit"] for t in trades
             if (t.get("after_our_exit") or {}).get("measured")]
@@ -482,6 +525,34 @@ def render(result: dict[str, Any]) -> str:
              "the stop and the profit exit. At this resolution the order is "
              "genuinely unknowable, so those are all resolved as LOSSES. No rule "
              "is allowed to win by assuming lucky timing.\n")
+
+    pp = s.get("peak_profile") or {}
+    L.append("## How high a trade actually peaks — and whether 30% is a sane leash\n")
+    if pp:
+        L.append(f"Measured at {result.get('interval_minutes')}-minute resolution, "
+                 f"peak basis = **{result.get('peak_basis')}**.\n")
+        L.append(f"- Typical (median) peak gain during a trade: **{pp.get('median_peak_pct')}%** "
+                 f"(average {pp.get('avg_peak_pct')}%)")
+        L.append(f"- Middle half of trades peak between **{pp.get('p25_peak_pct')}%** "
+                 f"and **{pp.get('p75_peak_pct')}%**")
+        L.append(f"- Trades that ever reached the 3% trail-arming level: "
+                 f"**{pp.get('trades_that_reached_trail_arm_3pct')}** of {s.get('n')}")
+        L.append(f"- At the median peak, a 30% giveback means surrendering "
+                 f"**{pp.get('giveback_at_median_peak_pct')}%** and banking "
+                 f"**{pp.get('trail_exit_at_median_peak_pct')}%**\n")
+        L.append("Read the middle-half range against the giveback. If the normal "
+                 "bar-to-bar wobble of these coins is WIDER than 30% of a typical "
+                 "peak, the trail will be struck by ordinary noise rather than by "
+                 "a real reversal — and the giveback should widen, or the peak "
+                 "should be measured on closes rather than wicks "
+                 "(`peak_basis=close`). Compare the two runs before deciding.\n")
+        L.append("Two protections are already in force and worth keeping in view: "
+                 "the trail cannot arm at all below **3%** profit, so noise beneath "
+                 "that level can never trigger it; and once a trade has been up "
+                 "0.63% its stop sits at breakeven, so the worst case for an armed "
+                 "trade is a scratch rather than a loss.\n")
+    else:
+        L.append("_No peak data — nothing was replayed._\n")
 
     ae = s.get("after_our_exit") or {}
     L.append("## What happened AFTER our agent sold\n")
