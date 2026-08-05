@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # already targets ~9 DTE; this pins it explicitly if ever needed.
     trezo_wheel_max_dte: int = 0
 
+    # Which volatility estimator the options + crypto lanes use.
+    # "yang_zhang" (default) reads the high/low/open/close of every bar --
+    # far more efficient than close-to-close, which is blind to a day that
+    # swings 8% and closes flat. Alternatives: "garman_klass",
+    # "rogers_satchell", "parkinson", or "close_to_close" to revert.
+    # Source: Sinclair, Volatility Trading, ch.2 (drop-box note
+    # SINCLAIR_MEASURING_VOLATILITY.md).
+    trezo_vol_estimator: str = "yang_zhang"
+
     # Service
     env: str = "development"
     # Trading mode - "paper" (default) or "live".

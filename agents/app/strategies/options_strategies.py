@@ -26,6 +26,7 @@ from typing import Optional
 
 from app.options.pricing import (
     OptionQuote, theoretical_price, estimate_iv, daily_returns_from_closes,
+    iv_from_candles,
 )
 from app.patterns import Candle
 
@@ -95,7 +96,7 @@ def build_long_call(underlying: str, candles: list[Candle], contracts: int = 1) 
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     strike = round(spot * 1.02, 2)  # slightly OTM
     q = theoretical_price("call", spot, strike, TARGET_DTE, iv)
     debit = q.premium * 100 * contracts
@@ -124,7 +125,7 @@ def build_bull_call_spread(underlying: str, candles: list[Candle], contracts: in
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     long_strike = round(spot * 1.01, 2)
     short_strike = round(spot * 1.08, 2)
     long_q = theoretical_price("call", spot, long_strike, TARGET_DTE, iv)
@@ -156,7 +157,7 @@ def build_cash_secured_put(underlying: str, candles: list[Candle], contracts: in
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     strike = round(spot * 0.95, 2)
     q = theoretical_price("put", spot, strike, TARGET_DTE, iv)
     credit = q.premium * 100 * contracts
@@ -189,7 +190,7 @@ def build_bull_put_spread(underlying: str, candles: list[Candle],
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     short_strike = round(spot * 0.95, 2)     # sell put ~5% OTM
     long_strike = round(spot * 0.90, 2)      # buy put ~10% OTM (the wing)
     short_q = theoretical_price("put", spot, short_strike, TARGET_DTE, iv)
@@ -226,7 +227,7 @@ def build_bear_call_spread(underlying: str, candles: list[Candle],
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     short_strike = round(spot * 1.05, 2)     # sell call ~5% OTM
     long_strike = round(spot * 1.10, 2)      # buy call ~10% OTM (the wing)
     short_q = theoretical_price("call", spot, short_strike, TARGET_DTE, iv)
@@ -263,7 +264,7 @@ def build_long_put(underlying: str, candles: list[Candle],
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     strike = round(spot * 0.98, 2)           # just under the money
     q = theoretical_price("put", spot, strike, TARGET_DTE, iv)
     debit = q.premium * 100 * contracts
@@ -298,7 +299,7 @@ def build_butterfly(underlying: str, candles: list[Candle],
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     lo = round(spot * 0.97, 2)
     mid = round(spot, 2)
     hi = round(spot * 1.03, 2)
@@ -341,7 +342,7 @@ def build_iron_condor(underlying: str, candles: list[Candle],
     spot = float(candles[-1].close)
     if spot <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     put_short = round(spot * 0.95, 2)
     put_long = round(spot * 0.90, 2)
     call_short = round(spot * 1.05, 2)

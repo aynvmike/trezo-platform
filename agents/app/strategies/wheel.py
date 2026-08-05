@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
 
-from app.options.pricing import OptionQuote, theoretical_price, estimate_iv, daily_returns_from_closes
+from app.options.pricing import OptionQuote, theoretical_price, estimate_iv, daily_returns_from_closes, iv_from_candles
 from app.patterns import Candle
 
 # Quality names suited to the Wheel - diverse dividend payers with
@@ -130,7 +130,7 @@ def evaluate_csp(
     if spot <= 0:
         return None
 
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     strike = round(spot * (1 - CSP_OTM), 2)
     _dp = False
     # Rulebook 5.4 - enter through the put. On a decaying name the
@@ -186,7 +186,7 @@ def evaluate_cc(
     if spot <= 0:
         return None
 
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     # Strike at least 5% above spot AND not below cost basis (don't cap
     # a loss in). When an ex-div date falls inside the contract life,
     # push the cushion to 7.5% so the bot doesn't sell the shares out
@@ -245,7 +245,7 @@ def evaluate_cc_recovery(
     spot = float(candles[-1].close)
     if spot <= 0 or cost_basis <= 0:
         return None
-    iv = estimate_iv(daily_returns_from_closes([c.close for c in candles[-60:]]))
+    iv = iv_from_candles(candles)
     otm = CC_OTM
     if days_until_exdiv is not None and 0 <= days_until_exdiv <= dte:
         otm = CC_OTM * 1.5
