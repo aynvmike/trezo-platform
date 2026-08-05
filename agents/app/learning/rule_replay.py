@@ -68,7 +68,16 @@ NET_EDGE_FLOOR = ROUND_TRIP + 0.0001                                  # 0.0063
 # Mike 2026-08-05 asked for step profit taking; these mirror the options
 # desk's staged harvest, scaled to a 5% crypto target.
 LADDER = ((1 / 3, 0.015), (1 / 3, 0.030))   # remainder rides to target/trail
-TIME_STOP_MINUTES = 90   # the live _decide_time_stop max_hold_90min
+# MAX_HOLD_MINUTES in position_monitor.py. NOT a setting chosen here --
+# the replay mirrors the live value so the variant measures the real rule.
+#
+# IMPORTANT (verified 2026-08-05): the live time stop only fires for
+# strategies whose name starts with stms / orb / scalp. "crypto_scalp"
+# starts with "crypto", so the 90-minute clock has NEVER applied to a
+# crypto trade. For the crypto replay this variant is therefore a
+# HYPOTHETICAL -- what a clock WOULD cost if one were introduced -- not
+# a description of anything that happened.
+TIME_STOP_MINUTES = 90
 # The live trail (runtime/capabilities.trailing_profit_stop) does not
 # engage until min_gain = 3%. An earlier draft armed it at +0.63% and a
 # self-test caught the consequence: on a slow winner a 30% giveback of a
@@ -476,7 +485,7 @@ _LABEL = {
     "target_only": "TARGET ONLY (let it run to the designed target)",
     "floor_then_trail": "FLOOR THEN TRAIL (arm a trail at +0.63%, give back 30% of peak)",
     "step_ladder": "STEP LADDER (a third at +1.5%, a third at +3%, rest to target)",
-    "trail_plus_timestop": "TRAIL + 90-MIN TIME STOP (Mike's order, with the clock ON)",
+    "trail_plus_timestop": "TRAIL + 90-MIN CLOCK (HYPOTHETICAL for crypto -- see note)",
 }
 
 
@@ -521,6 +530,11 @@ def render(result: dict[str, Any]) -> str:
                  f"${r.get('avg_win')} | ${r.get('avg_loss')} | "
                  f"{pf if pf is not None else 'n/a'} | {r.get('ambiguous_trades')} |")
     L.append("")
+    L.append("_The 90-minute clock row is HYPOTHETICAL for crypto: the live time "
+             "stop only matches strategies named stms/orb/scalp, and "
+             "\"crypto_scalp\" starts with \"crypto\", so no crypto trade has ever "
+             "been closed by it. That row answers \"what would a clock cost here\", "
+             "not \"what did the clock do\"._\n")
     L.append("The last column counts trades where a single candle contained both "
              "the stop and the profit exit. At this resolution the order is "
              "genuinely unknowable, so those are all resolved as LOSSES. No rule "
