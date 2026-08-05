@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { LayerHero } from "@/components/dashboard/layer-hero";
+import { PremiumQualityCard } from "@/components/dashboard/premium-quality-card";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 
@@ -617,6 +618,11 @@ export default async function WheelPage() {
           </p>
         </div>
       </Disclosure>
+
+      {/* Natenberg, 2026-08-05: selling premium is selling volatility, and
+          nothing in Trezo measured whether the volatility was worth selling.
+          Observation only -- these verdicts gate no decision yet. */}
+      <PremiumQualityCard />
     </div>
   );
 }

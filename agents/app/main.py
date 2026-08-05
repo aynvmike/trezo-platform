@@ -1761,6 +1761,66 @@ async def goal_today(user_id: str | None = None):
         return {"available": False, "error": str(e)[:200]}
 
 
+@app.get("/options/premium_quality", tags=["paper"])
+async def options_premium_quality(days: int = 14):
+    """Was the premium Trezo sold expensive or cheap? (Natenberg, 8/5.)
+
+    Reads the variance_premium lines written by refine_csp_live and
+    summarises them. Observation only -- these verdicts gate nothing yet.
+    The point is to accumulate enough of them to find out whether CHEAP
+    trades really did do worse than RICH ones before any rule changes."""
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    root = _os.path.abspath(_os.path.join(here, ".."))
+    logdir = _os.getenv("TREZO_ACTIVITY_LOG_DIR") or _os.path.join(
+        _os.path.dirname(root), "logs")
+    rows: list = []
+    counts: dict = {"RICH": 0, "FAIR": 0, "CHEAP": 0, "UNKNOWN": 0}
+    for i in range(max(1, int(days))):
+        day = (_dt.now(_tz.utc) - _td(days=i)).strftime("%Y-%m-%d")
+        path = _os.path.join(logdir, f"activity-{day}.jsonl")
+        if not _os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for ln in fh:
+                    if "variance_premium" not in ln:
+                        continue
+                    try:
+                        rec = _json.loads(ln)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if rec.get("event") != "variance_premium":
+                        continue
+                    ex = rec.get("extra") or {}
+                    v = str(ex.get("verdict") or "UNKNOWN")
+                    counts[v] = counts.get(v, 0) + 1
+                    rows.append({
+                        "ts": rec.get("ts"), "ticker": rec.get("ticker"),
+                        "verdict": v,
+                        "implied_vol": ex.get("implied_vol"),
+                        "realized_vol": ex.get("realized_vol"),
+                        "real_premium": ex.get("real_premium"),
+                        "why": str(rec.get("reason") or "")[:200],
+                    })
+        except Exception:  # noqa: BLE001
+            continue
+    rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+    total = sum(counts.values())
+    return {
+        "available": True, "days": days, "total": total, "counts": counts,
+        "recent": rows[:40],
+        "note": ("observation only -- no decision is gated on these yet. "
+                 "The gate becomes justifiable once enough verdicts exist to "
+                 "show whether CHEAP trades actually underperformed RICH ones."),
+        "reading": ("RICH = the option prices MORE movement than the stock has "
+                    "been delivering, so the seller is overpaid. CHEAP = it "
+                    "prices LESS, so the seller is underpaid for real risk."),
+    }
+
+
 @app.get("/activity/today", tags=["paper"])
 async def activity_today(limit: int = 14):
     """Today's agent decision trail for the UI (2026-07-02): the Overview
