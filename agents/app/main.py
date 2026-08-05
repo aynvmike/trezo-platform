@@ -1725,6 +1725,13 @@ async def learning_rule_replay(user_id: str | None = None, days: int = 30,
         if not res.get("ok"):
             return res
         res["doc_path"] = render(res)
+        # Return the report text as well. A file write can fail silently
+        # on this mount; the answer must not depend on it.
+        try:
+            from app.learning.rule_replay import _doc_path as _dp
+            res["doc_text"] = _dp().read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
         return res
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)[:300]}

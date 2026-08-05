@@ -68,6 +68,13 @@ NET_EDGE_FLOOR = ROUND_TRIP + 0.0001                                  # 0.0063
 # Mike 2026-08-05 asked for step profit taking; these mirror the options
 # desk's staged harvest, scaled to a 5% crypto target.
 LADDER = ((1 / 3, 0.015), (1 / 3, 0.030))   # remainder rides to target/trail
+TIME_STOP_MINUTES = 90   # the live _decide_time_stop max_hold_90min
+# The live trail (runtime/capabilities.trailing_profit_stop) does not
+# engage until min_gain = 3%. An earlier draft armed it at +0.63% and a
+# self-test caught the consequence: on a slow winner a 30% giveback of a
+# 0.9% peak is a razor-thin band, so it "trailed out" at +0.01%. Model
+# what the engine actually does.
+TRAIL_MIN_GAIN = 0.03
 TRAIL_GIVEBACK = 0.30    # give back at most 30% of peak gain, matching
                          # the crypto trail doctrine already in the engine
 
@@ -109,7 +116,8 @@ def _net(gross_gain: float, legs: int = 1) -> float:
 
 
 def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
-              bars: list, variant: str) -> dict[str, Any]:
+              bars: list, variant: str,
+              interval_minutes: int = 60) -> dict[str, Any]:
     """Walk the price path bar by bar under one exit rule.
 
     Returns {gain, exit_reason, bars_held, ambiguous}. `gain` is NET of
@@ -134,13 +142,27 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
     banked = 0.0
     legs = 0
     rungs = list(LADDER) if variant == "step_ladder" else []
+    # A 90-minute stop is only ~1-2 bars at hourly resolution. Run the
+    # replay with interval_minutes=15 to judge it fairly; the report
+    # states the resolution so this limit is never hidden.
+    time_stop_bars = (max(1, round(TIME_STOP_MINUTES / max(interval_minutes, 1)))
+                      if variant == "trail_plus_timestop" else None)
 
     for i, b in enumerate(bars):
         hi, lo = float(b.high), float(b.low)
         g_best = _gain(side, entry, hi if side == "long" else lo)
         g_worst = _gain(side, entry, lo if side == "long" else hi)
 
-        stop_hit = g_worst <= -stop_pct
+        # Mike's stated priority (2026-08-05): the 30% giveback trail is
+        # the FIRST exit; the +0.63% net-edge level is LAST and exists to
+        # PROTECT, not to take a win. Modelled as two stages:
+        #   at +0.63%  -> the stop ratchets up to breakeven (protection)
+        #   at +3.00%  -> the 30% giveback trail takes over (the exit)
+        _staged = variant in ("floor_then_trail", "trail_plus_timestop")
+        eff_stop = stop_pct
+        if _staged and peak >= NET_EDGE_FLOOR:
+            eff_stop = 0.0          # breakeven: it can no longer lose
+        stop_hit = g_worst <= -eff_stop
 
         exit_at = NET_EDGE_FLOOR if variant == "as_run" else target_pct
         profit_hit = g_best >= exit_at
@@ -148,7 +170,7 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
         # Trail is judged on the PRIOR peak, then the peak is updated below.
         trail_level = None
         trail_hit = False
-        if variant == "floor_then_trail" and peak >= NET_EDGE_FLOOR:
+        if _staged and peak >= TRAIL_MIN_GAIN:
             trail_level = peak * (1 - TRAIL_GIVEBACK)
             trail_hit = g_worst <= trail_level
 
@@ -156,13 +178,14 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
 
         # ---- the stop and a profitable exit in the SAME bar ----
         if stop_hit and (profit_hit or trail_hit or rung_reachable):
-            banked += remaining * -stop_pct        # no rung credit: pessimistic
+            banked += remaining * -eff_stop        # no rung credit: pessimistic
             return {"gain": _net(banked, max(legs, 1)),
                     "exit_reason": "stop(ambiguous)",
                     "bars_held": i + 1, "ambiguous": True}
         if stop_hit:
-            banked += remaining * -stop_pct
-            return {"gain": _net(banked, max(legs, 1)), "exit_reason": "stop",
+            banked += remaining * -eff_stop
+            return {"gain": _net(banked, max(legs, 1)),
+                    "exit_reason": "breakeven_floor" if eff_stop == 0.0 else "stop",
                     "bars_held": i + 1, "ambiguous": ambiguous}
 
         # ---- trail strikes before any further upside is credited ----
@@ -186,6 +209,11 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
                                    else "net_edge_floor",
                     "bars_held": i + 1, "ambiguous": ambiguous}
 
+        if time_stop_bars is not None and (i + 1) >= time_stop_bars:
+            banked += remaining * _gain(side, entry, float(b.close))
+            return {"gain": _net(banked, legs + 1), "exit_reason": "time_stop",
+                    "bars_held": i + 1, "ambiguous": ambiguous}
+
         peak = max(peak, g_best)
 
     if bars:
@@ -194,7 +222,8 @@ def _simulate(side: str, entry: float, stop_pct: float, target_pct: float,
             "bars_held": len(bars), "ambiguous": ambiguous}
 
 
-VARIANTS = ("as_run", "target_only", "floor_then_trail", "step_ladder")
+VARIANTS = ("as_run", "target_only", "floor_then_trail", "step_ladder",
+            "trail_plus_timestop")
 
 
 async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
@@ -222,7 +251,15 @@ async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
 
     rows = res.data or []
     from app.data.candles import fetch_kraken_ohlc
-    from app.strategies.crypto import CRYPTO_PARAMS
+    try:
+        from app.strategies.crypto import COIN_PARAMS as CRYPTO_PARAMS
+    except ImportError:      # older name
+        from app.strategies.crypto import CRYPTO_PARAMS
+    try:
+        from app.strategies.crypto import CRYPTO_WATCHLIST as _CW
+        _CRYPTO_UNIVERSE = set(_CW)
+    except Exception:  # noqa: BLE001
+        _CRYPTO_UNIVERSE = set()
 
     trades: list[dict[str, Any]] = []
     skipped: dict[str, int] = {}
@@ -230,7 +267,15 @@ async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
     for r in rows:
         strat = str(r.get("strategy") or "")
         tk = str(r.get("ticker") or "").upper()
-        if "crypto" not in strat.lower():
+        # Crypto detection must not rely on the strategy string alone --
+        # the live logs carry strategy="unknown" on most of these rows,
+        # so a strategy-only filter silently discarded every trade and
+        # produced an empty report. Accept the row if ANY signal says
+        # crypto: the strategy text, the asset_type column, or the
+        # ticker being in the crypto universe we actually trade.
+        _at = str(r.get("asset_type") or "").lower()
+        _known = tk in CRYPTO_PARAMS or tk in _CRYPTO_UNIVERSE
+        if not ("crypto" in strat.lower() or _at == "crypto" or _known):
             skipped["not_crypto"] = skipped.get("not_crypto", 0) + 1
             continue
         side = str(r.get("side") or "long").lower()
@@ -304,7 +349,8 @@ async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
                "bars_available": len(fwd), "after_our_exit": post,
                "real_pnl": (float(real_pnl) if real_pnl is not None else None)}
         for v in VARIANTS:
-            sim = _simulate(side, entry, stop_pct, target_pct, fwd, v)
+            sim = _simulate(side, entry, stop_pct, target_pct, fwd, v,
+                            interval_minutes=interval_minutes)
             row[v] = {"gain_pct": round(sim["gain"] * 100, 3),
                       "pnl_usd": round(sim["gain"] * entry * qty, 2),
                       "exit_reason": sim["exit_reason"],
@@ -387,6 +433,7 @@ _LABEL = {
     "target_only": "TARGET ONLY (let it run to the designed target)",
     "floor_then_trail": "FLOOR THEN TRAIL (arm a trail at +0.63%, give back 30% of peak)",
     "step_ladder": "STEP LADDER (a third at +1.5%, a third at +3%, rest to target)",
+    "trail_plus_timestop": "TRAIL + 90-MIN TIME STOP (Mike's order, with the clock ON)",
 }
 
 
@@ -506,10 +553,19 @@ def render(result: dict[str, Any]) -> str:
              "which exit rule would have served them best._\n")
 
     doc = "\n".join(L)
+    # Write atomically via a temp file. The first run left a ZERO BYTE
+    # report on disk, which is the worst possible failure: it looks like
+    # an answer. Write to .tmp, verify the byte count, then replace --
+    # so the real file is either complete or untouched.
     p = _doc_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(doc, encoding="utf-8")
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(doc, encoding="utf-8")
+        if tmp.stat().st_size < 200:
+            raise IOError(f"wrote only {tmp.stat().st_size} bytes")
+        tmp.replace(p)
     except Exception as e:  # noqa: BLE001
         log.warning("rule_replay: could not write %s: %s", p, e)
+        return f"WRITE FAILED ({e}) -- the report is in this response body"
     return str(p)
