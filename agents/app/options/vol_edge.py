@@ -199,6 +199,19 @@ def premium_verdict(implied: Optional[float], realized: Optional[float],
             "sell_premium_ok": False,
         }
     ratio = vp["premium_ratio"]
+    # TWO-SIDED (Mike 2026-08-05): "buying options that is under the strike
+    # price ... we can also win in those as well". He is right, and the first
+    # version of this was one-eyed. The same measurement answers both
+    # questions: RICH means the SELLER is overpaid, CHEAP means the BUYER is
+    # underpaid FOR -- an option pricing less movement than the underlying is
+    # actually delivering is a cheap lottery ticket, not merely a bad sale.
+    #
+    # The caveat that must travel with it: buying options inverts the payoff
+    # shape. Selling premium wins often and loses big; buying premium loses
+    # often and wins big. Both can be positive-expectancy, but they demand
+    # opposite temperaments and VERY different position sizing -- see
+    # runtime/optimal_f.py, where a low win rate with a high payoff ratio
+    # produces a much smaller optimal fraction than the win rate suggests.
     if ratio >= RICH_RATIO:
         v, why = "RICH", (
             f"implied {vp['implied_vol_pct']}% is {(ratio - 1) * 100:.0f}% above "
@@ -223,5 +236,15 @@ def premium_verdict(implied: Optional[float], realized: Optional[float],
         if vol_pct_rank < 20 and v == "RICH":
             why += (" -- but a quiet regime means the option may simply be "
                     "priced for a coming event")
-    return {"verdict": v, "why": why, "sell_premium_ok": ok, **vp,
+    # Buying is favoured exactly where selling is not: the option is asking
+    # LESS than the underlying has been delivering.
+    buy_ok = ratio <= 0.90
+    buy_note = (
+        f"option prices {(1 - ratio) * 100:.0f}% LESS movement than the "
+        f"underlying has been delivering -- cheap to own"
+        if buy_ok else
+        "not cheap enough to be worth owning; the buyer pays theta every day "
+        "and needs the move to actually arrive")
+    return {"verdict": v, "why": why, "sell_premium_ok": ok,
+            "buy_premium_ok": buy_ok, "buy_note": buy_note, **vp,
             "vol_percentile": vol_pct_rank}
