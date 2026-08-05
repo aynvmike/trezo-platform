@@ -249,18 +249,59 @@ async def replay(user_id: str, days: int = 30, interval_minutes: int = 60,
             candles = await fetch_kraken_ohlc(tk, interval_minutes=interval_minutes)
         except Exception:  # noqa: BLE001
             candles = []
-        fwd = [c for c in candles if getattr(c, "timestamp", None) and
-               _as_dt(c.timestamp) >= opened]
+        stamped = [c for c in candles if getattr(c, "timestamp", None)]
+        if not stamped:
+            skipped["no_price_path"] = skipped.get("no_price_path", 0) + 1
+            continue
+        # The window MUST reach back to the entry. Kraken returns ~720
+        # bars, so at 60 minutes that is 30 days -- a trade older than
+        # the window would otherwise be replayed from the middle of its
+        # own life and silently report nonsense.
+        earliest = min(_as_dt(c.timestamp) for c in stamped)
+        if earliest > opened + timedelta(minutes=interval_minutes):
+            skipped["entry_predates_candle_window"] = \
+                skipped.get("entry_predates_candle_window", 0) + 1
+            continue
+        fwd = [c for c in stamped if _as_dt(c.timestamp) >= opened]
         if len(fwd) < 3:
             skipped["no_price_path"] = skipped.get("no_price_path", 0) + 1
             continue
+
+        # ---- what the price did AFTER our agent actually sold --------
+        # Mike 2026-08-05: "make sure it is looking at the after exit of
+        # our agent... it was supposed to protect the money." The whole
+        # question is what the trade went on to do once the +0.63% rule
+        # closed it, so that move is measured explicitly rather than
+        # being buried inside a variant's P&L.
+        closed = _parse_iso(r.get("closed_at"))
+        real_exit = r.get("exit_price")
+        post = {"measured": False}
+        if closed and real_exit:
+            after = [c for c in fwd if _as_dt(c.timestamp) > closed]
+            try:
+                rx = float(real_exit)
+            except (TypeError, ValueError):
+                rx = 0.0
+            if after and rx > 0:
+                best = max((_gain(side, rx, float(c.high if side == "long"
+                                                  else c.low)) for c in after),
+                           default=0.0)
+                worst = min((_gain(side, rx, float(c.low if side == "long"
+                                                   else c.high)) for c in after),
+                            default=0.0)
+                post = {"measured": True, "bars_after": len(after),
+                        "best_move_pct": round(best * 100, 3),
+                        "worst_move_pct": round(worst * 100, 3),
+                        "left_on_table_usd": round(best * rx * qty, 2),
+                        "dodged_usd": round(abs(worst) * rx * qty, 2)}
 
         real_pnl = r.get("realized_pnl_usd")
         row = {"ticker": tk, "strategy": strat, "side": side, "entry": entry,
                "qty": qty, "notional": entry * qty,
                "opened_at": str(r.get("opened_at")),
+               "closed_at": str(r.get("closed_at") or ""),
                "stop_pct": stop_pct, "target_pct": target_pct,
-               "bars_available": len(fwd),
+               "bars_available": len(fwd), "after_our_exit": post,
                "real_pnl": (float(real_pnl) if real_pnl is not None else None)}
         for v in VARIANTS:
             sim = _simulate(side, entry, stop_pct, target_pct, fwd, v)
@@ -303,6 +344,22 @@ def _summarise(trades: list[dict]) -> dict[str, Any]:
             "profit_factor": round(gw / gl, 2) if gl > 0 else None,
             "ambiguous_trades": amb,
         }
+    # What happened AFTER our agent sold -- the heart of Mike's question.
+    post = [t["after_our_exit"] for t in trades
+            if (t.get("after_our_exit") or {}).get("measured")]
+    if post:
+        kept_running = [p for p in post if p["best_move_pct"] > 0.63]
+        out["after_our_exit"] = {
+            "trades_measured": len(post),
+            "kept_running_past_our_exit": len(kept_running),
+            "total_left_on_table_usd": round(sum(p["left_on_table_usd"] for p in post), 2),
+            "total_dodged_usd": round(sum(p["dodged_usd"] for p in post), 2),
+            "avg_best_move_after_exit_pct": round(
+                sum(p["best_move_pct"] for p in post) / len(post), 2),
+        }
+    else:
+        out["after_our_exit"] = {"trades_measured": 0}
+
     # Self-validation: does the replayed live rule match what was banked?
     if out["real_net_usd"] is not None and out["real_n"] >= 3:
         sim = out["as_run"]["net_usd"]
@@ -379,6 +436,28 @@ def render(result: dict[str, Any]) -> str:
              "genuinely unknowable, so those are all resolved as LOSSES. No rule "
              "is allowed to win by assuming lucky timing.\n")
 
+    ae = s.get("after_our_exit") or {}
+    L.append("## What happened AFTER our agent sold\n")
+    if ae.get("trades_measured"):
+        L.append(f"The +0.63% rule was meant to PROTECT the money, not to take "
+                 f"the win. So the fair test is what each trade went on to do "
+                 f"once we were already out.\n")
+        L.append(f"- Trades where the price kept running in our favour after we "
+                 f"sold: **{ae.get('kept_running_past_our_exit')} of "
+                 f"{ae.get('trades_measured')}**")
+        L.append(f"- Best further move, averaged: **{ae.get('avg_best_move_after_exit_pct')}%**")
+        L.append(f"- Value of that unclaimed move: **${ae.get('total_left_on_table_usd')}**")
+        L.append(f"- Value of the adverse moves we DID sidestep by selling early: "
+                 f"**${ae.get('total_dodged_usd')}**\n")
+        L.append("Read those last two together. The first is what exiting early "
+                 "cost; the second is what it saved. Selling at +0.63% is only "
+                 "the wrong rule if the money left behind exceeds the trouble "
+                 "avoided — and that is a measurement, not an opinion.\n")
+    else:
+        L.append("_No trade had both a recorded exit price and candles after "
+                 "its close, so this could not be measured. Usually means the "
+                 "window is too short or exit prices were not stored._\n")
+
     L.append("## What it means\n")
     best = None
     for key in VARIANTS:
@@ -403,14 +482,18 @@ def render(result: dict[str, Any]) -> str:
                      f"regression.\n")
 
     L.append("## Trade by trade\n")
-    L.append("| opened | coin | strategy | notional | as-run | target | trail | ladder |")
-    L.append("|---|---|---|---|---|---|---|---|")
+    L.append("| opened | coin | strategy | notional | as-run | target | trail | ladder | moved after we sold |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
     for t in sorted(result.get("trades") or [], key=lambda x: x.get("opened_at") or ""):
         L.append(f"| {str(t.get('opened_at'))[:16]} | {t.get('ticker')} | "
                  f"{t.get('strategy')} | ${t.get('notional'):.0f} | "
                  f"{t['as_run']['pnl_usd']:+.2f} | {t['target_only']['pnl_usd']:+.2f} | "
                  f"{t['floor_then_trail']['pnl_usd']:+.2f} | "
-                 f"{t['step_ladder']['pnl_usd']:+.2f} |")
+                 f"{t['step_ladder']['pnl_usd']:+.2f} | "
+                 + ((f"+{t['after_our_exit']['best_move_pct']}% / "
+                     f"{t['after_our_exit']['worst_move_pct']}%")
+                    if (t.get('after_our_exit') or {}).get('measured') else "n/a")
+                 + " |")
     L.append("")
     sk = result.get("skipped") or {}
     if sk:
