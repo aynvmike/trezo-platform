@@ -81,6 +81,28 @@ async def get_quote(symbol: str) -> Optional[Quote]:
     return _quote_from_raw(sym, q) if isinstance(q, dict) else None
 
 
+async def get_crypto_quote(symbol: str) -> Optional[Quote]:
+    """Latest bid/ask for one crypto pair. None if unavailable.
+
+    Added 2026-08-05 (Harris, phase 4). Until now Trezo had quote
+    functions for stocks and for options but NONE for crypto, so the
+    crypto spread was never observed at all -- while the cost model
+    assumed a flat 5bps of slippage for every asset. The crypto scalp
+    lane exits the moment a gain covers modelled round-trip cost, so
+    that unmeasured number was setting the exit for the whole lane.
+
+    Alpaca expects the pair form BTC/USD, so a bare ticker is expanded.
+    """
+    sym = symbol.upper().strip()
+    if "/" not in sym:
+        sym = f"{sym}/USD"
+    data = await _data_get("/v1beta3/crypto/us/latest/quotes", {"symbols": sym})
+    if not isinstance(data, dict):
+        return None
+    q = (data.get("quotes") or {}).get(sym)
+    return _quote_from_raw(sym, q) if isinstance(q, dict) else None
+
+
 async def get_quotes(symbols: list[str]) -> dict[str, Quote]:
     """Latest bid/ask for several stock symbols in one call."""
     syms = [s.upper() for s in symbols if s]

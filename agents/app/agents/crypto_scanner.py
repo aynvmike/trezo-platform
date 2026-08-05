@@ -167,6 +167,45 @@ class CryptoScannerAgent(Agent):
                       extra={"triggered": triggered})
         except Exception:  # noqa: BLE001
             pass
+
+        # REAL COST OBSERVATION (Harris, phase 4, 2026-08-05). Trezo's cost
+        # model charges a FLAT 5bps of slippage to every asset and had no
+        # crypto quote function at all, so the actual spread was never
+        # measured -- while the scalp lane's exit is set by exactly that
+        # modelled number. This samples the live spread on the coins that
+        # fired and records what a round trip really costs. Observation
+        # only: it changes no decision, it just ends the guessing.
+        try:
+            from app.brokers.alpaca_data import get_crypto_quote
+            from app.runtime.trading_costs import (
+                half_spread_pct, round_trip_cost, adverse_selection_note,
+            )
+            from app.paper.engine import CRYPTO_COMMISSION_BPS as _FEE
+            from app.agents.activity_log import record as _crec
+            _fired = [d.get("ticker") for d in detail
+                      if str(d.get("result") or "").upper() == "FIRED"][:4]
+            for _c in _fired:
+                _q = await get_crypto_quote(str(_c))
+                if _q is None:
+                    continue
+                _hs = half_spread_pct(_q.bid, _q.ask)
+                if _hs is None:
+                    continue
+                _cost = round_trip_cost(_FEE, half_spread=_hs)
+                _crec("real_cost", str(_c), strategy="crypto",
+                      reason=(f"round trip {_cost['total_pct']:.3f}% "
+                              f"(fee {_cost['fee_pct']:.3f}% + spread "
+                              f"{_cost['spread_pct']:.3f}%), dominated by "
+                              f"{_cost['dominant']}; modelled cost is 0.620% "
+                              f"flat -- {adverse_selection_note(_hs, _FEE)}")[:300],
+                      extra={"bid": _q.bid, "ask": _q.ask,
+                             "half_spread_pct": round(_hs * 100, 4),
+                             "real_round_trip_pct": _cost["total_pct"],
+                             "modelled_round_trip_pct": 0.620,
+                             "dominant_cost": _cost["dominant"],
+                             "observe_only": True})
+        except Exception:  # noqa: BLE001
+            pass
         out.append(AgentMessage(
             agent=self.name, kind="info",
             payload={
