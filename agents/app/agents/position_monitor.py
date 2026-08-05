@@ -457,6 +457,19 @@ def _decide_time_stop(
     Preserving the comparisons here to avoid behavior drift.
     """
     strat = (r.get("strategy") or "").lower()
+    # DELIBERATE, NOT A GAP (Mike, 2026-08-05, asked directly): crypto is
+    # excluded from every time-based exit on purpose. "I did not want to
+    # include that because of the possibility of the reach of profit."
+    #
+    # crypto_* strategies do not match these prefixes, so no crypto trade
+    # is ever closed by max_hold_90min or the 75-minute stagnation rule.
+    # That is the intent, not an oversight of the naming: crypto trades
+    # 24/7, and a 90-minute cap would close positions long before they
+    # could reach the +3% that arms the trailing stop. At 60% annual
+    # volatility a +3% move inside 90 minutes is roughly a 4-sigma event.
+    #
+    # DO NOT "fix" this by adding a crypto_ prefix here. Changing it is a
+    # trading decision that belongs to Mike, not a bug fix.
     if not (strat.startswith("stms") or strat.startswith("orb")
             or strat.startswith("scalp")):
         return None, ""
