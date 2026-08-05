@@ -129,8 +129,10 @@ async def run_detectors(client) -> dict:
     for c in closed:
         s = str(c.get("strategy") or "unknown")
         p = _f(c.get("realized_pnl_usd"))
-        d = by.setdefault(s, {"n": 0, "w": 0, "win": 0.0, "loss": 0.0})
+        d = by.setdefault(s, {"n": 0, "w": 0, "win": 0.0, "loss": 0.0,
+                              "pnls": []})
         d["n"] += 1
+        d["pnls"].append(p)
         if p >= 0:
             d["w"] += 1
             d["win"] += p
@@ -141,6 +143,53 @@ async def run_detectors(client) -> dict:
             continue                     # the platform's 8-trade minimum
         pf = (d["win"] / d["loss"]) if d["loss"] > 0 else 99.0
         wr = d["w"] / d["n"]
+
+        # SIGNIFICANCE GATE (de Prado, ch.14-15; added 2026-08-05).
+        # A profit factor computed on a couple of dozen trades is mostly
+        # noise. Before claiming a lane is weak or strong, ask whether the
+        # sample can support the claim at all, and what win rate the lane's
+        # OWN realised geometry actually demands. Both are appended to the
+        # evidence; neither blocks the proposal, because a proposal that
+        # says "this might be noise" is more useful than one suppressed.
+        _sig_line = ""
+        try:
+            from app.runtime.significance import (
+                bootstrap_mean_test, implied_precision,
+            )
+            _bt = bootstrap_mean_test(d["pnls"], iterations=4000)
+            _wins = [x for x in d["pnls"] if x > 0]
+            _loss = [x for x in d["pnls"] if x <= 0]
+            _need = None
+            if len(_wins) >= 2 and len(_loss) >= 2:
+                _aw = sum(_wins) / len(_wins)
+                _al = sum(_loss) / len(_loss)
+                _sc = (abs(_aw) + abs(_al)) / 2.0
+                if _sc > 0:
+                    _need = implied_precision(_al / _sc, _aw / _sc,
+                                              d["n"] / 21 * 365, 0.0)
+            if _bt is not None:
+                if _bt.get("conclusive"):
+                    _sig_line = (
+                        f" SIGNIFICANCE: with {d['n']} trades the 95% interval "
+                        f"for average P&L per trade is "
+                        f"${_bt['ci95_low']:+.2f} to ${_bt['ci95_high']:+.2f}, "
+                        f"which does NOT straddle zero -- this result is "
+                        f"distinguishable from luck.")
+                else:
+                    _sig_line = (
+                        f" SIGNIFICANCE: with only {d['n']} trades the 95% "
+                        f"interval for average P&L per trade runs "
+                        f"${_bt['ci95_low']:+.2f} to ${_bt['ci95_high']:+.2f}, "
+                        f"which STRADDLES ZERO. This sample cannot yet tell "
+                        f"profit from noise, so treat the figure above as a "
+                        f"signal to keep watching rather than as a finding.")
+            if _need is not None:
+                _sig_line += (
+                    f" GEOMETRY: its realised win/loss sizes demand a "
+                    f"{_need:.0%} win rate just to break even; it is running "
+                    f"at {wr:.0%}.")
+        except Exception:  # noqa: BLE001
+            _sig_line = ""
         if pf < 0.8:
             key = f"strategy_weak:{s}"
             propose(
@@ -152,7 +201,8 @@ async def run_detectors(client) -> dict:
                     f"${d['win']:.2f} gross won against ${d['loss']:.2f} "
                     f"gross lost."),
                 evidence=(f"PF {pf:.2f}, win rate {wr:.0%}, net "
-                          f"${d['win'] - d['loss']:+.2f} over {d['n']} closed trades."),
+                          f"${d['win'] - d['loss']:+.2f} over {d['n']} "
+                          f"closed trades.{_sig_line}"),
                 impact="Capital committed here is earning less than it loses.",
                 suggestion=(
                     f"Either raise {s}'s confidence bar so only its best "
@@ -173,7 +223,8 @@ async def run_detectors(client) -> dict:
                     f"{s} closed {d['n']} trades in 21 days with {d['w']} "
                     f"wins and a profit factor of {pf:.2f}."),
                 evidence=(f"PF {pf:.2f}, win rate {wr:.0%}, net "
-                          f"${d['win'] - d['loss']:+.2f} over {d['n']} closed trades."),
+                          f"${d['win'] - d['loss']:+.2f} over {d['n']} "
+                          f"closed trades.{_sig_line}"),
                 impact="This lane is currently the most reliable source of daily income.",
                 suggestion=(
                     f"Consider giving {s} a larger share of the daily "
