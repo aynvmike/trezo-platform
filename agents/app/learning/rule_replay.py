@@ -640,3 +640,46 @@ def render(result: dict[str, Any]) -> str:
         log.warning("rule_replay: could not write %s: %s", p, e)
         return f"WRITE FAILED ({e}) -- the report is in this response body"
     return str(p)
+
+
+async def replay_sweep(user_id: str, days: int = 30,
+                       intervals: tuple[int, ...] = (15, 30, 60),
+                       peak_basis: str = "high") -> dict[str, Any]:
+    """Run the replay at several candle resolutions and compare.
+
+    Mike 2026-08-05 wanted 15-minute bars, and to try 5 or 30 later. The
+    comparison matters more than any single run, because a trailing stop
+    is resolution-sensitive by nature: if the ranking of the rules flips
+    when you change the candle size, the result is an artefact of the
+    measurement rather than a property of the strategy.
+
+    THE TRADE-OFF, stated in the output rather than buried: Kraken's OHLC
+    endpoint returns roughly 720 candles and takes no date parameter, so
+    finer bars reach back less far -- 60min covers 30 days, 15min only
+    about 7.5, 5min about 2.5. A finer view of a smaller sample is not
+    automatically a better answer.
+    """
+    out: dict[str, Any] = {"ok": True, "days": days, "peak_basis": peak_basis,
+                           "by_interval": {}}
+    for iv in intervals:
+        res = await replay(user_id, days=days, interval_minutes=iv,
+                           peak_basis=peak_basis)
+        if not res.get("ok"):
+            out["by_interval"][str(iv)] = {"error": res.get("error")}
+            continue
+        s = res.get("summary") or {}
+        out["by_interval"][str(iv)] = {
+            "trades": s.get("n", 0),
+            "reach_back_days": round(720 * iv / 1440.0, 1),
+            "peak_profile": s.get("peak_profile"),
+            "by_rule": {v: (s.get(v) or {}).get("net_usd") for v in VARIANTS},
+            "win_rate": {v: (s.get(v) or {}).get("win_rate_pct") for v in VARIANTS},
+            "skipped": res.get("skipped"),
+        }
+    out["reading"] = (
+        "Compare the ROW ORDER, not the dollars. If the same rule wins at "
+        "every resolution, that is a property of the strategy. If the winner "
+        "changes with the candle size, the trail is being driven by noise and "
+        "no giveback value can be trusted until that is settled."
+    )
+    return out

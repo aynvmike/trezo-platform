@@ -1708,7 +1708,9 @@ async def knowledge_proposals(run: bool = False):
 
 @app.get("/learning/rule_replay", tags=["knowledge"])
 async def learning_rule_replay(user_id: str | None = None, days: int = 30,
-                               interval_minutes: int = 60):
+                               interval_minutes: int = 15,
+                               peak_basis: str = "high",
+                               sweep: str | None = None):
     """Mike 2026-08-05: the banked ledger cannot judge an exit rule that
     was never the intended one. This re-runs every closed crypto trade
     over its REAL forward price path under each candidate rule -- the
@@ -1721,7 +1723,17 @@ async def learning_rule_replay(user_id: str | None = None, days: int = 30,
         uid = user_id or _puid() or ""
         if not uid:
             return {"ok": False, "error": "no user id -- pass ?user_id= or set TREZO_PRIMARY_USER_ID"}
-        res = await replay(uid, days=days, interval_minutes=interval_minutes)
+        if sweep:
+            # e.g. sweep=15,30,60 -- compare resolutions side by side.
+            from app.learning.rule_replay import replay_sweep
+            try:
+                ivs = tuple(int(x) for x in sweep.split(",") if x.strip())
+            except ValueError:
+                return {"ok": False, "error": "sweep must look like 15,30,60"}
+            return await replay_sweep(uid, days=days, intervals=ivs,
+                                      peak_basis=peak_basis)
+        res = await replay(uid, days=days, interval_minutes=interval_minutes,
+                           peak_basis=peak_basis)
         if not res.get("ok"):
             return res
         res["doc_path"] = render(res)
