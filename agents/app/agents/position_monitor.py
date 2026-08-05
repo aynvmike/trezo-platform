@@ -1064,6 +1064,34 @@ class PositionMonitorAgent(Agent):
                         _td = await _maybe_ladder_stop(r, price_c, DCA_PROFIT_LADDER)
                         if _td is not None:
                             stop_c = _td
+                    elif r["side"] == "long" and "scalp" in _strat_a:
+                        # EXIT REPAIR, 2026-08-05. Scalps had NO trail at all --
+                        # only the net-edge auto-exit below, which closed them
+                        # the instant a gain covered round-trip cost. Mike's
+                        # stated intent for that level was the opposite: "it was
+                        # supposed to protect it from a loss not to take a win
+                        # at that rate under 1 percent."
+                        #
+                        # So the level now ARMS BREAKEVEN and the position is
+                        # given the same 30%-giveback profit trail swings
+                        # already use. Order of precedence is Mike's: trail
+                        # first, net-edge last and only as protection.
+                        try:
+                            from app.strategies.crypto import (
+                                clears_fee_edge as _cfe0)
+                            from app.paper.engine import (
+                                CRYPTO_COMMISSION_BPS as _F0, SLIPPAGE_BPS as _S0)
+                            _e0 = float(r.get("entry_price") or 0)
+                            if _e0 > 0:
+                                _g0 = (price_c - _e0) / _e0
+                                if _cfe0(_g0, _F0, _S0) and (
+                                        stop_c is None or _e0 > stop_c):
+                                    stop_c = _e0     # breakeven: cannot lose now
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _ts = await _maybe_trail_stock_profit(r, price_c)
+                        if _ts is not None and (stop_c is None or _ts > stop_c):
+                            stop_c = _ts
                     reason_c: str | None = None
                     if r.get("close_requested"):
                         reason_c = "manual"
@@ -1080,7 +1108,17 @@ class PositionMonitorAgent(Agent):
                     # Scalp net-edge auto-exit (Mike 2026-06-15): fast/quick plays take
                     # profit once they clear round-trip cost + the 0.01% net floor.
                     # SCALP only; HODL/SWING/DCA keep their ladders.
-                    if reason_c is None and "scalp" in _strat_a:
+                    # RETIRED 2026-08-05. This closed a scalp the moment its
+                    # gain covered round-trip cost -- 0.63% against a 1.8%
+                    # stop, a geometry of 1:0.35 AGAINST, needing a 74% win
+                    # rate to break even while the lane ran at 34%. The cost
+                    # work (Harris) showed it sat BELOW its own cost bar in
+                    # the friendliest market and closed at a loss outright in
+                    # a thin one. Breakeven-arming plus the trail replaces it
+                    # above. Set TREZO_SCALP_NET_EDGE_EXIT=1 to restore the
+                    # old behaviour instantly if this proves wrong.
+                    if (reason_c is None and "scalp" in _strat_a
+                            and os.getenv("TREZO_SCALP_NET_EDGE_EXIT", "0") == "1"):
                         try:
                             from app.strategies.crypto import clears_fee_edge as _cfe2
                             from app.paper.engine import (
