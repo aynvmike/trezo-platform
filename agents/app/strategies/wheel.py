@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
 
+import datetime as _dt
 from app.options.pricing import OptionQuote, theoretical_price, estimate_iv, daily_returns_from_closes, iv_from_candles
 from app.patterns import Candle
 
@@ -287,6 +288,36 @@ async def refine_csp_live(leg: WheelLeg) -> WheelLeg:
         lo = None
     if lo is None or lo.premium <= 0:
         return leg
+    # VARIANCE PREMIUM (Natenberg, phase 3, 2026-08-05). This is the one
+    # moment in the wheel where BOTH numbers exist: the real market premium
+    # and the realized volatility the model used. Backing the market price
+    # out to an implied vol and comparing the two says whether Trezo is being
+    # paid more than the stock's own behaviour justifies -- which is the only
+    # durable edge in selling premium, and which nothing currently measures.
+    #
+    # Note what this does NOT fix: the go/no-go decision was already made in
+    # evaluate_csp on the MODELED premium, and modeled_iv is carried forward
+    # below unchanged. So today this only observes. Acting on it is a
+    # behaviour change and belongs in a proposal.
+    try:
+        from app.options.vol_edge import implied_vol_from_price, premium_verdict
+        from app.agents.activity_log import record as _arec
+        _dte = max(1, (lo.expiration - _dt.date.today()).days
+                   if hasattr(lo.expiration, "year") else 30)
+        _real_iv = implied_vol_from_price("put", float(lo.premium),
+                                          float(leg.strike), float(lo.strike),
+                                          int(_dte))
+        _v = premium_verdict(_real_iv, float(leg.modeled_iv or 0))
+        _arec("variance_premium", str(leg.underlying), strategy="wheel_csp",
+              reason=(f"{_v['verdict']}: {_v['why']}")[:300],
+              extra={"real_premium": float(lo.premium),
+                     "implied_vol": _real_iv,
+                     "realized_vol": float(leg.modeled_iv or 0),
+                     "verdict": _v["verdict"],
+                     "sell_premium_ok": _v["sell_premium_ok"],
+                     "observe_only": True})
+    except Exception:  # noqa: BLE001
+        pass
     credit = lo.premium * 100 * leg.contracts
     return WheelLeg(
         underlying=leg.underlying,
