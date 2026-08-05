@@ -45,6 +45,7 @@ export const NAV: NavItem[] = [
 
   // PLAN & RESEARCH — analytical surfaces (build, test, learn)
   { href: "/dashboard/strategy-lab",       label: "Strategy Lab",      section: "plan" },
+  { href: "/dashboard/proposals",          label: "Agent Proposals",   section: "plan" },
   { href: "/dashboard/watchlists",         label: "Watchlists",        section: "plan" },
   // Budget Mirror + Future Projections merged into "Grasping Wallet"
   // on 2026-05-30. /dashboard/projections still redirects here.

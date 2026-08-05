@@ -1698,8 +1698,10 @@ async def knowledge_proposals(run: bool = False):
             from app.runtime.settings import _supabase as _sb
             res = await run_detectors(_sb())
             filed = res.get("filed")
+        # render_doc() returns the PATH it wrote, not the markdown --
+        # name it honestly so no UI renders a filesystem path as prose.
         return {"available": True, "filed_now": filed,
-                "doc": render_doc(), "proposals": open_proposals()}
+                "doc_path": render_doc(), "proposals": open_proposals()}
     except Exception as e:  # noqa: BLE001
         return {"available": False, "error": str(e)[:200]}
 
