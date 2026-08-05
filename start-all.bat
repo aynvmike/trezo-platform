@@ -63,6 +63,21 @@ if "%PORT_LIVE%"=="1" (
 )
 
 echo.
+REM -- Re-arm the health watchdog -------------------------------
+REM  stop-all.bat pauses TrezoHealthWatchdog so that a stop
+REM  actually holds. Re-enable it here so the pair is symmetric
+REM  and the self-healing net is never left switched off.
+schtasks /query /tn "TrezoHealthWatchdog" >nul 2>&1
+if not errorlevel 1 (
+  schtasks /change /tn "TrezoHealthWatchdog" /enable >nul 2>&1
+  if errorlevel 1 (
+    echo [WARN] Could not re-enable TrezoHealthWatchdog - run as Administrator.
+  ) else (
+    echo [OK] Health watchdog re-armed ^(checks every 15 min^).
+  )
+)
+
+echo.
 echo Done. Open http://localhost:3000 when the Web window says "Ready".
 timeout /t 4 >nul
 endlocal
