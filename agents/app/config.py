@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     # SINCLAIR_MEASURING_VOLATILITY.md).
     trezo_vol_estimator: str = "yang_zhang"
 
+    # Largest drop-box file the library will try to read, in megabytes.
+    # Was a hard-coded 8MB with a SILENT skip: three of the five books
+    # Mike bought on 2026-08-05 (Vince 14.7MB, Tharp 10.7MB, de Prado
+    # 8.9MB) were over it and would have been dropped without a trace.
+    # 40MB covers a large text PDF; genuinely scanned books still fail
+    # the separate "no readable text" check, which is correct.
+    trezo_library_max_mb: int = 40
+
     # Service
     env: str = "development"
     # Trading mode - "paper" (default) or "live".

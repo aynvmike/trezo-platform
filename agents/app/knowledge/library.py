@@ -137,7 +137,20 @@ def sweep_local_sources() -> int:
                     if ext not in TEXT_EXTS and ext not in DOC_EXTS:
                         continue
                     try:
-                        if os.path.getsize(src) > 8_000_000:
+                        # Oversize used to be a bare `continue` -- a file
+                        # too big vanished silently, which is the worst
+                        # way to fail: the shelf looks full and nobody
+                        # knows a book is missing. Now it is reported.
+                        _cap_mb = 40
+                        try:
+                            from app.config import get_settings as _gs
+                            _cap_mb = int(getattr(_gs(), "trezo_library_max_mb", 40) or 40)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _sz = os.path.getsize(src)
+                        if _sz > _cap_mb * 1_000_000:
+                            skipped.append(
+                                f"{fn} (too big: {_sz/1e6:.1f}MB > {_cap_mb}MB cap)")
                             continue
                         base = (os.path.splitext(fn)[0].strip().lower()
                                 .replace(" ", "-"))
