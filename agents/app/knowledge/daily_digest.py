@@ -157,7 +157,14 @@ async def build_digest(client, equity: float = 0.0,
     # Goal context: ~1% of equity is the target Mike manages to.
     eq = _f(equity)
     out["target_1pct"] = round(eq * 0.01, 2) if eq else None
-    out["hit_floor_10"] = net >= 10.0
+    # The $10/day floor was written for a $4.9k account, where it is 0.2% of
+    # equity. At $100k it is 0.01% -- a threshold so low it would report
+    # success on noise. Scales with equity now, with the original $10 as the
+    # floor so nothing changes at today's balance. (2026-08-05, for the
+    # staged paper-scaling plan.)
+    _floor = max(10.0, float(equity or 0.0) * 0.002)
+    out["floor_usd"] = round(_floor, 2)
+    out["hit_floor_10"] = net >= _floor
     out["hit_target"] = bool(eq and net >= eq * 0.01)
 
     # Silent-execution alarm: the pattern that meant a real bug twice.
@@ -206,7 +213,7 @@ def _write_doc(d: dict) -> None:
              f"profit factor {d.get('profit_factor')}).")
     if tgt:
         L.append(f"Target was ~${tgt:,.2f} (1% of ${d.get('equity'):,.2f} "
-                 f"equity); the $10/day floor was "
+                 f"equity); the ${d.get('floor_usd', 10):,.0f}/day floor was "
                  f"{'CLEARED' if d.get('hit_floor_10') else 'missed'}.\n")
     # R-MULTIPLES (Tharp, phase 5). Dollars answer "how much"; R answers
     # "was that good", which is the question a digest should be settling.

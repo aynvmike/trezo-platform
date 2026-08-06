@@ -34,6 +34,15 @@ GOAL_RUNGS: list[tuple[float, str]] = [
     (225.0, "living wage"),       # ~$58k/yr -- "lives on its own"
     (293.0, "six-figure pace"),   # Mike's marker
     (480.0, "comfortable"),       # ~$125k/yr
+    # Rungs above Mike's original ladder, added 2026-08-05 for the staged
+    # paper-scaling plan ($5k -> $25-30k -> $100k). Without these the ladder
+    # CAPPED at $480: a $100k account would have been asked for 0.48%/day and
+    # a $250k account 0.19%/day, so the goal would have quietly shrunk as a
+    # percentage exactly when the account grew. Nothing changes below ~$32k
+    # equity -- at today's balance the grind rung still applies.
+    (750.0, "two incomes"),       # ~$195k/yr
+    (1200.0, "quarter-million pace"),
+    (2000.0, "portfolio income"),
 ]
 
 _DY_CACHE: dict[str, tuple[float, float]] = {}   # uid -> (ts, today $) 60s
