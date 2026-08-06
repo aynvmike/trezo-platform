@@ -274,7 +274,8 @@ def evaluate_cc_recovery(
     )
 
 
-async def refine_csp_live(leg: WheelLeg) -> WheelLeg:
+async def refine_csp_live(leg: WheelLeg,
+                          spot: float | None = None) -> WheelLeg:
     """Replace a modeled CSP's strike / expiry / premium with the nearest
     real, live-quoted contract when the Alpaca options feed is available.
 
@@ -304,8 +305,16 @@ async def refine_csp_live(leg: WheelLeg) -> WheelLeg:
         from app.agents.activity_log import record as _arec
         _dte = max(1, (lo.expiration - _dt.date.today()).days
                    if hasattr(lo.expiration, "year") else 30)
+        # BUGFIX 2026-08-05: the first version passed leg.strike as the SPOT
+        # price because no spot was in scope here. Every implied vol it
+        # produced was therefore wrong, and every verdict came back CHEAP.
+        # The measurement now REFUSES to run without a real spot rather than
+        # inventing one -- a wrong number in a log is worse than no number,
+        # because it looks like evidence.
+        if not spot or float(spot) <= 0:
+            raise ValueError("no spot price - refusing to fake a variance premium")
         _real_iv = implied_vol_from_price("put", float(lo.premium),
-                                          float(leg.strike), float(lo.strike),
+                                          float(spot), float(lo.strike),
                                           int(_dte))
         _v = premium_verdict(_real_iv, float(leg.modeled_iv or 0))
         _arec("variance_premium", str(leg.underlying), strategy="wheel_csp",

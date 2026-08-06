@@ -2441,7 +2441,8 @@ class OptionsScannerAgent(Agent):
                         decay_monthly=decay_rate_monthly(candles),
                         dte=_wheel_dte_pick())
                     if leg:
-                        leg = await refine_csp_live(leg)
+                        leg = await refine_csp_live(
+                            leg, spot=float(candles[-1].close) if candles else None)
                     strategy = "wheel_csp"
                 if not leg:
                     continue
