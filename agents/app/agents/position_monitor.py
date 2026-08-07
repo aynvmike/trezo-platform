@@ -431,6 +431,15 @@ STAGNATION_R = 0.25
 # instant sell on activation. Default ON; env-tunable.
 STOCK_TRAIL_ENABLED = os.getenv("TREZO_STOCK_PROFIT_TRAIL", "1").strip().lower() not in ("0", "false", "no", "off")
 STOCK_TRAIL_MIN_GAIN = float(os.getenv("TREZO_STOCK_TRAIL_MIN_GAIN", "0.03"))
+# Scalps arm their trail EARLIER than swings (2026-08-07). Retiring the
+# +0.63% net-edge exit left a scalp with no way out between +0.63% and its
+# +3% target, because the shared trail also armed at 3%. Positions simply
+# sat: closes fell 20 -> 7 -> 2 per day over three days while ETH, LINK,
+# DOT and SOL stayed stuck, and anti-stacking then blocked every new entry
+# in those names until approvals hit zero. Arming at 2% locks no lower
+# than 1.40% after a 30% giveback -- 2.3x round-trip cost, so it is a real
+# profit rather than the pennies the old rule took.
+SCALP_TRAIL_MIN_GAIN = float(os.getenv("TREZO_SCALP_TRAIL_MIN_GAIN", "0.02"))
 STOCK_TRAIL_GIVEBACK = float(os.getenv("TREZO_STOCK_TRAIL_GIVEBACK", "0.30"))
 
 
@@ -581,7 +590,8 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     return new_stop
 
 
-async def _maybe_trail_stock_profit(r: dict, price: float) -> float | None:
+async def _maybe_trail_stock_profit(r: dict, price: float,
+                                    min_gain: float | None = None) -> float | None:
     """Stock profit trail-to-lock (Mike 2026-06-23). For a LONG stock up
     >= STOCK_TRAIL_MIN_GAIN over entry, RAISE (never lower) the stop to lock
     in (1 - STOCK_TRAIL_GIVEBACK) of the current gain. As price climbs the
@@ -613,7 +623,8 @@ async def _maybe_trail_stock_profit(r: dict, price: float) -> float | None:
             _anchor = max(price, _pk) if side == "long" else min(price, _pk)
     except (TypeError, ValueError):
         _anchor = price
-    new_stop = trailing_profit_stop(entry, _anchor, side, STOCK_TRAIL_MIN_GAIN, STOCK_TRAIL_GIVEBACK)
+    _arm = STOCK_TRAIL_MIN_GAIN if min_gain is None else float(min_gain)
+    new_stop = trailing_profit_stop(entry, _anchor, side, _arm, STOCK_TRAIL_GIVEBACK)
     # A peak-anchored stop cannot be WRITTEN above the live price for a
     # long (below for a short) -- the broker would reject it and a
     # modeled row would fire instantly. But that case is exactly the one
@@ -1089,7 +1100,8 @@ class PositionMonitorAgent(Agent):
                                     stop_c = _e0     # breakeven: cannot lose now
                         except Exception:  # noqa: BLE001
                             pass
-                        _ts = await _maybe_trail_stock_profit(r, price_c)
+                        _ts = await _maybe_trail_stock_profit(
+                            r, price_c, min_gain=SCALP_TRAIL_MIN_GAIN)
                         if _ts is not None and (stop_c is None or _ts > stop_c):
                             stop_c = _ts
                     reason_c: str | None = None

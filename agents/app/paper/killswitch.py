@@ -112,7 +112,24 @@ def _f(v) -> float:
         return 0.0
 
 
-def account_equity(account: dict) -> float:
+def account_equity(account: dict, broker_equity: float | None = None) -> float:
+    """Equity the loss limits are measured against.
+
+    THE BUG THIS FIXES (2026-08-07). This used to be cash + vault ONLY --
+    it excluded the market value of open positions. So on a fully deployed
+    book, cash collapsed and the baseline collapsed with it: day-start
+    equity was recording about $151 against a real account of $4,901, which
+    turned the 3% daily loss limit into $4.52 instead of $147. Trading
+    halted 33x earlier than intended, and the harder the agents worked the
+    smaller their own limit became.
+
+    The identical class of drift was found on 2026-07-02 in the allocation
+    pockets (ledger $2.8k vs broker $4.8k, shrinking every pocket by 40%)
+    and fixed there with effective_equity. This applies the same fix to the
+    kill-switch, which was missed at the time.
+    """
+    if broker_equity and broker_equity > 0:
+        return float(broker_equity)
     return _f(account.get("current_cash_usd")) + _f(account.get("vault_balance_usd"))
 
 
@@ -123,14 +140,15 @@ class KillSwitch:
     reason: str | None
 
 
-def period_updates(account: dict) -> dict:
+def period_updates(account: dict,
+                   broker_equity: float | None = None) -> dict:
     """If the day or week has rolled over, return the column updates that
     re-baseline the account (and clear a scoped halt). Empty dict if there
     is nothing to roll."""
     upd: dict = {}
     today = date.today()
     monday = today - timedelta(days=today.weekday())
-    equity = account_equity(account)
+    equity = account_equity(account, broker_equity)
 
     if str(account.get("last_reset_date") or "") != today.isoformat():
         upd["last_reset_date"] = today.isoformat()
@@ -167,6 +185,9 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
 
     wse = _f(account.get("week_start_equity_usd"))
     wpnl = _f(account.get("week_realized_pnl_usd"))
+    _tw = _f(account.get("_broker_equity"))
+    if _tw > 0 and wse > 0 and wse < 0.5 * _tw:
+        wse = _tw
     if wse > 0 and wpnl <= -WEEKLY_DRAWDOWN_PCT * wse:
         return KillSwitch(True, "week",
                           f"Weekly loss limit: down ${abs(wpnl):,.0f} "
@@ -174,6 +195,12 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
 
     dse = _f(account.get("day_start_equity_usd"))
     dpnl = _f(account.get("today_realized_pnl_usd"))
+    # STALENESS GUARD: a stored baseline far below true equity is left over
+    # from a fully-deployed day and would halt on a trivial loss. Never let
+    # it shrink the limit; the limit may only be as tight as real equity says.
+    _true = _f(account.get("_broker_equity"))
+    if _true > 0 and dse > 0 and dse < 0.5 * _true:
+        dse = _true
     if dse > 0 and dpnl <= -DAILY_DRAWDOWN_PCT * dse:
         return KillSwitch(True, "day",
                           f"Daily loss limit: down ${abs(dpnl):,.0f} "
@@ -221,7 +248,15 @@ async def check_all(client) -> KillSwitch:
     except Exception:  # noqa: BLE001
         consec_limit = MAX_CONSECUTIVE_LOSSES
     for acct in (res.data or []):
-        upd = period_updates(acct)
+        _beq = 0.0
+        try:
+            from app.paper.allocation import effective_equity
+            _beq = float(await effective_equity(str(acct.get("user_id") or "")) or 0)
+        except Exception:  # noqa: BLE001
+            _beq = 0.0
+        if _beq > 0:
+            acct = {**acct, "_broker_equity": _beq}
+        upd = period_updates(acct, broker_equity=_beq or None)
         if upd:
             acct = {**acct, **upd}
 
