@@ -13,6 +13,7 @@ from app.agents.cycle_awareness import CycleAwarenessAgent
 from app.agents.exit_advisor import ExitAdvisorAgent
 from app.agents.exit_advisor_options import ExitAdvisorOptionsAgent
 from app.agents.ops_watchdog import OpsWatchdogAgent
+from app.agents.portfolio_architect import PortfolioArchitectAgent
 from app.agents.dividend_manager import DividendManagerAgent
 from app.agents.extended_scanner import ExtendedScannerAgent
 from app.agents.kindrip_agent import KindripAgent
@@ -65,6 +66,7 @@ def bootstrap_agents() -> None:
     exit_adv  = ExitAdvisorAgent()
     exit_opts = ExitAdvisorOptionsAgent()
     watchdog  = OpsWatchdogAgent()
+    architect = PortfolioArchitectAgent()
 
     registry.register(pattern,   "Detects candlestick patterns and scores trade confidence (0-1000).",                  role="observer")
     registry.register(stms,      "Small-cap momentum scanner. Active 7-11 AM ET. Looks for $1-$20 stocks up 10%+ on 5x volume with TCS 750+.", role="observer")
@@ -74,6 +76,7 @@ def bootstrap_agents() -> None:
     registry.register(forex_scanner, "Forex scanner (Task #77). Watches major pairs (EUR/USD, USD/JPY, GBP/USD, USD/CHF, AUD/USD). Disabled by default until data source is wired.", role="observer")
     registry.register(options,   "Runs the Dividend Wheel (cash-secured puts) and surfaces options-strategy ideas. Pricing is modeled (Black-Scholes).", role="actor")
     registry.register(risk,      "Highest-authority gatekeeper. Approves or vetoes every signal; enforces Adaptive Scope, kill-switches and market filters.", role="observer")
+    registry.register(architect, "Portfolio Architect. Daily structural review using the library work: does each lane have a measurable edge (bootstrap), what bet size does that evidence support (optimal f), how should capital split across the lanes that qualify (hierarchical risk parity), and has the market changed underneath them (CUSUM structural break). Proposes only -- never changes a rule.", role="observer")
     registry.register(execution, "Routes approved signals - stock trades to Alpaca paper, crypto to the internal paper engine.", role="actor")
     registry.register(monitor,   "Watches every open position. Closes on stop/target, runs day-trade management, reconciles Alpaca fills.", role="actor")
     registry.register(tax,       "Tracks tax impact of every executed trade in real time.",                             role="observer")
