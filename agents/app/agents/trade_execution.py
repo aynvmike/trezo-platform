@@ -921,6 +921,25 @@ class TradeExecutionAgent(Agent):
         if not plan.ok:
             return _err(plan.reject_reason or "Sizing rejected the trade")
 
+        # ALPACA CRYPTO MINIMUM (2026-08-09). Alpaca rejects any crypto order
+        # whose cost basis is under $10 -- "cost basis must be >= minimal
+        # amount of order 10". On 8/9 that produced 12 rejects, and THREE
+        # rejects inside an hour trip the session kill-switch, so a sizing
+        # problem cascaded into an hour-long trading pause. Skipping the
+        # order cleanly costs one trade; sending it costs the hour.
+        _min_notional = float(os.getenv("TREZO_CRYPTO_MIN_ORDER_USD", "10"))
+        _notional = float(plan.quantity) * float(market_price)
+        if _notional < _min_notional:
+            return [AgentMessage(
+                agent=self.name, kind="info",
+                payload={"user_id": user_id, "ticker": ticker,
+                         "event": "crypto_skip_below_min",
+                         "note": (f"{ticker}: order would be ${_notional:,.2f}, "
+                                  f"below Alpaca's ${_min_notional:,.0f} crypto "
+                                  f"minimum -- skipped before the broker could "
+                                  f"reject it and trip the kill-switch")},
+            )]
+
         order, err = await submit_crypto_order(
             symbol=ticker,
             side=order_side,
