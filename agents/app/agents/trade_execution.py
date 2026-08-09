@@ -927,7 +927,8 @@ class TradeExecutionAgent(Agent):
         # rejects inside an hour trip the session kill-switch, so a sizing
         # problem cascaded into an hour-long trading pause. Skipping the
         # order cleanly costs one trade; sending it costs the hour.
-        _min_notional = float(os.getenv("TREZO_CRYPTO_MIN_ORDER_USD", "10"))
+        import os as _os_min      # module has NO top-level `import os`
+        _min_notional = float(_os_min.getenv("TREZO_CRYPTO_MIN_ORDER_USD", "10"))
         _notional = float(plan.quantity) * float(market_price)
         if _notional < _min_notional:
             return [AgentMessage(
