@@ -26,7 +26,9 @@
 >
 > **A SECOND REAL PERSON EXISTS IN THE DATA:** `fd5292e9-c080-43ff-a55a-6dcf62be7cd7` — in `profiles` with 5 `user_positions`, a `bot_settings` row (max_open 20) and watchlists, but NO `paper_accounts` row. Registered by `0047` as its own book labelled `Imported from user_positions`.
 >
-> **NEXT:** (1) **web account switcher** — `0049` seeded risk via migration because there is no UI to pick a book; settings must be user-editable per account (Mike: *"the actions the user wants, not being able to change any of the coding"*). (2) flip `TREZO_ACCOUNTS_ENABLED` + restart. (3) position_monitor's inline binder is verified by compile/import/routing test only — **watch the first restart**. (4) size-aware slippage before trusting 25k/75k results. (5) Webull **Connect API** (OAuth 2.0, no password) is the right shape for read-only account analysis for users who trade themselves.
+> **WEB ACCOUNT SWITCHER — BUILT.** `settings/bot` now resolves WHICH BOOK it is editing: reads `trading_accounts` (RLS already limits to `owner_id = auth.uid()`), renders `_account-switcher.tsx` (hidden when a person owns one book, so single-account users see no change), and `?account=<key>` selects. `_actions.ts` writes to the selected book and **re-checks ownership server-side** rather than relying on RLS alone. eslint + scoped tsc clean. **Risk/posture/lanes are now user-editable per account with no code — which is what `0049` had to do by migration.**
+>
+> **NEXT:** (1) flip `TREZO_ACCOUNTS_ENABLED` + restart. (3) position_monitor's inline binder is verified by compile/import/routing test only — **watch the first restart**. (4) size-aware slippage before trusting 25k/75k results. (5) Webull **Connect API** (OAuth 2.0, no password) is the right shape for read-only account analysis for users who trade themselves.
 
 > **2026-07-01 review (Nova) — full audit: where trades go, why the pockets are invisible, re-eval status.**
 > **Broker truth (Alpaca PA3PR4F6ZFWZ):** equity $4,816 / cash $2,846 / BP $4,670. Open: GM, MRK, SOFI, PYPL-short (DB) + KMI 7/17 30.5 CSP (broker-held). Jun-30 realized -$73 (WMT stop -$61, PYPL -$12); Jul-1 = ZERO broker orders.

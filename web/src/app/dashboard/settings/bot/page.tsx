@@ -7,30 +7,77 @@ import { SettingsAuditPanel } from "@/components/dashboard/settings-audit-panel"
 import { LearningInsights } from "@/components/dashboard/learning-insights";
 import { TradeImport } from "@/components/dashboard/trade-import";
 import { fetchAlpacaSnapshot } from "@/lib/alpaca-snapshot";
+import { AccountSwitcher, type BookOption } from "./_account-switcher";
 
 export const dynamic = "force-dynamic";
 
-export default async function BotTuningPage() {
+export default async function BotTuningPage({
+  searchParams
+}: {
+  searchParams?: { account?: string };
+}) {
   const supabase = createClient();
   const {
     data: { user }
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/settings/bot");
 
+  // A person can own several BOOKS (2026-08-09). These dials belong to a
+  // book, not to the person, so resolve which book is being edited before
+  // reading anything. RLS on trading_accounts already limits rows to
+  // owner_id = auth.uid(), so this cannot surface someone else's account.
+  const { data: accountRows } = await supabase
+    .from("trading_accounts")
+    .select("account_key, label, is_paper")
+    .eq("owner_id", user.id)
+    .eq("is_active", true)
+    .order("label");
+
+  const { data: capitalRows } = await supabase
+    .from("paper_accounts")
+    .select("user_id, starting_capital_usd");
+
+  const capitalByKey = new Map<string, number | null>(
+    (capitalRows ?? []).map((r) => [
+      String(r.user_id),
+      r.starting_capital_usd === null ? null : Number(r.starting_capital_usd)
+    ])
+  );
+
+  const books: BookOption[] = (accountRows ?? []).map((r) => ({
+    account_key: String(r.account_key),
+    label: r.label,
+    is_paper: Boolean(r.is_paper),
+    starting_capital_usd: capitalByKey.get(String(r.account_key)) ?? null
+  }));
+
+  // Requested book must be one of the caller's own. Anything else falls
+  // back to their own key rather than erroring -- a stale bookmark should
+  // land somewhere sane, not on a stranger's settings.
+  const requested = searchParams?.account;
+  const activeKey =
+    requested && books.some((b) => b.account_key === requested)
+      ? requested
+      : books.some((b) => b.account_key === user.id)
+        ? user.id
+        : (books[0]?.account_key ?? user.id);
+
   let { data: settings } = await supabase
     .from("bot_settings")
     .select("*")
-    .eq("user_id", user.id)
+    .eq("user_id", activeKey)
     .maybeSingle();
 
   if (!settings) {
     const { data: created } = await supabase
       .from("bot_settings")
-      .insert({ user_id: user.id })
+      .insert({ user_id: activeKey })
       .select("*")
       .single();
     settings = created;
   }
+
+  const activeBook = books.find((b) => b.account_key === activeKey) ?? null;
 
   const liveRequested =
     (process.env.TRADING_MODE ?? "paper").trim().toLowerCase() === "live";
@@ -60,7 +107,12 @@ export default async function BotTuningPage() {
           : "Every trade is simulated — no real money is at risk. Real-money brokerage arrives in Phase 10, behind its own go-live checklist."}
       </div>
 
+      <AccountSwitcher books={books} activeKey={activeKey} />
+
       <BotTuningForm
+        key={activeKey}
+        accountKey={activeKey}
+        accountLabel={activeBook?.label ?? null}
         initial={settings}
         liveEquity={await (async () => {
           try {

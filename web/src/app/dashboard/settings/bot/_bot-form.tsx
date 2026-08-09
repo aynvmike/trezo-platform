@@ -244,7 +244,18 @@ function AllocInput({ name, label, defaultValue }: { name: string; label: string
   );
 }
 
-export function BotTuningForm({ initial, liveEquity }: { initial: Settings; liveEquity?: number | null }) {
+export function BotTuningForm({
+  initial,
+  liveEquity,
+  accountKey,
+  accountLabel
+}: {
+  initial: Settings;
+  liveEquity?: number | null;
+  /** The BOOK these dials belong to. A person can own several. */
+  accountKey?: string;
+  accountLabel?: string | null;
+}) {
   const [state, formAction] = useFormState(saveBotSettings, initialState);
 
   const s: NonNullable<Settings> = initial ?? {
@@ -287,6 +298,17 @@ export function BotTuningForm({ initial, liveEquity }: { initial: Settings; live
 
   return (
     <form action={formAction} className="space-y-10">
+      {/* Which book is being saved. The server re-checks ownership; this
+          is routing, not authorisation. */}
+      {accountKey ? (
+        <input type="hidden" name="account_key" value={accountKey} />
+      ) : null}
+      {accountLabel ? (
+        <p className="text-xs text-[var(--muted-foreground)]">
+          Editing <span className="font-medium">{accountLabel}</span>. These
+          dials apply to this account only.
+        </p>
+      ) : null}
       <input type="hidden" name="risk_profile" value={profile} />
       <input type="hidden" name="min_reward_risk" value={String(minRR)} />
 

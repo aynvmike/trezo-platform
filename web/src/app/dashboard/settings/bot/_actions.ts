@@ -53,6 +53,26 @@ export async function saveBotSettings(
   } = await supabase.auth.getUser();
   if (!user) return { ok: false, message: "Not signed in." };
 
+  // WHICH BOOK (2026-08-09). These dials belong to an account, not to the
+  // person, and a person can own several. RLS on bot_settings already
+  // blocks writing to a book that is not theirs, but check explicitly so a
+  // bad request gets a clear message instead of a silent no-op -- and so
+  // this does not depend on a policy staying correct forever.
+  const requestedKey = String(formData.get("account_key") ?? "").trim();
+  let targetKey = user.id;
+  if (requestedKey && requestedKey !== user.id) {
+    const { data: owned } = await supabase
+      .from("trading_accounts")
+      .select("account_key")
+      .eq("owner_id", user.id)
+      .eq("account_key", requestedKey)
+      .maybeSingle();
+    if (!owned) {
+      return { ok: false, message: "That account is not yours to edit." };
+    }
+    targetKey = requestedKey;
+  }
+
   const raw = {
     tcs_threshold: formData.get("tcs_threshold"),
     max_open_positions: formData.get("max_open_positions"),
@@ -119,7 +139,7 @@ export async function saveBotSettings(
     const { data: prev } = await supabase
       .from("bot_settings")
       .select("risk_profile, min_reward_risk, default_stop_pct, default_target_pct, risk_per_trade_pct")
-      .eq("user_id", user.id)
+      .eq("user_id", targetKey)
       .maybeSingle();
     const changed =
       !prev ||
@@ -130,7 +150,7 @@ export async function saveBotSettings(
       Number(prev.risk_per_trade_pct) !== Number(parsed.data.risk_per_trade_pct);
     if (changed) {
       await supabase.from("risk_profile_audit").insert({
-        user_id: user.id,
+        user_id: targetKey,
         from_profile: prev?.risk_profile ?? null,
         to_profile: parsed.data.risk_profile,
         from_rr: prev?.min_reward_risk ?? null,
@@ -157,7 +177,7 @@ export async function saveBotSettings(
     .from("bot_settings")
     .upsert(
       {
-        user_id: user.id,
+        user_id: targetKey,
         ...parsed.data,
         allocation_overrides,
         pattern_weights: pwSave,
