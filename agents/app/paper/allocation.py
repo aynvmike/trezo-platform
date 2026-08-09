@@ -71,8 +71,19 @@ async def effective_equity(user_id: str) -> float:
     try:
         from app.brokers.alpaca import alpaca_configured
         from app.brokers.alpaca import get_account as _broker_account
+        # Bind the account that owns THIS book before asking the broker
+        # for equity. Without it, a caller that forgot to bind would size
+        # one book's pockets from another book's equity -- silently, and
+        # the kill-switch takes its daily baseline from this same number.
+        try:
+            from app.brokers.accounts import bind_for_user as _bind
+        except Exception:  # noqa: BLE001
+            from contextlib import nullcontext as _nc
+            def _bind(_u):  # noqa: ANN001
+                return _nc()
         if alpaca_configured():
-            acct = await _broker_account()
+            with _bind(user_id):
+                acct = await _broker_account()
             if acct is not None:
                 _eq = float(getattr(acct, "equity", 0) or 0)
                 if _eq > 0:

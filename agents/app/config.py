@@ -243,6 +243,43 @@ class Settings(BaseSettings):
     trezo_reeval_rotate: bool = True
     trezo_reeval_average_down: bool = False
 
+    # ---- Multi-account (2026-08-09, Mike) -------------------------------
+    # Trezo's state layer (positions, pockets, kill-switch, equity) already
+    # isolates by user_id. These fields carry ONLY the credentials that
+    # reach each broker account. Trading BEHAVIOUR is never configured
+    # here -- posture, lanes, risk and max_open stay in the per-user
+    # bot_settings row the web UI writes, so a user changes an account's
+    # behaviour through settings and never through code.
+    #
+    # SAFE BY DEFAULT: "primary" alone. Nothing changes until this is set
+    # to e.g. "primary,acct2,acct3". Duplicate .env keys do NOT create
+    # accounts -- dotenv silently keeps the last one (verified 2026-08-09,
+    # it had already crossed one account's key id with another's secret).
+    # Read via Settings, NOT os.getenv: agents/.env is loaded by pydantic
+    # only. This sat in .env since 2026-07-06 while _primary_user_id()
+    # used os.getenv, so single-row settings mode was never in effect.
+    trezo_primary_user_id: str = ""
+    trezo_settings_single_row: bool = True
+    # OWNER vs ACCOUNT (2026-08-09, Mike): "those accounts are under the
+    # main account... people can have multiple live accounts". An owner is
+    # a PERSON (profile, KINDRIP children, payment details); an account is
+    # a BOOK (positions, pockets, kill-switch, settings). One owner, many
+    # accounts. Blank owner falls back to the primary user id.
+    trezo_owner_id: str = ""
+    trezo_account_owner_id_2: str = ""
+    trezo_account_owner_id_3: str = ""
+    trezo_accounts_enabled: str = "primary"
+    alpaca_api_key_2: str = ""
+    alpaca_secret_key_2: str = ""
+    alpaca_base_url_2: str = ""
+    trezo_account_user_id_2: str = ""
+    trezo_account_label_2: str = "Account 2"
+    alpaca_api_key_3: str = ""
+    alpaca_secret_key_3: str = ""
+    alpaca_base_url_3: str = ""
+    trezo_account_user_id_3: str = ""
+    trezo_account_label_3: str = "Account 3"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -76,6 +76,29 @@ def _etf_blurb(sym: str) -> str:
     }.get(sym, "a diversified index fund.")
 
 
+def child_owner_id(child: dict) -> str:
+    """The PERSON this child belongs to.
+
+    A child is a person's child, never a trading account's child. These
+    were the same value while Trezo had one book per person; separating
+    them (2026-08-09) means a parent can close or open books without
+    orphaning their children's records.
+    """
+    return str(child.get("owner_id") or child.get("user_id") or "")
+
+
+def child_funding_account(child: dict) -> str:
+    """The BOOK the contribution is paid out of.
+
+    Falls back to user_id so this behaves identically until the
+    funding_account_key column exists. Once it does, a parent can fund
+    the children from whichever account they choose.
+    """
+    return str(child.get("funding_account_key")
+               or child.get("funding_account_id")
+               or child.get("user_id") or "")
+
+
 async def _parent_cash(client, parent_id: str) -> float:
     def _q():
         return (client.table("paper_accounts").select("current_cash_usd")
@@ -191,7 +214,9 @@ async def process_child(client, child: dict) -> Optional[dict]:
     """Run one child's due contribution + seed + auto-invest. Returns a
     summary dict, or None if nothing was due."""
     child_id = child["id"]
-    parent_id = child["user_id"]
+    # parent_id is the FUNDING BOOK, not the person -- see the helpers above.
+    owner_id = child_owner_id(child)          # noqa: F841 (surfaced by caller)
+    parent_id = child_funding_account(child)
     name = (child.get("child_name") or "your child").strip()
     today = date.today()
 

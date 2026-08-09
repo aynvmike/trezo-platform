@@ -94,7 +94,14 @@ class TradeExecutionAgent(Agent):
         if not user_id:
             return await self._execute_for_all_users(ticker, side, message.payload)
 
-        return await self._execute_for_user(user_id, ticker, side, message.payload)
+        # Bind THIS book's broker credentials before placing its order.
+        # trade_execution already fans out across paper_accounts rows, but
+        # nothing bound the account -- so every book's orders would have
+        # gone to the primary Alpaca account (2026-08-09).
+        from app.brokers.accounts import bind_for_user as _bind_acct
+        with _bind_acct(user_id):
+            return await self._execute_for_user(user_id, ticker, side,
+                                                message.payload)
 
     async def _execute_for_all_users(
         self,
@@ -152,9 +159,16 @@ class TradeExecutionAgent(Agent):
             )]
 
         out: list[AgentMessage] = []
+        from app.brokers.accounts import bind_for_user as _bind_acct
         for uid in users:
             try:
-                msgs = await self._execute_for_user(uid, ticker, side, source_payload)
+                # Each book's order must go to ITS OWN broker account.
+                # This loop already existed -- Trezo has always fanned out
+                # across paper_accounts -- but with one global credential
+                # every book's orders landed on the primary (2026-08-09).
+                with _bind_acct(uid):
+                    msgs = await self._execute_for_user(uid, ticker, side,
+                                                        source_payload)
                 out.extend(msgs or [])
             except Exception as e:  # noqa: BLE001
                 out.append(AgentMessage(

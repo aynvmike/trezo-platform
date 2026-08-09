@@ -23,6 +23,11 @@ from app.data.candles import fetch_candles_for
 import os
 
 from app.paper.engine import close_position, check_and_lock_profit
+from app.brokers.accounts import (
+    set_account_for_user as _pm_set_account,
+    clear_account as _pm_clear_account,
+    should_skip_unresolved as _pm_skip_unresolved,
+)
 
 # Profit-stepping LADDER (2026-07-02, multi-step per Mike: "it should be
 # able to do it multiple times, stepping out over time"). Each step banks
@@ -995,6 +1000,14 @@ class PositionMonitorAgent(Agent):
             return price_cache.get(key)
 
         for r in rows:
+            # Bind THIS row's book before any broker action. Exits are
+            # routed per position, and an exit for one book executed on
+            # another would close the wrong position AND leave the right
+            # one open. Set inline rather than `with`: the body is ~500
+            # lines and re-indenting live exit code is the riskier edit.
+            if _pm_skip_unresolved(str(r.get("user_id") or "")):
+                continue          # unknown book: never act on the primary
+            _pm_set_account(str(r.get("user_id") or ""))
             tk = r["ticker"]
             at = r["asset_type"]
 

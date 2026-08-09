@@ -17,8 +17,11 @@ import asyncio
 from datetime import date
 
 from app.config import get_settings
+from app.dividends.schedule import latest_unpaid_ex
 from app.dividends.drip import (
     distribution_due, period_distribution, drip_explanation,
+    payout_frequency, periods_per_year, ex_date_price,
+    total_return, yield_trap,
 )
 
 from .base import Agent, AgentMessage
@@ -69,10 +72,17 @@ class DividendManagerAgent(Agent):
         paid = 0
 
         for pos in positions:
-            if not distribution_due(pos, today):
-                continue
             shares = float(pos.get("shares") or 0)
             if shares <= 0:
+                continue
+
+            # Real ex-date beats a modeled interval (2026-08-09). Cached
+            # one call per symbol per day, and fails open to the holding's
+            # declared frequency when no calendar is available.
+            ex = await latest_unpaid_ex(
+                pos["ticker"], pos.get("last_distribution_date"), today)
+            ex_date = ex.ex_date if ex else None
+            if not distribution_due(pos, today, ex_date):
                 continue
 
             price = await _price(pos["ticker"])
@@ -81,20 +91,40 @@ class DividendManagerAgent(Agent):
             if value <= 0:
                 continue
 
-            dist = period_distribution(value, pos.get("dist_yield_pct"))
+            # Frequency comes from the holding now. This used to pay every
+            # holding every 7 days, which gave a quarterly payer 52
+            # compounding events a year instead of 4 (2026-08-09).
+            freq = payout_frequency(pos)
+            if ex is not None and ex.amount > 0:
+                # What the fund ACTUALLY declared beats any yield estimate.
+                dist = round(ex.amount * shares, 2)
+                dist_basis = f"declared ${ex.amount:.4f}/sh ({ex.source})"
+            else:
+                dist = period_distribution(value, pos.get("dist_yield_pct"),
+                                           periods_per_year(freq))
+                dist_basis = f"modeled from yield, {freq}"
             if dist <= 0:
                 continue
 
             drip_on = bool(pos.get("drip_enabled", True))
             cumulative = float(pos.get("cumulative_dist") or 0) + dist
             upd: dict = {
-                "last_distribution_date": today.isoformat(),
+                "last_distribution_date": (ex_date or today.isoformat()),
                 "cumulative_dist": round(cumulative, 4),
             }
             shares_added = 0.0
+            buy_price = price
             if drip_on and price > 0:
-                shares_added = round(dist / price, 6)
+                # A real DRIP buys after the price drops by the payout.
+                buy_price = ex_date_price(price, dist / shares if shares else 0.0)
+                shares_added = round(dist / buy_price, 6) if buy_price > 0 else 0.0
                 upd["shares"] = round(shares + shares_added, 8)
+
+            # Total return is the only honest score for an income holding:
+            # yield alone cannot say whether the position made money.
+            tr = total_return(shares + shares_added, price,
+                              float(pos.get("avg_cost") or 0), cumulative)
+            warning = yield_trap(tr)
 
             def _update(pid=pos["id"], u=upd):
                 return (client.table("user_positions").update(u)
@@ -117,8 +147,16 @@ class DividendManagerAgent(Agent):
                     "distribution_usd": dist,
                     "drip": drip_on,
                     "shares_added": shares_added,
+                    "frequency": freq,
+                    "ex_date": ex_date or "",
+                    "basis": dist_basis,
+                    "total_return_pct": tr["total_return_pct"],
+                    "income_return_pct": tr["income_return_pct"],
+                    "price_return_pct": tr["price_return_pct"],
+                    "yield_trap": bool(warning),
+                    "warning": warning or "",
                     "note": drip_explanation(pos["ticker"], dist, drip_on,
-                                             shares_added, price),
+                                             shares_added, buy_price, freq),
                 },
             ))
 

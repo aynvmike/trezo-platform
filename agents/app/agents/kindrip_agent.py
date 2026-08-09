@@ -68,8 +68,9 @@ class KindripAgent(Agent):
                 instruction_id = None
                 try:
                     from app.payments.kindrip_bridge import record_kindrip_draft
+                    from app.kindrip.engine import child_owner_id as _own
                     instruction_id = await record_kindrip_draft(
-                        user_id=child.get("user_id"),
+                        user_id=_own(child),
                         child_row=child,
                         contribution_usd=float(result.get("contribution_usd") or 0),
                         seed_usd=float(result.get("seed_usd") or 0),
@@ -81,6 +82,10 @@ class KindripAgent(Agent):
                     agent=self.name, kind="info", confidence=1.0,
                     payload={
                         "user_id": child.get("user_id"),
+                        "owner_id": (child.get("owner_id")
+                                     or child.get("user_id")),
+                        "funding_account": (child.get("funding_account_key")
+                                            or child.get("user_id")),
                         "event": "kindrip_contribution",
                         "child_name": result["child_name"],
                         "deposited_usd": result["deposited_usd"],

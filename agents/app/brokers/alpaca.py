@@ -54,8 +54,38 @@ class AlpacaAccount:
         return asdict(self)
 
 
+def _account_ctx():
+    """The broker account this task is bound to, or None.
+
+    Returns None -- meaning "behave exactly as before" -- in two cases:
+
+    * LIVE MODE. The account registry holds PAPER credentials only, so it
+      must never be allowed to redirect a live call. Live keeps its
+      existing single-account path until live multi-account is a
+      deliberate, separately-reviewed decision.
+    * SINGLE ACCOUNT. When only the primary account is enabled there is
+      nothing to route, so every call takes the original code path and
+      this whole mechanism is inert.
+
+    Set by app.brokers.accounts.use_account(), which is a ContextVar --
+    so concurrent per-account cycles cannot leak into each other's calls.
+    """
+    if _live_active():
+        return None
+    try:
+        from app.brokers.accounts import current_account, multi_account_active
+        if not multi_account_active():
+            return None
+        return current_account()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def alpaca_configured() -> bool:
-    """True when both Alpaca API keys are present in settings."""
+    """True when both Alpaca API keys are present for the active account."""
+    a = _account_ctx()
+    if a is not None:
+        return bool(a.key_id and a.secret)
     s = get_settings()
     return bool(s.alpaca_api_key and s.alpaca_secret_key)
 
@@ -81,6 +111,9 @@ def broker_venue() -> str:
 def _base_url() -> str:
     if _live_active():
         return LIVE_BASE_URL
+    a = _account_ctx()
+    if a is not None:
+        return a.base_url
     return get_settings().alpaca_base_url or PAPER_BASE_URL
 
 
@@ -91,6 +124,9 @@ def _headers() -> dict:
             "APCA-API-KEY-ID": s.alpaca_live_api_key,
             "APCA-API-SECRET-KEY": s.alpaca_live_secret_key,
         }
+    a = _account_ctx()
+    if a is not None:
+        return a.headers()
     return {
         "APCA-API-KEY-ID": s.alpaca_api_key,
         "APCA-API-SECRET-KEY": s.alpaca_secret_key,
@@ -275,6 +311,9 @@ def tradable_crypto_symbols() -> frozenset:
     if _CRYPTO_ASSETS["syms"] and (_t.time() - _CRYPTO_ASSETS["ts"]) < 21600:
         return _CRYPTO_ASSETS["syms"]
     try:
+        # Deliberately NOT account-scoped: which coins Alpaca lists is a
+        # venue fact, identical for every account under one login, and it
+        # is cached process-wide for 6h. Any valid key can read it.
         s = get_settings()
         base = (s.alpaca_base_url or PAPER_BASE_URL).rstrip("/")
         req = _u.Request(

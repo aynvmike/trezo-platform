@@ -95,6 +95,21 @@ _TTL = 30.0
 
 
 def _primary_user_id():
+    """The settings row every consumer anchors to.
+
+    Reads Settings FIRST. This lived in agents/.env from 2026-07-06 but
+    was fetched with os.getenv, which never sees that file -- so single-row
+    mode silently never engaged and get_bot_settings() fell through to
+    'most recently updated row'. Found 2026-08-09 while wiring multi-account.
+    The os.getenv fallback stays for a real process-level override.
+    """
+    try:
+        from app.config import get_settings as _gs
+        v = (getattr(_gs(), "trezo_primary_user_id", "") or "").strip()
+        if v:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
     import os as _o
     v = (_o.getenv("TREZO_PRIMARY_USER_ID") or "").strip()
     return v or None
@@ -215,9 +230,35 @@ def get_bot_settings(user_id: Optional[str] = None) -> BotSettings:
     # the paper-engine's user id -- two rows drifted apart and Bot Tuning
     # edits stopped reaching the trades. With TREZO_PRIMARY_USER_ID set,
     # EVERY consumer (global or per-user) resolves to that row.
-    _prim = _primary_user_id()
-    if _prim and _single_row_mode():
-        user_id = _prim
+    # Single-row mode exists (2026-07-06) because the web app saved the
+    # signed-in user's row while engine signals carried the paper engine's
+    # id -- two rows drifted and Bot Tuning edits stopped reaching trades.
+    # Collapsing EVERY lookup to one row is the right fix for one operator
+    # with one book. It is the WRONG fix once a person holds several: it
+    # would tie every account to the main account's settings, which is
+    # precisely what multi-account has to avoid (Mike, 2026-08-09). So the
+    # anchor generalises -- to THIS account when there is more than one.
+    _multi = False
+    _acct_key = None
+    try:
+        from app.brokers.accounts import (
+            multi_account_active as _maa, current_user_id as _cuid,
+        )
+        _multi = _maa()
+        if _multi:
+            _acct_key = _cuid()
+    except Exception:  # noqa: BLE001
+        _multi = False
+
+    if _multi:
+        # Each book keeps its own row. An explicit user_id IS an account
+        # key and is honoured; a bare call resolves to the bound account.
+        if not user_id:
+            user_id = _acct_key or _primary_user_id()
+    else:
+        _prim = _primary_user_id()
+        if _prim and _single_row_mode():
+            user_id = _prim
     now = time.time()
     hit = _cache.get(user_id)
     if hit is not None and (now - hit[1]) < _TTL:
