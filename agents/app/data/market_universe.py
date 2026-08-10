@@ -108,14 +108,28 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
                 continue
             dest.append(sym)
 
-    # Interleave: most-actives first (liquid, scalp-friendly), then
-    # gainers/losers round-robin so both directions stay represented.
-    lists = [actives, gainers, losers]
+    # Interleave, WEIGHTED 2:1:1 toward most-actives (2026-08-10).
+    #
+    # A flat 1:1:1 spent two thirds of every pool on gainers and losers,
+    # and percentage movers are overwhelmingly low-float microcaps -- so
+    # two thirds of the pool could never clear the liquidity floor the
+    # scanners apply next. On 2026-08-10 that showed up as 94% of stock
+    # vetoes being "average volume 14,978 below the 100,000 minimum":
+    # slots spent on names with no chance of becoming a trade.
+    #
+    # Movers are NOT dropped -- momentum is where the ORB and pattern
+    # setups live, and a liquid mover is the best candidate there is.
+    # They just stop outnumbering the tradable names 2 to 1.
+    pattern = [actives, actives, gainers, losers]
     i = 0
-    while len(universe) < limit and any(lists):
-        src_list = lists[i % 3]
+    while len(universe) < limit and any((actives, gainers, losers)):
+        src_list = pattern[i % 4]
         i += 1
         if not src_list:
+            # Nothing left in this slot -- fall through to whichever
+            # source still has names rather than spinning.
+            if not any((actives, gainers, losers)):
+                break
             continue
         sym = src_list.pop(0)
         if sym in seen:

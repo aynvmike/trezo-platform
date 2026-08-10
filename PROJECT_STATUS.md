@@ -1,5 +1,12 @@
 # Trezo — Project Status Handoff
 
+> ## 2026-08-10 (Nova) — SCAN POOL REGRESSION FIXED + the multi-account fan-out is ALREADY LIVE
+>
+> **⚠️ THE BOOKS ARE NOT INERT.** Running `0046` created `paper_accounts` rows, and `trade_execution`'s PRE-EXISTING fan-out picked them up with no restart and no flag. Proof from 8/10's log: `crypto_skip_no_usd` fired **564 times = 188 × 3 books** (`cf1b0460`, `6ce61054`, `49acafdd`). All three read **the PRIMARY's balance** — every message says *"USD wallet collateral-locked (available $5.06)"* while the 25k/75k books hold $25k/$75k. `bind_for_user` only resolves accounts in the REGISTRY, and `TREZO_ACCOUNTS_ENABLED=primary` means it falls back to primary. **It fails CLOSED (skips, never mis-routes) only because primary has $5.06 free.** FIX: flip `TREZO_ACCOUNTS_ENABLED=primary,acct2,acct3` + restart.
+>
+> **⭐ WHY STOCKS WENT QUIET: `get_most_actives` ranked by SHARE VOLUME, which is price-inverted.** A $2 stock printing 50M shares outranks AAPL printing 40M, so the "most liquid" list put penny stocks FIRST and the real names LAST. Measured live 8/10: `by=volume` → SOAR, SCKT, YYAI, AUUD, MSTU…; `by=trades` → NVDA, SPCX, JWEL, STKH, AAPL, TSLA, INTC, PLTR, MSFT. (SOAR: 290M shares in 229k trades. NVDA: 75M shares in **1.96M** trades.) Same code on 8/4 happened to surface AMZN/AMAT/NVDA — **the ranking is simply unstable**, not a code change. Result: 94% of stock vetoes were the volume floor correctly rejecting names the pool should never have surfaced. **The gates were right; the pool fed them names with no chance.**
+> **FIXED:** `get_most_actives(by="trades")` (param kept, default changed) + interleave weighted **2:1:1** toward actives (a flat 1:1:1 spent two thirds of every pool on percentage movers, which are overwhelmingly low-float microcaps). Movers are NOT dropped — a liquid mover is the best ORB/pattern candidate there is; they just stop outnumbering tradable names 2:1. **Pool now: NVDA, AAPL, TSLA, INTC, PLTR, MU, MSFT, GOOGL, SPY, QQQ, SOXX, KLAC… 26 of 40 with known volume, ALL clearing the 500k floor (was 21 of 40 microcap-heavy).** Takes effect at restart.
+>
 > ## 2026-08-09 (Nova) — MULTI-ACCOUNT (3 books, 1 owner) + dividend schedule fix. **STAGED, NOT LIVE.**
 >
 > **TO RESUME: `TREZO_ACCOUNTS_ENABLED=primary` in agents/.env. Flip to `primary,acct2,acct3` + restart to turn the other two books on. Nothing else is needed — everything below is already applied and verified.**

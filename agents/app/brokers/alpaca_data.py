@@ -273,13 +273,40 @@ async def get_daily_bars(symbol: str, lookback_days: int = 140) -> list:
     return bars if isinstance(bars, list) else []
 
 
-async def get_most_actives(top: int = 25) -> list[str]:
-    """Most-active stocks by share volume -- the LIQUID end of today's
-    tape (2026-07-02). These are the scalp-friendly names; movers skew
-    to tiny caps. Empty list on any failure."""
+async def get_most_actives(top: int = 25, by: str = "trades") -> list[str]:
+    """Most-active stocks -- the LIQUID end of today's tape (2026-07-02).
+
+    RANKED BY TRADE COUNT, NOT SHARE VOLUME (changed 2026-08-10).
+
+    Share volume is price-inverted: a $2 stock printing 50M shares
+    outranks AAPL printing 40M, so `by=volume` systematically puts penny
+    stocks at the FRONT of the "most liquid" list and the real names at
+    the back. Measured live on 2026-08-10:
+
+        by=volume  SOAR, SCKT, YYAI, AUUD, MSTU, SPCX, RCON, ACHR ...
+        by=trades  NVDA, SPCX, JWEL, STKH, AAPL, TSLA, INTC, PLTR, MSFT
+
+        SOAR: 289,992,648 shares in   229,812 trades
+        NVDA:  75,486,505 shares in 1,963,091 trades
+
+    Trade count is price-independent -- it counts how many times the
+    market actually changed hands, which is what decides whether an order
+    fills without moving the price. That is the property the scan pool
+    needs, and the property the liquidity gate downstream tests for.
+
+    This was the cause of the 2026-08-10 "agents aren't trading stocks"
+    report: 94% of stock vetoes were the volume floor rejecting names the
+    pool should never have surfaced (VREX, YJ, SOAR at 15k-58k average
+    volume against a 100k minimum). The gates were right; the pool fed
+    them names that could not pass. Same code on 8/4 happened to surface
+    AMZN/AMAT/NVDA -- the ranking is simply unstable.
+
+    `by` stays a parameter so "volume" remains available for anything
+    that genuinely wants share-count ordering. Empty list on any failure.
+    """
     try:
         data = await _data_get("/v1beta1/screener/stocks/most-actives",
-                               {"by": "volume", "top": str(int(top))})
+                               {"by": str(by or "trades"), "top": str(int(top))})
     except Exception:  # noqa: BLE001
         return []
     rows = (data or {}).get("most_actives", []) if isinstance(data, dict) else []
