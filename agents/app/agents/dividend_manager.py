@@ -52,11 +52,45 @@ class DividendManagerAgent(Agent):
     name = "dividend_manager"
     tick_interval_seconds = 21600  # every 6 hours
 
+    _accum_day: dict = {}
+
     async def tick(self) -> list[AgentMessage]:
         client = _supabase()
         if not client:
             return [AgentMessage(agent=self.name, kind="info",
                                  payload={"note": "Supabase not configured."})]
+
+        # INCOME ACCUMULATOR (2026-08-11, Mike: "we can purchase dividends
+        # for holdings now we have the books"). Once per day per book, buy
+        # a small tranche of the best real payer from the income pocket --
+        # evidence from live ex-dates, decayer-guarded, route-checked.
+        # Failure of a buy never blocks the distribution pass below.
+        try:
+            from datetime import date as _d
+            from app.dividends.accumulator import accumulate_for_book
+            def _users():
+                return (client.table("paper_accounts")
+                        .select("user_id").execute())
+            _uids = [u["user_id"] for u in
+                     ((await asyncio.to_thread(_users)).data or [])]
+            _today = _d.today().isoformat()
+            for _uid in _uids:
+                if self._accum_day.get(_uid) == _today:
+                    continue
+                res = await accumulate_for_book(client, _uid)
+                self._accum_day[_uid] = _today
+                if res:
+                    out_buy = AgentMessage(
+                        agent=self.name, kind="info", confidence=1.0,
+                        payload={"user_id": _uid,
+                                 "event": "income_accumulate", **res})
+                    try:
+                        from app.runtime.bus import bus as _bus
+                        await _bus.publish(out_buy)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
 
         def _q():
             return (client.table("user_positions").select("*")
