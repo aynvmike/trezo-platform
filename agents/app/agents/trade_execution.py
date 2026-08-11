@@ -99,7 +99,17 @@ class TradeExecutionAgent(Agent):
         # nothing bound the account -- so every book's orders would have
         # gone to the primary Alpaca account (2026-08-09).
         from app.brokers.accounts import bind_for_user as _bind_acct
+        from app.brokers.route_guard import check_route, record_mismatch
         with _bind_acct(user_id):
+            _ok, _note = check_route(user_id)
+            if not _ok:
+                # Refuse rather than mis-route: 7 orders landed on the
+                # wrong broker account on 8/10-11 with no error anywhere.
+                record_mismatch(ticker, user_id, _note, "execute.single")
+                return [AgentMessage(
+                    agent=self.name, kind="error", confidence=1.0,
+                    payload={"user_id": user_id, "ticker": ticker,
+                             "error": f"route check failed: {_note}"})]
             return await self._execute_for_user(user_id, ticker, side,
                                                 message.payload)
 
@@ -160,6 +170,8 @@ class TradeExecutionAgent(Agent):
 
         out: list[AgentMessage] = []
         from app.brokers.accounts import bind_for_user as _bind_acct
+        from app.brokers.route_guard import check_route as _check_route
+        from app.brokers.route_guard import record_mismatch as _rec_mm
         for uid in users:
             try:
                 # Each book's order must go to ITS OWN broker account.
@@ -167,6 +179,10 @@ class TradeExecutionAgent(Agent):
                 # across paper_accounts -- but with one global credential
                 # every book's orders landed on the primary (2026-08-09).
                 with _bind_acct(uid):
+                    _ok, _note = _check_route(uid)
+                    if not _ok:
+                        _rec_mm(ticker, uid, _note, "execute.fanout")
+                        continue
                     msgs = await self._execute_for_user(uid, ticker, side,
                                                         source_payload)
                 out.extend(msgs or [])

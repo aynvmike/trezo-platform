@@ -127,6 +127,19 @@ class OpsWatchdogAgent(Agent):
         return []
 
     async def tick(self) -> list[AgentMessage]:
+        # Route audit (2026-08-11): every tick, verify each book's
+        # broker-routed ledger rows exist at that book's OWN broker.
+        # Catches the mis-routed-stray pattern (7 found on 8/10-11) the
+        # same cycle it happens instead of when a human notices. Fails
+        # open; detection always on, autorepair behind its own flag.
+        try:
+            from app.brokers.route_guard import audit_routes
+            # Findings are recorded as route_orphan activity lines inside
+            # audit_routes itself -- greppable and Mike-visible. Nothing
+            # to return here; a failed audit must never block the tick.
+            await audit_routes()
+        except Exception:  # noqa: BLE001
+            pass
         out: list[AgentMessage] = []
         # Daily DB janitor (2026-07-07, Task #56 finally shipped): purge
         # agent_messages older than 48h once per day. The table regrew to

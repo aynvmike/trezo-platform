@@ -278,8 +278,16 @@ def owners() -> list:
 
 
 def primary_account():
-    """The primary account, or the first that loaded, or None."""
-    return get_account("primary") or (load_accounts() or [None])[0]
+    """The DEFAULT account -- switchable via TREZO_DEFAULT_ACCOUNT
+    (2026-08-11, Mike: the default book should be able to move without
+    code). Falls back: configured default -> 'primary' -> first loaded."""
+    try:
+        want = (getattr(get_settings(), "trezo_default_account", "primary")
+                or "primary").strip()
+    except Exception:  # noqa: BLE001
+        want = "primary"
+    return (get_account(want) or get_account("primary")
+            or (load_accounts() or [None])[0])
 
 
 def multi_account_active() -> bool:

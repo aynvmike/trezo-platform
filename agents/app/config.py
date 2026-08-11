@@ -269,6 +269,14 @@ class Settings(BaseSettings):
     trezo_account_owner_id_2: str = ""
     trezo_account_owner_id_3: str = ""
     trezo_accounts_enabled: str = "primary"
+    # Route guard (2026-08-11). Which account is THE DEFAULT is a setting,
+    # so re-pointing the platform's default book is one env change:
+    #   TREZO_DEFAULT_ACCOUNT=primary|acct2|acct3
+    # Autorepair: audit_routes() may retag a mis-routed stray back to the
+    # account that really holds it. Detection is ALWAYS on; repair is a
+    # decision, so it defaults OFF.
+    trezo_default_account: str = "primary"
+    trezo_route_autorepair: bool = False
     alpaca_api_key_2: str = ""
     alpaca_secret_key_2: str = ""
     alpaca_base_url_2: str = ""

@@ -1008,6 +1008,19 @@ class PositionMonitorAgent(Agent):
             if _pm_skip_unresolved(str(r.get("user_id") or "")):
                 continue          # unknown book: never act on the primary
             _pm_set_account(str(r.get("user_id") or ""))
+            # Route guard (8/11): an exit on the wrong account would close
+            # a stranger's position AND leave the real one open. Verify the
+            # binding actually took before any broker action on this row.
+            try:
+                from app.brokers.route_guard import (
+                    check_route as _pm_check, record_mismatch as _pm_mm)
+                _rok, _rnote = _pm_check(str(r.get("user_id") or ""))
+                if not _rok:
+                    _pm_mm(str(r.get("ticker") or "?"),
+                           str(r.get("user_id") or ""), _rnote, "monitor")
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
             tk = r["ticker"]
             at = r["asset_type"]
 
