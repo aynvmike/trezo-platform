@@ -1837,6 +1837,21 @@ class OptionsScannerAgent(Agent):
         import asyncio
 
         # Resolve token: per-user OAuth first, env-key fallback.
+        # MULTI-ACCOUNT FIX (2026-08-11): bind THIS book before anything
+        # touches the broker. Without it, get_account(), the broker-truth
+        # CSP count, and the bare get_bot_settings() below all resolved to
+        # the PRIMARY -- so every book saw primary's $4.7k equity (growth
+        # posture, max 1 CSP) and primary's open AGNC put (count=1), and
+        # the wheel refused the 25k book 131 times and the 75k 119 times
+        # in one morning with "growth-posture max (1)".
+        from app.brokers.accounts import set_account_for_user as _bind_book
+        from app.brokers.route_guard import check_route as _rt_check
+        from app.brokers.route_guard import record_mismatch as _rt_mm
+        _bind_book(str(user_id or ""))
+        _rok, _rnote = _rt_check(str(user_id or ""))
+        if not _rok:
+            _rt_mm(underlying, str(user_id or ""), _rnote, "wheel_fire")
+            return None
         token: "UserToken | None" = None
         routed = "env-keys"
         bt = await get_user_broker_token(user_id, "alpaca")
@@ -1933,7 +1948,7 @@ class OptionsScannerAgent(Agent):
                     try:
                         from app.paper.allocation import default_posture
                         from app.runtime.settings import get_bot_settings as _gbs
-                        _post = str(getattr(_gbs(), "account_posture", "auto") or "auto")
+                        _post = str(getattr(_gbs(user_id), "account_posture", "auto") or "auto")
                         if _post not in _limits:
                             _post = default_posture(_eq)
                     except Exception:  # noqa: BLE001

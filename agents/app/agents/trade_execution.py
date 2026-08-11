@@ -710,13 +710,29 @@ class TradeExecutionAgent(Agent):
         #     equity AND 90% of current BP. Three of these rejects tripped
         #     the session kill-switch and killed the whole day.
         try:
+            # DIRECTION-AWARE clamp (fixed 2026-08-11). The 7/7 version
+            # assumed every trade was a LONG: it forced take-profit above
+            # market and stop below market. Applied to a SHORT, that takes
+            # correct levels and INVERTS them -- TP dragged above the stop
+            # -- so every short bracket died on the local orientation
+            # guard ("short take-profit must sit BELOW stop"). IREN,
+            # 2026-08-11 13:31, and the 6 rejects of 8/5 are this bug.
             _tick = max(0.01, round(float(market_price) * 0.001, 2))
-            if target_price is not None:
-                target_price = max(float(target_price),
-                                   round(float(market_price) + _tick, 2))
-            if stop_price is not None:
-                stop_price = min(float(stop_price),
-                                 round(float(market_price) - _tick, 2))
+            if order_side == "sell":
+                # Short: profit BELOW market, stop ABOVE market.
+                if target_price is not None:
+                    target_price = min(float(target_price),
+                                       round(float(market_price) - _tick, 2))
+                if stop_price is not None:
+                    stop_price = max(float(stop_price),
+                                     round(float(market_price) + _tick, 2))
+            else:
+                if target_price is not None:
+                    target_price = max(float(target_price),
+                                       round(float(market_price) + _tick, 2))
+                if stop_price is not None:
+                    stop_price = min(float(stop_price),
+                                     round(float(market_price) - _tick, 2))
         except Exception:  # noqa: BLE001
             pass
         try:
