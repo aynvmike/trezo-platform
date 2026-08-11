@@ -229,7 +229,31 @@ async def accumulate_for_book(client, user_id: str) -> Optional[dict]:
     except Exception:  # noqa: BLE001
         pass
     sleeve_used = sum(v for k, v in held_cost.items() if tier_of(k))
-    free = sleeve - deployed_income - sleeve_used
+    # INITIAL DEPLOYMENT target (Mike 2026-08-11): the sleeve spends up
+    # to this milestone, then stops tranche buys -- while the pocket
+    # itself keeps its posture size and keeps growing with the book.
+    # 0 / unset = no cap. Keyed by account slot via the registry.
+    target = sleeve
+    try:
+        from app.config import get_settings as _gs
+        from app.brokers.accounts import account_for_user as _afu
+        _acct = _afu(user_id)
+        _slot = {"acct2": "trezo_divlt_target_2",
+                 "acct3": "trezo_divlt_target_3"}.get(
+                     getattr(_acct, "account_id", ""))
+        if _slot:
+            _tv = float(getattr(_gs(), _slot, 0) or 0)
+            if _tv > 0:
+                target = min(sleeve, _tv)
+    except Exception:  # noqa: BLE001
+        pass
+    if sleeve_used >= target:
+        _rec("SLEEVE", f"deployment target reached: ${sleeve_used:,.0f} of "
+                       f"${target:,.0f} invested -- holding, not buying",
+             user_id)
+        return None
+    free = min(sleeve - deployed_income - sleeve_used,
+               target - sleeve_used)
     tranche = min(TRANCHE_PCT * sleeve, TRANCHE_MAX_USD, free)
     if tranche < TRANCHE_MIN_USD:
         _rec("SLEEVE", f"skipped: sleeve ${sleeve:,.0f}, free ${free:,.0f} "

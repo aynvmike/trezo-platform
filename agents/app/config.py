@@ -275,6 +275,13 @@ class Settings(BaseSettings):
     # Autorepair: audit_routes() may retag a mis-routed stray back to the
     # account that really holds it. Detection is ALWAYS on; repair is a
     # decision, so it defaults OFF.
+    # Dividends-LT sleeve: INITIAL DEPLOYMENT target per book (Mike
+    # 2026-08-11: "the initial spend of dividends for the 75k portfolio
+    # be 15k" -- a spend milestone, NOT a pocket pin; the pocket keeps
+    # its posture size and grows with the book). 0 = no cap, deploy to
+    # the full pocket. Keyed by account slot, like the credentials.
+    trezo_divlt_target_2: float = 0
+    trezo_divlt_target_3: float = 0
     trezo_default_account: str = "primary"
     trezo_route_autorepair: bool = False
     alpaca_api_key_2: str = ""
