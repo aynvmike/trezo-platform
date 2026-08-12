@@ -311,12 +311,14 @@ async def accumulate_for_book(client, user_id: str) -> Optional[dict]:
             return None
         try:
             from app.brokers.alpaca import _post
-            order_r = await _post("/v2/orders", {
+            # _post returns (json, error) -- treating it as a dict was the
+            # 'tuple has no attribute get' failure on QYLD (2026-08-12).
+            order_r, _oerr = await _post("/v2/orders", {
                 "symbol": best["symbol"], "notional": str(notional),
                 "side": "buy", "type": "market", "time_in_force": "day",
             })
-            if not order_r or order_r.get("id") is None:
-                raise RuntimeError(f"order not accepted: {order_r}")
+            if _oerr or not order_r or order_r.get("id") is None:
+                raise RuntimeError(f"order not accepted: {_oerr or order_r}")
             import json as _j, urllib.request as _u  # noqa: E401
             await asyncio.sleep(3)
             from app.brokers.accounts import current_account
