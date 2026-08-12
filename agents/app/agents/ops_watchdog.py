@@ -110,6 +110,8 @@ _BOOT_AT = datetime.now(timezone.utc)
 
 _JANITOR_DAY = ""   # daily agent_messages purge marker (2026-07-07)
 _ALERT_ACK_HOUR = ""  # hourly stale-advisory auto-ack marker (2026-07-15)
+_BRIEF_AM_DAY = ""    # market-brief once-a-day gates (2026-08-12)
+_BRIEF_PM_DAY = ""
 
 
 class OpsWatchdogAgent(Agent):
@@ -172,6 +174,32 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                     except Exception:  # noqa: BLE001
                         pass
+                # MARKET BRIEFS (Mike 2026-08-12: "do it the right way --
+                # everything self reliant"). Pre-market and pre-close reads
+                # computed BY the engine, landed in the brief file, the
+                # activity log, and agent memory. Weekdays only; once each
+                # per day; ET approximated the same way is_market_hours
+                # does (DST ignored, erring toward running).
+                try:
+                    global _BRIEF_AM_DAY, _BRIEF_PM_DAY
+                    _bnow = _dt.now(_tz.utc)
+                    _bet_h = (_bnow.hour - 4) % 24
+                    _bet_m = _bnow.minute
+                    _bday = _bnow.date().isoformat()
+                    _bwk = _bnow.weekday() < 5
+                    if (_bwk and _BRIEF_AM_DAY != _bday
+                            and (_bet_h == 8 and _bet_m >= 30
+                                 or _bet_h == 9 and _bet_m <= 25)):
+                        _BRIEF_AM_DAY = _bday
+                        from app.knowledge.market_brief import build_brief
+                        await build_brief(_cl, "pre_market")
+                    if (_bwk and _BRIEF_PM_DAY != _bday
+                            and _bet_h == 15 and _bet_m >= 25):
+                        _BRIEF_PM_DAY = _bday
+                        from app.knowledge.market_brief import build_brief
+                        await build_brief(_cl, "pre_close")
+                except Exception:  # noqa: BLE001
+                    pass
                 # Knowledge drop-folder sweep (Mike 2026-07-16): anything
                 # dropped into C:\Trezo\Quantconnect (or the external-
                 # research folder) joins the library within a day -- no
