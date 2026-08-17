@@ -174,6 +174,18 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                     except Exception:  # noqa: BLE001
                         pass
+                # OPS RELAY (Mike 2026-08-13, his idea): Nova queues an
+                # operator job in Supabase; the engine runs it here and
+                # writes the result back -- no SSH, no Mike at a keyboard.
+                # Whitelisted job kinds only; never trading actions. Also
+                # pushes the server's activity log BACK to Supabase so
+                # Nova can read this machine's log from anywhere again.
+                try:
+                    from app.runtime.ops_relay import drain_once, push_log_tail
+                    await drain_once(_cl)
+                    await push_log_tail(_cl)
+                except Exception:  # noqa: BLE001
+                    pass
                 # MARKET BRIEFS (Mike 2026-08-12: "do it the right way --
                 # everything self reliant"). Pre-market and pre-close reads
                 # computed BY the engine, landed in the brief file, the
