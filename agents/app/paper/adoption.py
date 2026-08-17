@@ -78,11 +78,24 @@ def _ledger_ticker(broker_row: dict, asset_type: str) -> str:
 
 
 def _default_geometry(ticker: str, asset_type: str, side: str,
-                      entry: float) -> tuple[float, float]:
+                      entry: float, price: float | None = None) -> tuple[float, float]:
     """A stop and target for a position we are meeting for the first
     time. Per-coin parameters where we have them, otherwise a plain
     percentage -- deliberately WIDE, because an adopted position's real
-    entry may be days old and a tight stop would sell it on contact."""
+    entry may be days old and a tight stop would sell it on contact.
+
+    THE TRAP (caught 2026-08-17 before this ever ran): these percentages
+    are measured from ENTRY, and an adopted position's entry may be days
+    old. A coin already up 20% would get a target at +8% -- i.e. BELOW
+    the live price -- and the monitor's very next tick would read that
+    as "target hit" and liquidate at market. Adopting a book would have
+    become a mass sell of its winners.
+
+    So both levels are clamped against the CURRENT price when we know
+    it: the target is pushed above the market, and the stop is pulled
+    below it. Adoption exists to put a position back under management.
+    It must never, by itself, be a trading decision.
+    """
     stop_pct, target_pct = 0.05, 0.10
     if asset_type == "crypto":
         try:
@@ -96,10 +109,38 @@ def _default_geometry(ticker: str, asset_type: str, side: str,
     elif asset_type == "stock":
         stop_pct, target_pct = 0.04, 0.08
     if side == "long":
-        return (round(entry * (1 - stop_pct), 6),
-                round(entry * (1 + target_pct), 6))
-    return (round(entry * (1 + stop_pct), 6),
-            round(entry * (1 - target_pct), 6))
+        stop = entry * (1 - stop_pct)
+        target = entry * (1 + target_pct)
+        if price and price > 0:
+            # Target must sit ABOVE the market, stop BELOW it, or the
+            # act of adopting fires an exit on the next tick.
+            target = max(target, price * (1 + target_pct))
+            stop = min(stop, price * (1 - stop_pct))
+        return (round(stop, 6), round(target, 6))
+    stop = entry * (1 + stop_pct)
+    target = entry * (1 - target_pct)
+    if price and price > 0:
+        target = min(target, price * (1 - target_pct))
+        stop = max(stop, price * (1 + stop_pct))
+    return (round(stop, 6), round(target, 6))
+
+
+async def _last_price(ticker: str, asset_type: str) -> Optional[float]:
+    """What the position is worth right now, or None. Best-effort: with
+    no price we simply skip the clamp and keep entry-based levels, which
+    is the pre-2026-08-17 behaviour."""
+    # The broker position itself is the cheapest quote we have -- Alpaca
+    # returns current_price on every position row -- but adoption also
+    # runs for rows the caller did not pass, so fall back to candles.
+    try:
+        from app.data.candles import fetch_candles_for
+        candles = await fetch_candles_for(
+            ticker, asset_type if asset_type != "option" else "stock")
+        if candles:
+            return float(candles[-1].close)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 async def _inherit(client, user_id: str, ticker: str,
@@ -198,22 +239,55 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
         if (ticker, side) in have:
             continue
 
+        # What is it worth right now? Both the defaults and anything we
+        # inherit are checked against this, so adoption can never hand
+        # the monitor a level that is already breached.
+        price_now = None
+        try:
+            _cp = bp.get("current_price")
+            price_now = float(_cp) if _cp not in (None, "") else None
+        except (TypeError, ValueError):
+            price_now = None
+        if not price_now or price_now <= 0:
+            price_now = await _last_price(ticker, at)
+
         inh = await _inherit(client, str(user_id), ticker, side) or {}
         stop = inh.get("stop_price")
         target = inh.get("target_price")
         if not stop or not target:
-            d_stop, d_target = _default_geometry(ticker, at, side, entry)
+            d_stop, d_target = _default_geometry(
+                ticker, at, side, entry, price_now)
             stop = stop or d_stop
             target = target or d_target
+
+        # An INHERITED level can be stale too -- the row it came from was
+        # closed, possibly days ago, and the market has moved since. Same
+        # rule: adoption puts a position back under management, it does
+        # not decide to trade it. If an inherited level is already
+        # breached, fall back to the clamped default and say so.
+        clamped = False
+        if price_now and price_now > 0:
+            try:
+                _s, _t = float(stop), float(target)
+                breached = ((side == "long" and (price_now >= _t or price_now <= _s))
+                            or (side != "long" and (price_now <= _t or price_now >= _s)))
+                if breached:
+                    stop, target = _default_geometry(
+                        ticker, at, side, entry, price_now)
+                    clamped = True
+            except (TypeError, ValueError):
+                pass
+
         strategy = inh.get("strategy") or f"adopted_{at}"
 
         if dry_run:
             out["adopted"].append({
                 "ticker": ticker, "asset_type": at, "side": side,
                 "quantity": abs(qty), "entry_price": entry,
+                "price_now": price_now,
                 "stop_price": stop, "target_price": target,
                 "strategy": strategy, "inherited": bool(inh),
-                "dry_run": True})
+                "clamped": clamped, "dry_run": True})
             continue
 
         try:
@@ -225,7 +299,9 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
                 source_payload={"adopted": True,
                                 "adopted_at": datetime.now(timezone.utc).isoformat(),
                                 "broker_asset_class": bp.get("asset_class"),
-                                "inherited": bool(inh)})
+                                "inherited": bool(inh),
+                                "geometry_clamped": clamped,
+                                "price_at_adoption": price_now})
         except Exception as e:  # noqa: BLE001
             out["skipped"].append({"ticker": ticker, "why": f"insert failed: {e}"})
             continue
@@ -238,8 +314,10 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
         out["adopted"].append({
             "ticker": ticker, "asset_type": at, "side": side,
             "quantity": abs(qty), "entry_price": entry,
+            "price_now": price_now,
             "stop_price": stop, "target_price": target,
-            "strategy": strategy, "inherited": bool(inh)})
+            "strategy": strategy, "inherited": bool(inh),
+            "clamped": clamped})
         try:
             from app.agents.activity_log import record
             record("position_adopted", ticker,
@@ -248,8 +326,12 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
                            f"row - adopted so stops, targets and the profit "
                            f"ladder can manage it again"
                            + (" (geometry inherited from the row that was "
-                              "wrongly closed)" if inh else
-                              " (default geometry - no recent matching row)")),
+                              "wrongly closed)" if inh and not clamped else
+                              " (default geometry - no recent matching row)")
+                           + (" [levels clamped around the live price: the "
+                              "inherited ones were already breached, and "
+                              "adopting must not fire an exit]"
+                              if clamped else "")),
                    extra={"user_id": str(user_id), "asset_type": at,
                           "broker": "alpaca"})
         except Exception:  # noqa: BLE001
