@@ -817,6 +817,14 @@ async def count_profit_steps(user_id: str, position_id: str) -> int:
         return 0
 
 
+from app.paper.position_status import assert_valid as _assert_status
+
+# Validated at import: if someone edits this to a status the schema does
+# not allow, the agents refuse to start instead of silently failing to
+# book every partial from then on.
+_POS_PARTIAL = _assert_status("closed_partial", "record_external_partial_close")
+
+
 async def record_external_partial_close(
     user_id: str,
     position_id: str,
@@ -872,7 +880,11 @@ async def record_external_partial_close(
             "target_price": pos.get("target_price"),
             "source_payload": pos.get("source_payload"),
             "fees_usd": 0,
-            "status": "closed_partial",
+            # One source of truth with migration 0051's CHECK constraint.
+            # This literal string is what the database rejected for six
+            # weeks (2026-07-02 -> 2026-08-17) while the caller printed
+            # "booking failed" and threw the reason away.
+            "status": _POS_PARTIAL,
             "exit_price": fill_price,
             "exit_at": now_iso,
             "realized_pnl_usd": round(pnl, 2),

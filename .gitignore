@@ -121,3 +121,6 @@ agents/app/data/crypto_discovered.json
 agents/app/knowledge/_proposals.json
 agents/app/knowledge/_digest_history.json
 agents/app/knowledge/_research_seen.json
+
+# Runtime counter, rewritten constantly -- never source of truth.
+agents/app/memory/.usage_budget.json

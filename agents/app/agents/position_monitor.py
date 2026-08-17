@@ -422,6 +422,8 @@ from app.strategies.extended import SWING_MAX_HOLD_DAYS
 from app.agents.reevaluator import reeval_is_enabled, reevaluate_position
 
 from .base import Agent, AgentMessage
+from app.runtime.asset_policy import policy_for as _asset_policy
+from app.runtime.asset_policy import trail_policy_for as _trail_policy
 
 # Day-trade management thresholds (Phase 8e).
 MAX_HOLD_MINUTES = 90
@@ -760,16 +762,30 @@ _LIQ_MAX_FAILS = 3      # after 3 consecutive failures, back off (alert once)
 
 async def _alpaca_profit_step(r, price: float,
                               frac: float | None = None) -> tuple[bool, str]:
-    """Bank a slice of a broker-held LONG stock winner, then re-protect the
-    remainder with an OCO. VERIFIED at each step; on failure it restores
-    protection and reports. (Mike 2026-07-02: partial selling controls
-    drawdown -- but a botched leg dance leaves shares naked, so nothing
-    proceeds unverified.) Returns (stepped, note)."""
+    """Bank a slice of a broker-held LONG winner, then re-protect the
+    remainder. VERIFIED at each step; on failure it restores protection
+    and reports. (Mike 2026-07-02: partial selling controls drawdown --
+    but a botched leg dance leaves shares naked, so nothing proceeds
+    unverified.) Returns (stepped, note).
+
+    Any asset class the registry allows to step: the policy decides the
+    slice size, whether there are bracket legs to renegotiate first, and
+    whether the venue is even open. It was stocks-only until 2026-08-17,
+    which is why crypto banked nothing for six weeks."""
     from app.brokers.alpaca import (
         cancel_open_orders_for, get_open_orders_for,
         submit_market_sell, submit_oco_sell,
     )
+    from app.runtime.asset_policy import policy_for
     sym = str(r.get("ticker") or "").upper()
+    pol = policy_for(r.get("asset_type"))
+    # 2026-08-17: this used to be stocks-only by omission, not by
+    # decision -- the caller gated on `at == "stock"` and crypto could
+    # never bank a slice however far it ran. The asset policy now says
+    # who may step, how small a slice may be, and whether the venue
+    # holds a bracket we have to renegotiate first.
+    if not pol.supports_partial_step:
+        return False, f"{pol.label} does not step out by policy"
     try:
         qty_total = float(r.get("quantity") or 0)
         entry = float(r.get("entry_price") or 0)
@@ -777,15 +793,21 @@ async def _alpaca_profit_step(r, price: float,
         target_p = float(r.get("target_price") or 0)
     except (TypeError, ValueError):
         return False, "bad row numbers"
-    if entry <= 0 or stop_p <= 0 or target_p <= entry:
+    if entry <= 0 or target_p <= entry:
+        return False, "row lacks a usable target"
+    # A broker-held bracket must be re-placed after the slice, so it needs
+    # a stop to re-place. Where the venue holds no bracket at all (Alpaca
+    # crypto) there is nothing to renegotiate, and a missing stop must not
+    # block banking a winner.
+    if pol.native_brackets and stop_p <= 0:
         return False, "row lacks usable stop/target"
     if frac is None:
         frac = min(0.9, max(0.1, float(
             os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
-    slice_qty = float(int(qty_total * frac))
-    remaining = qty_total - slice_qty
-    if slice_qty < 1 or remaining < 1:
+    slice_qty = pol.slice_size(qty_total, frac)
+    if slice_qty <= 0:
         return False, "too small to split"
+    remaining = qty_total - slice_qty
     # 0) SESSION GATE (2026-08-05). Equity bracket legs cannot be
     #    cancelled while the market is shut, so every overnight attempt
     #    failed at step 1 and retried forever: 47 identical aborts on
@@ -793,25 +815,29 @@ async def _alpaca_profit_step(r, price: float,
     #    logged. The profit was never taken because the harvest kept
     #    running when it could not possibly succeed. Crypto is exempt --
     #    it genuinely trades 24/7.
-    _is_crypto = str(r.get("asset_type") or "").lower() == "crypto"
-    if not _is_crypto:
+    if pol.session_gated:
         try:
             from app.agents.ops_watchdog import _us_market_open
             if not _us_market_open():
                 return False, "market closed - step harvest deferred to the open"
         except Exception:  # noqa: BLE001
             pass
-    # 1) Release the shares: cancel bracket legs (cancel-legs-first,
-    #    6/12 lesson) and VERIFY they are gone before selling anything.
-    _n, err = await cancel_open_orders_for(sym)
-    if err:
-        return False, f"could not list legs ({err}) - aborted untouched"
-    left = None
-    for _ in range(4):
-        left = await get_open_orders_for(sym)
-        if left == []:
-            break
-        await asyncio.sleep(0.7)
+    # 1) Release the units: cancel bracket legs (cancel-legs-first, 6/12
+    #    lesson) and VERIFY they are gone before selling anything. Skipped
+    #    where the venue holds no bracket -- there are no legs to cancel,
+    #    and asking would only invent a failure mode.
+    if pol.native_brackets:
+        _n, err = await cancel_open_orders_for(sym)
+        if err:
+            return False, f"could not list legs ({err}) - aborted untouched"
+        left = None
+        for _ in range(4):
+            left = await get_open_orders_for(sym)
+            if left == []:
+                break
+            await asyncio.sleep(0.7)
+    else:
+        left = []
     # get_open_orders_for returns None when the CALL ITSELF failed, and
     # [] only when the broker confirmed there is nothing open. `if left:`
     # treated None as falsy, so a failed check read as "all clear" and
@@ -822,24 +848,49 @@ async def _alpaca_profit_step(r, price: float,
         return False, "could not verify legs were cancelled - aborted untouched"
     if left:
         return False, "legs did not cancel - aborted untouched"
-    # 2) Sell the slice at market.
-    order, serr = await submit_market_sell(sym, slice_qty)
+    # 2) Sell the slice at market, through the venue's own order shape.
+    #    Crypto is a different endpoint and a different time-in-force
+    #    ('day' is rejected on a 24/7 venue), so the asset policy picks.
+    if pol.asset_type == "crypto":
+        from app.brokers.alpaca import submit_crypto_order
+        order, serr = await submit_crypto_order(sym, "sell", slice_qty)
+    else:
+        order, serr = await submit_market_sell(sym, slice_qty)
     if serr or not order:
         # Nothing sold -- put the FULL protection back before leaving.
-        await submit_oco_sell(sym, qty_total, target_p, stop_p)
-        return False, f"slice sell rejected ({serr}); protection restored"
+        if pol.native_brackets:
+            await submit_oco_sell(sym, qty_total, target_p, stop_p)
+            return False, f"slice sell rejected ({serr}); protection restored"
+        return False, f"slice sell rejected ({serr}); position untouched"
     # 3) Re-protect the remainder (OCO: original target + stop), retry once.
-    prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
-    if perr or not prot:
-        await asyncio.sleep(1.0)
+    #    Where the venue holds no bracket, protection was never AT the
+    #    broker: the monitor enforces this row's stop client-side every
+    #    tick, so the remainder is as protected as it ever was.
+    if not pol.native_brackets:
+        protected = True
+    else:
         prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
-    protected = bool(prot) and not perr
+        if perr or not prot:
+            await asyncio.sleep(1.0)
+            prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
+        protected = bool(prot) and not perr
     # 4) Book the slice (closed_partial row + reduced open row).
     from app.paper.engine import record_external_partial_close
     fill = await record_external_partial_close(
         r["user_id"], r["id"], slice_qty, price)
-    booked = f"${fill.realized_pnl_usd:+.2f}" if fill.ok else "booking failed"
-    note = (f"banked {int(slice_qty)}/{int(qty_total)} shares ({booked}); "
+    # 2026-08-17: this said the bare words "booking failed" on every
+    # single step for six weeks -- the slice really sold at the broker,
+    # the ledger insert was rejected by a status CHECK constraint, and
+    # the reason was thrown away right here. An error we swallow is an
+    # error nobody fixes. Say what the database said.
+    if fill.ok:
+        booked = f"${fill.realized_pnl_usd:+.2f}"
+    else:
+        booked = f"BOOKING FAILED: {str(fill.error or 'unknown')[:120]}"
+    _unit = "units" if pol.fractional else "shares"
+    _fmt = (f"{slice_qty:g}/{qty_total:g}" if pol.fractional
+            else f"{int(slice_qty)}/{int(qty_total)}")
+    note = (f"banked {_fmt} {_unit} ({booked}); "
             + ("remainder re-protected (OCO)" if protected
                else "remainder NOT re-protected - naked-guard enforcing"))
     return True, note
@@ -936,6 +987,22 @@ class PositionMonitorAgent(Agent):
                     await reconcile_account_balances_all_users()
                 except Exception:  # noqa: BLE001
                     pass
+                # Adopt anything the broker holds that we have no row for
+                # (2026-08-17). The reconcile above only fixes rows we
+                # already have; a position with no row is a position the
+                # ladder, the stop and the target never see. On crypto,
+                # where Alpaca holds no bracket, it is also a position
+                # with no stop anywhere. Best-effort, never blocks a tick.
+                try:
+                    if os.getenv("TREZO_ADOPT_ORPHANS", "1") != "0":
+                        from app.paper.adoption import adopt_all_books
+                        _adopt = await adopt_all_books(
+                            dry_run=os.getenv("TREZO_ADOPT_DRY_RUN", "0") == "1")
+                        if _adopt.get("adopted"):
+                            result = dict(result or {})
+                            result["adopted"] = _adopt.get("adopted")
+                except Exception:  # noqa: BLE001
+                    pass
                 type(self)._did_initial_reconcile = True
                 if result.get("ok") and (
                     result.get("closed", 0)
@@ -980,16 +1047,24 @@ class PositionMonitorAgent(Agent):
         alpaca_managed = 0
         alpaca_reconciled = 0
 
-        # Phase 8g: which symbols Alpaca still holds. None = could not check
-        # (so a transient failure never closes a position by mistake).
+        # Phase 8g: which symbols the broker still holds. None = could not
+        # check (so a transient failure never closes a position by mistake).
+        #
+        # 2026-08-17: this was ONE call, made HERE -- fifty lines BEFORE
+        # the per-row account binding below. So the answer was always the
+        # first-bound (primary) account's holdings, and every 25k/75k row
+        # whose symbol the primary did not also hold failed the membership
+        # test and was closed as a phantom. Nine real positions per book
+        # went unmanaged, and because Alpaca holds no bracket on crypto,
+        # those coins had no stop at all.
+        #
+        # It is now asked PER BOOK, inside the loop, through book_scope --
+        # which binds the book as part of answering, so the wrong order is
+        # no longer expressible. Cleared each tick: a stale holdings set is
+        # precisely the input that phantom-closes a live position.
+        from app.runtime import book_scope
+        book_scope.new_cycle()
         alpaca_held = None
-        if any(r.get("broker") == "alpaca" for r in rows):
-            try:
-                from app.brokers.alpaca import alpaca_configured, get_open_symbols
-                if alpaca_configured():
-                    alpaca_held = await get_open_symbols()
-            except Exception:  # noqa: BLE001
-                alpaca_held = None
 
         async def _price(tk: str, at: str) -> float | None:
             key = f"{tk}:{at}"
@@ -1023,6 +1098,13 @@ class PositionMonitorAgent(Agent):
                 pass
             tk = r["ticker"]
             at = r["asset_type"]
+            # Broker truth for THIS book -- not for whichever account
+            # happened to be bound first. Cached per book for the tick.
+            if r.get("broker") == "alpaca":
+                alpaca_held = await book_scope.held_symbols(
+                    str(r.get("user_id") or ""), where="monitor")
+            else:
+                alpaca_held = None
 
             # --- Alpaca-routed positions (Phase 8b / 8g) -------------------
             if r.get("broker") == "alpaca":
@@ -1078,7 +1160,19 @@ class PositionMonitorAgent(Agent):
                     # holding); SWING keeps its target but step-ladders the
                     # stop up to lock return-on-capital on the way there.
                     _strat_a = (r.get("strategy") or "").lower()
+                    # 2026-08-17: this was an if/elif chain, and a chain is
+                    # how crypto DCA ended up with ladder rungs but no trail
+                    # between them -- the continuous trail was hand-wired to
+                    # SWING and later SCALP, and DCA was simply never added.
+                    # DCA's first rung is +3% against a ~6% target, so every
+                    # gain under +3% round-tripped by construction. That is
+                    # the XRP giveback. Each strategy now DECLARES what it
+                    # wants (asset_policy.TRAIL_POLICIES) and this reads it,
+                    # so a new strategy cannot be silently left out.
+                    _tp = _trail_policy(_strat_a)
                     if r["side"] == "long" and "hodl" in _strat_a:
+                        # A HODL is meant to ride: its own +40%/20% trail and
+                        # the catastrophe stop, deliberately no giveback trail.
                         _t = await _maybe_trail_hodl(r, price_c)
                         if _t is not None:
                             stop_c = _t
@@ -1101,6 +1195,12 @@ class PositionMonitorAgent(Agent):
                         _td = await _maybe_ladder_stop(r, price_c, DCA_PROFIT_LADDER)
                         if _td is not None:
                             stop_c = _td
+                        # The missing half of the DCA rules (8/17 audit).
+                        if _tp.continuous_trail:
+                            _tdt = await _maybe_trail_stock_profit(
+                                r, price_c, min_gain=_tp.trail_arm_gain)
+                            if _tdt is not None and (stop_c is None or _tdt > stop_c):
+                                stop_c = _tdt
                     elif r["side"] == "long" and "scalp" in _strat_a:
                         # EXIT REPAIR, 2026-08-05. Scalps had NO trail at all --
                         # only the net-edge auto-exit below, which closed them
@@ -1130,6 +1230,14 @@ class PositionMonitorAgent(Agent):
                             r, price_c, min_gain=SCALP_TRAIL_MIN_GAIN)
                         if _ts is not None and (stop_c is None or _ts > stop_c):
                             stop_c = _ts
+                    elif r["side"] == "long" and _tp.continuous_trail:
+                        # Anything not named above -- a new crypto strategy,
+                        # a hand-tagged row, a reconciled import -- still
+                        # gets the shared profit trail instead of nothing.
+                        _tg = await _maybe_trail_stock_profit(
+                            r, price_c, min_gain=_tp.trail_arm_gain)
+                        if _tg is not None and (stop_c is None or _tg > stop_c):
+                            stop_c = _tg
                     reason_c: str | None = None
                     if r.get("close_requested"):
                         reason_c = "manual"
@@ -1170,6 +1278,59 @@ class PositionMonitorAgent(Agent):
                                     reason_c = "scalp_net_edge"
                         except Exception:
                             pass
+                    # Step-profit ladder for CRYPTO (2026-08-17). Broker-
+                    # routed crypto reached none of this: the only step
+                    # call sat further down behind `at == "stock"`, so a
+                    # coin could run the whole way to its target and bank
+                    # nothing on the way. Same ladder, same env knobs, same
+                    # daily-goal nudge -- sized by the asset policy, which
+                    # knows coins are fractional and the venue never shuts.
+                    if (reason_c is None and r["side"] == "long"
+                            and os.getenv("TREZO_PROFIT_STEP_CRYPTO", "1") != "0"
+                            and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
+                        try:
+                            _ec = float(r.get("entry_price") or 0)
+                            _tc = float(r.get("target_price") or 0)
+                            _qc = float(r.get("quantity") or 0)
+                            _polc = _asset_policy(at)
+                            if (_ec > 0 and _tc > _ec and price_c > _ec
+                                    and _polc.can_step(_qc)):
+                                _runc = (price_c - _ec) / (_tc - _ec)
+                                _at0c, _fracc = _step_profile(_ec * _qc)
+                                _okc, _nc = await _step_check(
+                                    str(r.get("id")), r.get("user_id"),
+                                    _runc, at0_override=_at0c)
+                                if _okc:
+                                    _stepped_c, _notec = await _alpaca_profit_step(
+                                        r, price_c, frac=_fracc)
+                                    _notec = f"step {_nc + 1}: {_notec}"
+                                    if _stepped_c:
+                                        _step_mark(str(r.get("id")))
+                                        affected_users.add(r["user_id"])
+                                        out.append(AgentMessage(
+                                            agent=self.name, kind="info",
+                                            payload={
+                                                "user_id": r["user_id"],
+                                                "ticker": tk,
+                                                "note": f"Profit step: {_notec}",
+                                                "position_id": r["id"],
+                                                "broker": "alpaca",
+                                            }))
+                                    try:
+                                        from app.agents.activity_log import record as _arecc
+                                        _arecc("profit_step" if _stepped_c
+                                               else "profit_step_abort", tk,
+                                               strategy=(r.get("strategy") or ""),
+                                               reason=_notec,
+                                               extra={"user_id": str(r.get("user_id")),
+                                                      "broker": "alpaca"})
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    if _stepped_c:
+                                        continue
+                        except Exception:  # noqa: BLE001
+                            pass
+
                     if reason_c is None:
                         alpaca_managed += 1
                         continue
@@ -1287,15 +1448,21 @@ class PositionMonitorAgent(Agent):
                     # 2026-07-02: partial selling controls drawdown). The
                     # broker-side twin of the modeled stepping: cancel legs
                     # -> sell slice -> OCO re-protect, verified at each step.
+                    # 2026-08-17: was `at == "stock"` -- true by accident of
+                    # history, not by decision, and the reason crypto never
+                    # banked a slice. The registry answers now, so options,
+                    # futures, bonds and a 401k sleeve each get the behaviour
+                    # someone actually chose for them.
+                    _pol2 = _asset_policy(at)
                     if (os.getenv("TREZO_PROFIT_STEP_ALPACA", "1") != "0"
                             and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"
-                            and at == "stock"
+                            and _pol2.supports_partial_step
                             and r["side"] == "long"):
                         try:
                             _e2 = float(r.get("entry_price") or 0)
                             _t2 = float(r.get("target_price") or 0)
                             _q2 = float(r.get("quantity") or 0)
-                            if _e2 > 0 and _t2 > _e2 and _q2 >= 2:
+                            if _e2 > 0 and _t2 > _e2 and _pol2.can_step(_q2):
                                 price_ps = await _price(tk, at)
                                 _run2 = ((price_ps - _e2) / (_t2 - _e2)
                                          if price_ps is not None else -1.0)
@@ -1544,7 +1711,7 @@ class PositionMonitorAgent(Agent):
                 try:
                     _e = float(r.get("entry_price") or 0)
                     _q = float(r.get("quantity") or 0)
-                    _big_enough = (at == "crypto") or _q >= 2
+                    _big_enough = _asset_policy(at).can_step(_q)
                     if (_e > 0 and _q > 0 and _big_enough
                             and target is not None and float(target) > _e):
                         _run = (price - _e) / (float(target) - _e)

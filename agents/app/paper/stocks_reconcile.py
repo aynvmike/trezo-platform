@@ -93,6 +93,32 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
         if not user_id:
             continue
 
+        # 2026-08-17: this loop said "every user's positions" but bound
+        # NO account -- so with three books live it reconciled book B
+        # against whatever book A happened to be holding, and every row
+        # B owned that A did not was closed as a phantom. With one
+        # account that was invisible; with three it cost both new books
+        # their entire open ledger. Bind this book, verify the bind took,
+        # and skip rather than guess.
+        from app.brokers.accounts import (
+            set_account_for_user as _bind_book,
+            should_skip_unresolved as _skip_book,
+        )
+        from app.runtime import book_scope
+        if _skip_book(str(user_id)):
+            continue
+        _bind_book(str(user_id))
+        _route_ok, _route_note = book_scope.verify(str(user_id))
+        if not _route_ok:
+            try:
+                from app.brokers.route_guard import record_mismatch
+                record_mismatch("-", str(user_id), _route_note,
+                                "stocks_reconcile")
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        book_scope.invalidate(str(user_id))
+
         bt = await get_user_broker_token(user_id, "alpaca")
         token = UserToken(
             access_token=bt.access_token,
@@ -473,6 +499,12 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             "notes": notes_list,
         })
 
+    try:
+        from app.brokers.accounts import clear_account
+        clear_account()
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "ok": True,
         "users_touched": len(per_user),
@@ -650,6 +682,21 @@ async def run_integrity_sweep() -> dict[str, Any]:
         report["options"] = await import_orphan_options_all_users()
     except Exception as e:  # noqa: BLE001
         report["options"] = {"ok": False, "error": str(e)}
+    # Adoption closes the loop the other way round (2026-08-17). The steps
+    # above fix rows we HAVE; this one writes rows for positions the
+    # broker holds and we have NO row for -- which is the state the
+    # pre-binding phantom closes left both new books in, and the state
+    # every crashed fill or hand-placed order leaves us in. A position
+    # with no row is a position nothing manages; on crypto, with no
+    # native bracket, it is a position with no stop.
+    try:
+        import os as _os
+        if _os.getenv("TREZO_ADOPT_ORPHANS", "1") != "0":
+            from app.paper.adoption import adopt_all_books
+            report["adopted"] = await adopt_all_books(
+                dry_run=_os.getenv("TREZO_ADOPT_DRY_RUN", "0") == "1")
+    except Exception as e:  # noqa: BLE001
+        report["adopted"] = {"ok": False, "error": str(e)}
     return report
 
 
