@@ -129,6 +129,21 @@ class OpsWatchdogAgent(Agent):
         return []
 
     async def tick(self) -> list[AgentMessage]:
+        # OPS RELAY -- EVERY TICK (Mike 2026-08-13). First version sat
+        # inside the once-a-day janitor block, so the mailbox would have
+        # been checked once per 24h: useless for "fix it while I sleep".
+        # The whole point is a job queued now runs within one tick.
+        # Whitelisted kinds only, never trading. Also pushes the server's
+        # activity log back to Supabase so Nova can read it from anywhere.
+        try:
+            from app.runtime.settings import _supabase as _sb_relay
+            _relay_cl = _sb_relay()
+            if _relay_cl is not None:
+                from app.runtime.ops_relay import drain_once, push_log_tail
+                await drain_once(_relay_cl)
+                await push_log_tail(_relay_cl)
+        except Exception:  # noqa: BLE001
+            pass
         # Route audit (2026-08-11): every tick, verify each book's
         # broker-routed ledger rows exist at that book's OWN broker.
         # Catches the mis-routed-stray pattern (7 found on 8/10-11) the
@@ -174,18 +189,6 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                     except Exception:  # noqa: BLE001
                         pass
-                # OPS RELAY (Mike 2026-08-13, his idea): Nova queues an
-                # operator job in Supabase; the engine runs it here and
-                # writes the result back -- no SSH, no Mike at a keyboard.
-                # Whitelisted job kinds only; never trading actions. Also
-                # pushes the server's activity log BACK to Supabase so
-                # Nova can read this machine's log from anywhere again.
-                try:
-                    from app.runtime.ops_relay import drain_once, push_log_tail
-                    await drain_once(_cl)
-                    await push_log_tail(_cl)
-                except Exception:  # noqa: BLE001
-                    pass
                 # MARKET BRIEFS (Mike 2026-08-12: "do it the right way --
                 # everything self reliant"). Pre-market and pre-close reads
                 # computed BY the engine, landed in the brief file, the
