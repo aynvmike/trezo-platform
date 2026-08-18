@@ -46,12 +46,24 @@ def test_every_asset_type_in_the_codebase_has_a_policy():
             val = m.group(1) or m.group(2)
             if val:
                 seen.add(val)
-    missing = sorted(v for v in seen if not ap.is_registered(v))
+    missing = sorted(v for v in seen
+                     if not ap.is_registered(v) and v not in ap.SENTINELS)
     assert not missing, (
         f"asset types compared in code with no AssetPolicy: {missing}. "
         f"Add one in app/runtime/asset_policy.py -- an unregistered class "
         f"is managed defensively and never stepped, which is safe but "
         f"probably not what you meant.")
+
+
+def test_sentinels_are_not_mistaken_for_asset_classes():
+    """`auto` reads like an asset type in a comparison but means "detect
+    it". It must stay UNREGISTERED -- if someone ever gives it a policy,
+    positions would be managed under a class that does not exist."""
+    for s in ap.SENTINELS:
+        assert not ap.is_registered(s), (
+            f"{s!r} is a sentinel, not an asset class -- it must not have "
+            f"a policy")
+        assert ap.policy_for(s) is ap.UNKNOWN_POLICY
 
 
 def test_the_classes_we_promised_are_all_there():

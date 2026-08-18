@@ -267,6 +267,14 @@ ALIASES: dict[str, str] = {
 }
 
 
+# Strings that LOOK like an asset type in a comparison but are not one.
+# `auto` is an API query parameter meaning "work it out for me" --
+# api/patterns.py turns it into None on the next line. Declared here so
+# the guard test can tell a sentinel from a class we forgot to register,
+# rather than the test being loosened until it stops catching anything.
+SENTINELS: frozenset = frozenset({"auto"})
+
+
 def policy_for(asset_type: Optional[str]) -> AssetPolicy:
     """The policy for this asset class. NEVER raises and never returns
     None -- an unregistered class gets UNKNOWN_POLICY, which is the
