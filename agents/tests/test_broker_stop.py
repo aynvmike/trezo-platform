@@ -282,12 +282,20 @@ def test_a_position_is_never_left_with_nothing_resting():
 
 # --- the venue gate -------------------------------------------------------
 
-def test_only_venues_that_hold_stops_are_synced():
-    """Alpaca has no native stop for crypto. Syncing one would fail on
-    every tick and teach us to ignore the error."""
+def test_a_venue_is_asked_for_the_stop_type_it_actually_takes():
+    """Rewritten 2026-08-18. This test used to assert "crypto gets no
+    stop" and read as settled fact for two months. Half true: crypto
+    gets no BRACKET, but it does take a stop_limit on gtc, and while
+    this test passed, real coins were riding with nothing behind them.
+
+    A test can encode a wrong belief as confidently as a right one. The
+    question is now the useful one -- which order type, not whether."""
     _reset()
     assert ap.policy_for("stock").native_brackets is True
-    assert ap.policy_for("crypto").native_brackets is False
+    assert ap.policy_for("crypto").native_brackets is False, (
+        "still no OCO for crypto -- that part was right")
+    assert ap.policy_for("stock").stop_order_type == "stop"
+    assert ap.policy_for("crypto").stop_order_type == "stop_limit"
 
 
 def test_replace_order_sends_only_what_changed():

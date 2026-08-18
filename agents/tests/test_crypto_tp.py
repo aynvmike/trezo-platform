@@ -232,5 +232,136 @@ def test_the_policy_tells_sell_paths_to_release_first():
     assert ap.policy_for("bond").holds_orders is False
 
 
+# --- the resting STOP, which is the half that actually protects --------
+# Corrected 2026-08-18. This file used to encode "Alpaca holds no stop
+# for crypto" as settled fact. It holds no *stop* and no bracket -- but
+# a stop_limit rests fine on gtc, and Mike had one on BTCUSD at 65,000
+# while the code was insisting otherwise. Alpaca's docs: crypto gets
+# market/limit (gtc, ioc) and stop_limit (gtc only).
+
+STOP_LEG = {"id": "sl-1", "type": "stop_limit", "side": "sell",
+            "stop_price": "60000.00", "limit_price": "59700.00",
+            "qty": "0.1"}
+
+
+def test_a_crypto_stop_is_sent_as_the_only_type_the_venue_takes():
+    _reset()
+    _orders([])
+    posted, _d, _r = _capture()
+    changed, note = _run(alp.ratchet_crypto_stop(
+        "BTCUSD", 60000.0, qty=0.1, offset_profile="balanced"))
+    assert changed is True, note
+    body = posted[0][1]
+    assert body["type"] == "stop_limit", (
+        "a plain stop is rejected for crypto -- it is equities-only")
+    assert body["time_in_force"] == "gtc", "crypto stop_limit is gtc-only"
+    assert body["symbol"] == "BTC/USD"
+    assert float(body["stop_price"]) == 60000.0
+    assert float(body["limit_price"]) == 59700.0, (
+        "the limit must sit UNDER the stop or it cannot fill on the way down")
+
+
+def test_a_crypto_stop_is_never_moved_down():
+    """The invariant the whole trail rests on. A stop that fails to
+    tighten costs upside; one that loosens costs the position."""
+    _reset()
+    _orders([STOP_LEG])
+    posted, deleted, replaced = _capture()
+    changed, note = _run(alp.ratchet_crypto_stop("BTCUSD", 55000.0, qty=0.1))
+    assert changed is False
+    assert not posted and not deleted and not replaced
+    assert "already at" in note
+
+
+def test_a_crypto_stop_ratchets_up_in_place():
+    """This is the trailing stop: as the ladder walks the stop up, the
+    lock-in walks up AT THE VENUE, so a good run stays banked even if
+    the engine is not running."""
+    _reset()
+    _orders([STOP_LEG])
+    posted, _deleted, replaced = _capture()
+    changed, _ = _run(alp.ratchet_crypto_stop(
+        "BTCUSD", 63000.0, qty=0.1, offset_profile="balanced"))
+    assert changed is True
+    assert len(replaced) == 1 and replaced[0][0] == "sl-1"
+    assert replaced[0][1]["stop_price"] == 63000.0
+    assert abs(replaced[0][1]["limit_price"] - 62685.0) < 1e-6
+    assert not posted, "amending must not also place a second stop"
+
+
+def test_a_refused_amend_re_places_the_stop_rather_than_dropping_it():
+    """Unlike a target, a stop may not simply be abandoned. If even the
+    re-place fails the note has to SAY the position is unprotected."""
+    _reset()
+    _orders([STOP_LEG])
+    posted, deleted, _r = _capture()
+
+    async def _refuse(order_id, **kw):
+        return None, "HTTP 422: order cannot be replaced"
+    alp.replace_order = _refuse
+
+    changed, _ = _run(alp.ratchet_crypto_stop("BTCUSD", 63000.0, qty=0.1))
+    assert changed is True
+    assert deleted == ["/v2/orders/sl-1"]
+    assert posted and posted[0][1]["type"] == "stop_limit"
+
+    # ...and when the re-place ALSO fails, say so loudly.
+    _reset()
+    _orders([STOP_LEG])
+    alp.replace_order = _refuse
+
+    async def _no(path, body, token=None):
+        return None, "HTTP 403: insufficient balance"
+
+    async def _del(path, token=None):
+        return {}, None
+    alp._post, alp._delete = _no, _del
+    changed2, note2 = _run(alp.ratchet_crypto_stop("BTCUSD", 63000.0, qty=0.1))
+    assert changed2 is False
+    assert "STOP IS GONE" in note2, note2
+
+
+def test_releasing_units_clears_the_stop_and_the_target_together():
+    """No OCO means they are two independent orders reserving the same
+    coins. Cancelling one leaves the other holding them, and the sell
+    that follows gets an insufficient-balance reject."""
+    _reset()
+    _orders([STOP_LEG, TP,
+             {"id": "buy-9", "type": "limit", "side": "buy",
+              "limit_price": "50000", "qty": "0.1"}])
+    _p, deleted, _r = _capture()
+    n, err = _run(alp.cancel_crypto_exits("BTCUSD"))
+    assert err is None and n == 2
+    assert set(deleted) == {"/v2/orders/sl-1", "/v2/orders/tp-1"}
+    assert "/v2/orders/buy-9" not in deleted, (
+        "cancelling a resting BUY would silently abandon an entry")
+
+
+def test_the_offset_scale_is_the_one_mike_named():
+    _reset()
+    from importlib import import_module  # noqa: F401
+    assert round(ap.stop_limit_offset("conservative"), 5) == 0.0015
+    assert round(ap.stop_limit_offset("balanced"), 5) == 0.0050
+    assert round(ap.stop_limit_offset("aggressive"), 5) == 0.0075
+    assert round(ap.stop_limit_offset("tolerant"), 5) == 0.0100
+    assert round(ap.stop_limit_offset("high"), 5) == 0.0150
+    # bot_settings speaks risk_profile; it maps rather than duplicating.
+    assert ap.stop_limit_offset("expert") == ap.stop_limit_offset("balanced")
+    # Never zero. A limit AT the stop is the one setting guaranteed to
+    # miss in the fast market a stop exists for.
+    assert ap.stop_limit_offset("nonsense") > 0
+
+
+def test_the_policy_names_the_order_type_each_venue_takes():
+    _reset()
+    assert ap.policy_for("crypto").stop_order_type == "stop_limit"
+    assert ap.policy_for("stock").stop_order_type == "stop"
+    assert ap.policy_for("crypto").holds_stop is True, (
+        "this was False until 8/18 and it was costing real protection")
+    # Fails CLOSED: a venue we have not confirmed must not be assumed.
+    assert ap.policy_for("option").holds_stop is False
+    assert ap.policy_for("nonsense-class").holds_stop is False
+
+
 if __name__ == "__main__":
     sys.exit(run_tests(dict(globals())))

@@ -957,6 +957,109 @@ async def ensure_crypto_take_profit(
     return True, f"crypto TP resting at {target:g}"
 
 
+def _is_crypto_stop_leg(order: dict) -> bool:
+    t = str(order.get("type") or order.get("order_type") or "").lower()
+    return t == "stop_limit" and str(order.get("side") or "").lower() == "sell"
+
+
+async def ratchet_crypto_stop(
+    symbol: str, new_stop: float, *, qty: Optional[float] = None,
+    offset_profile: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Move a coin's resting STOP-LIMIT up to `new_stop`, or place one.
+
+    Added 2026-08-18. For two months this codebase asserted that Alpaca
+    holds no stop for crypto, so every coin's stop lived only in our
+    ledger and died with the engine -- fifteen hours of it on 8/17. The
+    assertion was half wrong: no *stop* and no bracket, but a stop_limit
+    rests fine on gtc. Mike had one on BTCUSD at 65,000 while the code
+    was still calling it impossible.
+
+    RATCHET ONLY, same rule as equities: a long's stop never moves down.
+    That is what makes this a trailing stop rather than just protection
+    -- as the ladder walks the stop up, the lock-in walks up WITH IT at
+    the venue, so a good run is banked even if we are not running.
+
+    The limit rides below the stop by the book's offset (see
+    asset_policy.STOP_LIMIT_OFFSETS). Returns (changed, note); never
+    raises."""
+    from app.runtime.asset_policy import stop_limit_price
+
+    sym = symbol.upper().strip()
+    pair = _crypto_pair(sym)
+    if not new_stop or new_stop <= 0:
+        return False, "no stop to place"
+
+    orders = await open_crypto_orders(sym)
+    if orders is None:
+        return False, "could not read open orders - left untouched"
+
+    limit_px = stop_limit_price(new_stop, "long", offset_profile)
+    legs = [o for o in orders if _is_crypto_stop_leg(o)]
+
+    if legs:
+        leg = legs[0]
+        try:
+            current = float(leg.get("stop_price") or 0)
+        except (TypeError, ValueError):
+            current = 0.0
+        # Never down. A bug that loosens a stop costs the position; one
+        # that fails to tighten costs some upside.
+        if current and new_stop <= current * 1.0004:
+            return False, f"crypto stop already at {current:g}"
+        _res, err = await replace_order(
+            str(leg.get("id")), stop_price=new_stop, limit_price=limit_px)
+        if not err:
+            return True, f"crypto stop {current:g} -> {new_stop:g}"
+        # Amend refused. Unlike a target, a stop must not simply be
+        # dropped -- cancel and re-place, then say so if even that fails,
+        # because the position is unprotected until it succeeds.
+        for o in legs:
+            if o.get("id"):
+                await _delete(f"/v2/orders/{o.get('id')}")
+        _o2, err2 = await _post("/v2/orders", {
+            "symbol": pair, "qty": str(qty or leg.get("qty")), "side": "sell",
+            "type": "stop_limit", "stop_price": str(new_stop),
+            "limit_price": str(limit_px), "time_in_force": "gtc",
+        })
+        if err2:
+            return False, (f"STOP IS GONE - amend refused ({err}) and "
+                           f"re-place failed ({err2})")
+        return True, f"crypto stop re-placed at {new_stop:g} (amend refused: {err})"
+
+    if not qty or qty <= 0:
+        return False, "no resting stop and no quantity to protect"
+    _o, err = await _post("/v2/orders", {
+        "symbol": pair, "qty": str(qty), "side": "sell",
+        "type": "stop_limit", "stop_price": str(new_stop),
+        "limit_price": str(limit_px), "time_in_force": "gtc",
+    })
+    if err:
+        return False, f"could not place crypto stop: {err}"
+    return True, f"crypto stop resting at {new_stop:g} (limit {limit_px:g})"
+
+
+async def cancel_crypto_exits(symbol: str) -> tuple[int, Optional[str]]:
+    """Release EVERY resting sell on a coin -- stop-limit and target
+    alike -- so another sell can use the units.
+
+    Alpaca gives crypto no OCO, so protection and target are two
+    independent orders and each reserves inventory separately. Anything
+    about to sell must clear both; clearing only one leaves the other
+    holding the coins and the sell gets an insufficient-balance reject.
+    Error ONLY when the LISTING failed, so a caller can tell "nothing
+    was resting" from "I could not find out"."""
+    orders = await open_crypto_orders(symbol)
+    if orders is None:
+        return 0, "could not list open crypto orders"
+    n = 0
+    for o in orders:
+        if (_is_sell_limit(o) or _is_crypto_stop_leg(o)) and o.get("id"):
+            await _delete(f"/v2/orders/{o.get('id')}")
+            n += 1
+    return n, None
+
+
 async def cancel_crypto_take_profit(symbol: str) -> tuple[int, Optional[str]]:
     """Release the units a resting TP is holding. Returns (cancelled,
     error) -- error ONLY when the listing failed, because a caller that

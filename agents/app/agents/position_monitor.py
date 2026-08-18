@@ -563,6 +563,21 @@ async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
     return new_stop
 
 
+def _stop_offset_profile(r: dict) -> str:
+    """This BOOK's stop-limit offset setting, by name.
+
+    Per book, not global -- the 25k and the 75k may want different
+    tolerance for a stop that does not fill, and 8/18 was spent removing
+    exactly this kind of one-book-decides-for-all leak. Falls back to
+    the balanced default when the row has no book or the read fails."""
+    try:
+        from app.runtime.settings import get_bot_settings
+        return str(getattr(get_bot_settings(str(r.get("user_id") or "")),
+                           "risk_profile", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def _push_stop_to_broker(r: dict, new_stop: float) -> None:
     """Mirror a ratcheted stop to the VENUE, where it keeps working when
     we do not.
@@ -574,23 +589,39 @@ async def _push_stop_to_broker(r: dict, new_stop: float) -> None:
     the broker survives a crash, a restart, a locked-out afternoon and a
     deleted instance.
 
-    Only for venues that actually hold stops: the asset policy decides,
-    so crypto (no native stop at Alpaca) is skipped rather than failing
-    noisily every tick. Ratchet-only, and never raises -- a failure here
-    must not stop the ledger-side protection that already worked."""
+    Only for venues that actually hold stops -- the asset policy decides,
+    and it names the ORDER TYPE, because they differ: equities take a
+    plain stop, crypto only a stop_limit. Ratchet-only, and never raises;
+    a failure here must not stop the ledger-side protection that already
+    worked."""
     if os.getenv("TREZO_BROKER_STOP_SYNC", "1") == "0":
         return
     if str(r.get("broker") or "") != "alpaca":
         return
     try:
-        if not _asset_policy(r.get("asset_type")).native_brackets:
-            return          # e.g. crypto: the venue cannot hold a stop
-        from app.brokers.alpaca import ratchet_stop
-        changed, note = await ratchet_stop(
-            str(r.get("ticker") or ""), float(new_stop),
-            qty=float(r.get("quantity") or 0) or None,
-            target_price=(float(r["target_price"])
-                          if r.get("target_price") else None))
+        pol = _asset_policy(r.get("asset_type"))
+        if not pol.holds_stop:
+            return          # e.g. options: nothing to mirror to
+        if r.get("side") != "long":
+            return          # ratchet-up is a long's rule
+        _sym = str(r.get("ticker") or "")
+        _qty = float(r.get("quantity") or 0) or None
+        if pol.stop_order_type == "stop_limit":
+            # Crypto (2026-08-18). Alpaca holds no stop and no bracket
+            # for a coin, but it does hold a stop_limit on gtc -- so the
+            # trail can live at the venue after all, and a good run stays
+            # banked through an outage instead of unwinding during one.
+            # The limit rides under the stop by this BOOK's offset.
+            from app.brokers.alpaca import ratchet_crypto_stop
+            changed, note = await ratchet_crypto_stop(
+                _sym, float(new_stop), qty=_qty,
+                offset_profile=_stop_offset_profile(r))
+        else:
+            from app.brokers.alpaca import ratchet_stop
+            changed, note = await ratchet_stop(
+                _sym, float(new_stop), qty=_qty,
+                target_price=(float(r["target_price"])
+                              if r.get("target_price") else None))
         if changed:
             from app.agents.activity_log import record
             record("broker_stop_moved", str(r.get("ticker") or "?"),
@@ -615,10 +646,14 @@ async def _push_crypto_tp(r: dict, target: float | None) -> None:
     sell path, it must release them too -- AssetPolicy.resting_exits is
     the flag that says so.
 
-    Off with TREZO_CRYPTO_TP_RESTING=0. Never raises: a venue that
-    refuses the order leaves the row exactly as protected as it was
-    yesterday, which is to say client-side only."""
-    if os.getenv("TREZO_CRYPTO_TP_RESTING", "1") == "0":
+    OFF BY DEFAULT since 2026-08-18, and the reason matters. Alpaca has
+    no OCO for crypto, so a resting target and a resting stop are two
+    separate orders reserving the same coins -- rest a full-size target
+    and the stop gets an insufficient-balance reject. Mike's call: the
+    stop wins. Set TREZO_CRYPTO_TP_RESTING=1 only if you have confirmed
+    the venue lets both rest at once, and check the stop is still there
+    afterwards. Never raises."""
+    if os.getenv("TREZO_CRYPTO_TP_RESTING", "0") == "0":
         return
     if str(r.get("broker") or "") != "alpaca":
         return
@@ -1005,11 +1040,14 @@ async def _alpaca_profit_step(r, price: float,
         # straight into an insufficient-balance reject. Cancel our TP,
         # then verify -- an unverifiable release must abort exactly like
         # an unverifiable leg cancel.
-        from app.brokers.alpaca import (cancel_crypto_take_profit,
+        from app.brokers.alpaca import (cancel_crypto_exits,
                                         open_crypto_orders)
-        _n, err = await cancel_crypto_take_profit(sym)
+        # BOTH the stop-limit and the target, because crypto has no OCO:
+        # they are independent orders and each reserves inventory, so
+        # clearing one leaves the other holding the coins.
+        _n, err = await cancel_crypto_exits(sym)
         if err:
-            return False, f"could not release resting TP ({err}) - aborted untouched"
+            return False, f"could not release resting exits ({err}) - aborted untouched"
         left = []
         for _ in range(4):
             await asyncio.sleep(0.5)
@@ -1018,7 +1056,7 @@ async def _alpaca_profit_step(r, price: float,
             # is resting, and a verify that cannot fail verifies nothing.
             _open = await open_crypto_orders(sym)
             if _open is None:
-                return False, "could not verify TP released - aborted untouched"
+                return False, "could not verify exits released - aborted untouched"
             left = [o for o in _open
                     if str(o.get("side") or "").lower() == "sell"]
             if not left:
@@ -1048,24 +1086,23 @@ async def _alpaca_profit_step(r, price: float,
         if pol.native_brackets:
             await submit_oco_sell(sym, qty_total, target_p, stop_p)
             return False, f"slice sell rejected ({serr}); protection restored"
-        if pol.resting_exits and target_p:
-            # We cancelled the TP to free the units and then sold
-            # nothing. Leaving without re-resting it would quietly strip
-            # the only exit the venue holds for this row.
-            from app.brokers.alpaca import ensure_crypto_take_profit
-            await ensure_crypto_take_profit(sym, qty_total, target_p)
-            return False, f"slice sell rejected ({serr}); TP restored"
+        if pol.resting_exits:
+            # We released the venue orders to free the units and then
+            # sold nothing. Walking away here strips the protection we
+            # came to improve. STOP first -- it is the one that matters,
+            # and with no OCO there may only be room for one.
+            _restored = await _rest_crypto_exits(r, sym, qty_total,
+                                                 stop_p, target_p)
+            return False, f"slice sell rejected ({serr}); {_restored}"
         return False, f"slice sell rejected ({serr}); position untouched"
     # 3) Re-protect the remainder (OCO: original target + stop), retry once.
     #    Where the venue holds no bracket, protection was never AT the
     #    broker: the monitor enforces this row's stop client-side every
     #    tick, so the remainder is as protected as it ever was.
     if pol.resting_exits and not pol.native_brackets:
-        # Put the target back on what is left. The STOP stays
-        # client-side; the venue has none to give for crypto.
-        from app.brokers.alpaca import ensure_crypto_take_profit
-        if target_p and remaining > 0:
-            await ensure_crypto_take_profit(sym, remaining, target_p)
+        # Put protection back on what is left, stop first.
+        if remaining > 0:
+            await _rest_crypto_exits(r, sym, remaining, stop_p, target_p)
         protected = True
     elif not pol.native_brackets:
         protected = True
@@ -1095,6 +1132,35 @@ async def _alpaca_profit_step(r, price: float,
             + ("remainder re-protected (OCO)" if protected
                else "remainder NOT re-protected - naked-guard enforcing"))
     return True, note
+
+
+async def _rest_crypto_exits(r: dict, sym: str, qty: float,
+                             stop_p: float, target_p: float) -> str:
+    """Put a coin's venue-side exits back, STOP FIRST.
+
+    Alpaca gives crypto no OCO, so the stop-limit and the target are two
+    separate orders competing for the same units. If only one fits, it
+    must be the stop -- Mike's call on 2026-08-18, and the right one: a
+    missed target costs upside, a missed stop costs the position.
+
+    The target is attempted second and allowed to fail quietly. That is
+    also how we learn, per coin, whether Alpaca double-reserves: if it
+    rejects, the target simply stays client-side where it has always
+    been."""
+    notes = []
+    if stop_p and stop_p > 0:
+        from app.brokers.alpaca import ratchet_crypto_stop
+        ok, note = await ratchet_crypto_stop(
+            sym, float(stop_p), qty=qty,
+            offset_profile=_stop_offset_profile(r))
+        notes.append("stop rested" if ok else f"STOP NOT RESTED ({note})")
+    if target_p and target_p > 0 and os.getenv(
+            "TREZO_CRYPTO_TP_RESTING", "0") != "0":
+        from app.brokers.alpaca import ensure_crypto_take_profit
+        ok2, _n2 = await ensure_crypto_take_profit(sym, qty, float(target_p))
+        if ok2:
+            notes.append("target rested")
+    return "; ".join(notes) or "nothing to rest"
 
 
 async def _throttled_liquidate(symbol: str, asset_type: str = "stock"):

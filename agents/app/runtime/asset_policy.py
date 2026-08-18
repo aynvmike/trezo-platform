@@ -55,6 +55,29 @@ class AssetPolicy:
     # equity brackets, whose legs expire at the close.
     client_side_exits: bool = True
 
+    # WHICH ORDER TYPE will this venue hold as a resting stop for us?
+    # "" means none, and the monitor is the only thing standing between
+    # the position and a drawdown.
+    #
+    # Corrected 2026-08-18 (Mike, with the receipts): this codebase had
+    # said since June that Alpaca holds NO stop for crypto. Half true.
+    # It holds no *stop* and no bracket -- but it does hold a STOP-LIMIT,
+    # gtc, and Mike had one resting on BTCUSD at 65,000 while the code
+    # was still insisting it was impossible. Alpaca's own docs agree:
+    # crypto gets market/limit (gtc, ioc) and stop_limit (gtc only);
+    # stop, trailing_stop, and bracket/OCO/OTO are equities-only.
+    #
+    # So a crypto position CAN be protected at the venue, and the stop
+    # can ratchet up there -- which is what makes a trailing stop
+    # survive an engine outage instead of dying with it.
+    #
+    # Defaults to "" -- fails CLOSED. A venue we have not confirmed holds
+    # a stop must not be assumed to, because the failure is invisible:
+    # we would send a stop, it would be rejected, and the position would
+    # look protected while being naked. Declare it per class, from the
+    # venue's own documentation.
+    stop_order_type: str = ""
+
     # Do we park a STANDALONE resting order at this venue -- one that is
     # not a bracket leg but still reserves the inventory?
     #
@@ -122,6 +145,13 @@ class AssetPolicy:
         return slice_qty
 
     @property
+    def holds_stop(self) -> bool:
+        """True when protection can rest at the venue rather than only
+        in our ledger. The single most important question about an asset
+        class, because it decides what survives us going down."""
+        return bool(self.stop_order_type)
+
+    @property
     def holds_orders(self) -> bool:
         """True when something of ours may be RESTING at the venue for
         this symbol -- a bracket leg or a standalone limit. Any code
@@ -153,6 +183,7 @@ def _crypto_variants(symbol: str) -> frozenset:
 STOCK = AssetPolicy(
     asset_type="stock", label="US equity / ETF",
     native_brackets=True,
+    stop_order_type="stop",
     # Day-TIF bracket legs die at the close, so a row that survives into
     # the next session has no protection at the broker until we re-arm it
     # (the 2026-06-11 naked-position case). We check every tick regardless.
@@ -167,13 +198,15 @@ CRYPTO = AssetPolicy(
     # Alpaca has NO native bracket for crypto. This single False is why
     # a crypto row Trezo cannot see is a genuinely naked position.
     native_brackets=False,
+    # No bracket and no OCO -- but a stop_limit rests fine, gtc only.
+    stop_order_type="stop_limit",
     client_side_exits=True,
     resting_exits=True,
     supports_partial_step=True, fractional=True,
     min_slice=1e-6, min_remainder=1e-6,
     session_gated=False, adoptable=True,
     symbol_variants=_crypto_variants,
-    notes="24/7; no broker bracket; resting GTC limit holds the target;"
+    notes="24/7; no bracket or OCO, but a gtc stop_limit rests;"
           " fractional units.",
 )
 
@@ -206,6 +239,7 @@ FOREX = AssetPolicy(
 FUTURE = AssetPolicy(
     asset_type="future", label="Futures contract",
     native_brackets=True,
+    stop_order_type="stop",
     client_side_exits=True,
     supports_partial_step=True, fractional=False,
     min_slice=1.0, min_remainder=1.0,
@@ -341,6 +375,7 @@ def describe() -> list[dict]:
         "native_brackets": p.native_brackets,
         "client_side_exits": p.client_side_exits,
         "resting_exits": p.resting_exits,
+        "stop_order_type": p.stop_order_type,
         "supports_partial_step": p.supports_partial_step,
         "fractional": p.fractional, "session_gated": p.session_gated,
         "adoptable": p.adoptable, "venue": p.venue, "notes": p.notes,
@@ -354,6 +389,69 @@ def describe() -> list[dict]:
 # trail -- the trail was added to SWING and SCALP by hand and DCA was
 # simply missed (2026-08-17 audit: XRP ran up and round-tripped with
 # nothing between the rungs).
+
+
+
+# ---------------------------------------------------------------------------
+# Stop-limit offset: how far UNDER the stop the limit sits.
+# ---------------------------------------------------------------------------
+# A stop_limit is the only resting stop crypto can have at Alpaca, and it
+# carries a failure mode a plain stop does not: when the trigger fires,
+# the order becomes a LIMIT. If price has already jumped past that limit
+# -- which is exactly what happens in the crashes a stop exists for --
+# nothing fills, and an unfilled stop is indistinguishable from no stop.
+# It fails silently, which is the worst way for protection to fail.
+#
+# The offset buys fill probability with exit price. Mike named the scale
+# on 2026-08-18; the names are his framing (tight = conservative on
+# PRICE). Worth saying plainly, because the names point the opposite way
+# from the risk: "conservative" is the tightest limit and therefore the
+# one MOST likely not to fill at all.
+STOP_LIMIT_OFFSETS: dict[str, float] = {
+    "conservative": 0.0015,   # 0.15% -- best fill price, worst fill odds
+    "balanced": 0.0050,       # 0.5%  -- the default
+    "aggressive": 0.0075,     # 0.75%
+    "tolerant": 0.0100,       # 1.0%
+    "high": 0.0150,           # 1.5%  -- worst price, best odds of being out
+}
+DEFAULT_STOP_LIMIT_OFFSET = STOP_LIMIT_OFFSETS["balanced"]
+
+# bot_settings.risk_profile speaks a different vocabulary than the scale
+# above. Map it rather than making Mike keep two settings in sync.
+_RISK_PROFILE_TO_OFFSET = {
+    "conservative": "conservative",
+    "balanced": "balanced",
+    "aggressive": "aggressive",
+    "expert": "balanced",     # expert unlocks the raw slider; until it is
+                              # set, expert is not a licence to guess
+}
+
+
+def stop_limit_offset(name_or_profile: Optional[str] = None) -> float:
+    """Fraction to subtract from a stop to get its limit price.
+
+    Accepts either a scale name ('balanced') or a bot_settings
+    risk_profile ('aggressive'). Unknown input returns the default --
+    never zero, because a limit AT the stop is the one setting
+    guaranteed to miss in a fast market."""
+    key = (name_or_profile or "").strip().lower()
+    if key in STOP_LIMIT_OFFSETS:
+        return STOP_LIMIT_OFFSETS[key]
+    mapped = _RISK_PROFILE_TO_OFFSET.get(key)
+    if mapped:
+        return STOP_LIMIT_OFFSETS[mapped]
+    return DEFAULT_STOP_LIMIT_OFFSET
+
+
+def stop_limit_price(stop: float, side: str = "long",
+                     name_or_profile: Optional[str] = None) -> float:
+    """The limit that pairs with `stop`. For a long we are SELLING, so
+    the limit sits BELOW the stop (accept a worse price to get out); for
+    a short we are buying back, so it sits above."""
+    off = stop_limit_offset(name_or_profile)
+    if side == "short":
+        return round(float(stop) * (1.0 + off), 6)
+    return round(float(stop) * (1.0 - off), 6)
 
 
 @dataclass(frozen=True)
