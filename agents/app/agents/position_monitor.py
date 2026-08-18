@@ -622,6 +622,8 @@ async def _push_crypto_tp(r: dict, target: float | None) -> None:
         return
     if str(r.get("broker") or "") != "alpaca":
         return
+    if r.get("side") != "long":
+        return          # a resting SELL is only a target for a long
     if not target or target <= 0:
         return
     try:
