@@ -926,14 +926,18 @@ async def _alpaca_profit_step(r, price: float,
         # straight into an insufficient-balance reject. Cancel our TP,
         # then verify -- an unverifiable release must abort exactly like
         # an unverifiable leg cancel.
-        from app.brokers.alpaca import cancel_crypto_take_profit
+        from app.brokers.alpaca import (cancel_crypto_take_profit,
+                                        open_crypto_orders)
         _n, err = await cancel_crypto_take_profit(sym)
         if err:
             return False, f"could not release resting TP ({err}) - aborted untouched"
         left = []
         for _ in range(4):
             await asyncio.sleep(0.5)
-            _open = await get_open_orders_for(sym)
+            # open_crypto_orders, not get_open_orders_for: a bare ticker
+            # asked of the equity-shaped query returns [] no matter what
+            # is resting, and a verify that cannot fail verifies nothing.
+            _open = await open_crypto_orders(sym)
             if _open is None:
                 return False, "could not verify TP released - aborted untouched"
             left = [o for o in _open

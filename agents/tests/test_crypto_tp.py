@@ -45,9 +45,13 @@ def _run(coro):
 
 
 def _orders(rows):
+    asked = []
+
     async def _f(symbol):
+        asked.append(symbol)
         return list(rows)
     alp.get_open_orders_for = _f
+    return asked
 
 
 def _capture():
@@ -158,6 +162,20 @@ def test_every_spelling_of_a_coin_reaches_the_same_venue_symbol():
     assert alp._crypto_pair("USDCUSD") == "USDC/USD", (
         "a coin whose own name ends in USD must not be truncated twice")
     assert alp._crypto_pair("USDT") == "USDT/USD"
+
+
+def test_a_coin_is_asked_about_by_its_venue_symbol():
+    """get_open_orders_for passes the symbol straight through, which is
+    right for equities and wrong here: asking symbols=XRP returns []
+    while an order rests under XRPUSD. An empty answer that really means
+    "wrong question" is worse than an error -- the caller reads it as
+    "nothing is resting" and sells into a reservation."""
+    _reset()
+    asked = _orders([])
+    _capture()
+    _run(alp.ensure_crypto_take_profit("XRP", 714.7, 1.20))
+    _run(alp.cancel_crypto_take_profit("XRP"))
+    assert asked == ["XRPUSD", "XRPUSD"], asked
 
 
 def test_a_resting_buy_is_not_mistaken_for_our_target():

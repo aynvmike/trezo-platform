@@ -799,6 +799,17 @@ async def ratchet_stop(symbol: str, new_stop: float, *,
 # cancel it first (see AssetPolicy.resting_exits).
 
 
+async def open_crypto_orders(symbol: str) -> Optional[list]:
+    """Open orders for a coin, addressed the way the venue addresses it.
+
+    get_open_orders_for() passes the symbol through untouched, which is
+    right for equities and wrong for crypto: a row stored as 'XRP' would
+    query symbols=XRP and come back EMPTY while an order rests under
+    XRPUSD. An empty answer that means 'wrong question' is worse than an
+    error, because callers read it as 'nothing is resting' and sell."""
+    return await get_open_orders_for(_crypto_pair(symbol).replace("/", ""))
+
+
 def _is_sell_limit(order: dict) -> bool:
     t = str(order.get("type") or order.get("order_type") or "").lower()
     return t == "limit" and str(order.get("side") or "").lower() == "sell"
@@ -824,7 +835,7 @@ async def ensure_crypto_take_profit(
     if not (qty and qty > 0 and target and target > 0):
         return False, "no quantity or target to rest"
 
-    orders = await get_open_orders_for(pair.replace("/", ""))
+    orders = await open_crypto_orders(sym)
     if orders is None:
         return False, "could not read open orders - left untouched"
 
@@ -875,8 +886,7 @@ async def cancel_crypto_take_profit(symbol: str) -> tuple[int, Optional[str]]:
     error) -- error ONLY when the listing failed, because a caller that
     is about to sell must be able to tell 'nothing was resting' apart
     from 'I could not find out'."""
-    pair = _crypto_pair(symbol.upper().strip()).replace("/", "")
-    orders = await get_open_orders_for(pair)
+    orders = await open_crypto_orders(symbol)
     if orders is None:
         return 0, "could not list open crypto orders"
     n = 0
