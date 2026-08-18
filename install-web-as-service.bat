@@ -47,13 +47,30 @@ if not defined NODE (
 )
 echo Using Node: %NODE%
 
+REM --- locate the next binary ---
+REM This repo is an npm WORKSPACES monorepo: `npm install` at the ROOT
+REM hoists dependencies into the root node_modules, and web\node_modules
+REM may not exist at all on a clean checkout. This script used to assume
+REM web\node_modules and failed on the server with MODULE_NOT_FOUND while
+REM working fine on Mike's PC, where both copies happen to exist
+REM (2026-08-18). Same assumption broke CI the same morning. Check both.
 set "NEXTBIN=%~dp0web\node_modules\next\dist\bin\next"
+if not exist "%NEXTBIN%" set "NEXTBIN=%~dp0node_modules\next\dist\bin\next"
 if not exist "%NEXTBIN%" (
-  echo ERROR: next binary not found at %NEXTBIN%
-  echo Run: npm install
+  echo ERROR: next binary not found in either location:
+  echo   %~dp0web\node_modules\next\dist\bin\next
+  echo   %~dp0node_modules\next\dist\bin\next
+  echo.
+  echo Install dependencies from the REPO ROOT, not from web\ -- this is
+  echo an npm workspaces monorepo and the lockfile lives at the root:
+  echo.
+  echo   cd /d "%~dp0"
+  echo   npm install --no-audit --no-fund
+  echo.
   pause
   exit /b 1
 )
+echo Using next:  %NEXTBIN%
 
 REM --- stop the legacy console-window autostart so we do not end up
 REM     with two things fighting over port 3000 ---
