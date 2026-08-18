@@ -246,7 +246,7 @@ def test_score_runs_without_context():
                for i in range(60)]
     s = calculate_score(candles)
     assert 0 <= s.score <= 100
-    assert 0 <= s.tcs <= 1000
+    assert 0 <= s.tcs <= 100      # one scale everywhere (2026-07-08)
     assert s.direction in {"bullish", "bearish", "neutral"}
 
 
@@ -255,8 +255,16 @@ def test_score_with_market_context():
                for i in range(60)]
     ctx = MarketContext(spy_trending_up=True, iv_rank=45.0, catalyst_today=True)
     s = calculate_score(candles, ctx)
-    # Catalyst + IV-in-sweet-spot + uptrending market should give a meaningful score
-    assert s.tcs > 300
+    # Catalyst + IV-in-sweet-spot + uptrending market should give a
+    # meaningful score.
+    #
+    # Was `> 300` until 2026-08-18. TCS moved to a single 0-100 scale on
+    # 2026-07-08 (scoring.py line 53; settings.py even self-heals
+    # old-scale writes), so this assertion has been impossible to pass
+    # for six weeks. Nobody noticed because pytest is not installed on
+    # the server and nothing ran these -- which is the actual lesson:
+    # a suite no runner touches decays into decoration.
+    assert s.tcs > 60
 
 
 # ----- Confluence --------------------------------------------------------------

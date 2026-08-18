@@ -47,10 +47,17 @@ def test_eligible_all_windows_open():
 
 def test_eligible_all_windows_closed():
     # STMS, ORB and Extended drop out; the always-on strategies remain.
+    # 'scalp' joined the always-on set after this test was written and
+    # the expected list was never updated (fixed 2026-08-18). Assert the
+    # PROPERTY -- windowed strategies leave, unwindowed ones stay --
+    # rather than a literal list, so adding a strategy does not break a
+    # test about windows.
     got = eligible_strategies("stock", in_stms_window=False,
                               in_orb_window=False, in_swing_window=False)
-    assert got == ["default", "pattern"]
-    assert "stms" not in got and "orb" not in got and "extended" not in got
+    windowed = {"stms", "orb", "extended"}
+    assert not (windowed & set(got)), got
+    assert set(got) == set(STOCK_STRATEGIES) - windowed, got
+    assert "default" in got and "pattern" in got
 
 
 def test_eligible_one_window_open():
