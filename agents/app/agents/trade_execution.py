@@ -67,7 +67,12 @@ class TradeExecutionAgent(Agent):
         try:
             from app.runtime.settings import get_bot_settings
             cfg = get_bot_settings(user_id)
-            if not cfg.auto_trade_enabled:
+            # 2026-08-18: only when the signal names a book. Without a
+            # user_id this read the GLOBAL row and returned here, so the
+            # primary's Auto-trade toggle silenced all three books --
+            # and, flipped on, spoke for books that had it off. The
+            # fan-out below asks each book for itself.
+            if user_id and not cfg.auto_trade_enabled:
                 return [AgentMessage(
                     agent=self.name, kind="info", confidence=1.0,
                     payload={
@@ -172,6 +177,8 @@ class TradeExecutionAgent(Agent):
         from app.brokers.accounts import bind_for_user as _bind_acct
         from app.brokers.route_guard import check_route as _check_route
         from app.brokers.route_guard import record_mismatch as _rec_mm
+        from app.runtime.book_gate import admits as _admits
+        from app.runtime.settings import get_bot_settings as _bot_settings
         for uid in users:
             try:
                 # Each book's order must go to ITS OWN broker account.
@@ -182,6 +189,32 @@ class TradeExecutionAgent(Agent):
                     _ok, _note = _check_route(uid)
                     if not _ok:
                         _rec_mm(ticker, uid, _note, "execute.fanout")
+                        continue
+                    # Per-book appetite (2026-08-18). A scanner signal
+                    # carries no user_id, so every settings read upstream
+                    # of here -- the scanner's own toggle, the TCS floor
+                    # Risk Manager judged it against -- resolved to the
+                    # GLOBAL row. One book's opinion then applied to all
+                    # three: turning crypto off on the 25k did nothing,
+                    # because the primary's crypto_enabled was what the
+                    # scanner read. This is the first line where a book
+                    # has a name, so it is where its own answer counts.
+                    _v = _admits(
+                        _bot_settings(uid),
+                        asset_type=("crypto" if ticker.upper() in CRYPTO_SYMBOLS
+                                    else str(source_payload.get("asset_type")
+                                             or "stock")),
+                        strategy=str(source_payload.get("strategy") or ""),
+                        tcs=source_payload.get("tcs"))
+                    if not _v.ok:
+                        out.append(AgentMessage(
+                            agent=self.name, kind="info", confidence=1.0,
+                            payload={"user_id": uid, "ticker": ticker,
+                                     "side": side,
+                                     "event": _v.event,
+                                     "strategy": source_payload.get("strategy"),
+                                     "tcs": source_payload.get("tcs"),
+                                     "note": f"{ticker}: {_v.reason}"}))
                         continue
                     msgs = await self._execute_for_user(uid, ticker, side,
                                                         source_payload)
