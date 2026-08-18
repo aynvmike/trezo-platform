@@ -23,8 +23,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _bootstrap import load_module, run_tests  # noqa: E402
+from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
 
+stub_config()  # app.brokers.accounts reads settings at import
 book_scope = load_module("app.runtime.book_scope")
 from app.brokers import accounts as acct  # noqa: E402
 

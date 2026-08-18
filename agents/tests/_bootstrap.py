@@ -29,6 +29,35 @@ def _stub_package(name: str, path: Path) -> types.ModuleType:
     return mod
 
 
+def stub_config(**overrides) -> types.ModuleType:
+    """Install a credential-free `app.config` BEFORE anything imports it.
+
+    Several modules under test (`app.brokers.*`) read settings at import
+    time, so on a machine without pydantic-settings or a .env the import
+    dies and the guard never runs. Call this first in any test file that
+    touches a broker module."""
+    if "app.config" in sys.modules:
+        return sys.modules["app.config"]
+    _stub_package("app", AGENTS_DIR / "app")
+    cfg = types.ModuleType("app.config")
+
+    class _Settings:
+        alpaca_api_key = "K" * 26
+        alpaca_secret_key = "S" * 44
+        alpaca_base_url = "https://paper-api.alpaca.markets"
+        trezo_live_trading = False
+        supabase_url = "https://stub.supabase.co"
+        supabase_service_role_key = "stub"
+        supabase_anon_key = "stub"
+
+    for k, v in overrides.items():
+        setattr(_Settings, k, v)
+    cfg.get_settings = lambda: _Settings()
+    cfg.settings = _Settings()
+    sys.modules["app.config"] = cfg
+    return cfg
+
+
 def load_module(dotted: str) -> types.ModuleType:
     """load_module('app.runtime.book_scope') -> the module object."""
     if str(AGENTS_DIR) not in sys.path:

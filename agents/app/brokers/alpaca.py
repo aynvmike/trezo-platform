@@ -194,6 +194,36 @@ async def _post(path: str, body: dict,
         return None, str(e)
 
 
+async def _patch(path: str, body: dict,
+                 token: Optional["UserToken"] = None) -> tuple[Optional[dict], Optional[str]]:
+    """PATCH an Alpaca endpoint -- used to AMEND a resting order in place
+    rather than cancelling and re-placing it.
+
+    WHY THIS EXISTS (2026-08-18): nothing in this codebase had ever
+    modified a live order. Moving a stop meant cancel-then-place, which
+    opens a window where the position has no protection at all -- and
+    that window is exactly how the profit step kept leaving remainders
+    naked when the second leg failed. Amending is atomic at the venue:
+    the order either moves or it doesn't, and the old one stays in force
+    until it does."""
+    if token is None and not alpaca_configured():
+        return None, "Alpaca is not configured"
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(_base_url() + path, json=body,
+                                      headers={**_headers_for(token),
+                                               "Content-Type": "application/json"})
+            if resp.status_code >= 400:
+                return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            try:
+                return resp.json(), None
+            except Exception:  # noqa: BLE001
+                return {}, None
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)[:200]
+
+
 async def _delete(path: str,
                     token: Optional["UserToken"] = None) -> tuple[Optional[dict], Optional[str]]:
     """DELETE an Alpaca endpoint. Returns (json, None) on success or
@@ -655,6 +685,83 @@ async def get_open_orders_for(symbol: str) -> Optional[list]:
     with AAPL). Callers must treat None as 'could not check'."""
     data = await _get(f"/v2/orders?status=open&symbols={symbol.upper()}")
     return data if isinstance(data, list) else None
+
+
+async def replace_order(order_id: str, *, qty: Optional[float] = None,
+                        limit_price: Optional[float] = None,
+                        stop_price: Optional[float] = None,
+                        time_in_force: Optional[str] = None
+                        ) -> tuple[Optional[dict], Optional[str]]:
+    """Amend a resting order in place. Only the fields you pass change.
+
+    Alpaca returns a NEW order id for the replacement; the old one is
+    cancelled by the venue as part of the same operation, so there is no
+    unprotected gap."""
+    body: dict = {}
+    if qty is not None:
+        body["qty"] = str(int(qty)) if float(qty).is_integer() else str(qty)
+    if limit_price is not None:
+        body["limit_price"] = str(round(float(limit_price), 2))
+    if stop_price is not None:
+        body["stop_price"] = str(round(float(stop_price), 2))
+    if time_in_force is not None:
+        body["time_in_force"] = time_in_force
+    if not body:
+        return None, "replace_order called with nothing to change"
+    return await _patch(f"/v2/orders/{order_id}", body)
+
+
+def _is_stop_leg(order: dict) -> bool:
+    t = str(order.get("type") or order.get("order_type") or "").lower()
+    return "stop" in t and str(order.get("side") or "").lower() == "sell"
+
+
+async def ratchet_stop(symbol: str, new_stop: float, *,
+                       qty: Optional[float] = None,
+                       target_price: Optional[float] = None
+                       ) -> tuple[bool, str]:
+    """Move the resting stop for `symbol` UP to `new_stop`, or place one
+    if none exists. Returns (changed, note). Never raises.
+
+    This is the piece that makes a trailing stop real. Until now the
+    ladder ratcheted a number in OUR ledger and enforced it by watching
+    the tape -- which works only while the engine is alive. On 2026-08-17
+    the engine was not alive for fifteen hours. A stop that lives at the
+    venue keeps working while we are down, restarting, or locked out.
+
+    RATCHET ONLY: it will never move a long's stop DOWN. A bug that
+    loosens protection is far worse than one that fails to tighten it."""
+    sym = symbol.upper().strip()
+    orders = await get_open_orders_for(sym)
+    if orders is None:
+        return False, "could not read open orders - left untouched"
+
+    stop_legs = [o for o in orders if _is_stop_leg(o)]
+    if stop_legs:
+        leg = stop_legs[0]
+        try:
+            current = float(leg.get("stop_price") or 0)
+        except (TypeError, ValueError):
+            current = 0.0
+        if current and new_stop <= current + 0.004:
+            return False, f"broker stop already at {current:g}"
+        _res, err = await replace_order(str(leg.get("id")), stop_price=new_stop)
+        if err:
+            return False, f"amend failed: {err}"
+        return True, f"broker stop {current:g} -> {new_stop:g}"
+
+    # No stop at the venue at all. This is the naked case -- place
+    # protection rather than reporting it and moving on.
+    if target_price and qty:
+        _o, err = await submit_oco_sell(sym, qty, target_price, new_stop)
+        if not err:
+            return True, f"no broker stop existed - placed OCO at {new_stop:g}"
+    if qty:
+        _o, err = await submit_stop_sell(sym, qty, new_stop)
+        if not err:
+            return True, f"no broker stop existed - placed stop at {new_stop:g}"
+        return False, f"could not place protection: {err}"
+    return False, "no stop leg and no quantity to protect"
 
 
 async def cancel_open_orders_for(symbol: str) -> tuple[int, Optional[str]]:

@@ -559,7 +559,45 @@ async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
+    await _push_stop_to_broker(r, new_stop)
     return new_stop
+
+
+async def _push_stop_to_broker(r: dict, new_stop: float) -> None:
+    """Mirror a ratcheted stop to the VENUE, where it keeps working when
+    we do not.
+
+    Until 2026-08-18 every trailing stop in Trezo lived only in our
+    ledger, enforced by the monitor watching the tape. That is fine right
+    up to the moment the monitor stops watching -- and on 8/17 it stopped
+    for fifteen hours while three books held positions. A stop resting at
+    the broker survives a crash, a restart, a locked-out afternoon and a
+    deleted instance.
+
+    Only for venues that actually hold stops: the asset policy decides,
+    so crypto (no native stop at Alpaca) is skipped rather than failing
+    noisily every tick. Ratchet-only, and never raises -- a failure here
+    must not stop the ledger-side protection that already worked."""
+    if os.getenv("TREZO_BROKER_STOP_SYNC", "1") == "0":
+        return
+    if str(r.get("broker") or "") != "alpaca":
+        return
+    try:
+        if not _asset_policy(r.get("asset_type")).native_brackets:
+            return          # e.g. crypto: the venue cannot hold a stop
+        from app.brokers.alpaca import ratchet_stop
+        changed, note = await ratchet_stop(
+            str(r.get("ticker") or ""), float(new_stop),
+            qty=float(r.get("quantity") or 0) or None,
+            target_price=(float(r["target_price"])
+                          if r.get("target_price") else None))
+        if changed:
+            from app.agents.activity_log import record
+            record("broker_stop_moved", str(r.get("ticker") or "?"),
+                   strategy=str(r.get("strategy") or ""), reason=note,
+                   extra={"user_id": str(r.get("user_id") or "")})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
@@ -594,6 +632,7 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
+    await _push_stop_to_broker(r, new_stop)
     return new_stop
 
 
@@ -673,6 +712,7 @@ async def _maybe_trail_stock_profit(r: dict, price: float,
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
+    await _push_stop_to_broker(r, new_stop)
     # Broker-held rows: the ratchet must move the REAL stop leg too
     # (Mike 2026-07-14: a DB-only trail protects nothing at Alpaca).
     try:
