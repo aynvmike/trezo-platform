@@ -68,6 +68,13 @@ if not errorlevel 1 (
   echo   not registered - nothing to do
 )
 
+REM --- the log directory must EXIST before AppStdout points at it ---
+REM Found 2026-08-18: NSSM cannot create the redirect target itself, and
+REM when it cannot open the file it fails the start with no log to say
+REM so -- the service parks in START_PENDING, nothing listens, and there
+REM is no output anywhere to explain it. Silent by construction.
+if not exist "%~dp0logs" mkdir "%~dp0logs"
+
 REM --- free the port so install can bind cleanly ---
 echo Freeing port %PORT%...
 call "%~dp0_freeport.bat" %PORT%
@@ -94,7 +101,19 @@ REM 0.0.0.0 for the Tailscale address 100.115.119.32.
 "%NSSM%" set %SERVICE% AppExit Default Restart
 "%NSSM%" set %SERVICE% AppRestartDelay 5000
 "%NSSM%" set %SERVICE% AppStopMethodSkip 6
-"%NSSM%" set %SERVICE% NODE_ENV development
+REM NSSM sets child environment through AppEnvironmentExtra, not by
+REM naming the variable directly -- `nssm set TrezoWeb NODE_ENV
+REM development` is an unknown parameter and silently sets nothing
+REM (found 2026-08-18 while the service would not start). `next dev`
+REM sets NODE_ENV=development itself, so this is belt and braces, but a
+REM line that looks like it works and does not is worse than no line.
+"%NSSM%" set %SERVICE% AppEnvironmentExtra NODE_ENV=development
+
+REM Do not give up after a fast crash-loop. NSSM's default throttle
+REM stops restarting a service that keeps exiting within 1500ms, which
+REM is exactly what a port conflict looks like -- and then the service
+REM sits in START_PENDING forever with nothing obviously wrong.
+"%NSSM%" set %SERVICE% AppThrottle 10000
 
 "%NSSM%" start %SERVICE%
 
