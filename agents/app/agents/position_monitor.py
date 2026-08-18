@@ -829,6 +829,69 @@ async def _naked_position_check(ticker: str, row: dict) -> dict | None:
     }
 
 
+
+_stop_armed_at: dict[str, float] = {}
+_STOP_ARM_EVERY_S = 600     # re-check one symbol's protection every 10 min
+
+
+async def _arm_broker_stop(r: dict) -> str | None:
+    """Make sure this equity row has a STOP resting at the venue.
+
+    The naked-position check next to this one asks "are there any open
+    orders" -- which misses the case Mike found on the 25k book on
+    8/18: GDX with a resting sell limit at 94 and no stop under it. One
+    order, so it read as protected; no floor, so it was not.
+
+    This asks the question that matters instead ("is one of them a
+    stop") and fixes it rather than alerting about it. Placing is safe
+    now in a way it was not in June: ensure_stock_protection reads the
+    book first and does nothing when a stop already rests, so it cannot
+    double-sell against legs that do exist -- the reason the original
+    check was deliberately alert-only.
+
+    Market hours only: equity legs cannot be cancelled while the market
+    is shut, so trying overnight just fails on a loop (the 47-aborts
+    lesson). Off with TREZO_BROKER_STOP_SYNC=0. Never raises."""
+    if os.getenv("TREZO_BROKER_STOP_SYNC", "1") == "0":
+        return None
+    if str(r.get("broker") or "") != "alpaca" or r.get("side") != "long":
+        return None
+    tk = str(r.get("ticker") or "")
+    try:
+        pol = _asset_policy(r.get("asset_type"))
+        if not pol.native_brackets:
+            return None
+        stop = float(r.get("stop_price") or 0)
+        qty = float(r.get("quantity") or 0)
+        if stop <= 0 or qty <= 0:
+            return None
+        import time as _time
+        now_s = _time.time()
+        if now_s - _stop_armed_at.get(tk, 0.0) < _STOP_ARM_EVERY_S:
+            return None
+        _stop_armed_at[tk] = now_s
+        if pol.session_gated:
+            try:
+                from app.agents.ops_watchdog import _us_market_open
+                if not _us_market_open():
+                    return None
+            except Exception:  # noqa: BLE001
+                pass
+        from app.brokers.alpaca import ensure_stock_protection
+        changed, note = await ensure_stock_protection(
+            tk, qty, stop,
+            float(r["target_price"]) if r.get("target_price") else None)
+        if not changed:
+            return None
+        from app.agents.activity_log import record
+        record("broker_stop_armed", tk,
+               strategy=str(r.get("strategy") or ""), reason=note,
+               extra={"user_id": str(r.get("user_id") or "")})
+        return note
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # --- Liquidation throttle / circuit-breaker (Mike 2026-06-15) ----------------
 # The exit branches below call liquidate_position every tick while a position
 # sits past its stop. If the broker keeps REJECTING/CANCELING the close (e.g. a
@@ -1679,6 +1742,16 @@ class PositionMonitorAgent(Agent):
                         # case: AAPL). Alert-only -- auto-selling here
                         # could double-sell against legs that DO exist.
                         if at == "stock":
+                            _armed = await _arm_broker_stop(r)
+                            if _armed:
+                                out.append(AgentMessage(
+                                    agent=self.name, kind="info",
+                                    payload={"user_id": r["user_id"],
+                                             "ticker": tk,
+                                             "position_id": r["id"],
+                                             "broker": "alpaca",
+                                             "event": "broker_stop_armed",
+                                             "note": f"{tk}: {_armed}"}))
                             note = await _naked_position_check(tk, r)
                             if note is not None:
                                 _enforced = False

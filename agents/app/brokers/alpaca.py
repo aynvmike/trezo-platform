@@ -781,6 +781,59 @@ async def ratchet_stop(symbol: str, new_stop: float, *,
     return False, "no stop leg and no quantity to protect"
 
 
+async def ensure_stock_protection(
+    symbol: str, qty: float, stop: float, target: Optional[float] = None,
+) -> tuple[bool, str]:
+    """Make sure an equity position actually has a STOP at the venue.
+
+    Mike, 2026-08-18, looking at the 25k book: "I see GDX but in a sell
+    order for 94, why not put in a stop loss and a take profit". He was
+    right, and the existing naked-position check could not see it. That
+    check fires only when a symbol has ZERO open orders -- the day-TIF
+    case, where both bracket legs died at the close. GDX had ONE order,
+    a resting sell limit, so it read as protected. It was not: a lone
+    target is upside with no floor under it.
+
+    So the test here is not "are there orders" but "is one of them a
+    stop". If a target rests alone we cancel it and place a proper OCO,
+    because the shares it reserves are the same shares the stop needs.
+    Losing a target for a few seconds risks nothing; going a day without
+    a stop is how a book bleeds.
+
+    Falls back to a plain stop when the OCO is refused -- protection
+    first, the 2026-07-15 PYPL lesson. Returns (changed, note); never
+    raises."""
+    sym = symbol.upper().strip()
+    if not (qty and qty > 0 and stop and stop > 0):
+        return False, "no quantity or stop to protect"
+
+    orders = await get_open_orders_for(sym)
+    if orders is None:
+        return False, "could not read open orders - left untouched"
+    if any(_is_stop_leg(o) for o in orders):
+        return False, "stop already resting at the broker"
+
+    resting_sells = [o for o in orders if _is_sell_limit(o)]
+    for o in resting_sells:
+        if o.get("id"):
+            await _delete(f"/v2/orders/{o.get('id')}")
+    lost_target = bool(resting_sells)
+
+    if target and target > 0:
+        _o, err = await submit_oco_sell(sym, qty, target, stop)
+        if not err:
+            return True, (f"no broker stop existed - placed OCO "
+                          f"{stop:g}/{target:g}"
+                          + (" (replaced a lone resting target)"
+                             if lost_target else ""))
+    _o2, err2 = await submit_stop_sell(sym, qty, stop)
+    if err2:
+        return False, f"could not place protection: {err2}"
+    return True, (f"no broker stop existed - placed stop at {stop:g}"
+                  + (" (target NOT restored - OCO refused)"
+                     if lost_target else ""))
+
+
 # --------------------------------------------------------------------------
 # Crypto take-profit: the half of the exit Alpaca WILL hold for us.
 # --------------------------------------------------------------------------

@@ -35,7 +35,14 @@ ap = load_module("app.runtime.asset_policy")
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # Close the loop each time: leaking one per call makes CPython spew
+    # a GC traceback AFTER the results print, which reads like a failure
+    # in a suite that passed.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # Every stub below REPLACES a module attribute. Snapshot the real ones
@@ -46,7 +53,7 @@ def _run(coro):
 # replace_order plumbing tests ran, so they were testing the fake).
 _REAL = {name: getattr(alp, name) for name in
          ("get_open_orders_for", "replace_order", "submit_oco_sell",
-          "submit_stop_sell", "_patch")}
+          "submit_stop_sell", "_patch", "_delete")}
 
 
 def _reset():
@@ -145,6 +152,99 @@ def test_a_buy_order_is_not_mistaken_for_a_stop_leg():
         {"type": "stop", "side": "buy", "stop_price": "88"}) is False
     assert alp._is_stop_leg(
         {"type": "limit", "side": "sell", "limit_price": "99"}) is False
+
+
+# --- arming a stop that was never there -----------------------------------
+# The naked-position check asks "are there any open orders". Mike found
+# the case that slips past it on 8/18: GDX on the 25k book with a resting
+# sell limit at 94 and nothing under it. One order, so it read as
+# protected. A lone target is upside with no floor.
+
+TARGET_ONLY = {"id": "tgt-1", "type": "limit", "side": "sell",
+               "limit_price": "94.00", "qty": "3"}
+
+
+def _capture_protection():
+    placed, deleted = [], []
+
+    async def _oco(sym, qty, limit_price, stop_price):
+        placed.append(("oco", sym, qty, limit_price, stop_price))
+        return {"id": "oco-1"}, None
+
+    async def _stop(sym, qty, stop_price):
+        placed.append(("stop", sym, qty, stop_price))
+        return {"id": "stop-1"}, None
+
+    async def _del(path, token=None):
+        deleted.append(path)
+        return {}, None
+
+    alp.submit_oco_sell, alp.submit_stop_sell, alp._delete = _oco, _stop, _del
+    return placed, deleted
+
+
+def test_a_lone_resting_target_is_not_mistaken_for_protection():
+    _reset()
+    _fake_orders([TARGET_ONLY])
+    placed, deleted = _capture_protection()
+    changed, note = _run(alp.ensure_stock_protection("GDX", 3, 88.0, 94.0))
+    assert changed is True, note
+    assert deleted == ["/v2/orders/tgt-1"], (
+        "the target reserves the same shares the stop needs")
+    assert placed and placed[0][0] == "oco"
+    assert placed[0][3] == 94.0 and placed[0][4] == 88.0
+
+
+def test_an_existing_stop_is_left_alone():
+    """Placing a second stop would double-sell the position. This is why
+    the June check was alert-only; reading the book first is what makes
+    placing safe."""
+    _reset()
+    _fake_orders([STOP_LEG])
+    placed, deleted = _capture_protection()
+    changed, _ = _run(alp.ensure_stock_protection("GDX", 3, 91.0, 99.0))
+    assert changed is False
+    assert not placed and not deleted
+
+
+def test_a_refused_oco_still_leaves_a_stop():
+    """Protection first (2026-07-15, the PYPL naked-4 incident). A lost
+    target costs upside; a lost stop costs the position."""
+    _reset()
+    _fake_orders([])
+    placed, _deleted = _capture_protection()
+
+    async def _refuse(sym, qty, limit_price, stop_price):
+        return None, "HTTP 422: insufficient qty"
+    alp.submit_oco_sell = _refuse
+
+    changed, note = _run(alp.ensure_stock_protection("GDX", 3, 88.0, 94.0))
+    assert changed is True
+    assert placed and placed[0][0] == "stop" and placed[0][3] == 88.0
+    assert "target NOT restored" not in note, "nothing was cancelled here"
+
+
+def test_a_failed_order_read_arms_nothing():
+    _reset()
+
+    async def _none(symbol):
+        return None
+    alp.get_open_orders_for = _none
+    placed, deleted = _capture_protection()
+    changed, note = _run(alp.ensure_stock_protection("GDX", 3, 88.0, 94.0))
+    assert changed is False
+    assert not placed and not deleted
+    assert "could not read" in note
+
+
+def test_arming_without_a_stop_price_does_nothing():
+    """A row with no stop is a data problem, not a licence to invent a
+    level and sell against it."""
+    _reset()
+    _fake_orders([])
+    placed, _d = _capture_protection()
+    changed, _ = _run(alp.ensure_stock_protection("GDX", 3, 0.0, 94.0))
+    assert changed is False and not placed
 
 
 # --- the venue gate -------------------------------------------------------

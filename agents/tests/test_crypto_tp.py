@@ -41,7 +41,14 @@ def _reset():
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # Close the loop each time: leaking one per call makes CPython spew
+    # a GC traceback AFTER the results print, which reads like a failure
+    # in a suite that passed.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _orders(rows):
