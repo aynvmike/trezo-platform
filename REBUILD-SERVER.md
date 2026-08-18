@@ -22,6 +22,47 @@ answer than anyone had written down.
 | Activity logs, runtime caches | the VM → archived hourly to Supabase Storage, weekly to Dropbox | yes, since 8/18 |
 | **Credentials (`agents/.env`)** | **the VM and Mike's PC only** | **only if the PC copy exists** |
 
+### The third category: state established ON the box
+
+The table above answers "what survives losing the VM". It does not
+answer the question that actually cost a day on 2026-08-18: **what has
+to be TRUE on the server that lives neither in git nor in Supabase?**
+
+| Established state | Set by | How it fails |
+|---|---|---|
+| `main` tracks `origin/main` | `git branch --set-upstream-to` | every `git pull --ff-only` silently pulls nothing |
+| `node_modules` (ROOT — workspaces hoist) | `npm install` at the repo root | `next` not found; TrezoWeb dies MODULE_NOT_FOUND |
+| `agents\.venv` | the setup script | the engine cannot start |
+| `agents\.env` | copied by hand | nothing authenticates |
+| TrezoAgents / TrezoWeb / TrezoApi services | the install-as-service scripts | tiers die on logoff instead of running at boot |
+| `TrezoWebWatchdog`, health watchdog tasks | the register-\*-task scripts | nothing self-heals |
+| NSSM stdout/stderr redirects + the log dirs | `nssm set AppStdout` / `mkdir` | failures leave no evidence at all |
+| Migrations applied in Supabase | you, in the SQL editor | guards that exist in the repo never run |
+
+Four of those were missing on 2026-08-18 and **not one of them
+announced itself**. The deploy said `done`. The service said
+`START_PENDING`. The alert never fired. The only symptom was money
+moving in a book nobody was watching.
+
+Which is the real lesson: each was verified at the wrong end — by
+looking at Mike's PC, or at a status row, instead of at the box.
+
+**So: run `verify-server.ps1` on the server.** It checks every line of
+that table plus the guard suites, changes nothing, and reports what is
+MISSING rather than what is fine. Run it after any rebuild, after any
+deploy you are unsure about, and any time something works locally and
+not in production — which is the moment this whole class of bug
+announces itself, if you know to ask.
+
+```
+powershell -ExecutionPolicy Bypass -File C:\Trezo\trezo-platform\verify-server.ps1
+```
+
+A non-zero exit means something on this box is not established. The
+script prints the fix next to each failure.
+
+---
+
 That last row is the one thing a rebuild genuinely needs and cannot
 fetch for itself. It is deliberately not in git. Keep a copy somewhere
 you trust — a password manager entry is ideal.
