@@ -92,6 +92,64 @@ decisions that risk data, because the data was never there. The only
 irreplaceable thing is `agents/.env`, and that is one file you can keep
 in a password manager.
 
+## The offline route: a flash drive
+
+Mike, 2026-08-18: keep a physical path that needs no network. It earned
+its place the same day — the server's `git pull` had been failing on
+branch-tracking config for two days and the deploy channel was, in
+practice, dead. A drive in a pocket does not care about tokens, DNS,
+egress rules, or whether GitHub is up.
+
+Copy a **bundle**, not a folder. A bundle is a single file containing
+real git history that the server can fetch from exactly like a remote,
+and git verifies it on the way in. A copied working directory gives you
+none of that — you cannot tell what revision it is, whether it is
+complete, or whether something was half-written mid-copy.
+
+On the PC:
+
+```
+cd C:\Trezo\trezo-platform
+git bundle create E:\trezo.bundle --all
+git log --oneline -1        # note the revision you are carrying
+```
+
+On the server:
+
+```
+cd C:\Trezo\trezo-platform
+git fetch E:\trezo.bundle main
+git merge --ff-only FETCH_HEAD
+git log --oneline -1        # must match what you noted
+```
+
+Then the same rule as any other deploy, because the channel changing
+does not change what makes a deploy safe:
+
+```
+cd C:\Trezo\trezo-platform\agents
+.\.venv\Scripts\python.exe -m tests.run_all
+```
+
+Green, then restart. Red, then do not.
+
+**Also put `agents/.env` on the drive** — it is the one file a rebuild
+cannot fetch for itself, and the table above says so. But be honest
+about what that makes the drive: a removable object carrying live broker
+credentials. Encrypt it (BitLocker To Go on Windows is two clicks) or
+keep it somewhere you would keep a spare house key, not in a laptop bag.
+
+### What this is and is not
+
+It is a cold copy and an emergency channel. It is **not** the backup —
+the hourly archive to Supabase Storage and the weekly one to Dropbox are
+the backup, precisely because they happen whether or not anyone
+remembers. A drive only holds what it held the last time someone plugged
+it in, and the date on it is the date you actually get back. Refresh it
+when you refresh anything else you would hate to lose.
+
+---
+
 ## The one thing to check monthly
 
 That the archive is actually running. A backup nobody verifies is a
