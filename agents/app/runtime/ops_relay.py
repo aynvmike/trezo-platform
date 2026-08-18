@@ -41,6 +41,19 @@ PKG_ALLOW = {"mem0ai", "supabase", "httpx", "yfinance", "structlog",
 MAX_ATTEMPTS = 3
 _TICK_BUSY = False
 
+# A handler that needs THIS process restarted returns this marker instead
+# of doing it, so the drain can write the result down FIRST.
+#
+# Why (2026-08-18): self-kill jobs used to be marked done with a canned
+# "restarting agents now" line BEFORE the handler ran, because the
+# restart kills us mid-handler and nothing could be written after. The
+# cost was total: a pull that failed and a pull that worked produced the
+# identical row. The server sat eight commits behind for two deploys
+# while every row read done, and the one line that would have explained
+# it -- "no tracking information for the current branch" -- was thrown
+# away each time. Record, THEN die.
+RESTART_SENTINEL = "<<RESTART_TREZOAGENTS>>"
+
 
 def _run(cmd: list[str], timeout: int = 900, cwd: str | None = None) -> str:
     """Run a command with NO shell. Returns combined output, truncated."""
@@ -57,9 +70,9 @@ def _h_restart_service(args: dict) -> str:
     if svc not in SERVICES:
         raise ValueError(f"service must be one of {sorted(SERVICES)}")
     if svc == "TrezoAgents":
-        # Restarting our own host process from inside it: fire and let
-        # NSSM bring us back; the row is marked done BEFORE we die.
-        return _run([NSSM, "restart", svc], timeout=120)
+        # Restarting our own host process from inside it. Hand it back to
+        # the drain so the result is durable before we go.
+        return RESTART_SENTINEL
     return _run([NSSM, "restart", svc], timeout=300)
 
 
@@ -74,6 +87,16 @@ def _h_pip_install(args: dict) -> str:
 
 
 VENV_PY = REPO / "agents" / ".venv" / "Scripts" / "python.exe"
+
+
+def _tell(message: str, key: str = "deploy_blocked") -> None:
+    """Say it out loud. A deploy that fails quietly is how the server
+    ended up eight commits behind with every row marked done."""
+    try:
+        from app.runtime.alerts import notify
+        notify(key, message, severity="urgent")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _head() -> str:
@@ -99,8 +122,26 @@ def _h_git_pull_restart(args: dict) -> str:
     it. Skip with args {"skip_tests": true} when you need to ship a fix
     to the tests themselves."""
     before = _head()
-    out = _run(["git", "-C", str(REPO), "pull", "--ff-only"], timeout=300)
+    # `git pull --ff-only` with no arguments needs branch tracking, and
+    # on 2026-08-18 the server had none: every deploy since the GitHub
+    # repo was created exited with "no tracking information for the
+    # current branch", pulled nothing, and restarted anyway. The box sat
+    # eight commits behind while the rows all said done. Name the remote
+    # and branch explicitly so the deploy never depends on a piece of
+    # server-side config nobody set and nobody can see from here.
+    out = _run(["git", "-C", str(REPO), "pull", "--ff-only", "origin", "main"],
+               timeout=300)
     after = _head()
+
+    # A pull that did nothing must not look like a pull that worked.
+    if "[exit 0]" not in out:
+        out += "\nNOT restarted - the pull FAILED, so there is nothing new to run"
+        _tell(f"Deploy aborted: git pull failed on the server, still on "
+              f"{before[:8]}. Nothing was restarted.")
+        return out
+    if before and after and before == after:
+        out += f"\nNothing to deploy - already on {before[:8]}; NOT restarted"
+        return out
 
     if not args.get("skip_tests"):
         py = str(VENV_PY) if VENV_PY.exists() else "python"
@@ -120,19 +161,12 @@ def _h_git_pull_restart(args: dict) -> str:
                 out += f"\nROLLED BACK to {before[:8]} - guards failed"
             else:
                 out += "\nNOT restarted - guards failed"
-            try:
-                from app.runtime.alerts import notify
-                notify("deploy_blocked",
-                       f"Deploy blocked: guards failed on {after[:8]}. "
-                       f"Rolled back to {before[:8]}; engine still running "
-                       f"the old code and was NOT restarted.",
-                       severity="urgent")
-            except Exception:  # noqa: BLE001
-                pass
+            _tell(f"Deploy blocked: guards failed on {after[:8]}. "
+                  f"Rolled back to {before[:8]}; engine still running the "
+                  f"old code and was NOT restarted.")
             return out
 
-    out += "\n" + _run([NSSM, "restart", "TrezoAgents"], timeout=120)
-    return out
+    return out + "\n" + RESTART_SENTINEL
 
 
 def _h_web_rebuild(args: dict) -> str:
@@ -230,33 +264,31 @@ async def drain_once(client) -> dict | None:
             fn = HANDLERS.get(kind)
             if fn is None:
                 raise ValueError(f"unknown kind '{kind}'")
-            # Restarting ourselves kills this process: record success first.
-            self_kill = (kind == "restart_service"
-                         and str(args.get("service")) == "TrezoAgents") \
-                        or kind == "git_pull_restart"
-            if self_kill:
-                def _pre():
-                    return (client.table("ops_tasks").update({
-                        "status": "done",
-                        "result": "restarting agents now (result recorded "
-                                  "before the process exits)",
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", jid).execute())
-                await asyncio.to_thread(_pre)
             out = await asyncio.to_thread(fn, args)
-            if not self_kill:
-                def _done():
-                    return (client.table("ops_tasks").update({
-                        "status": "done", "result": out[:8000],
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", jid).execute())
-                await asyncio.to_thread(_done)
+            wants_restart = RESTART_SENTINEL in out
+            out = out.replace(RESTART_SENTINEL, "").strip()
+
+            # ALWAYS write the real result, self-kill or not. This is the
+            # whole fix: the row now says what actually happened, so a
+            # failed pull can never again read exactly like a good one.
+            def _done():
+                return (client.table("ops_tasks").update({
+                    "status": "done",
+                    "result": (out + ("\n[restarting TrezoAgents now]"
+                                      if wants_restart else ""))[:8000],
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", jid).execute())
+            await asyncio.to_thread(_done)
             try:
                 from app.agents.activity_log import record
                 record("ops_relay", kind.upper(),
                        reason=f"executed {kind} -> {out[:180]}")
             except Exception:  # noqa: BLE001
                 pass
+            if wants_restart:
+                # Everything above is durable now. Safe to be killed.
+                await asyncio.to_thread(
+                    _run, [NSSM, "restart", "TrezoAgents"], 120)
             return {"kind": kind, "status": "done"}
         except Exception as e:  # noqa: BLE001
             final = "failed" if attempts >= MAX_ATTEMPTS else "queued"
