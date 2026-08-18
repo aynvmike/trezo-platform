@@ -12,6 +12,8 @@ string, so the rest of Trezo can fall back to its internal paper ledger.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -518,13 +520,30 @@ async def submit_bracket_order(
     side: str,
     take_profit_price: float,
     stop_loss_price: float,
-    time_in_force: str = "day",
+    time_in_force: Optional[str] = None,
     token: Optional["UserToken"] = None,
 ) -> tuple[Optional[dict], Optional[str]]:
     """Submit a bracket order (entry + take-profit + stop-loss) to Alpaca
     paper. `side` is 'buy' (long) or 'sell' (short). The bracket means
     Alpaca manages the stop and target server-side once the entry fills.
-    Returns (order, None) on success or (None, error_message)."""
+    Returns (order, None) on success or (None, error_message).
+
+    TIME IN FORCE IS NOW GTC (2026-08-18). It defaulted to `day`, which
+    meant the exit legs DIED AT EVERY CLOSE: a position held overnight
+    had no stop and no target at the broker until something re-armed it.
+    That is the naked-position alert from 2026-06-11, and it is also why
+    a server outage leaves stock positions unprotected -- the protection
+    was never really at the broker, it just looked like it was until
+    16:00.
+
+    The whole point of a bracket is that the venue holds the exits when
+    we cannot. `day` gave that up every evening for free.
+
+    Override per call, or globally with TREZO_BRACKET_TIF=day to revert.
+    If Alpaca ever rejects gtc on a bracket we retry once as `day`, since
+    a protected position on a worse TIF beats no order at all -- and a
+    422 here would otherwise count as a broker reject and creep toward
+    the kill-switch (the 2026-07-27 XLE lesson)."""
     try:
         shares = int(qty)
     except (TypeError, ValueError):
@@ -550,17 +569,36 @@ async def submit_bracket_order(
         return None, (f"Bracket rejected locally: short take-profit ${_tp} "
                       f"must sit BELOW stop ${_sl} (levels inverted)")
 
+    tif = (time_in_force or os.getenv("TREZO_BRACKET_TIF", "gtc")).strip().lower()
     body = {
         "symbol": symbol.upper(),
         "qty": str(shares),
         "side": side,
         "type": "market",
-        "time_in_force": time_in_force,
+        "time_in_force": tif,
         "order_class": "bracket",
         "take_profit": {"limit_price": _tp},
         "stop_loss": {"stop_price": _sl},
     }
-    return await _post("/v2/orders", body, token=token)
+    resp, err = await _post("/v2/orders", body, token=token)
+    if err and tif == "gtc" and "time_in_force" in str(err).lower():
+        # The venue refused GTC on this bracket. Fall back rather than
+        # abandon the trade: an exit pair that expires at the close is
+        # far better than an entry with no protection at all.
+        body["time_in_force"] = "day"
+        resp2, err2 = await _post("/v2/orders", body, token=token)
+        if not err2:
+            try:
+                from app.agents.activity_log import record
+                record("bracket_tif_fallback", symbol.upper(),
+                       reason=("Alpaca refused GTC on this bracket; placed "
+                               "with day TIF instead. The exit legs will "
+                               "expire at the close -- the naked-position "
+                               "check covers it until re-armed."))
+            except Exception:  # noqa: BLE001
+                pass
+            return resp2, None
+    return resp, err
 
 
 async def submit_option_order(

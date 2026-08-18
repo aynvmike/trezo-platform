@@ -947,7 +947,8 @@ class RiskManagerAgent(Agent):
             # Per-coin daily loss limit (QW6) - crypto only. Benches a
             # single coin without halting the rest of the book.
             from app.paper.killswitch import coin_loss_halt
-            coin_veto = await coin_loss_halt(_supabase(), ticker)
+            coin_veto = await coin_loss_halt(
+                _supabase(), ticker, message.payload.get("user_id"))
             if coin_veto:
                 return [self._veto(ticker, tcs, coin_veto)]
 

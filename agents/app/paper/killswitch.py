@@ -242,12 +242,21 @@ async def check_all(client) -> KillSwitch:
         return KillSwitch(False, None, None)
 
     active = KillSwitch(False, None, None)
-    try:
-        from app.runtime.settings import get_bot_settings
-        consec_limit = int(get_bot_settings().consecutive_loss_limit)
-    except Exception:  # noqa: BLE001
-        consec_limit = MAX_CONSECUTIVE_LOSSES
+    # 2026-08-18 (Mike: "the agents are not responding to each book's own
+    # setting"). He was right. consecutive_loss_limit was read ONCE, here,
+    # OUTSIDE the loop, with no book bound -- so get_bot_settings() fell
+    # back to whichever bot_settings row was updated last, and one book's
+    # loss limit governed all three. A conservative book could be halted
+    # on an aggressive book's threshold, or worse, the reverse.
+    #
+    # The limit is a per-book setting. Read it per book, inside the loop.
+    from app.runtime.settings import get_bot_settings
     for acct in (res.data or []):
+        try:
+            consec_limit = int(get_bot_settings(
+                str(acct.get("user_id") or "")).consecutive_loss_limit)
+        except Exception:  # noqa: BLE001
+            consec_limit = MAX_CONSECUTIVE_LOSSES
         _beq = 0.0
         try:
             from app.paper.allocation import effective_equity
@@ -345,7 +354,8 @@ NUM_CRYPTO_COINS = 3                 # XRP / ETH / SOL
 PER_COIN_DAILY_LOSS_PCT = 0.10       # of a coin's slice of the crypto budget
 
 
-async def coin_loss_halt(client, ticker: str) -> str | None:
+async def coin_loss_halt(client, ticker: str,
+                         user_id: str | None = None) -> str | None:
     """Per-coin daily loss limit (TREZO_NOVA_BOT_TRADE_RULES, Section 1).
 
     A crypto coin is benched for the rest of the UTC day once its realized
@@ -379,8 +389,16 @@ async def coin_loss_halt(client, ticker: str) -> str | None:
 
     # The coin's slice of the crypto allocation budget.
     try:
-        def _acct():
-            return client.table("paper_accounts").select("*").limit(1).execute()
+        # 2026-08-18: this took the FIRST account row it found, so a
+        # per-coin halt on one book was computed from another book's
+        # equity and allocation budget. With a user_id it now reads the
+        # book actually being judged; without one it keeps the old
+        # behaviour so nothing breaks while callers are updated.
+        def _acct(uid=user_id):
+            q = client.table("paper_accounts").select("*")
+            if uid:
+                q = q.eq("user_id", uid)
+            return q.limit(1).execute()
         ares = await asyncio.to_thread(_acct)
         acct = (ares.data or [None])[0]
         if not acct:
@@ -388,7 +406,7 @@ async def coin_loss_halt(client, ticker: str) -> str | None:
         equity = account_equity(acct)
         from app.paper.allocation import build_allocation
         from app.runtime.settings import get_bot_settings
-        cfg = get_bot_settings()
+        cfg = get_bot_settings(user_id or str(acct.get("user_id") or ""))
         alloc = build_allocation(equity, posture_setting=cfg.account_posture,
                                  overrides=cfg.allocation_overrides)
         crypto_budget = float(alloc.budgets.get("crypto", 0.0))

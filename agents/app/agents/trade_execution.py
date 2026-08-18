@@ -333,7 +333,9 @@ class TradeExecutionAgent(Agent):
         except Exception:  # noqa: BLE001
             pass
         from app.runtime.settings import get_bot_settings
-        cfg = get_bot_settings()
+        # Per book. Posture and allocation overrides are exactly the kind
+        # of setting that must not leak between accounts (2026-08-18).
+        cfg = get_bot_settings(user_id)
         mt = market_type_for(strategy, asset_type)
         alloc = build_allocation(
             equity,
@@ -534,7 +536,7 @@ class TradeExecutionAgent(Agent):
             "market_price": market_price,
             "strategy": strategy,
             "source_payload": source_payload,
-            "risk_pct": get_bot_settings().risk_per_trade_pct,
+            "risk_pct": get_bot_settings(user_id).risk_per_trade_pct,
             "max_notional": remaining,
         }
         if isinstance(stop_pct, (int, float)) and stop_pct > 0:
@@ -636,7 +638,11 @@ class TradeExecutionAgent(Agent):
 
         risk_pct = source_payload.get("risk_pct_override")
         if risk_pct is None:
-            risk_pct = get_bot_settings().risk_per_trade_pct
+            # Per book (2026-08-18). A bare get_bot_settings() here meant
+            # every book could be SIZED from one book's risk_per_trade_pct
+            # -- the 75k's appetite applied to the 25k, or the reverse.
+            # Sizing is the last place a setting should leak.
+            risk_pct = get_bot_settings(user_id).risk_per_trade_pct
         plan = plan_position(
             equity=acct.equity,
             entry_price=market_price,
@@ -886,7 +892,11 @@ class TradeExecutionAgent(Agent):
 
         risk_pct = source_payload.get("risk_pct_override")
         if risk_pct is None:
-            risk_pct = get_bot_settings().risk_per_trade_pct
+            # Per book (2026-08-18). A bare get_bot_settings() here meant
+            # every book could be SIZED from one book's risk_per_trade_pct
+            # -- the 75k's appetite applied to the 25k, or the reverse.
+            # Sizing is the last place a setting should leak.
+            risk_pct = get_bot_settings(user_id).risk_per_trade_pct
         # Crypto spends NON-MARGINABLE USD at Alpaca (2026-07-23: six
         # approvals died as HTTP 403 "insufficient balance for USD,
         # available: 0" while options collateral pledged every dollar,
