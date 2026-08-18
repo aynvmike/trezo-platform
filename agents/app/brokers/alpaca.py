@@ -454,13 +454,30 @@ def crypto_symbol_variants(symbol: str) -> frozenset:
     return frozenset({s, f"{s}/USD", f"{s}USD"})
 
 
-def _crypto_pair(symbol: str) -> str:
-    """Convert a bare ticker like 'BTC' to Alpaca's crypto pair format
-    'BTC/USD'. Already-paired inputs pass through."""
+def _crypto_base(symbol: str) -> str:
+    """The bare coin from any spelling Trezo or Alpaca might use:
+    'XRP', 'XRPUSD' and 'XRP/USD' all give 'XRP'.
+
+    Fixed 2026-08-18. _crypto_pair() only ever handled the bare form, so
+    a row stored as 'XRPUSD' became 'XRPUSD/USD' -- a symbol no venue
+    recognises. That silently broke liquidate_position() for any crypto
+    row written in pair form, which is the forced-exit path: the stop
+    fires, the DELETE 404s, the row stays open and the coin keeps
+    falling. Both spellings are in the table because adoption reads the
+    broker's naming while our own entries write the bare ticker.
+    crypto_symbol_variants() has always normalised this way; this is the
+    same rule, applied where it also matters."""
     s = (symbol or "").upper().strip()
     if "/" in s:
-        return s
-    return f"{s}/USD"
+        return s.split("/", 1)[0]
+    if s.endswith("USD") and len(s) > 4:
+        return s[:-3]
+    return s
+
+
+def _crypto_pair(symbol: str) -> str:
+    """Any spelling of a coin -> Alpaca's pair format ('BTC/USD')."""
+    return f"{_crypto_base(symbol)}/USD"
 
 
 async def submit_crypto_order(
@@ -762,6 +779,112 @@ async def ratchet_stop(symbol: str, new_stop: float, *,
             return True, f"no broker stop existed - placed stop at {new_stop:g}"
         return False, f"could not place protection: {err}"
     return False, "no stop leg and no quantity to protect"
+
+
+# --------------------------------------------------------------------------
+# Crypto take-profit: the half of the exit Alpaca WILL hold for us.
+# --------------------------------------------------------------------------
+# Alpaca gives crypto no bracket and no stop order, so for two months a
+# coin's target and stop both lived only in the ledger, enforced by the
+# monitor watching the tape. On 2026-08-17 the monitor stopped watching
+# for fifteen hours and every crypto row rode it out unprotected.
+#
+# The stop half cannot be fixed here -- the venue has no crypto stop, and
+# no amount of code invents one. The TARGET half can: a resting GTC limit
+# sell is a plain order type crypto supports, and it keeps working while
+# we are down, restarting, or locked out. It is half a seatbelt, and half
+# is what is on offer.
+#
+# The cost: a resting sell RESERVES the units. Every other sell path must
+# cancel it first (see AssetPolicy.resting_exits).
+
+
+def _is_sell_limit(order: dict) -> bool:
+    t = str(order.get("type") or order.get("order_type") or "").lower()
+    return t == "limit" and str(order.get("side") or "").lower() == "sell"
+
+
+async def ensure_crypto_take_profit(
+    symbol: str, qty: float, target: float,
+) -> tuple[bool, str]:
+    """Keep exactly one resting GTC limit sell at `target` for `symbol`.
+
+    Places one when none rests, moves the existing one when the target
+    has changed, and does nothing when it is already right. Returns
+    (changed, note) and never raises.
+
+    Unlike ratchet_stop this is NOT one-directional: a target may legally
+    move down (the ladder tightens toward a trailing exit) as well as up.
+    Nothing here can lose the position -- the worst case of a wrong
+    target is a fill at a price we chose. That is why a cancel-and-place
+    fallback is acceptable here and is not acceptable for a stop.
+    """
+    sym = symbol.upper().strip()
+    pair = _crypto_pair(sym)
+    if not (qty and qty > 0 and target and target > 0):
+        return False, "no quantity or target to rest"
+
+    orders = await get_open_orders_for(pair.replace("/", ""))
+    if orders is None:
+        return False, "could not read open orders - left untouched"
+
+    resting = [o for o in orders if _is_sell_limit(o)]
+    body = {
+        "symbol": pair,
+        "qty": str(qty),
+        "side": "sell",
+        "type": "limit",
+        "limit_price": str(round(float(target), 6)),
+        "time_in_force": "gtc",
+    }
+
+    if resting:
+        leg = resting[0]
+        try:
+            cur_px = float(leg.get("limit_price") or 0)
+            cur_qty = float(leg.get("qty") or 0)
+        except (TypeError, ValueError):
+            cur_px, cur_qty = 0.0, 0.0
+        px_same = cur_px and abs(cur_px - target) <= max(1e-6, target * 0.0005)
+        qty_same = cur_qty and abs(cur_qty - qty) <= max(1e-8, qty * 0.001)
+        if px_same and qty_same:
+            return False, f"crypto TP already resting at {cur_px:g}"
+        # Amend in place if the venue allows it; a rejected PATCH is not
+        # a failure worth aborting on, because unlike a stop, briefly
+        # having no target risks nothing.
+        _res, err = await replace_order(
+            str(leg.get("id")), qty=qty, limit_price=target)
+        if not err:
+            return True, f"crypto TP {cur_px:g} -> {target:g}"
+        for o in resting:
+            if o.get("id"):
+                await _delete(f"/v2/orders/{o.get('id')}")
+        _o2, err2 = await _post("/v2/orders", body)
+        if err2:
+            return False, f"crypto TP re-place failed after amend {err}: {err2}"
+        return True, f"crypto TP re-placed at {target:g} (amend refused: {err})"
+
+    _o, err = await _post("/v2/orders", body)
+    if err:
+        return False, f"crypto TP place failed: {err}"
+    return True, f"crypto TP resting at {target:g}"
+
+
+async def cancel_crypto_take_profit(symbol: str) -> tuple[int, Optional[str]]:
+    """Release the units a resting TP is holding. Returns (cancelled,
+    error) -- error ONLY when the listing failed, because a caller that
+    is about to sell must be able to tell 'nothing was resting' apart
+    from 'I could not find out'."""
+    pair = _crypto_pair(symbol.upper().strip()).replace("/", "")
+    orders = await get_open_orders_for(pair)
+    if orders is None:
+        return 0, "could not list open crypto orders"
+    n = 0
+    for o in orders:
+        if _is_sell_limit(o) and o.get("id"):
+            await _delete(f"/v2/orders/{o.get('id')}")
+            n += 1
+    return n, None
 
 
 async def cancel_open_orders_for(symbol: str) -> tuple[int, Optional[str]]:

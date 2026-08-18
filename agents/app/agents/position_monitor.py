@@ -600,6 +600,49 @@ async def _push_stop_to_broker(r: dict, new_stop: float) -> None:
         pass
 
 
+async def _push_crypto_tp(r: dict, target: float | None) -> None:
+    """Keep the crypto take-profit RESTING at the venue.
+
+    The stop half of a crypto exit cannot live at Alpaca -- there is no
+    crypto stop order, and _push_stop_to_broker correctly declines to
+    pretend otherwise. The target half can: a GTC limit sell is an
+    ordinary order type, and it fills whether or not this process is
+    running. Half a seatbelt, which is what the venue offers.
+
+    The units it reserves are released by _alpaca_profit_step before any
+    partial sell, and by liquidate_position (which cancels a symbol's
+    open orders first) before any forced exit. If you add a third crypto
+    sell path, it must release them too -- AssetPolicy.resting_exits is
+    the flag that says so.
+
+    Off with TREZO_CRYPTO_TP_RESTING=0. Never raises: a venue that
+    refuses the order leaves the row exactly as protected as it was
+    yesterday, which is to say client-side only."""
+    if os.getenv("TREZO_CRYPTO_TP_RESTING", "1") == "0":
+        return
+    if str(r.get("broker") or "") != "alpaca":
+        return
+    if not target or target <= 0:
+        return
+    try:
+        pol = _asset_policy(r.get("asset_type"))
+        if not pol.resting_exits or pol.native_brackets:
+            return
+        qty = float(r.get("quantity") or 0)
+        if qty <= 0:
+            return
+        from app.brokers.alpaca import ensure_crypto_take_profit
+        changed, note = await ensure_crypto_take_profit(
+            str(r.get("ticker") or ""), qty, float(target))
+        if changed:
+            from app.agents.activity_log import record
+            record("broker_tp_rested", str(r.get("ticker") or "?"),
+                   strategy=str(r.get("strategy") or ""), reason=note,
+                   extra={"user_id": str(r.get("user_id") or "")})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     """Step-ladder profit lock (crypto Part 2b, 2026-06-13). For a long
     position, as unrealized gain (return on capital) climbs through the
@@ -876,6 +919,27 @@ async def _alpaca_profit_step(r, price: float,
             if left == []:
                 break
             await asyncio.sleep(0.7)
+    elif pol.resting_exits:
+        # No bracket here, but our own resting take-profit limit is
+        # holding the units (2026-08-18). Before this branch existed the
+        # code assumed "no bracket" meant "nothing resting" and sold
+        # straight into an insufficient-balance reject. Cancel our TP,
+        # then verify -- an unverifiable release must abort exactly like
+        # an unverifiable leg cancel.
+        from app.brokers.alpaca import cancel_crypto_take_profit
+        _n, err = await cancel_crypto_take_profit(sym)
+        if err:
+            return False, f"could not release resting TP ({err}) - aborted untouched"
+        left = []
+        for _ in range(4):
+            await asyncio.sleep(0.5)
+            _open = await get_open_orders_for(sym)
+            if _open is None:
+                return False, "could not verify TP released - aborted untouched"
+            left = [o for o in _open
+                    if str(o.get("side") or "").lower() == "sell"]
+            if not left:
+                break
     else:
         left = []
     # get_open_orders_for returns None when the CALL ITSELF failed, and
@@ -901,12 +965,26 @@ async def _alpaca_profit_step(r, price: float,
         if pol.native_brackets:
             await submit_oco_sell(sym, qty_total, target_p, stop_p)
             return False, f"slice sell rejected ({serr}); protection restored"
+        if pol.resting_exits and target_p:
+            # We cancelled the TP to free the units and then sold
+            # nothing. Leaving without re-resting it would quietly strip
+            # the only exit the venue holds for this row.
+            from app.brokers.alpaca import ensure_crypto_take_profit
+            await ensure_crypto_take_profit(sym, qty_total, target_p)
+            return False, f"slice sell rejected ({serr}); TP restored"
         return False, f"slice sell rejected ({serr}); position untouched"
     # 3) Re-protect the remainder (OCO: original target + stop), retry once.
     #    Where the venue holds no bracket, protection was never AT the
     #    broker: the monitor enforces this row's stop client-side every
     #    tick, so the remainder is as protected as it ever was.
-    if not pol.native_brackets:
+    if pol.resting_exits and not pol.native_brackets:
+        # Put the target back on what is left. The STOP stays
+        # client-side; the venue has none to give for crypto.
+        from app.brokers.alpaca import ensure_crypto_take_profit
+        if target_p and remaining > 0:
+            await ensure_crypto_take_profit(sym, remaining, target_p)
+        protected = True
+    elif not pol.native_brackets:
         protected = True
     else:
         prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
@@ -1372,6 +1450,10 @@ class PositionMonitorAgent(Agent):
                             pass
 
                     if reason_c is None:
+                        # Holding. Make sure the venue is holding the
+                        # target for us, so it still gets taken if this
+                        # process is not here next tick.
+                        await _push_crypto_tp(r, target_c)
                         alpaca_managed += 1
                         continue
                     _liq, _cstat = await _throttled_liquidate(

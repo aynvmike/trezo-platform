@@ -55,6 +55,23 @@ class AssetPolicy:
     # equity brackets, whose legs expire at the close.
     client_side_exits: bool = True
 
+    # Do we park a STANDALONE resting order at this venue -- one that is
+    # not a bracket leg but still reserves the inventory?
+    #
+    # Added 2026-08-18 for the crypto take-profit. Alpaca gives crypto no
+    # bracket, so a coin's target lived only in our ledger and died with
+    # the engine; a resting GTC limit sell survives us. But the moment
+    # one rests there, the units are RESERVED, and every other sell path
+    # -- the ladder's partial, a forced exit -- gets an insufficient
+    # balance reject unless it releases them first. This flag is what
+    # tells those paths to cancel before they sell.
+    #
+    # It stays True even when the placement env-switch is off, so a TP
+    # placed under an earlier setting is still released. Cancelling when
+    # nothing rests costs one no-op call; NOT cancelling when something
+    # does costs the sell.
+    resting_exits: bool = False
+
     # May the step-profit ladder sell a FRACTION of the position?
     supports_partial_step: bool = True
 
@@ -104,6 +121,13 @@ class AssetPolicy:
             return 0.0
         return slice_qty
 
+    @property
+    def holds_orders(self) -> bool:
+        """True when something of ours may be RESTING at the venue for
+        this symbol -- a bracket leg or a standalone limit. Any code
+        about to sell must release those first."""
+        return self.native_brackets or self.resting_exits
+
     def can_step(self, quantity: float) -> bool:
         """Is this position big enough to bank a slice at all?"""
         if not self.supports_partial_step:
@@ -144,11 +168,13 @@ CRYPTO = AssetPolicy(
     # a crypto row Trezo cannot see is a genuinely naked position.
     native_brackets=False,
     client_side_exits=True,
+    resting_exits=True,
     supports_partial_step=True, fractional=True,
     min_slice=1e-6, min_remainder=1e-6,
     session_gated=False, adoptable=True,
     symbol_variants=_crypto_variants,
-    notes="24/7; no broker bracket; fractional units.",
+    notes="24/7; no broker bracket; resting GTC limit holds the target;"
+          " fractional units.",
 )
 
 OPTION = AssetPolicy(
@@ -314,6 +340,7 @@ def describe() -> list[dict]:
         "asset_type": p.asset_type, "label": p.label,
         "native_brackets": p.native_brackets,
         "client_side_exits": p.client_side_exits,
+        "resting_exits": p.resting_exits,
         "supports_partial_step": p.supports_partial_step,
         "fractional": p.fractional, "session_gated": p.session_gated,
         "adoptable": p.adoptable, "venue": p.venue, "notes": p.notes,
