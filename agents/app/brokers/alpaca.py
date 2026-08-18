@@ -827,11 +827,34 @@ async def ensure_stock_protection(
                           + (" (replaced a lone resting target)"
                              if lost_target else ""))
     _o2, err2 = await submit_stop_sell(sym, qty, stop)
-    if err2:
-        return False, f"could not place protection: {err2}"
-    return True, (f"no broker stop existed - placed stop at {stop:g}"
-                  + (" (target NOT restored - OCO refused)"
-                     if lost_target else ""))
+    if not err2:
+        return True, (f"no broker stop existed - placed stop at {stop:g}"
+                      + (" (target NOT restored - OCO refused)"
+                         if lost_target else ""))
+
+    # Both attempts failed -- most likely the ledger quantity is larger
+    # than what the broker actually holds, so every sell is rejected for
+    # insufficient shares. We have already cancelled the target by this
+    # point, and walking away here would leave the position with NOTHING
+    # resting: strictly worse than the lone target we set out to improve
+    # on. Put it back and report, rather than "improving" a position into
+    # having no orders at all.
+    restored = ""
+    for o in resting_sells:
+        try:
+            _q = float(o.get("qty") or 0)
+            _px = float(o.get("limit_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if _q > 0 and _px > 0:
+            _r, _rerr = await _post("/v2/orders", {
+                "symbol": sym, "qty": str(_q), "side": "sell",
+                "type": "limit", "limit_price": str(round(_px, 2)),
+                "time_in_force": "gtc",
+            })
+            restored = (" - original target restored" if not _rerr
+                        else f" - AND THE TARGET IS GONE: {_rerr}")
+    return False, f"could not place protection: {err2}{restored}"
 
 
 # --------------------------------------------------------------------------

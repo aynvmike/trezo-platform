@@ -53,7 +53,7 @@ def _run(coro):
 # replace_order plumbing tests ran, so they were testing the fake).
 _REAL = {name: getattr(alp, name) for name in
          ("get_open_orders_for", "replace_order", "submit_oco_sell",
-          "submit_stop_sell", "_patch", "_delete")}
+          "submit_stop_sell", "_patch", "_delete", "_post")}
 
 
 def _reset():
@@ -165,7 +165,7 @@ TARGET_ONLY = {"id": "tgt-1", "type": "limit", "side": "sell",
 
 
 def _capture_protection():
-    placed, deleted = [], []
+    placed, deleted, posted = [], [], []
 
     async def _oco(sym, qty, limit_price, stop_price):
         placed.append(("oco", sym, qty, limit_price, stop_price))
@@ -179,14 +179,19 @@ def _capture_protection():
         deleted.append(path)
         return {}, None
 
+    async def _post(path, body, token=None):
+        posted.append(body)
+        return {"id": "re-1"}, None
+
     alp.submit_oco_sell, alp.submit_stop_sell, alp._delete = _oco, _stop, _del
-    return placed, deleted
+    alp._post = _post
+    return placed, deleted, posted
 
 
 def test_a_lone_resting_target_is_not_mistaken_for_protection():
     _reset()
     _fake_orders([TARGET_ONLY])
-    placed, deleted = _capture_protection()
+    placed, deleted, _posted = _capture_protection()
     changed, note = _run(alp.ensure_stock_protection("GDX", 3, 88.0, 94.0))
     assert changed is True, note
     assert deleted == ["/v2/orders/tgt-1"], (
@@ -201,7 +206,7 @@ def test_an_existing_stop_is_left_alone():
     placing safe."""
     _reset()
     _fake_orders([STOP_LEG])
-    placed, deleted = _capture_protection()
+    placed, deleted, _posted = _capture_protection()
     changed, _ = _run(alp.ensure_stock_protection("GDX", 3, 91.0, 99.0))
     assert changed is False
     assert not placed and not deleted
@@ -212,7 +217,7 @@ def test_a_refused_oco_still_leaves_a_stop():
     target costs upside; a lost stop costs the position."""
     _reset()
     _fake_orders([])
-    placed, _deleted = _capture_protection()
+    placed, _deleted, _posted = _capture_protection()
 
     async def _refuse(sym, qty, limit_price, stop_price):
         return None, "HTTP 422: insufficient qty"
@@ -230,7 +235,7 @@ def test_a_failed_order_read_arms_nothing():
     async def _none(symbol):
         return None
     alp.get_open_orders_for = _none
-    placed, deleted = _capture_protection()
+    placed, deleted, _posted = _capture_protection()
     changed, note = _run(alp.ensure_stock_protection("GDX", 3, 88.0, 94.0))
     assert changed is False
     assert not placed and not deleted
@@ -242,9 +247,37 @@ def test_arming_without_a_stop_price_does_nothing():
     level and sell against it."""
     _reset()
     _fake_orders([])
-    placed, _d = _capture_protection()
+    placed, _d, _posted = _capture_protection()
     changed, _ = _run(alp.ensure_stock_protection("GDX", 3, 0.0, 94.0))
     assert changed is False and not placed
+
+
+def test_a_position_is_never_left_with_nothing_resting():
+    """The failure mode this whole function could have created: ledger
+    qty larger than what the broker holds, so every sell is rejected --
+    but the lone target was cancelled on the way in. Walking away there
+    leaves the position with NO orders at all, strictly worse than the
+    target we set out to improve on."""
+    _reset()
+    _fake_orders([TARGET_ONLY])
+    placed, deleted, posted = _capture_protection()
+
+    async def _reject_oco(sym, qty, limit_price, stop_price):
+        return None, "HTTP 403: insufficient qty available"
+
+    async def _reject_stop(sym, qty, stop_price):
+        return None, "HTTP 403: insufficient qty available"
+    alp.submit_oco_sell, alp.submit_stop_sell = _reject_oco, _reject_stop
+
+    changed, note = _run(alp.ensure_stock_protection("GDX", 99, 88.0, 94.0))
+    assert changed is False
+    assert deleted == ["/v2/orders/tgt-1"]
+    assert len(posted) == 1, "the cancelled target must be put back"
+    assert posted[0]["side"] == "sell" and posted[0]["type"] == "limit"
+    assert float(posted[0]["limit_price"]) == 94.0
+    assert float(posted[0]["qty"]) == 3.0, (
+        "restore the ORDER's original quantity, not the ledger's")
+    assert "target restored" in note
 
 
 # --- the venue gate -------------------------------------------------------
