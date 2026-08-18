@@ -76,7 +76,14 @@ foreach ($svc in @("TrezoAgents", "TrezoWeb", "TrezoApi")) {
 # --------------------------------------------------------------- ports
 Section "Listening"
 
-foreach ($p in @(@(8001,"engine"), @(3000,"dashboard"), @(4000,"api"))) {
+# Ports corrected 2026-08-18 on the verifier's FIRST run: it claimed the
+# api was down on 4000. The api listens on 8000 (api\src\core\config.ts,
+# PORT ?? "8000") and binds 127.0.0.1 deliberately -- it was reachable
+# from the whole network in July and collected IoT exploit probes.
+#
+# A verifier that reports a failure that is not real is the same defect
+# as the system it checks: it teaches you to skim past red.
+foreach ($p in @(@(8001,"engine"), @(3000,"dashboard"), @(8000,"api"))) {
     $port = $p[0]; $what = $p[1]
     $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
     if ($conn) { Ok "$what listening on $port" } else { Bad "nothing listening on $port ($what)" }
@@ -126,9 +133,17 @@ if (Test-Path $venv) {
 # ----------------------------------------------------- scheduled tasks
 Section "Scheduled tasks"
 
-foreach ($t in @("TrezoWebWatchdog", "TrezoHealthWatchdog")) {
+$tasks = @{
+    "TrezoHealthWatchdog" = "the ENGINE's self-healing restart -- without it a dead engine stays dead until a human notices (5h30m on 2026-08-18). Register: register-watchdog-task.bat as Admin"
+    "TrezoWebWatchdog"    = "the dashboard's self-healing restart. Register: register-web-watchdog-task.bat as Admin"
+}
+foreach ($t in $tasks.Keys) {
     $q = schtasks /Query /TN $t 2>$null
-    if ($LASTEXITCODE -eq 0) { Ok "$t registered" } else { Warn "$t not registered" }
+    if ($LASTEXITCODE -eq 0) { Ok "$t registered" }
+    else {
+        Bad "$t NOT registered"
+        Write-Host "        $($tasks[$t])" -ForegroundColor Yellow
+    }
 }
 
 # --------------------------------------------------------------- logs
