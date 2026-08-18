@@ -797,15 +797,28 @@ _NAKED_CHECK_EVERY_S = 600    # poll Alpaca orders at most every 10 min/symbol
 _NAKED_ALERT_EVERY_S = 3600   # re-alert at most hourly/symbol
 
 
+def _throttle_key(row: dict, ticker: str) -> str:
+    """Throttles must be per BOOK per symbol, not per symbol.
+
+    Three books can hold the same ticker. Keyed on the ticker alone, the
+    first book to be examined claims the ten-minute slot and the other
+    two are skipped every single tick -- silently, forever, for exactly
+    the symbols most likely to matter (the ones everyone holds). Same
+    shape as the phantom-close bug on 8/17: shared state where the book
+    was the thing that distinguished the rows."""
+    return f"{row.get('user_id') or '?'}:{ticker}"
+
+
 async def _naked_position_check(ticker: str, row: dict) -> dict | None:
     """Return an alert payload when an Alpaca-held STOCK position has no
-    open exit orders (expired day-TIF bracket legs). Throttled per
-    symbol; never raises."""
+    open exit orders (expired day-TIF bracket legs). Throttled per book
+    per symbol; never raises."""
     import time as _time
     now_s = _time.time()
-    if now_s - _naked_checked_at.get(ticker, 0.0) < _NAKED_CHECK_EVERY_S:
+    _k = _throttle_key(row, ticker)
+    if now_s - _naked_checked_at.get(_k, 0.0) < _NAKED_CHECK_EVERY_S:
         return None
-    _naked_checked_at[ticker] = now_s
+    _naked_checked_at[_k] = now_s
     try:
         from app.brokers.alpaca import get_open_orders_for
         orders = await get_open_orders_for(ticker)
@@ -813,9 +826,9 @@ async def _naked_position_check(ticker: str, row: dict) -> dict | None:
         return None
     if orders is None or len(orders) > 0:
         return None  # could not check, or legs are alive -- all fine
-    if now_s - _naked_alerted_at.get(ticker, 0.0) < _NAKED_ALERT_EVERY_S:
+    if now_s - _naked_alerted_at.get(_k, 0.0) < _NAKED_ALERT_EVERY_S:
         return None
-    _naked_alerted_at[ticker] = now_s
+    _naked_alerted_at[_k] = now_s
     return {
         "user_id": row.get("user_id"),
         "ticker": ticker,
@@ -869,9 +882,10 @@ async def _arm_broker_stop(r: dict) -> str | None:
             return None
         import time as _time
         now_s = _time.time()
-        if now_s - _stop_armed_at.get(tk, 0.0) < _STOP_ARM_EVERY_S:
+        _k = _throttle_key(r, tk)
+        if now_s - _stop_armed_at.get(_k, 0.0) < _STOP_ARM_EVERY_S:
             return None
-        _stop_armed_at[tk] = now_s
+        _stop_armed_at[_k] = now_s
         if pol.session_gated:
             try:
                 from app.agents.ops_watchdog import _us_market_open
