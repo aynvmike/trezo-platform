@@ -42,10 +42,10 @@ MAX_ATTEMPTS = 3
 _TICK_BUSY = False
 
 
-def _run(cmd: list[str], timeout: int = 900) -> str:
+def _run(cmd: list[str], timeout: int = 900, cwd: str | None = None) -> str:
     """Run a command with NO shell. Returns combined output, truncated."""
     p = subprocess.run(cmd, capture_output=True, text=True,
-                       timeout=timeout, shell=False)
+                       timeout=timeout, shell=False, cwd=cwd)
     out = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
     return f"[exit {p.returncode}]\n{out[-4000:]}"
 
@@ -73,8 +73,64 @@ def _h_pip_install(args: dict) -> str:
     return _run([str(VENV_PIP), "install", pkg], timeout=600)
 
 
+VENV_PY = REPO / "agents" / ".venv" / "Scripts" / "python.exe"
+
+
+def _head() -> str:
+    p = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
+                       capture_output=True, text=True, timeout=60, shell=False)
+    return (p.stdout or "").strip()
+
+
 def _h_git_pull_restart(args: dict) -> str:
+    """Pull, PROVE the new code passes its guards, then restart.
+
+    Added 2026-08-18. Before this, deploy was pull-then-restart on
+    faith: if the pulled commit was broken the engine restarted onto it
+    and stopped managing three books, which is exactly the fifteen-hour
+    outage on 8/17 with an extra step. The guard suites run in a bare
+    checkout by design -- no .env, no keys, no network -- so there is no
+    excuse for a deploy not to run them.
+
+    On failure the checkout is rolled back to the commit that was there
+    before and NO restart happens, so the running engine keeps serving
+    the code it is already on. The server checkout is deploy-only, which
+    is what makes reset --hard safe here; pull --ff-only already assumes
+    it. Skip with args {"skip_tests": true} when you need to ship a fix
+    to the tests themselves."""
+    before = _head()
     out = _run(["git", "-C", str(REPO), "pull", "--ff-only"], timeout=300)
+    after = _head()
+
+    if not args.get("skip_tests"):
+        py = str(VENV_PY) if VENV_PY.exists() else "python"
+        try:
+            # cwd matters: `-m tests.run_all` resolves relative to it,
+            # and the service's own working directory is not agents/.
+            tests = _run([py, "-m", "tests.run_all"], timeout=600,
+                         cwd=str(REPO / "agents"))
+        except Exception as e:  # noqa: BLE001
+            tests = f"[guards could not run] {e}"
+        out += "\n--- guards ---\n" + tests
+        if "all green across" not in tests:
+            if before and after and before != after:
+                out += "\n" + _run(
+                    ["git", "-C", str(REPO), "reset", "--hard", before],
+                    timeout=120)
+                out += f"\nROLLED BACK to {before[:8]} - guards failed"
+            else:
+                out += "\nNOT restarted - guards failed"
+            try:
+                from app.runtime.alerts import notify
+                notify("deploy_blocked",
+                       f"Deploy blocked: guards failed on {after[:8]}. "
+                       f"Rolled back to {before[:8]}; engine still running "
+                       f"the old code and was NOT restarted.",
+                       severity="urgent")
+            except Exception:  # noqa: BLE001
+                pass
+            return out
+
     out += "\n" + _run([NSSM, "restart", "TrezoAgents"], timeout=120)
     return out
 
