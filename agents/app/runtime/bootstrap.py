@@ -12,6 +12,7 @@ from app.agents.crypto_scanner import CryptoScannerAgent
 from app.agents.cycle_awareness import CycleAwarenessAgent
 from app.agents.exit_advisor import ExitAdvisorAgent
 from app.agents.exit_advisor_options import ExitAdvisorOptionsAgent
+from app.agents.book_health import BookHealthAgent
 from app.agents.ops_watchdog import OpsWatchdogAgent
 from app.agents.portfolio_architect import PortfolioArchitectAgent
 from app.agents.dividend_manager import DividendManagerAgent
@@ -66,6 +67,7 @@ def bootstrap_agents() -> None:
     exit_adv  = ExitAdvisorAgent()
     exit_opts = ExitAdvisorOptionsAgent()
     watchdog  = OpsWatchdogAgent()
+    bookhealth = BookHealthAgent()
     architect = PortfolioArchitectAgent()
 
     registry.register(pattern,   "Detects candlestick patterns and scores trade confidence (0-1000).",                  role="observer")
@@ -92,6 +94,7 @@ def bootstrap_agents() -> None:
     registry.register(exit_adv,  "Exit Advisor (Phase 13d). Every 5 min watches every open position for the held-too-long pattern - tracks the running peak unrealized P&L and raises a dashboard alert when the position gives back 30%+ of its peak gain. Never closes a trade; surfaces suggestions for the user to act on.", role="observer")
     registry.register(exit_opts, "Exit Advisor - Options edition (Phase B). Every 5 min watches open option positions and applies Mike's rules: contract-count drives target (1-10 -> 30-50%, >10 -> 15%), drawback ladder (39/30/25%), catalyst-aware urgency bump. Never closes; surfaces alerts.", role="observer")
     registry.register(watchdog,  "Operations Watchdog (Task #31, 21st agent). Every 5 min checks the runtime registry vs the expected-agent list and the last-tick time of every registered agent. Raises ops_health_alerts when an agent is missing or has gone silent during market hours.", role="observer")
+    registry.register(bookhealth, "Book integrity monitor (2026-08-18). Every 5 min asks one question per book: does it add up? Alarms on UNMANAGED NOTIONAL (broker holds it, the ledger has no row -- nothing is stopping it), positions sitting past their own stop, and a halt whose condition has already cleared. Sends OUT through the alert webhook rather than into a table nobody reads.", role="observer")
 
     # Wire on_message handlers - agents react to each other's messages.
     async def _route(message):
