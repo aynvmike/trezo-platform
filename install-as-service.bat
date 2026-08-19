@@ -36,6 +36,11 @@ nssm set %SERVICE% Description "Trezo Layer-by-Layer Trading Bot - FastAPI agent
 nssm set %SERVICE% Start SERVICE_AUTO_START
 nssm set %SERVICE% AppStdout "%~dp0logs\agents-service.log"
 nssm set %SERVICE% AppStderr "%~dp0logs\agents-service.err"
+REM Kill the ENTIRE process tree on stop (2026-08-19). uvicorn spawns worker
+REM processes; without this, nssm kills only the parent and the workers
+REM orphan - which is how "nssm restart" kept leaving yesterday's engine
+REM running underneath today's. A restart that leaves survivors is a spawn.
+nssm set %SERVICE% AppKillProcessTree 1
 nssm set %SERVICE% AppRotateFiles 1
 nssm set %SERVICE% AppRotateBytes 10485760
 nssm set %SERVICE% AppExit Default Restart

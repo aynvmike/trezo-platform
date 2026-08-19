@@ -53,8 +53,15 @@ if ($failures -lt 2) {
 # Restart
 Log "RESTART agents service (failures=$failures)"
 
-# Kill anything on port 8001
-$pids = (Get-NetTCPConnection -LocalPort 8001 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
+# Kill anything on port 8001 - but NOT the service engine mid-start.
+# If TrezoAgents is RUNNING, whatever holds 8001 is either the service
+# (leave it alone) or a zombie the service will report failing against;
+# nssm restart below handles both without this script firing blind.
+$svcPre = Get-Service -Name "TrezoAgents" -ErrorAction SilentlyContinue
+$pids = @()
+if ($null -eq $svcPre -or $svcPre.Status -ne "Running") {
+    $pids = (Get-NetTCPConnection -LocalPort 8001 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
+}
 foreach ($p in $pids) {
     try {
         Stop-Process -Id $p -Force -ErrorAction Stop
@@ -64,13 +71,29 @@ foreach ($p in $pids) {
 
 Start-Sleep -Seconds 2
 
-# Launch start-agents.bat in a NEW window so it survives this script
-$startBat = Join-Path $scriptDir "start-agents.bat"
-if (Test-Path $startBat) {
-    Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "start", '"Trezo - Agents"', "cmd.exe", "/k", "`"$startBat`""
-    Log "  start-agents.bat launched in new window"
+# RECOVER VIA THE SERVICE, NEVER BY LAUNCHING OUR OWN ENGINE.
+# (2026-08-19.) This block used to launch start-agents.bat directly. The
+# engine is managed by nssm, so that made TWO independent things whose job
+# was "make sure an engine is running" - and they fought: every deliberate
+# nssm stop looked like an outage to this watchdog, which then spawned a
+# rival engine (with --reload, no less) that took port 8001, which made the
+# real service crash-loop, which looked like another outage... Eighteen
+# pythons deep, several were live trading engines on ONE Alpaca account.
+# A watchdog may poke the manager; it must never become a second manager.
+$svc = Get-Service -Name "TrezoAgents" -ErrorAction SilentlyContinue
+if ($null -ne $svc) {
+    Log "  restarting via nssm (service state was: $($svc.Status))"
+    & nssm restart TrezoAgents 2>&1 | ForEach-Object { Log "  nssm: $_" }
 } else {
-    Log "  ERROR start-agents.bat not found at $startBat"
+    # No service on this box (dev machine) - the old path is acceptable here,
+    # and start-agents.bat no longer carries --reload.
+    $startBat = Join-Path $scriptDir "start-agents.bat"
+    if (Test-Path $startBat) {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "start", '"Trezo - Agents"', "cmd.exe", "/k", "`"$startBat`""
+        Log "  no TrezoAgents service; start-agents.bat launched in new window"
+    } else {
+        Log "  ERROR no TrezoAgents service AND start-agents.bat not found"
+    }
 }
 
 # Clear the failure counter

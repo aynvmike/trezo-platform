@@ -130,6 +130,30 @@ if (Test-Path $venv) {
     else { Bad "guards NOT green -- do not restart the engine on this code" }
 } else { Warn "skipped (no venv)" }
 
+# ------------------------------------------------- one engine, exactly
+# Added 2026-08-19, the day we found EIGHTEEN pythons: uvicorn --reload
+# engines (spawned by the old health-watchdog path) racing the nssm service
+# for port 8001, several trading the same Alpaca account at once. One
+# account, one engine. This check would have gone red within minutes of
+# the first orphan.
+Section "engine singleton"
+$uvicorns = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match "uvicorn" -and $_.CommandLine -match "app\.main" })
+$parents = @($uvicorns | Where-Object { $_.CommandLine -notmatch "multiprocessing" })
+if ($parents.Count -gt 2) {
+    Bad "MULTIPLE ENGINES: $($parents.Count) uvicorn parents (expected <=2: supervisor+worker). PIDs: $($parents.ProcessId -join ', '). Two engines on one Alpaca account can double-trade it."
+} elseif ($parents.Count -eq 0) {
+    Bad "NO ENGINE: no uvicorn app.main process found at all."
+} else {
+    Ok "single engine ($($parents.Count) uvicorn process(es))"
+}
+$reloaders = @($uvicorns | Where-Object { $_.CommandLine -match "--reload" })
+if ($reloaders.Count -gt 0) {
+    Bad "--reload ENGINE RUNNING: PIDs $($reloaders.ProcessId -join ', '). Dev flag in production; kill it and find what launched it."
+} else {
+    Ok "no --reload engines"
+}
+
 # ----------------------------------------------------- scheduled tasks
 Section "Scheduled tasks"
 

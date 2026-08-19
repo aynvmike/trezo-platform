@@ -59,7 +59,15 @@ for /d /r "%~dp0agents\app" %%d in (__pycache__) do (
 
 set /a "DISPLAY_ATTEMPT=%RESTART_COUNT% + 1"
 echo === Starting uvicorn ^(attempt !DISPLAY_ATTEMPT! of %MAX_RESTARTS%^) ===
-.\.venv\Scripts\uvicorn.exe app.main:app --reload --port 8001
+REM NO --reload. EVER. (2026-08-19 incident.)
+REM --reload is a DEV flag: it spawns a supervisor plus workers and respawns
+REM them when files change. On this server it meant: every git pull forked new
+REM engines, kills orphaned the workers, and at one point EIGHTEEN pythons -
+REM several of them full trading engines on the same Alpaca account - were
+REM running at once while the nssm service crash-looped on the taken port.
+REM One account, one engine, one process tree. Dev machines can pass --reload
+REM by hand; no script in this repo may.
+.\.venv\Scripts\uvicorn.exe app.main:app --port 8001 --host 127.0.0.1
 
 set /a "RESTART_COUNT=%RESTART_COUNT% + 1"
 echo.
