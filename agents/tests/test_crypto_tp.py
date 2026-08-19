@@ -321,6 +321,54 @@ def test_a_refused_amend_re_places_the_stop_rather_than_dropping_it():
     assert "STOP IS GONE" in note2, note2
 
 
+def test_a_resting_target_does_not_block_the_stop():
+    """The live hazard on 2026-08-19, caught before restarting onto this
+    code. The previous build rested crypto take-profits by default; this
+    one stands them down -- but standing down only stops NEW ones. The
+    orders already at the venue keep holding the coins, so with no OCO
+    every stop placement is rejected for insufficient balance, on
+    precisely the rows we are adding stops to protect.
+
+    Stop wins: cancel the target, place the stop, and SAY the target
+    went. Losing upside is the price of having a floor; it should be
+    visible in the note, not silent."""
+    _reset()
+    _orders([TP])                      # a target rests; no stop leg
+    posted, deleted, _r = _capture()
+
+    calls = {"n": 0}
+
+    async def _post(path, body, token=None):
+        calls["n"] += 1
+        posted.append((path, body))
+        if calls["n"] == 1:
+            return None, "HTTP 403: insufficient balance for XRP"
+        return {"id": "sl-new"}, None
+    alp._post = _post
+
+    changed, note = _run(alp.ratchet_crypto_stop("XRPUSD", 0.9, qty=714.7))
+    assert changed is True, note
+    assert deleted == ["/v2/orders/tp-1"], "the target must be released"
+    assert len(posted) == 2, "and the stop retried once it is free"
+    assert posted[1][1]["type"] == "stop_limit"
+    assert "cancelled the resting target" in note, (
+        "a silently sacrificed target is how you find out weeks later")
+
+
+def test_a_stop_that_cannot_be_placed_at_all_says_so_plainly():
+    _reset()
+    _orders([TP])
+    _p, _d, _r = _capture()
+
+    async def _never(path, body, token=None):
+        return None, "HTTP 403: insufficient balance"
+    alp._post = _never
+
+    changed, note = _run(alp.ratchet_crypto_stop("XRPUSD", 0.9, qty=714.7))
+    assert changed is False
+    assert "even after freeing the target" in note, note
+
+
 def test_releasing_units_clears_the_stop_and_the_target_together():
     """No OCO means they are two independent orders reserving the same
     coins. Cancelling one leaves the other holding them, and the sell

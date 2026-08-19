@@ -1029,14 +1029,44 @@ async def ratchet_crypto_stop(
 
     if not qty or qty <= 0:
         return False, "no resting stop and no quantity to protect"
-    _o, err = await _post("/v2/orders", {
+
+    body = {
         "symbol": pair, "qty": str(qty), "side": "sell",
         "type": "stop_limit", "stop_price": str(new_stop),
         "limit_price": str(limit_px), "time_in_force": "gtc",
-    })
-    if err:
+    }
+    _o, err = await _post("/v2/orders", body)
+    if not err:
+        return True, f"crypto stop resting at {new_stop:g} (limit {limit_px:g})"
+
+    # Rejected. The overwhelmingly likely reason is that a resting
+    # TAKE-PROFIT limit is holding the coins: crypto has no OCO, so the
+    # two orders compete for the same units and whichever is already
+    # there wins by default.
+    #
+    # Found 2026-08-19 before restarting onto this code. The engine had
+    # spent the evening on the previous build, which rested crypto
+    # take-profits by default. This build stands them down -- but
+    # standing down only stops NEW ones; the orders already at the venue
+    # sit there holding inventory forever. Every stop would have been
+    # rejected, on exactly the rows we were adding stops to protect, and
+    # the note would have read like a venue problem.
+    #
+    # Mike's rule decides it: stop wins. Cancel the target, place the
+    # stop, and say in the note that the target went -- losing upside is
+    # the price of having a floor, and it should be visible, not silent.
+    targets = [o for o in orders if _is_sell_limit(o)]
+    if not targets:
         return False, f"could not place crypto stop: {err}"
-    return True, f"crypto stop resting at {new_stop:g} (limit {limit_px:g})"
+    for o in targets:
+        if o.get("id"):
+            await _delete(f"/v2/orders/{o.get('id')}")
+    _o2, err2 = await _post("/v2/orders", body)
+    if err2:
+        return False, (f"could not place crypto stop even after freeing "
+                       f"the target: {err2} (first attempt: {err})")
+    return True, (f"crypto stop resting at {new_stop:g} (limit {limit_px:g}) "
+                  f"- cancelled the resting target to free the units")
 
 
 async def cancel_crypto_exits(symbol: str) -> tuple[int, Optional[str]]:
