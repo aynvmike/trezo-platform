@@ -1187,90 +1187,101 @@ async def admin_settings_audit():
     s = _gs()
     out: dict = {"ok": True, "checks": [], "saved": None}
 
-    saved: dict = {}
+    # ---- WHICH BOOK? (rewritten 2026-08-19) -----------------------
+    # The old version compared two DIFFERENT books and called the
+    # difference drift. It read `saved` with os.getenv("TREZO_PRIMARY_
+    # USER_ID") -- which cannot see agents/.env, the exact bug already
+    # found and fixed in settings._primary_user_id() on 2026-08-09 and
+    # never fixed here -- so `saved` fell through to "most recently
+    # updated row", i.e. whichever book was last edited in the UI.
+    # Meanwhile `live` called get_bot_settings() with no argument, which
+    # under multi-account resolves to the BOUND (or primary) book.
+    #
+    # Two books, compared field by field, reported as drift. Mike saw
+    # max_open_positions 6 vs 14 and risk_per_trade 0.1 vs 0.04 -- the
+    # two settings you would deliberately differ between a 25k and a 75k
+    # book -- while tcs_threshold and consecutive_loss_limit matched
+    # because those genuinely are the same everywhere. The tool designed
+    # to catch settings not reaching the agents was itself asking the
+    # wrong book.
+    #
+    # Now: audit EVERY book, each against its OWN row. Apples to apples.
+    from app.runtime.settings import primary_user_id as _prim_uid
+
+    books: list = []
+    cl = None
     if s.supabase_url and s.supabase_service_role_key:
         try:
             from supabase import create_client
             import asyncio
             cl = create_client(s.supabase_url, s.supabase_service_role_key)
-            def _q():
-                # Compare the SAME row the agents read (2026-07-06):
-                # with TREZO_PRIMARY_USER_ID set, that row; else the
-                # most-recently-updated one (legacy).
-                import os as _o
-                _prim = (_o.getenv("TREZO_PRIMARY_USER_ID") or "").strip()
-                qq = cl.table("bot_settings").select("*")
-                if _prim:
-                    qq = qq.eq("user_id", _prim)
-                return qq.order("updated_at", desc=True).limit(1).execute()
-            res = await asyncio.to_thread(_q)
-            if res.data:
-                saved = res.data[0]
+            res = await asyncio.to_thread(
+                lambda: cl.table("paper_accounts").select("user_id").execute())
+            books = [r["user_id"] for r in (res.data or []) if r.get("user_id")]
         except Exception as e:  # noqa: BLE001
-            out["checks"].append({"name": "supabase_read", "ok": False,
-                                  "detail": f"could not read bot_settings: {e}"})
-    out["saved"] = saved
+            out["checks"].append({"name": "book_discovery", "ok": False,
+                                  "detail": f"could not list paper_accounts: {e}"})
+    if not books:
+        books = [_prim_uid()]
+    out["books"] = [str(b) for b in books]
 
-    cfg = get_bot_settings()
-    live = {
-        "tcs_threshold": cfg.tcs_threshold,
-        "max_open_positions": cfg.max_open_positions,
-        "consecutive_loss_limit": cfg.consecutive_loss_limit,
-        "risk_per_trade_pct": cfg.risk_per_trade_pct,
-        "default_stop_pct": cfg.default_stop_pct,
-        "default_target_pct": cfg.default_target_pct,
-        "min_reward_risk": cfg.min_reward_risk,
-        "risk_profile": cfg.risk_profile,
-        "pattern_enabled": cfg.pattern_enabled,
-        "stms_enabled": cfg.stms_enabled,
-        "extended_enabled": cfg.extended_enabled,
-        "crypto_enabled": cfg.crypto_enabled,
-        "autonomy_mode": cfg.autonomy_mode,
-        "account_posture": cfg.account_posture,
-        "switching_mode": cfg.switching_mode,
-        "switching_advantage_pct": cfg.switching_advantage_pct,
-        "wheel_auto_execute": cfg.wheel_auto_execute,
-        # Phase C+D options filters (Path α): show per-user override when
-        # set, else what the agent will actually use (env default).
-        "options_min_dte": (cfg.options_min_dte
-                            if cfg.options_min_dte is not None
-                            else int(s.options_min_dte)),
-        "options_max_premium_delta": (cfg.options_max_premium_delta
-                                      if cfg.options_max_premium_delta is not None
-                                      else float(s.options_max_premium_delta)),
-        "options_min_iv_rank_scalp": (cfg.options_min_iv_rank_scalp
-                                      if cfg.options_min_iv_rank_scalp is not None
-                                      else float(s.options_min_iv_rank_scalp)),
-        "options_hopeful_allocation_cap_pct": (
-            cfg.options_hopeful_allocation_cap_pct
-            if cfg.options_hopeful_allocation_cap_pct is not None
-            else float(s.options_hopeful_allocation_cap_pct)
-        ),
-    }
-    out["live_in_agents"] = live
+    FIELDS = ("tcs_threshold", "max_open_positions", "consecutive_loss_limit",
+              "risk_per_trade_pct", "default_stop_pct", "default_target_pct",
+              "min_reward_risk", "risk_profile", "pattern_enabled",
+              "stms_enabled", "extended_enabled", "crypto_enabled",
+              "autonomy_mode", "account_posture", "switching_mode",
+              "switching_advantage_pct", "wheel_auto_execute")
 
-    for key, agent_val in live.items():
-        saved_val = saved.get(key) if saved else None
-        if saved_val is None:
+    saved = {}
+    out["per_book"] = []
+    multi = len(books) > 1
+
+    for uid in books:
+        label = (str(uid)[:8] if uid else "default")
+        row: dict = {}
+        if cl is not None and uid:
+            try:
+                import asyncio
+                r = await asyncio.to_thread(
+                    lambda: cl.table("bot_settings").select("*")
+                            .eq("user_id", uid)
+                            .order("updated_at", desc=True).limit(1).execute())
+                row = (r.data or [{}])[0]
+            except Exception as e:  # noqa: BLE001
+                out["checks"].append({"name": f"{label}·read", "ok": False,
+                                      "detail": f"could not read row: {e}"})
+        if not saved:
+            saved = row
+
+        cfg = get_bot_settings(str(uid) if uid else None)
+        live = {k: getattr(cfg, k) for k in FIELDS}
+        out["per_book"].append({"user_id": str(uid), "saved": row, "live": live})
+
+        for key, agent_val in live.items():
+            saved_val = row.get(key) if row else None
+            name = f"{label} · {key}" if multi else key
+            if saved_val is None:
+                out["checks"].append({
+                    "name": name, "ok": True,
+                    "detail": f"not saved · agent using default {agent_val}",
+                })
+                continue
+            try:
+                match = (float(saved_val) == float(agent_val)
+                         if isinstance(agent_val, (int, float))
+                         and not isinstance(agent_val, bool)
+                         else saved_val == agent_val)
+            except (TypeError, ValueError):
+                match = saved_val == agent_val
             out["checks"].append({
-                "name": key, "ok": True,
-                "detail": f"not saved · agent using default {agent_val}",
+                "name": name, "ok": match,
+                "detail": (f"saved={saved_val} · agent={agent_val}" if match
+                           else f"DRIFT · saved={saved_val}, agent={agent_val}"),
             })
-            continue
-        match = (
-            float(saved_val) == float(agent_val)
-            if isinstance(agent_val, (int, float))
-            and isinstance(saved_val, (int, float, str))
-            and str(saved_val).replace(".", "").replace("-", "").isdigit()
-            else saved_val == agent_val
-        )
-        out["checks"].append({
-            "name": key, "ok": match,
-            "detail": (
-                f"saved={saved_val} · agent={agent_val}"
-                if match else f"DRIFT · saved={saved_val}, agent={agent_val}"
-            ),
-        })
+
+    out["saved"] = saved
+    cfg = get_bot_settings()
+    out["live_in_agents"] = {k: getattr(cfg, k) for k in FIELDS}
 
     try:
         from app.strategies.stms import TCS_THRESHOLD as _STMS_SEED

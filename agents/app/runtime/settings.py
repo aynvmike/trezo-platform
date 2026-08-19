@@ -115,6 +115,18 @@ def _primary_user_id():
     return v or None
 
 
+def primary_user_id():
+    """Public name for the anchor row.
+
+    Added 2026-08-19. The settings-audit endpoint had its own copy of
+    this lookup using os.getenv -- which cannot see agents/.env, the
+    exact bug fixed inside _primary_user_id() on 2026-08-09. The fix
+    landed in one place and the duplicate went on being wrong, so the
+    audit silently compared the wrong book. One implementation, exported,
+    so there is nothing left to drift against."""
+    return _primary_user_id()
+
+
 def _single_row_mode() -> bool:
     import os as _o
     return _o.getenv("TREZO_SETTINGS_SINGLE_ROW", "1") != "0"
