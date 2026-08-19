@@ -445,8 +445,8 @@ export function BotTuningForm({
             <div className="mt-2 grid sm:grid-cols-2 gap-2">
               <FrictionMode value="off"      current={s.switching_mode ?? "adaptive"} label="Off"                    desc="Every tick can flip. Debug / backtest only." />
               <FrictionMode value="fixed"    current={s.switching_mode ?? "adaptive"} label="Fixed"                  desc="Challenger must beat current by the % below." />
-              <FrictionMode value="adaptive" current={s.switching_mode ?? "adaptive"} label="Adaptive (Recommended)" desc="Threshold scales inversely with your TCS dial - lower TCS = bigger gap required. Math: base x (800 / current TCS)." />
-              <FrictionMode value="tiered"   current={s.switching_mode ?? "adaptive"} label="Tiered"                 desc="Three bands keyed on the new pick's TCS: 700+ needs 5%, 500-699 needs 10%, under 500 needs 20%." />
+              <FrictionMode value="adaptive" current={s.switching_mode ?? "adaptive"} label="Adaptive (Recommended)" desc="Threshold scales inversely with your TCS dial - lower TCS = bigger gap required. Math: base x (80 / current TCS)." />
+              <FrictionMode value="tiered"   current={s.switching_mode ?? "adaptive"} label="Tiered"                 desc="Three bands keyed on the new pick's TCS: 70+ needs 5%, 50-69 needs 10%, under 50 needs 20%." />
             </div>
           </div>
           <div className="flex items-center gap-4">
@@ -460,7 +460,7 @@ export function BotTuningForm({
           </div>
           <div className="text-[11px] text-weave-500 leading-relaxed border-t border-weave-50 pt-3">
             <p className="font-medium text-weave-700">How adaptive scales:</p>
-            <p className="mt-1">base 10% x (800 / TCS) - at TCS 800 needs 10%, at TCS 700 needs 11.4%, at TCS 500 needs 16%, at TCS 400 needs 20%.</p>
+            <p className="mt-1">base 10% x (80 / TCS) - at TCS 80 needs 10%, at TCS 70 needs 11.4%, at TCS 50 needs 16%, at TCS 40 needs 20%.</p>
             <p className="mt-1">
               Suppressed flips emit a &quot;strategy_held&quot; activity-feed event so you can see the friction working.
               The pick that&apos;s held keeps its TCS as the baseline for the next comparison.

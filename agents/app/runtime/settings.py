@@ -186,16 +186,26 @@ def required_switch_advantage(
     Modes:
       off       - always 0.0 (legacy behavior).
       fixed     - base_pct / 100.
-      adaptive  - base_pct scaled by (800 / current TCS threshold).
-                  At threshold=500 with base=10 you get 16%; at
-                  threshold=800 you get 10%. Lower TCS = noisier =
+      adaptive  - base_pct scaled by (80 / current TCS threshold).
+                  At threshold=50 with base=10 you get 16%; at
+                  threshold=80 you get 10%. Lower TCS = noisier =
                   bigger gap to flip.
       tiered    - three bands keyed on the NEW pick's TCS:
-                  >= 700 needs 5%,  500-699 needs 10%,  < 500 needs 20%.
+                  >= 70 needs 5%,  50-69 needs 10%,  < 50 needs 20%.
                   Ignores base_pct.
 
-    Anchored to TCS=800 (the conservative ceiling) so the adaptive
+    Anchored to TCS=80 (the conservative ceiling) so the adaptive
     multiplier is >= 1.0 - friction never gets EASIER than the base.
+
+    SCALE (read before touching the numbers): TCS is 0-100 everywhere
+    since 2026-07-08. The adaptive branch was migrated then; the tiered
+    branch was NOT, and kept testing >= 700 and >= 500 on a scale whose
+    maximum is 100. Every score fell through both bands to the final
+    return, so tiered silently meant "a flat 20%, always" -- three bands
+    collapsed into one, for six weeks, with the UI still describing all
+    three. Found 2026-08-19 by Mike reading the settings page and asking
+    whether it would confuse the agents. It confused him first, which is
+    usually the order these are found in.
     """
     m = (mode or "adaptive").strip().lower()
     if m == "off":
@@ -203,9 +213,11 @@ def required_switch_advantage(
     if m == "fixed":
         return max(0.0, float(base_pct)) / 100.0
     if m == "tiered":
-        if new_tcs >= 700:
+        # 0-100 scale. Was 700/500 until 2026-08-19 -- unreachable, so
+        # this branch always returned 0.20.
+        if new_tcs >= 70:
             return 0.05
-        if new_tcs >= 500:
+        if new_tcs >= 50:
             return 0.10
         return 0.20
     # adaptive (default)
