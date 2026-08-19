@@ -377,6 +377,15 @@ SWING_RSI_LO, SWING_RSI_HI = 48, 72
 SWING_BB_MIN = _envf("TREZO_CRYPTO_SWING_BB_MIN", 2.0)
 SWING_VOL_MIN = _envf("TREZO_CRYPTO_SWING_VOL_MIN", 0.8)
 DCA_RSI_MAX = _envf("TREZO_CRYPTO_DCA_RSI_MAX", 40)
+# DCA BOUNCE GATE (2026-08-19, Mike: "DCA is having an issue of its own
+# lane"). 30-day audit: DCA was the only mode whose entire entry condition
+# was `rsi < 40` -- no bands, no volume, no trend, nothing asking whether
+# the fall had STOPPED. RSI under 40 means the coin is falling; buying on
+# that alone is catching knives, and the month priced it: 29 closes,
+# -$738, most never bouncing even +0.8% after entry because the bounce
+# had not started when we bought. Every other mode earns its entry; now
+# DCA does too: oversold AND turning up. Set to 0 to restore knife-catching.
+DCA_REQUIRE_BOUNCE = _envf("TREZO_CRYPTO_DCA_REQUIRE_BOUNCE", 1) >= 1
 
 
 def _vol_ratio_live(candles: list[Candle]) -> tuple[float, float]:
@@ -476,14 +485,28 @@ def detect_mode(ticker: str, candles: list[Candle]) -> Optional[CryptoSignal]:
                     f"hold (no profit target)."),
         )
 
-    # --- DCA: oversold accumulation. ---
+    # --- DCA: oversold accumulation -- of a coin that has STOPPED falling.
+    # Oversold alone is not a reason to buy; it is a description of the
+    # fall. The bounce gate demands the first evidence of recovery: RSI
+    # higher than the previous bar AND the last close above the one before
+    # it. Same coins, same discipline, one word added: bounce. ---
     if rsi_now < DCA_RSI_MAX:
-        return CryptoSignal(
-            ticker=sym, mode="dca", direction="bullish",
-            stop_pct=base["stop_pct"], target_pct=base["target_pct"],
-            rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
-            reason=f"DCA - RSI {rsi_now:.0f} oversold, accumulating.",
-        )
+        _rsi_series = rsi(cl, 14)
+        _rsi_prev = _rsi_series[-2] if len(_rsi_series) >= 2 else rsi_now
+        _bouncing = (rsi_now > _rsi_prev) and (cl[-1] > cl[-2])
+        if _bouncing or not DCA_REQUIRE_BOUNCE:
+            return CryptoSignal(
+                ticker=sym, mode="dca", direction="bullish",
+                stop_pct=base["stop_pct"], target_pct=base["target_pct"],
+                rsi=rsi_now, bb_width_pct=bb_w, volume_ratio=vol_ratio,
+                reason=(f"DCA - RSI {rsi_now:.0f} oversold and turning up "
+                        f"(prev {_rsi_prev:.0f}), buying the bounce."),
+            )
+        # Oversold but still falling: the old code bought exactly here.
+        # No signal -- and deliberately no fall-through to SCALP below,
+        # because a coin with RSI under 40 mid-fall is not a calm range
+        # coin either. Held off is the trade.
+        return None
 
     # --- SCALP: fast, flexible default for calm/range coins. Loose bands,
     # volume-OPTIONAL so it is not frozen out on no-volume feeds. ---
