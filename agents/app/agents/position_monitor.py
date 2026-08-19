@@ -622,9 +622,16 @@ async def _push_stop_to_broker(r: dict, new_stop: float) -> None:
                 _sym, float(new_stop), qty=_qty,
                 target_price=(float(r["target_price"])
                               if r.get("target_price") else None))
+        from app.agents.activity_log import record
         if changed:
-            from app.agents.activity_log import record
             record("broker_stop_moved", str(r.get("ticker") or "?"),
+                   strategy=str(r.get("strategy") or ""), reason=note,
+                   extra={"user_id": str(r.get("user_id") or "")})
+        elif "already" not in (note or ""):
+            # Failed to move a stop the ledger has already ratcheted:
+            # our book thinks the position is protected at the new level
+            # and the venue does not agree. Never silent.
+            record("broker_stop_unmoved", str(r.get("ticker") or "?"),
                    strategy=str(r.get("strategy") or ""), reason=note,
                    extra={"user_id": str(r.get("user_id") or "")})
     except Exception:  # noqa: BLE001
@@ -950,9 +957,24 @@ async def _arm_broker_stop(r: dict) -> str | None:
             changed, note = await ensure_stock_protection(
                 tk, qty, stop,
                 float(r["target_price"]) if r.get("target_price") else None)
-        if not changed:
-            return None
         from app.agents.activity_log import record
+        if not changed:
+            # A FAILURE TO PROTECT MUST BE AUDIBLE (2026-08-19).
+            # This used to `return None` on anything but success, so a
+            # stop that could not be placed left no line anywhere -- and
+            # "no broker_stop events in three hours" was unreadable: not
+            # deployed, nothing to do, and failing every tick all looked
+            # identical. That is the exact failure this codebase spent a
+            # day removing everywhere else.
+            #
+            # "already at" is the one genuinely boring outcome (the stop
+            # is where we want it); everything else is a reason the
+            # position is not protected at the venue, and gets said.
+            if "already" not in (note or ""):
+                record("broker_stop_unplaced", tk,
+                       strategy=str(r.get("strategy") or ""), reason=note,
+                       extra={"user_id": str(r.get("user_id") or "")})
+            return None
         record("broker_stop_armed", tk,
                strategy=str(r.get("strategy") or ""), reason=note,
                extra={"user_id": str(r.get("user_id") or "")})
