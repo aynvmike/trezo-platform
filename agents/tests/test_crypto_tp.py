@@ -400,6 +400,30 @@ def test_the_offset_scale_is_the_one_mike_named():
     assert ap.stop_limit_offset("nonsense") > 0
 
 
+def test_a_coin_that_is_not_trailing_still_gets_a_stop():
+    """The gap found on 2026-08-19, minutes after shipping the feature.
+
+    Mirroring a crypto stop happened ONLY from the three ratchet sites,
+    which fire when a stop moves UP. A coin sitting still never called
+    them, so it never got a venue-side stop at all -- the feature
+    protected exactly the positions already doing well and nothing else.
+    Five live coins had no broker stop while the log looked healthy.
+
+    Arming must therefore place at the CURRENT ledger stop, with no
+    ratchet required. ratchet_crypto_stop does that when no leg rests,
+    which is why it is the arming call too."""
+    _reset()
+    _orders([])                        # nothing resting: the naked case
+    posted, _d, _r = _capture()
+    changed, note = _run(alp.ratchet_crypto_stop(
+        "LINKUSD", 9.4, qty=133.7, offset_profile="balanced"))
+    assert changed is True, note
+    assert len(posted) == 1
+    assert posted[0][1]["type"] == "stop_limit"
+    assert float(posted[0][1]["stop_price"]) == 9.4, (
+        "arming places at the ledger stop -- it must not wait for a ratchet")
+
+
 def test_the_policy_names_the_order_type_each_venue_takes():
     _reset()
     assert ap.policy_for("crypto").stop_order_type == "stop_limit"

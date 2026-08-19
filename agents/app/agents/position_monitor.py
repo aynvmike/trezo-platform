@@ -899,9 +899,11 @@ async def _arm_broker_stop(r: dict) -> str | None:
     double-sell against legs that do exist -- the reason the original
     check was deliberately alert-only.
 
-    Market hours only: equity legs cannot be cancelled while the market
-    is shut, so trying overnight just fails on a loop (the 47-aborts
-    lesson). Off with TREZO_BROKER_STOP_SYNC=0. Never raises."""
+    Session-gated per asset class, not universally: equity legs cannot
+    be cancelled while the market is shut, so trying overnight just
+    fails on a loop (the 47-aborts lesson). Crypto is not gated -- it
+    trades 24/7 and a coin at 3am is exactly when a venue-side stop
+    earns its keep. Off with TREZO_BROKER_STOP_SYNC=0. Never raises."""
     if os.getenv("TREZO_BROKER_STOP_SYNC", "1") == "0":
         return None
     if str(r.get("broker") or "") != "alpaca" or r.get("side") != "long":
@@ -909,7 +911,7 @@ async def _arm_broker_stop(r: dict) -> str | None:
     tk = str(r.get("ticker") or "")
     try:
         pol = _asset_policy(r.get("asset_type"))
-        if not pol.native_brackets:
+        if not pol.holds_stop:
             return None
         stop = float(r.get("stop_price") or 0)
         qty = float(r.get("quantity") or 0)
@@ -928,10 +930,26 @@ async def _arm_broker_stop(r: dict) -> str | None:
                     return None
             except Exception:  # noqa: BLE001
                 pass
-        from app.brokers.alpaca import ensure_stock_protection
-        changed, note = await ensure_stock_protection(
-            tk, qty, stop,
-            float(r["target_price"]) if r.get("target_price") else None)
+        if pol.stop_order_type == "stop_limit":
+            # Crypto (2026-08-19). Mirroring a stop only ever happened
+            # from the three RATCHET sites -- hodl trail, ladder, profit
+            # trail -- so a coin whose stop had not moved never reached
+            # the venue at all. The feature protected exactly the
+            # positions that were already doing well, and nothing else.
+            # Five coins were sitting with no broker stop while the log
+            # looked healthy.
+            #
+            # ratchet_crypto_stop places one when none rests and declines
+            # when the resting stop is already higher, so it is the right
+            # call for arming as well as trailing.
+            from app.brokers.alpaca import ratchet_crypto_stop
+            changed, note = await ratchet_crypto_stop(
+                tk, stop, qty=qty, offset_profile=_stop_offset_profile(r))
+        else:
+            from app.brokers.alpaca import ensure_stock_protection
+            changed, note = await ensure_stock_protection(
+                tk, qty, stop,
+                float(r["target_price"]) if r.get("target_price") else None)
         if not changed:
             return None
         from app.agents.activity_log import record
@@ -1599,9 +1617,17 @@ class PositionMonitorAgent(Agent):
                             pass
 
                     if reason_c is None:
-                        # Holding. Make sure the venue is holding the
-                        # target for us, so it still gets taken if this
+                        # Holding. Make sure the venue is holding this
+                        # row's protection, so it still works if this
                         # process is not here next tick.
+                        #
+                        # 2026-08-19: the stop arming lives HERE as well
+                        # as in the stock branch. Mirroring a crypto stop
+                        # used to happen only from the ratchet sites, so
+                        # a coin whose stop had not moved never reached
+                        # the venue -- protection for the positions
+                        # already doing well, and nothing for the rest.
+                        await _arm_broker_stop(r)
                         await _push_crypto_tp(r, target_c)
                         alpaca_managed += 1
                         continue
