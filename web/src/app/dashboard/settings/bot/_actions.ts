@@ -5,7 +5,14 @@ import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 
 const schema = z.object({
-  tcs_threshold: z.coerce.number().int().min(300).max(1000),
+  // TCS is 0-100 everywhere since 2026-07-08. This validator kept the
+  // OLD 0-1000 bounds, and the slider that feeds it offers 30-95 -- the
+  // slider's MAXIMUM was below the validator's MINIMUM, so the form
+  // could never validate. zod rejects the whole object on one bad
+  // field, so every OTHER setting on this page was unsaveable too, for
+  // every book, behind a message that named no field.
+  // Found 2026-08-19 by Mike, who could not save and could not see why.
+  tcs_threshold: z.coerce.number().int().min(0).max(100),
   max_open_positions: z.coerce.number().int().min(1).max(20),
   consecutive_loss_limit: z.coerce.number().int().min(2).max(10),
   risk_per_trade_pct: z.coerce.number().min(0.005).max(0.25),
@@ -102,7 +109,18 @@ export async function saveBotSettings(
 
   const parsed = schema.safeParse(raw);
   if (!parsed.success) {
-    return { ok: false, message: "Some values were out of range - not saved." };
+    // SAY WHICH FIELD. "Some values were out of range" is unactionable:
+    // it proves something is wrong and withholds the one detail needed
+    // to fix it. That is how a stale TCS bound hid here for six weeks
+    // while the page silently refused every save.
+    const detail = parsed.error.issues
+      .map((i) => {
+        const field = i.path.join(".") || "form";
+        const got = (raw as Record<string, unknown>)[field];
+        return `${field} (${String(got)}): ${i.message}`;
+      })
+      .join("; ");
+    return { ok: false, message: `Not saved - ${detail}` };
   }
 
   const allocation_overrides: Record<string, number> = {};
