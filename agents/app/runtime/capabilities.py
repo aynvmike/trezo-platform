@@ -101,8 +101,17 @@ def ladder_stop(entry, price: float, ladder, side: str = "long") -> float | None
     s = str(side or "").lower()
     gain = (price - entry) / entry if s == "long" else (entry - price) / entry
     locked = None
+    # EXACT-BOUNDARY EPSILON (2026-08-19). `gain >= trigger` on raw floats
+    # misses the rung when the peak lands ON it: entry 100.0, price 100.8
+    # gives 0.007999999999999996, which is not >= 0.008, so the +0.8% rung
+    # does not arm. Same for +1.8% at 101.8. With the old +5%/+8%/+10% rungs
+    # nobody noticed. With sub-1% rungs this is the difference between a
+    # ladder that works and a ladder that looks deployed and locks nothing.
+    # 1e-9 is ~1000x the double-rounding error at these magnitudes and far
+    # below any price move that could matter.
+    _EPS = 1e-9
     for trigger, floor in ladder:
-        if gain >= trigger:
+        if gain >= float(trigger) - _EPS:
             locked = floor
     if locked is None:
         return None

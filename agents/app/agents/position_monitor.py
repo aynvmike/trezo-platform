@@ -559,7 +559,13 @@ async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
-    await _push_stop_to_broker(r, new_stop)
+    if _breached:
+        record("ladder_lock_breached", tk,
+               entry=r.get("entry_price"), peak=_anchor, price=price,
+               locked_stop=new_stop,
+               reason="gave back through the rung - local stop-check sells")
+    else:
+        await _push_stop_to_broker(r, new_stop)
     return new_stop
 
 
@@ -696,15 +702,66 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     Returns the new stop if it ratcheted up (and persists it), else None.
     Never lowers a stop. Long-only."""
     from app.runtime.capabilities import ladder_stop
-    new_stop = ladder_stop(r.get("entry_price"), price, ladder, "long")
+    from app.agents.activity_log import record
+
+    # ARM ON THE PEAK, NOT ON THIS TICK (2026-08-19, with the retuned rungs).
+    # This passed the monitor's 60s observation straight into ladder_stop, so
+    # a rung only armed if a tick HAPPENED to land while the gain was above
+    # it. With +5% rungs that rarely mattered. With a +0.8% first rung it
+    # matters constantly: crypto crosses +0.8% and comes back inside one
+    # tick interval all day, and the ladder would have sat there reading
+    # "below rung one" through the entire move.
+    #
+    # This is the SAME wrong assumption already fixed in
+    # _maybe_trail_stock_profit on 7/27 (the ETH trade that gave back half
+    # its peak). It was in two places; the first fix only found one of them.
+    # The row already stores peak_price. Use it.
+    _anchor = price
+    try:
+        _pk = float(r.get("peak_price") or 0)
+        if _pk > 0:
+            _anchor = max(price, _pk)
+    except (TypeError, ValueError):
+        _anchor = price
+
+    new_stop = ladder_stop(r.get("entry_price"), _anchor, ladder, "long")
     if new_stop is None:
         return None  # below the first rung / bad input -> keep original stop
+
+    tk = r.get("ticker") or r.get("symbol") or "?"
+
+    # THE LOCK MUST CLEAR THE ROUND TRIP (2026-08-19). A floor at or under
+    # 0.62% books a net LOSS while calling itself a profit lock. Refuse it
+    # and SAY SO -- do not quietly clamp it upward, because a stop tighter
+    # than the rung intended is its own way of losing money.
+    try:
+        _entry = float(r.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        _entry = 0.0
+    if _entry > 0 and str(r.get("asset_type") or "").lower() == "crypto":
+        from app.paper.engine import CRYPTO_COMMISSION_BPS as _FB, SLIPPAGE_BPS as _SB
+        from app.strategies.crypto import round_trip_cost_pct
+        _floor_pct = round_trip_cost_pct(_FB, _SB)
+        if (new_stop / _entry - 1.0) <= _floor_pct:
+            record("ladder_lock_below_fee_floor", tk,
+                   entry=_entry, proposed_stop=new_stop,
+                   fee_floor_pct=round(_floor_pct * 100, 4),
+                   reason="rung locks at or under round-trip cost - refused")
+            return None
+
     try:
         cur = float(r["stop_price"]) if r.get("stop_price") else None
     except (TypeError, ValueError):
         cur = None
     if cur is not None and new_stop <= cur:
         return None  # only ever ratchet UP
+
+    # Anchoring on the peak means the locked floor can now sit ABOVE the
+    # last price -- the trade already gave back through the rung. That is a
+    # SELL, not a resting stop, and the broker would reject an order placed
+    # through the market. Persist it so the local stop-check sells on this
+    # same pass, skip the broker push, and make the situation audible.
+    _breached = _anchor > price and new_stop >= price
     client = _supabase()
     if client is None:
         return None

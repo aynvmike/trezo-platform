@@ -110,22 +110,62 @@ HODL_TRAIL_GIVEBACK = 0.20     # then trail 20% below price (lock ~80% of high)
 # climb toward the target, tightening the give-back as profit grows -- the
 # same "tighter the more you are up" discipline as Mike's options drawback
 # ladder. Tune the rungs here.
+# RUNG REPLAY, 2026-08-19 (Mike). The rungs above were measured against 30
+# days of real closed crypto longs (90 trades, $112k notional). Result: they
+# armed on SIX of ninety trades and moved the month's P&L by $1.68. Sixty of
+# ninety trades never reached even +0.8%, and the median scalp/DCA peak is
+# ~0.58% -- BELOW the 0.62% round-trip cost. A ladder whose first rung is
+# +5% is not protection on this book; it is decoration.
+#
+# The replay says nearly all the value is in the FIRST rung: a +0.8% trigger
+# fired on 38 of 90 and added $306 over the month, while the +5% rung fired
+# on 6 and added $119. Same trades, retuned ladder: -$456.87 actual becomes
+# -$47.74 modelled.
+#
+# WHY THE GAP BETWEEN TRIGGER AND LOCK MATTERS MORE THAN THE TRIGGER: the
+# replay knows entry, peak and final exit -- NOT the path between them, so
+# it cannot see a stop tripped early by a wiggle. A 0.65%/0.63% pair scored
+# best in the model and is the worst real choice: 0.02% of room, and $672 of
+# realized profit standing behind it. Mike chose the +0.8% and +1.0% rows,
+# which arm early and then widen the room to 0.35% as the trade proves out.
+#
+# EVERY LOCK HERE MUST CLEAR round_trip_cost_pct() = 0.62%. A lock under it
+# books a LOSS while the log says "profit locked" -- see ladder_clears_fees().
 SWING_PROFIT_LADDER = (
-    (0.05, 0.00),   # +5% gain  -> lock breakeven (the spec's "trail after 5%")
-    (0.08, 0.03),   # +8% gain  -> lock +3%
-    (0.10, 0.05),   # +10% gain -> lock +5% (target at +12% takes the rest)
+    (0.008, 0.0065),  # +0.8% peak -> lock +0.65% (just over the 0.62% floor)
+    (0.010, 0.0075),  # +1.0%      -> lock +0.75%
+    (0.018, 0.0110),  # +1.8%      -> lock +1.10%  (Mike's "1% on 10k" rung)
+    (0.030, 0.0200),  # +3.0%      -> lock +2.00%
+    (0.050, 0.0340),  # +5.0%      -> lock +3.40%
+    (0.100, 0.0500),  # +10%       -> lock +5.00%  (kept from the 6/13 ladder)
 )
 
 # DCA accumulation profit lock (crypto). DCA targets are smaller (per-coin
 # ~6%), so the rungs are tighter: protect capital early, lock a little after.
+# Same replay, same verdict, plus one of its own: the +3% rung locked
+# BREAKEVEN, and breakeven on crypto is a 0.62% LOSS once the round trip is
+# paid. DCA armed on 1 of 25 trades in 30 days. Retuned it improves the
+# month from -$555 to -$512 -- real, but small, because DCA's problem is
+# not the exit. 25 trades on $55.7k of notional bleeding half a thousand
+# dollars is an ENTRY-quality problem, and no exit rule fixes it. Mike
+# 2026-08-19: fix the DCA entries first, then revisit these rungs.
 DCA_PROFIT_LADDER = (
-    (0.03, 0.00),   # +3% gain -> lock breakeven
-    (0.05, 0.02),   # +5% gain -> lock +2%
+    (0.008, 0.0065),  # +0.8% peak -> lock +0.65%
+    (0.010, 0.0075),  # +1.0%      -> lock +0.75%
+    (0.018, 0.0110),  # +1.8%      -> lock +1.10%
+    (0.030, 0.0200),  # +3.0%      -> lock +2.00%
+    (0.050, 0.0340),  # +5.0%      -> lock +3.40%
 )
 
 # Extended (STOCK multi-day swing) profit lock. Bigger moves than crypto DCA,
 # so wider rungs. Kept here with the other ladders as one tunable home; the
 # Position Monitor applies it to Alpaca-routed Extended rows.
+#
+# DELIBERATELY NOT RETUNED by the 2026-08-19 crypto rung replay. That study
+# covered crypto longs only, where a 0.62% round trip eats the small moves.
+# Alpaca equities are commission-free, so a breakeven rung here is genuinely
+# breakeven, not a hidden loss. Retuning this on crypto evidence would be
+# borrowing a conclusion from a different cost model.
 EXTENDED_PROFIT_LADDER = (
     (0.04, 0.00),   # +4% gain  -> lock breakeven
     (0.07, 0.03),   # +7% gain  -> lock +3%
@@ -165,6 +205,38 @@ def clears_fee_edge(target_pct: float, fee_bps: float, slippage_bps: float,
     """The gate: True when expected net edge meets the required cushion
     (default +0.01%). Independent of the coin's price/cost."""
     return net_edge_pct(target_pct, fee_bps, slippage_bps) >= float(buffer)
+
+
+def ladder_clears_fees(ladder, fee_bps: float, slippage_bps: float
+                       ) -> list[tuple[float, float]]:
+    """Every rung whose LOCKED FLOOR sits at or below round-trip cost.
+
+    A rung that locks +0.00% (or anything under 0.62%) exits at a NET LOSS
+    while the activity log cheerfully says "profit locked". That is the
+    failure this repo cares most about: a loss wearing the costume of a win.
+    Returns the offending rungs -- empty list means the ladder is safe.
+
+    Added 2026-08-19 with the retuned rungs, because the old DCA ladder's
+    first rung WAS +0.00% and had been for two months without anyone -- me
+    included -- noticing that it could not make money."""
+    floor = round_trip_cost_pct(fee_bps, slippage_bps)
+    bad: list[tuple[float, float]] = []
+    for trigger, locked in ladder:
+        if float(locked) <= floor:
+            bad.append((float(trigger), float(locked)))
+    return bad
+
+
+def ladder_is_monotonic(ladder) -> bool:
+    """True when both triggers and locked floors climb strictly. A ladder
+    that dips (the 6/13 SWING ladder went +8%->+3% AFTER +5%->+0%, then
+    +10%->+5%) means a HIGHER peak can propose a LOWER stop; the ratchet
+    then silently ignores the rung and the tier reads as active when it is
+    not."""
+    trigs = [float(t) for t, _ in ladder]
+    locks = [float(f) for _, f in ladder]
+    return (all(b > a for a, b in zip(trigs, trigs[1:]))
+            and all(b > a for a, b in zip(locks, locks[1:])))
 
 
 def is_accumulation_strategy(strategy: str | None) -> bool:
