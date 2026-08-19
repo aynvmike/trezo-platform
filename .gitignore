@@ -124,3 +124,14 @@ agents/app/knowledge/_research_seen.json
 
 # Runtime counter, rewritten constantly -- never source of truth.
 agents/app/memory/.usage_budget.json
+
+# ---- Watchdog counters ----
+# heartbeat-check.ps1 and web-watchdog.ps1 keep their consecutive-fail
+# and repair-attempt counts here. Pure runtime state, rewritten every
+# five minutes, meaningless on any other machine.
+#
+# Added 2026-08-19: this was the ONLY thing making the server's working
+# tree dirty, and a dirty tree is not cosmetic -- it can make a deploy's
+# `git pull --ff-only` refuse to fast-forward. Which would have been the
+# next silent deploy failure, after the one that cost two outages.
+state/
