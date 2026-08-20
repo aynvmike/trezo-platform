@@ -832,21 +832,41 @@ class RiskManagerAgent(Agent):
                     user_id=message.payload.get("user_id"),
                 )]
 
+        # Book-first (Mike 2026-08-20): "make the agents look at the
+        # books as a default and not the account. no matter what."
+        # This counter spans EVERY book - it seeds from paper_positions
+        # with no user filter - so with three books holding ~10
+        # positions each it sat permanently at 14/14 and vetoed the
+        # whole platform's entries: 516 "Open-signal cap reached (14)"
+        # vetoes on 08-20 alone, while no single book was near ITS cap.
+        # A platform-wide count judged against one book's setting is a
+        # category error. The cap now lives at the fan-out, where each
+        # book is counted by name (trade_execution._book_open_tickers)
+        # against its own max_open_positions. Here the crossing is only
+        # NOTED - with the rotation hint kept, since "which weakest
+        # position frees a slot" is still useful on the dashboard.
         if _coin_u not in self._recent_approvals and len(self._recent_approvals) >= max_open:
-            # Mike 2026-06-01 capital recycling: the veto stands BUT we
-            # attach a rotation hint so the user/UI can see which
-            # weakest open position would free up the slot. Pure
-            # advisory - we do not auto-close anything here.
-            rotation_hint = await _find_rotation_candidate(
-                message.payload.get("user_id"), tcs,
-            )
-            veto = self._veto(
-                ticker, tcs,
-                f"Open-signal cap reached ({max_open})",
-            )
-            if rotation_hint:
-                veto.payload["rotation_candidate"] = rotation_hint
-            return [veto]
+            try:
+                rotation_hint = await _find_rotation_candidate(
+                    message.payload.get("user_id"), tcs,
+                )
+                note = AgentMessage(
+                    agent=self.name, kind="info", confidence=0.3,
+                    payload={
+                        "ticker": ticker,
+                        "event": "platform_signal_pressure",
+                        "note": (f"{len(self._recent_approvals)} tickers "
+                                 f"approved-and-open across all books - "
+                                 f"per-book caps decide at the fan-out"),
+                        **({"rotation_candidate": rotation_hint}
+                           if rotation_hint else {}),
+                    })
+                # advisory only - the signal continues to the gates below
+                _pressure_note = [note]
+            except Exception:  # noqa: BLE001
+                _pressure_note = []
+        else:
+            _pressure_note = []
 
         # Daily-drawdown gate - veto if ANY user is over their loss limit.
         drawdown = await _users_in_daily_drawdown()
@@ -1336,7 +1356,7 @@ class RiskManagerAgent(Agent):
                          "direction": approve_payload.get("direction")})
         except Exception:  # noqa: BLE001
             pass
-        return [
+        return _pressure_note + [
             AgentMessage(
                 agent=self.name,
                 kind="approve",

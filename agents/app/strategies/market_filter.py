@@ -253,10 +253,61 @@ async def spread_quality_check(ticker: str) -> Optional[str]:
     if q is None:
         return None  # transient miss - never block trading on one
     if q.bid <= 0 or q.ask <= 0:
-        return (f"{ticker}: no live bid/ask quote - possibly halted, "
-                f"signal skipped")
+        # IEX artifact guard (Mike 2026-08-20: "we need to get the feed
+        # back up"). The free IEX feed routinely reports an EMPTY
+        # top-of-book for names trading normally on other venues - on
+        # 08-20 this line alone produced 199 false "possibly halted"
+        # vetoes, WMT among them. An empty book is UNKNOWN, not HALTED.
+        # Ask the tape: if the latest bar is fresh, the name is
+        # trading - pass with the spread unmeasured (the liquidity and
+        # volume floors still stand elsewhere). Only an empty book AND
+        # a silent tape still reads as a possible halt.
+        if await _tape_is_fresh(ticker):
+            return None
+        return (f"{ticker}: no live bid/ask quote and no recent trade - "
+                f"possibly halted, signal skipped")
     sp = q.spread_pct
     if sp > MAX_SPREAD_PCT:
+        # Same feed, same artifact, other face: a sparse IEX book can
+        # show one stale side and read as a 10% spread on a liquid name
+        # (RBLX "10.62%", 166 vetoes on 08-20). When the tape's latest
+        # bar sits far outside the quoted book, the book is stale - the
+        # spread is unmeasured, not wide.
+        try:
+            mid = (float(q.bid) + float(q.ask)) / 2.0
+            bar = await _latest_bar(ticker)
+            close = float((bar or {}).get("c") or 0)
+            if close > 0 and mid > 0 and abs(close - mid) / close > 0.02:
+                return None
+        except Exception:  # noqa: BLE001
+            pass
         return (f"{ticker}: bid/ask spread {sp * 100:.2f}% is too wide "
                 f"(limit {MAX_SPREAD_PCT * 100:.1f}%) - illiquid, skipped")
     return None
+
+
+async def _latest_bar(ticker: str):
+    """Latest bar via the data feed; None when unavailable."""
+    try:
+        from app.brokers.alpaca_data import get_latest_bar
+        return await get_latest_bar(ticker)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _tape_is_fresh(ticker: str, max_age_minutes: float = 20.0) -> bool:
+    """True when the symbol's latest bar printed recently - proof the
+    name is trading even when IEX shows an empty top-of-book."""
+    bar = await _latest_bar(ticker)
+    if not isinstance(bar, dict):
+        return False
+    ts = str(bar.get("t") or "")
+    if not ts:
+        return False
+    try:
+        from datetime import datetime, timezone
+        stamp = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - stamp).total_seconds() / 60.0
+        return 0 <= age <= max_age_minutes
+    except Exception:  # noqa: BLE001
+        return False

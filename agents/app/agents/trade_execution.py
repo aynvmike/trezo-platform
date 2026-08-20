@@ -140,6 +140,36 @@ class TradeExecutionAgent(Agent):
             return await self._execute_for_user(user_id, ticker, side,
                                                 message.payload)
 
+    async def _book_open_tickers(self) -> dict | None:
+        """{user_id: {TICKER, ...}} of OPEN positions - one query serving
+        the whole fan-out, so each book is measured against its own
+        holdings (book-first, Mike 2026-08-20). None on any failure:
+        fail OPEN, the historical behavior - a capacity gate that turns
+        a Supabase blip into a frozen platform is worse than the
+        oversized minute it might allow."""
+        try:
+            import asyncio
+            from app.runtime.persistence import _client
+            client = _client()
+            if client is None:
+                return None
+
+            def _fetch():
+                return (client.table("paper_positions")
+                        .select("user_id, ticker")
+                        .eq("status", "open").execute())
+
+            res = await asyncio.to_thread(_fetch)
+            out: dict = {}
+            for row in (res.data or []):
+                u = str(row.get("user_id") or "")
+                t = (row.get("ticker") or "").strip().upper()
+                if u and t:
+                    out.setdefault(u, set()).add(t)
+            return out
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _execute_for_all_users(
         self,
         ticker: str,
@@ -201,6 +231,14 @@ class TradeExecutionAgent(Agent):
         from app.brokers.route_guard import record_mismatch as _rec_mm
         from app.runtime.book_gate import admits as _admits
         from app.runtime.settings import get_bot_settings as _bot_settings
+        # Book-first capacity (Mike 2026-08-20): "make the agents look
+        # at the books as a default and not the account. no matter
+        # what." The old open-signal cap counted every book's positions
+        # in one bucket and judged the total against ONE book's
+        # max_open_positions - three books x ~10 positions read as
+        # 14/14 and 516 entries died in a day with every book holding
+        # spare slots. Count each book by name, once per signal.
+        open_by_book = await self._book_open_tickers()
         for uid in users:
             try:
                 # Each book's order must go to ITS OWN broker account.
@@ -221,13 +259,34 @@ class TradeExecutionAgent(Agent):
                     # because the primary's crypto_enabled was what the
                     # scanner read. This is the first line where a book
                     # has a name, so it is where its own answer counts.
+                    _cfg = _bot_settings(uid)
                     _v = _admits(
-                        _bot_settings(uid),
+                        _cfg,
                         asset_type=("crypto" if ticker.upper() in CRYPTO_SYMBOLS
                                     else str(source_payload.get("asset_type")
                                              or "stock")),
                         strategy=str(source_payload.get("strategy") or ""),
                         tcs=source_payload.get("tcs"))
+                    # THIS book's slot count vs THIS book's cap. A book
+                    # already holding the ticker may still add to it
+                    # (accumulation) - a full book only refuses NEW names.
+                    if _v.ok and open_by_book is not None:
+                        _held = open_by_book.get(str(uid), set())
+                        _cap = int(getattr(_cfg, "max_open_positions", 14)
+                                   or 14)
+                        if (ticker.upper() not in _held
+                                and len(_held) >= _cap):
+                            out.append(AgentMessage(
+                                agent=self.name, kind="info",
+                                confidence=1.0,
+                                payload={"user_id": uid, "ticker": ticker,
+                                         "side": side,
+                                         "event": "book_at_capacity",
+                                         "note": (f"{ticker}: book holds "
+                                                  f"{len(_held)}/{_cap} open "
+                                                  f"positions - no free "
+                                                  f"slot")}))
+                            continue
                     if not _v.ok:
                         out.append(AgentMessage(
                             agent=self.name, kind="info", confidence=1.0,
