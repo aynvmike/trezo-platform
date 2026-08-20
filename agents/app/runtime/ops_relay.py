@@ -55,6 +55,27 @@ _TICK_BUSY = False
 RESTART_SENTINEL = "<<RESTART_TREZOAGENTS>>"
 
 
+def _restart_detached() -> str:
+    """Restart TrezoAgents from OUTSIDE our own process tree.
+
+    Why (2026-08-20): the drain used to run `nssm restart TrezoAgents`
+    inline. nssm's stop kills this service's whole process tree
+    (AppKillProcessTree is on) -- including that very nssm child, which
+    died between the STOP and the START. The row said done, the guards
+    were green, and the engine stayed down for 28 minutes until a human
+    typed the start by hand. A Task Scheduler one-shot runs under the
+    Task Scheduler service, not under us, so it survives our death and
+    issues the restart on our grave."""
+    out = _run(["schtasks", "/Create", "/F", "/TN", "TrezoRelayRestart",
+                "/TR", f"{NSSM} restart TrezoAgents",
+                "/SC", "ONCE",
+                "/ST", (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")],
+               timeout=60)
+    out += "\n" + _run(["schtasks", "/Run", "/TN", "TrezoRelayRestart"],
+                        timeout=60)
+    return out
+
+
 def _run(cmd: list[str], timeout: int = 900, cwd: str | None = None) -> str:
     """Run a command with NO shell. Returns combined output, truncated."""
     p = subprocess.run(cmd, capture_output=True, text=True,
@@ -286,9 +307,10 @@ async def drain_once(client) -> dict | None:
             except Exception:  # noqa: BLE001
                 pass
             if wants_restart:
-                # Everything above is durable now. Safe to be killed.
-                await asyncio.to_thread(
-                    _run, [NSSM, "restart", "TrezoAgents"], 120)
+                # Everything above is durable now. Safe to be killed --
+                # but the restart itself must NOT be: hand it to Task
+                # Scheduler so it survives this process's death.
+                await asyncio.to_thread(_restart_detached)
             return {"kind": kind, "status": "done"}
         except Exception as e:  # noqa: BLE001
             final = "failed" if attempts >= MAX_ATTEMPTS else "queued"
