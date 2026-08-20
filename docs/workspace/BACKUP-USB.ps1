@@ -12,6 +12,9 @@ if (-not (Test-Path "E:\")) {
   return
 }
 $log = "C:\Trezo\usb-backup-log.txt"
+Write-Host "  Mirroring C:\Trezo -> E:\Trezo. SILENCE IS NORMAL - a full pass" -ForegroundColor Cyan
+Write-Host "  can take 10+ quiet minutes on a USB stick. Do NOT close this" -ForegroundColor Cyan
+Write-Host "  window; wait for the 'complete' line." -ForegroundColor Cyan
 robocopy $src $dst /MIR /R:1 /W:2 /NP /NFL /NDL `
   /XD "$src\_to_delete" "$src\trezo-platform\agents\.venv" `
       "$src\trezo-platform\web\node_modules" "$src\trezo-platform\web\.next" `

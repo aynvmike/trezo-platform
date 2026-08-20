@@ -21,10 +21,16 @@ if ($Register) {
              -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\Trezo\AUTO-PULL.ps1"
   $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
              -RepetitionInterval (New-TimeSpan -Minutes 10)
-  Register-ScheduledTask -TaskName "TrezoAutoPull" -Action $action `
-    -Trigger $trigger -RunLevel Highest `
-    -Description "Deploy [ship]-tagged Trezo commits from GitHub every 10 min" -Force
-  Write-Host "  TrezoAutoPull registered - checks GitHub every 10 minutes." -ForegroundColor Cyan
+  try {
+    Register-ScheduledTask -TaskName "TrezoAutoPull" -Action $action `
+      -Trigger $trigger -RunLevel Highest `
+      -Description "Deploy [ship]-tagged Trezo commits from GitHub every 10 min" `
+      -Force -ErrorAction Stop | Out-Null
+    Write-Host "  TrezoAutoPull registered - checks GitHub every 10 minutes." -ForegroundColor Cyan
+  } catch {
+    Write-Host "  REGISTRATION FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  This needs an ADMINISTRATOR PowerShell, on the SERVER." -ForegroundColor Red
+  }
   return
 }
 

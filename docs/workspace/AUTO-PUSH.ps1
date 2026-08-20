@@ -12,9 +12,15 @@ if ($Register) {
              -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\Trezo\AUTO-PUSH.ps1"
   $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
              -RepetitionInterval (New-TimeSpan -Minutes 10)
-  Register-ScheduledTask -TaskName "TrezoAutoPush" -Action $action `
-    -Trigger $trigger -Description "Push Trezo commits to GitHub every 10 min" -Force
-  Write-Host "  TrezoAutoPush registered - every 10 minutes while you're logged in." -ForegroundColor Cyan
+  try {
+    Register-ScheduledTask -TaskName "TrezoAutoPush" -Action $action `
+      -Trigger $trigger -Description "Push Trezo commits to GitHub every 10 min" `
+      -Force -ErrorAction Stop | Out-Null
+    Write-Host "  TrezoAutoPush registered - every 10 minutes while you're logged in." -ForegroundColor Cyan
+  } catch {
+    Write-Host "  REGISTRATION FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  Re-run from an ADMINISTRATOR PowerShell." -ForegroundColor Red
+  }
   return
 }
 
