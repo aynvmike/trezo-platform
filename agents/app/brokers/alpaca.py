@@ -694,6 +694,14 @@ async def get_open_symbols() -> Optional[set]:
     return {str(p.get("symbol", "")).upper() for p in data if p.get("symbol")}
 
 
+async def get_all_open_orders() -> Optional[list]:
+    """Every open order, unfiltered (list, possibly empty) or None when
+    the call failed. Crypto callers match client-side by base instead of
+    trusting a venue-side symbol filter -- see open_crypto_orders."""
+    data = await _get("/v2/orders?status=open&limit=500")
+    return data if isinstance(data, list) else None
+
+
 async def get_open_orders_for(symbol: str) -> Optional[list]:
     """Open orders for one symbol (list, possibly empty) or None when the
     call failed. Added 2026-06-11 PM for the naked-position alert: a
@@ -882,8 +890,29 @@ async def open_crypto_orders(symbol: str) -> Optional[list]:
     right for equities and wrong for crypto: a row stored as 'XRP' would
     query symbols=XRP and come back EMPTY while an order rests under
     XRPUSD. An empty answer that means 'wrong question' is worse than an
-    error, because callers read it as 'nothing is resting' and sell."""
-    return await get_open_orders_for(_crypto_pair(symbol).replace("/", ""))
+    error, because callers read it as 'nothing is resting' and sell.
+
+    2026-08-20, Mike's stale-stop report: the first version of this
+    function knew all of that and then asked the wrong question anyway --
+    it queried symbols=XRPUSD while the venue files the order under
+    XRP/USD. The filter matched nothing, every caller read "nothing
+    resting", tried to PLACE a fresh stop, and the invisible old order
+    rejected it with 403 insufficient balance -- every tick, all morning,
+    while the venue stop fossilized at its first level (1.04 on an XRP
+    whose ledger lock had climbed to 1.147). Mike found it by eye on the
+    Alpaca dashboard before any of our checks did.
+
+    So: no symbol filter at all. Fetch every open order and match
+    client-side by normalized BASE (XRP == XRP/USD == XRPUSD). A slash
+    convention can change under us again; base-matching cannot be blinded
+    by it. None still means "could not check"; callers must not treat it
+    as empty."""
+    data = await get_all_open_orders()
+    if data is None:
+        return None
+    want = _crypto_base(symbol)
+    return [o for o in data
+            if _crypto_base(str(o.get("symbol") or "")) == want]
 
 
 def _is_sell_limit(order: dict) -> bool:
@@ -1056,17 +1085,37 @@ async def ratchet_crypto_stop(
     # stop, and say in the note that the target went -- losing upside is
     # the price of having a floor, and it should be visible, not silent.
     targets = [o for o in orders if _is_sell_limit(o)]
-    if not targets:
+    if targets:
+        for o in targets:
+            if o.get("id"):
+                await _delete(f"/v2/orders/{o.get('id')}")
+        _o2, err2 = await _post("/v2/orders", body)
+        if not err2:
+            return True, (f"crypto stop resting at {new_stop:g} (limit "
+                          f"{limit_px:g}) - cancelled the resting target "
+                          f"to free the units")
+        err = f"{err2} (after freeing the target; first attempt: {err})"
+    # Still blocked (or no target existed to free): something sell-side
+    # we did not classify is holding the units -- a hand-placed or
+    # hand-edited order, and Mike adjusts stops from the dashboard,
+    # which is allowed. 2026-08-20: the no-target early-return here was
+    # exactly how those hand-edited orders became permanent blockers.
+    # Stop wins over ALL of it: clear every remaining sell on the coin
+    # and try once more.
+    others = [o for o in orders
+              if str(o.get("side") or "").lower() == "sell"
+              and o.get("id")
+              and o not in targets]
+    if not others:
         return False, f"could not place crypto stop: {err}"
-    for o in targets:
-        if o.get("id"):
-            await _delete(f"/v2/orders/{o.get('id')}")
-    _o2, err2 = await _post("/v2/orders", body)
-    if err2:
-        return False, (f"could not place crypto stop even after freeing "
-                       f"the target: {err2} (first attempt: {err})")
-    return True, (f"crypto stop resting at {new_stop:g} (limit {limit_px:g}) "
-                  f"- cancelled the resting target to free the units")
+    for o in others:
+        await _delete(f"/v2/orders/{o.get('id')}")
+    _o3, err3 = await _post("/v2/orders", body)
+    if not err3:
+        return True, (f"crypto stop resting at {new_stop:g} - cleared "
+                      f"{len(others)} other resting sell(s) to free the units")
+    return False, (f"could not place crypto stop even after clearing every "
+                   f"resting sell: {err3} (first attempt: {err})")
 
 
 async def cancel_crypto_exits(symbol: str) -> tuple[int, Optional[str]]:
@@ -1136,18 +1185,36 @@ async def submit_market_sell(
     })
 
 
+def _equity_sell_tif(qty: float) -> str:
+    """GTC for whole shares; DAY when the quantity is fractional.
+
+    2026-08-20, the QYLD 422s: Alpaca refuses GTC on fractional equity
+    orders outright -- "fractional orders must be DAY orders" -- so a
+    fractional position's protection was being rejected EVERY tick and
+    the position sat naked at the venue. DAY protection that dies at the
+    close and is re-placed on the next tick after the open beats no
+    protection at all; the naked-position check covers the overnight gap
+    it creates, and that gap is Alpaca's rule, not our choice."""
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return "gtc"
+    return "gtc" if q == int(q) else "day"
+
+
 async def submit_stop_sell(
     symbol: str, qty: float, stop_price: float,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Plain GTC stop sell — the protection-first fallback when an OCO is
-    refused (2026-07-15, the PYPL naked-4 incident)."""
+    """Plain stop sell — the protection-first fallback when an OCO is
+    refused (2026-07-15, the PYPL naked-4 incident). GTC for whole
+    shares, DAY for fractional (see _equity_sell_tif)."""
     return await _post("/v2/orders", {
         "symbol": symbol.upper(),
         "qty": str(qty),
         "side": "sell",
         "type": "stop",
         "stop_price": str(round(float(stop_price), 2)),
-        "time_in_force": "gtc",
+        "time_in_force": _equity_sell_tif(qty),
     })
 
 
@@ -1156,13 +1223,14 @@ async def submit_oco_sell(
 ) -> tuple[Optional[dict], Optional[str]]:
     """OCO exit pair for an existing LONG: take-profit limit + stop, one
     cancels the other. Re-protects a remainder after a partial sell
-    (2026-07-02). Prices rounded to pennies (Alpaca sub-penny rule)."""
+    (2026-07-02). Prices rounded to pennies (Alpaca sub-penny rule).
+    GTC for whole shares, DAY for fractional (see _equity_sell_tif)."""
     return await _post("/v2/orders", {
         "symbol": symbol.upper(),
         "qty": str(qty),
         "side": "sell",
         "type": "limit",
-        "time_in_force": "gtc",
+        "time_in_force": _equity_sell_tif(qty),
         "order_class": "oco",
         "take_profit": {"limit_price": str(round(float(limit_price), 2))},
         "stop_loss": {"stop_price": str(round(float(stop_price), 2))},

@@ -32,7 +32,8 @@ alp = load_module("app.brokers.alpaca")
 ap = load_module("app.runtime.asset_policy")
 
 _REAL = {n: getattr(alp, n) for n in
-         ("get_open_orders_for", "replace_order", "_post", "_delete")}
+         ("get_open_orders_for", "get_all_open_orders", "replace_order",
+          "_post", "_delete")}
 
 
 def _reset():
@@ -52,11 +53,18 @@ def _run(coro):
 
 
 def _orders(rows):
+    """Feed the venue's open-order list. Since 2026-08-20 crypto reads
+    ALL open orders and matches by base client-side, so rows given here
+    should carry venue-shaped symbols (XRP/USD) to stay honest."""
     asked = []
 
+    async def _all():
+        asked.append("*all*")
+        return list(rows)
     async def _f(symbol):
         asked.append(symbol)
         return list(rows)
+    alp.get_all_open_orders = _all
     alp.get_open_orders_for = _f
     return asked
 
@@ -80,7 +88,10 @@ def _capture():
     return posted, deleted, replaced
 
 
-TP = {"id": "tp-1", "type": "limit", "side": "sell",
+# Venue-shaped: real orders come back with the slashed pair symbol, and
+# since 2026-08-20 the matcher keys on it. A fixture without a symbol is
+# a fixture for the bug.
+TP = {"id": "tp-1", "symbol": "XRP/USD", "type": "limit", "side": "sell",
       "limit_price": "1.2000", "qty": "714.7"}
 
 
@@ -147,9 +158,10 @@ def test_a_failed_order_read_places_nothing():
     with two resting sells for one position."""
     _reset()
 
-    async def _none(symbol):
+    async def _none(symbol=None):
         return None
     alp.get_open_orders_for = _none
+    alp.get_all_open_orders = _none
     posted, deleted, replaced = _capture()
     changed, note = _run(alp.ensure_crypto_take_profit("XRPUSD", 714.7, 1.31))
     assert changed is False
@@ -171,18 +183,23 @@ def test_every_spelling_of_a_coin_reaches_the_same_venue_symbol():
     assert alp._crypto_pair("USDT") == "USDT/USD"
 
 
-def test_a_coin_is_asked_about_by_its_venue_symbol():
-    """get_open_orders_for passes the symbol straight through, which is
-    right for equities and wrong here: asking symbols=XRP returns []
-    while an order rests under XRPUSD. An empty answer that really means
-    "wrong question" is worse than an error -- the caller reads it as
-    "nothing is resting" and sells into a reservation."""
+def test_a_coin_is_never_asked_about_through_a_symbol_filter():
+    """REWRITTEN 2026-08-20, and the old version of this test is the
+    lesson: it asserted that crypto queried the venue with
+    symbols=XRPUSD -- pinning the exact bug that froze Mike's stops.
+    The venue files the order under XRP/USD, the XRPUSD filter matched
+    nothing, every caller read [] as "nothing resting", and each push
+    became a fresh placement that 403'd against the invisible old order.
+    A test can encode a wrong belief as confidently as a right one; this
+    one did, with a docstring that described the trap while asserting we
+    walk into it. Crypto now reads ALL open orders and matches by base
+    client-side."""
     _reset()
     asked = _orders([])
     _capture()
     _run(alp.ensure_crypto_take_profit("XRP", 714.7, 1.20))
     _run(alp.cancel_crypto_take_profit("XRP"))
-    assert asked == ["XRPUSD", "XRPUSD"], asked
+    assert asked and all(a == "*all*" for a in asked), asked
 
 
 def test_a_resting_buy_is_not_mistaken_for_our_target():
@@ -202,9 +219,10 @@ def test_cancelling_reports_a_failed_listing_rather_than_zero():
     is how a sell walks into an insufficient-balance reject."""
     _reset()
 
-    async def _none(symbol):
+    async def _none(symbol=None):
         return None
     alp.get_open_orders_for = _none
+    alp.get_all_open_orders = _none
     n, err = _run(alp.cancel_crypto_take_profit("XRPUSD"))
     assert n == 0 and err, "a failed listing must surface as an error"
 
@@ -239,9 +257,9 @@ def test_the_policy_tells_sell_paths_to_release_first():
 # while the code was insisting otherwise. Alpaca's docs: crypto gets
 # market/limit (gtc, ioc) and stop_limit (gtc only).
 
-STOP_LEG = {"id": "sl-1", "type": "stop_limit", "side": "sell",
-            "stop_price": "60000.00", "limit_price": "59700.00",
-            "qty": "0.1"}
+STOP_LEG = {"id": "sl-1", "symbol": "BTC/USD", "type": "stop_limit",
+            "side": "sell", "stop_price": "60000.00",
+            "limit_price": "59700.00", "qty": "0.1"}
 
 
 def test_a_crypto_stop_is_sent_as_the_only_type_the_venue_takes():
@@ -366,7 +384,10 @@ def test_a_stop_that_cannot_be_placed_at_all_says_so_plainly():
 
     changed, note = _run(alp.ratchet_crypto_stop("XRPUSD", 0.9, qty=714.7))
     assert changed is False
-    assert "even after freeing the target" in note, note
+    # Wording shifted 2026-08-20 when the clear-every-sell fallback went
+    # in; what must survive is that the note says the target WAS freed
+    # and it still failed -- not a bare venue error.
+    assert "could not place crypto stop" in note and "freeing the target" in note, note
 
 
 def test_releasing_units_clears_the_stop_and_the_target_together():
@@ -374,9 +395,10 @@ def test_releasing_units_clears_the_stop_and_the_target_together():
     coins. Cancelling one leaves the other holding them, and the sell
     that follows gets an insufficient-balance reject."""
     _reset()
-    _orders([STOP_LEG, TP,
-             {"id": "buy-9", "type": "limit", "side": "buy",
-              "limit_price": "50000", "qty": "0.1"}])
+    btc_tp = dict(TP, symbol="BTC/USD")   # TP fixture is XRP; this test is BTC
+    _orders([STOP_LEG, btc_tp,
+             {"id": "buy-9", "symbol": "BTC/USD", "type": "limit",
+              "side": "buy", "limit_price": "50000", "qty": "0.1"}])
     _p, deleted, _r = _capture()
     n, err = _run(alp.cancel_crypto_exits("BTCUSD"))
     assert err is None and n == 2
