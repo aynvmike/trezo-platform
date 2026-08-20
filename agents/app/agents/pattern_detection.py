@@ -122,7 +122,23 @@ class PatternDetectionAgent(Agent):
                            if it.get("ticker")]
                 if tickers:
                     targets.append((uid, tickers))
-            return targets or [(None, self.watchlist)]
+            if targets:
+                return targets
+            # No book has narrowed itself to a watchlist. The platform
+            # default is THE MARKET (Mike 2026-08-20: "the agents should
+            # work with the market and not just a watchlist"), not a
+            # hardcoded symbol list. Walk the same pool the Extended
+            # scanner uses - watchlist seeds lead, liquid market movers
+            # fill - and emit unpinned signals every book may judge.
+            try:
+                from app.data.market_universe import expanded_scan_pool
+                pool, _info = await expanded_scan_pool(
+                    list(self.watchlist), limit=40)
+                if pool:
+                    return [(None, list(pool))]
+            except Exception:  # noqa: BLE001
+                pass
+            return [(None, self.watchlist)]
         except Exception:  # noqa: BLE001
             return [(None, self.watchlist)]
 

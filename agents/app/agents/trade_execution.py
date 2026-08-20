@@ -59,6 +59,28 @@ class TradeExecutionAgent(Agent):
         side = "long" if direction == "bullish" else "short"
         user_id = message.payload.get("user_id")
 
+        # Platform-default routing (Mike 2026-08-20): "by default all
+        # accounts and books have access to the platform - we adjust in
+        # the settings." A user_id on an approve payload is PROVENANCE -
+        # which book's scan raised the signal - not a fence around who
+        # may act on it. The tape is global; the appetite is per book,
+        # and the per-book answer already lives at the fan-out
+        # (book_gate.admits: lane toggles, TCS floor, auto-trade, each
+        # judged with THAT book's settings). Before this, a
+        # pattern_detection signal carried its origin book's id and
+        # executed on that book alone: the 25k and 75k books took their
+        # last scanner-driven stock entry on 08-14 and nobody chose
+        # that - they simply had no watchlist for the per-user scanner
+        # to walk. Only a payload that says book_scoped=True stays
+        # pinned to its book: flows that are genuinely one book's
+        # business (a wheel leg on its own account, a manual UI order).
+        if user_id and not message.payload.get("book_scoped"):
+            fanout_payload = dict(message.payload)
+            fanout_payload["origin_book"] = user_id
+            fanout_payload.pop("user_id", None)
+            return await self._execute_for_all_users(
+                ticker, side, fanout_payload)
+
         # Auto-trade toggle (Mike 2026-06-01). When the user has flipped
         # auto_trade_enabled OFF, every signal still scored + approved
         # + recorded - but no open_position fires. The post-mortem loop
