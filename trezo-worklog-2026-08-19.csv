@@ -1,0 +1,46 @@
+# Trezo work log,generated 2026-08-19 23:10
+# project start,2026-05-15 15:43:15
+# NOTE,credited hours are a FLOOR from git commit spans; pre-repo and non-commit work not included -- append manual rows below
+
+date,commits,first_commit,last_commit,hours,source,summary
+2026-06-01,1,18:45,18:45,1.0,git,"Trezo baseline 2026-06-01 - paper page recovered, capital pressure shipped"
+2026-06-03,1,20:12,20:12,1.0,git,"Trezo snapshot 2026-06-03 20:12 - all green: 22 agents, sliding-scale giveback, OpsWatchdo"
+2026-06-04,1,11:54,11:54,1.0,git,"Trezo snapshot 2026-06-04 11:54 - all green: 22 agents, sliding-scale giveback, OpsWatchdo"
+2026-06-12,3,02:29,22:07,19.63,git,"2026-06-11/12 marathon audit: 32 fixes — crypto exits, Wheel full-market universe, trim_po"
+2026-06-13,10,04:13,18:30,14.28,git,"Crypto Part 1: fix crypto classification (ISO coins -> modeled engine), add HODL accumulat"
+2026-06-16,1,17:47,17:47,1.0,git,6/16 bug-fix + self-healing integrity sweep
+2026-06-17,2,02:08,08:25,6.28,git,6/16 learning loop: outcome-weighted strategy selection + macro fall-through
+2026-06-19,9,05:17,17:10,11.88,git,Paper page: positions/trades up top; account-size testing to Strategy Lab
+2026-06-23,2,13:47,14:18,1.0,git,Trading: integrity flags — classify positions Live/Modeled/Unconfirmed vs Alpaca
+2026-06-26,3,18:32,19:22,1.0,git,Agents: route crypto + options exits through the shared capability library
+2026-06-29,3,13:55,16:18,2.38,git,Trading page: show why each position is held + its path to profit
+2026-07-01,2,22:25,22:39,1.0,git,"Visibility pack: activity log wired into vetoes, approvals, pocket skips, submits, broker "
+2026-07-02,12,05:47,14:45,8.97,git,"Realistic ATR-capped targets, crypto revival (dead-SCALP units bug + volume bar + CoinGeck"
+2026-07-06,3,13:40,14:17,1.0,git,"R:R-consistent stops when realism caps targets (unblocks all sizing-rejected approvals), e"
+2026-07-07,2,11:26,12:12,1.0,git,"Post-wipe armor: bracket price clamps + notional/BP cap (kills the 422/403 reject storm), "
+2026-07-08,1,17:06,17:06,1.0,git,"Posture-scaled wheel limits (growth: 1 CSP, 21 DTE, 25% collateral), CSP buy-backs queued "
+2026-07-09,3,10:57,11:08,1.0,git,Self-calibrating targets: median achieved peak move per strategy caps new targets (learned
+2026-07-11,1,16:34,16:34,1.0,git,"ONE SCALE: TCS 0-100 platform-wide (scorer, every floor, bumps, confidence, scope rows), q"
+2026-07-13,6,12:54,14:13,1.32,git,"PROJECT_STATUS: 2026-07-13 block (atom hero, STMS 7A-4P, Sector Compass, wider desks, ETH "
+2026-07-14,13,08:36,15:07,6.52,git,"Strategy Lab: portfolio-driven pattern charts, market/industry scan with save-as-watchlist"
+2026-07-15,10,05:35,17:23,11.8,git,Leg-resync hardened: broker-truth quantity + protection-first stop fallback (PYPL partial-
+2026-07-16,5,08:07,19:31,11.4,git,Harvest one-shot guard re-arms daily: an expired unfilled buy-back retries tomorrow (the F
+2026-07-20,3,10:46,10:51,1.0,git,"Paper page: forex cards get real numbers (Kraken live spot, Forex badge, forex_swing copy)"
+2026-07-22,2,17:02,17:08,1.0,git,Stop paying for dead symbols: no-data rest list + warrant filter + quiet yfinance
+2026-07-23,4,04:00,14:46,10.77,git,"Crypto desk unblocked: coverage floor reaches the scanner, BTC joins the universe, night-b"
+2026-07-24,2,11:24,11:33,1.0,git,HOTFIX: AlpacaAccount dataclass field order (non-default 'cash' after default)
+2026-07-27,6,11:24,18:21,6.95,git,The agents get a voice: evidence-backed rule-change proposals + library that returns craft
+2026-07-28,5,16:24,21:40,5.27,git,Security sweep: service installer no longer publishes the trading engine + loopback write-
+2026-08-03,5,20:54,22:36,1.7,git,"Remove the temporary tsconfig.check.json (typecheck scratch file, committed by accident)"
+2026-08-05,22,03:11,23:17,20.1,git,"fix: step profit harvest ran while the market was shut, and a failed      leg check read a"
+2026-08-06,2,00:03,00:05,1.0,git,"hrp: allocation across lanes, and a bugfix it exposed (phase 6, part 1)"
+2026-08-07,1,14:30,14:30,1.0,git,"fix: scalps had no exit path, and the kill-switch was 33x too tight"
+2026-08-09,5,10:55,14:02,3.12,git,"multi-account: owner/account split, per-book credentials, dividend schedule"
+2026-08-10,1,14:12,14:12,1.0,git,"scan pool: rank actives by trade count, not share volume"
+2026-08-11,5,09:53,14:56,5.05,git,"dividends: $15k is the 75k sleeve's INITIAL DEPLOYMENT, not a pocket pin"
+2026-08-12,3,13:28,20:28,7.0,git,"requirements: add mem0ai -- it was hand-installed on the PC, so the server's venv build si"
+2026-08-17,4,09:41,19:25,9.73,git,"fix: ops relay drains EVERY tick, not once a day -- first wiring landed inside the janitor"
+2026-08-18,23,10:56,23:58,13.03,git,"Rest the crypto take-profit at the venue, and release it before selling"
+2026-08-19,10,00:03,22:09,22.1,git,"Two managers, one port: the watchdog was spawning rival engines"
+
+# add untracked days below with source=manual

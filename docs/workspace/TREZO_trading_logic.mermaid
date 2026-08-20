@@ -1,0 +1,13 @@
+flowchart LR
+  DATA["Market data (Alpaca · Kraken · macro)"] --> SCAN["Scanners per layer + Pattern Detection"]
+  SCAN --> SIG["Signals — TCS confidence scored"]
+  SIG --> RISK["Risk Manager — sleeve budget, TCS/IV, time/cycle, scaled cap"]
+  RISK -->|approved| EXE["Trade Execution — sleeve slot sizing by velocity"]
+  RISK -->|veto| HOLD["Held back + logged"]
+  EXE --> POS["Positions (paper_positions / Alpaca)"]
+  POS --> PMON["Position Monitor — stops, targets, TIME-EXITS per sleeve, profit locks"]
+  PMON --> EXIT["Exits"]
+  EXIT --> OUT["Outcomes — learning loop to strategy weighting"]
+  OUT -.feeds.-> RISK
+  SLEEVE["Capital Sleeves: Active · Quick-Options · Holding"] -.governs.-> EXE
+  TAX["Tax Optimizer"] -.wraps every layer.-> POS

@@ -1,0 +1,53 @@
+# ================= TREZO — one paste, ON THE SERVER =================
+# PowerShell as Administrator, inside the mstsc session.
+# Replace <TOKEN> on line 8 first. Everything else is ready.
+# ====================================================================
+$ErrorActionPreference = "Continue"
+$nssm = "C:\ProgramData\chocolatey\bin\nssm.exe"
+
+# --- 1. stop the engine so nothing is trading mid-swap ---------------
+& $nssm stop TrezoAgents
+Start-Sleep 3
+
+# --- 2. point this box at GitHub and pull the fix --------------------
+cd C:\Trezo\trezo-platform
+git stash -u
+git remote remove origin 2>$null
+git remote add origin https://x-access-token:REDACTED@github.com/aynvmike/trezo-platform.git
+git fetch origin
+git reset --hard origin/main
+Write-Host "`n--- now at ---" -ForegroundColor Cyan
+git log --oneline -1
+
+# --- 3. turn alerts on ------------------------------------------------
+$envf = "C:\Trezo\trezo-platform\agents\.env"
+if (-not (Select-String -Path $envf -Pattern 'TREZO_ALERT_WEBHOOK' -Quiet)) {
+  Add-Content $envf ""
+  Add-Content $envf "TREZO_ALERT_WEBHOOK=https://discord.com/api/webhooks/1539228694692765726/KhLmyz2tyGfhaVcclww9wKyqJqUmt8F3ro1aPl_urMm6eBynFSYPqSa_eLSUHlGZKmUn"
+  Add-Content $envf "TREZO_ARCHIVE_ENABLED=1"
+  Add-Content $envf "TREZO_REPO_DIR=C:\Trezo\trezo-platform"
+  Write-Host "alerts + archive configured" -ForegroundColor Green
+} else {
+  Write-Host "alert webhook already present" -ForegroundColor Yellow
+}
+
+# --- 4. guard tests BEFORE the engine comes back ----------------------
+Write-Host "`n--- guard tests ---" -ForegroundColor Cyan
+cd C:\Trezo\trezo-platform\agents
+.\.venv\Scripts\python.exe tests\test_asset_policy.py
+.\.venv\Scripts\python.exe tests\test_book_scope.py
+.\.venv\Scripts\python.exe tests\test_position_status.py
+
+# --- 5. start it again ------------------------------------------------
+Write-Host "`n--- starting ---" -ForegroundColor Cyan
+& $nssm start TrezoAgents
+Start-Sleep 15
+& $nssm status TrezoAgents
+Invoke-RestMethod http://localhost:8001/health
+
+# ====================================================================
+# IF IT WILL NOT START, roll straight back — old code beats no engine:
+#   cd C:\Trezo\trezo-platform
+#   git reset --hard 536e626
+#   & $nssm start TrezoAgents
+# ====================================================================

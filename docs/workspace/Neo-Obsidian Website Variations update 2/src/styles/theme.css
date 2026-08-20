@@ -1,0 +1,241 @@
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --font-serif: 'Playfair Display', Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'Courier New', monospace;
+
+  --font-size: 15px;
+
+  /* Light theme — warm pale stone, not bright white */
+  --background: #f0eff6;
+  --foreground: #1b1826;
+  --card: #faf9fe;
+  --card-foreground: #1b1826;
+  --popover: #faf9fe;
+  --popover-foreground: #1b1826;
+  --primary: #8b6232;
+  --primary-foreground: #fdf8f0;
+  --secondary: #e5e3ef;
+  --secondary-foreground: #3c3852;
+  --muted: #eae8f2;
+  --muted-foreground: #6e6b82;
+  --accent: #e8dfc8;
+  --accent-foreground: #6b4a1e;
+  --destructive: #c0392b;
+  --destructive-foreground: #ffffff;
+  --border: rgba(27, 24, 38, 0.09);
+  --input: transparent;
+  --input-background: #eceaf4;
+  --switch-background: #c8c5d8;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: rgba(139, 98, 50, 0.4);
+
+  /* Functional accent colors */
+  --emerald: #10b981;
+  --amber: #f59e0b;
+  --sky: #0ea5e9;
+  --rose: #e11d48;
+  --treasure: #c4964a;
+
+  --chart-1: #10b981;
+  --chart-2: #f59e0b;
+  --chart-3: #0ea5e9;
+  --chart-4: #c4964a;
+  --chart-5: #e11d48;
+
+  --radius: 0.75rem;
+
+  --sidebar: #e8e6f2;
+  --sidebar-foreground: #1b1826;
+  --sidebar-primary: #8b6232;
+  --sidebar-primary-foreground: #fdf8f0;
+  --sidebar-accent: #dddaea;
+  --sidebar-accent-foreground: #3c3852;
+  --sidebar-border: rgba(27, 24, 38, 0.07);
+  --sidebar-ring: rgba(139, 98, 50, 0.3);
+}
+
+.dark {
+  /* Dark theme — true Neo Obsidian */
+  --background: #0b0b11;
+  --foreground: #e6e3f2;
+  --card: #12121b;
+  --card-foreground: #e6e3f2;
+  --popover: #12121b;
+  --popover-foreground: #e6e3f2;
+  --primary: #c4964a;
+  --primary-foreground: #0b0b11;
+  --secondary: #1a1a26;
+  --secondary-foreground: #b4b0cc;
+  --muted: #1d1d2c;
+  --muted-foreground: #6e6b88;
+  --accent: rgba(196, 150, 74, 0.12);
+  --accent-foreground: #c4964a;
+  --destructive: #9f2020;
+  --destructive-foreground: #fca5a5;
+  --border: rgba(255, 255, 255, 0.07);
+  --input: rgba(255, 255, 255, 0.05);
+  --input-background: #1d1d2c;
+  --switch-background: #2e2e44;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: rgba(196, 150, 74, 0.35);
+
+  --emerald: #10b981;
+  --amber: #f59e0b;
+  --sky: #38bdf8;
+  --rose: #f43f5e;
+  --treasure: #c4964a;
+
+  --chart-1: #10b981;
+  --chart-2: #f59e0b;
+  --chart-3: #38bdf8;
+  --chart-4: #c4964a;
+  --chart-5: #f43f5e;
+
+  --sidebar: #0e0e18;
+  --sidebar-foreground: #e6e3f2;
+  --sidebar-primary: #c4964a;
+  --sidebar-primary-foreground: #0b0b11;
+  --sidebar-accent: #1a1a28;
+  --sidebar-accent-foreground: #b4b0cc;
+  --sidebar-border: rgba(255, 255, 255, 0.05);
+  --sidebar-ring: rgba(196, 150, 74, 0.3);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+  }
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  h1 {
+    font-family: var(--font-serif);
+    font-size: var(--text-2xl);
+    font-weight: 500;
+    line-height: 1.3;
+  }
+
+  h2 {
+    font-size: var(--text-xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.4;
+  }
+
+  h3 {
+    font-size: var(--text-lg);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.4;
+  }
+
+  h4 {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  label {
+    font-size: var(--text-sm);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: var(--text-sm);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  input {
+    font-size: var(--text-sm);
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+  }
+
+  /* Neo Obsidian sheen — applied to every elevated panel */
+  .obsidian-panel {
+    position: relative;
+    isolation: isolate;
+  }
+  .obsidian-panel::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(135deg, rgba(196,150,74,0.04) 0%, transparent 35%, transparent 65%, rgba(196,150,74,0.02) 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .obsidian-panel > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  /* Hide scrollbars at rest, show on hover */
+  ::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 3px;
+    transition: background 0.2s;
+  }
+  *:hover::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
+}

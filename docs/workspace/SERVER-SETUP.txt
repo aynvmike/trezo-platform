@@ -1,0 +1,121 @@
+=====================================================================
+ ONE-TIME SERVER SETUP -- run in Lightsail browser RDP
+ (Instance page -> Connect. Works regardless of your home IP.)
+=====================================================================
+
+STEP 0 -- rotate the password. Do this first, it has been exposed
+since yesterday afternoon. In the server's PowerShell (Admin):
+
+   net user administrator <a-new-password>
+
+Save the new one wherever you keep them; Lightsail's stored copy
+stops being valid once you change it in the OS.
+
+
+STEP 1 -- make a read-only token, on github.com (in any browser):
+
+   Settings -> Developer settings -> Personal access tokens
+   -> Fine-grained tokens -> Generate new token
+     Repository access : Only select repositories -> trezo-platform
+     Permissions       : Contents = Read-only.  Nothing else.
+     Expiration        : 90 days is fine
+
+   Read-only matters: that box holds live broker credentials. A token
+   that can only read cannot damage the repo if the box is ever
+   compromised.
+
+
+STEP 2 -- point the server at GitHub and pull. Paste as one block,
+substituting your token for <TOKEN>:
+
+   cd C:\Trezo\trezo-platform
+   git stash -u
+   git remote remove origin
+   git remote add origin https://x-access-token:REDACTED@github.com/aynvmike/trezo-platform.git
+   git fetch origin
+   git reset --hard origin/main
+   git log --oneline -1
+
+   Last line must print:
+     408dd94 adoption: never hand the monitor a level the market...
+
+   `git stash -u` parks anything the engine has scribbled so the
+   fetch cannot be blocked. `reset --hard` is safe: GitHub is now
+   the source of truth and the server's copy came from a tar drop.
+
+
+STEP 3 -- guard tests, BEFORE restarting:
+
+   cd C:\Trezo\trezo-platform\agents
+   .venv\Scripts\python.exe tests\test_asset_policy.py
+   .venv\Scripts\python.exe tests\test_book_scope.py
+   .venv\Scripts\python.exe tests\test_position_status.py
+
+   All three should end "all green (0 failures)". test_position_status
+   passes now that migration 0051 is applied.
+
+   If any fail: STOP, do not restart, send Nova the output.
+
+
+STEP 4 -- restart the engine (before 9:30am ET, or after 4:00pm):
+
+   C:\ProgramData\chocolatey\bin\nssm.exe restart TrezoAgents
+   Start-Sleep 12
+   C:\ProgramData\chocolatey\bin\nssm.exe status TrezoAgents
+   Invoke-RestMethod http://localhost:8001/health
+
+
+=====================================================================
+ AFTER THIS, YOU NEVER NEED RDP TO DEPLOY AGAIN
+=====================================================================
+ 1. Nova commits, you run:  git push
+ 2. In Supabase SQL editor:
+      insert into ops_tasks (kind, note)
+      values ('git_pull_restart', 'what changed');
+
+ The engine pulls and restarts itself on its next watchdog tick and
+ writes the outcome back to the row. Works from your phone.
+
+
+=====================================================================
+ STEP 5 -- TURN ON ALERTS  (added 2026-08-18, commit d30788d)
+=====================================================================
+The platform had no way to reach you. Every alert it raised went into
+a table. That is why 5 days of unmanaged positions and a 15-hour
+outage both went unnoticed. This fixes it.
+
+5a. Make the webhook (2 minutes, in Discord):
+    Make a channel, e.g. #trezo-alerts
+    Channel settings (cog) -> Integrations -> Webhooks -> New Webhook
+    -> Copy Webhook URL
+
+5b. On the SERVER, add it to the engine's env:
+    notepad C:\Trezo\trezo-platform\agents\.env
+    Add this line, save, close:
+       TREZO_ALERT_WEBHOOK=https://discord.com/api/webhooks/...
+
+    Then restart so it is picked up:
+       C:\ProgramData\chocolatey\bin\nssm.exe restart TrezoAgents
+
+    Within ~5 minutes you should get "Engine started" in the channel.
+    If you do NOT, the channel is broken -- and better to learn that
+    now than during the next incident.
+
+5c. In Supabase SQL editor, run migration 0052:
+       db/migrations/0052_engine_dead_man_switch.sql
+    then paste the SAME url in:
+       insert into ops_alert_config (id, webhook_url)
+       values (1, 'https://discord.com/api/webhooks/...')
+       on conflict (id) do update set webhook_url = excluded.webhook_url;
+
+    That one is the dead man's switch: Supabase checks the engine's
+    heartbeat every 5 minutes and shouts if it goes quiet. It runs
+    OUTSIDE the engine on purpose -- a dead process cannot report its
+    own death, which is exactly what happened on 8/17.
+
+You will then be told about:
+  * unmanaged notional -- money the broker holds that Trezo is not
+    managing. Should always be zero.
+  * a position sitting past its own stop while still open
+  * a halt whose condition has already cleared
+  * the engine going silent for more than 15 minutes

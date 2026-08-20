@@ -1,0 +1,53 @@
+# Trezo Midday Snapshot — Wednesday, June 24, 2026
+
+_Scheduled run: ~12:10 PM ET (automated noon snapshot). Read-only health check — no trades, orders, or code/config were touched._
+
+## ⚠️ Headline: still no line of sight to Trezo's Alpaca account
+
+The **Trezo Alpaca connector is not usable in this session** — it never exposed any tools, so I have no read on the paper account's equity, buying power, orders, positions, or P&L. The only brokerage connector actually available is an **Interactive Brokers** one — a *different, unrelated account* — and per the snapshot rules I did **not** read it or report it as Trezo's status.
+
+This gap has now persisted across 6/23 and **both** 6/24 runs (the manual 11 AM run and this scheduled noon run). It is a **visibility gap in the reporting tool**, not proof that anything is broken — the agents and the Alpaca account can be perfectly healthy and trading while this run simply has no broker link. Account status and agent-service health are independent. Three runs in a row is worth a quick reconnect on your side (see step 1 below).
+
+---
+
+## 1. Market clock
+🟢 **Open** — regular session.
+
+- Alpaca clock unreachable (connector not usable), so confirmed from the **public NYSE/NASDAQ schedule**: regular hours 9:30 AM – 4:00 PM ET; open right now (~12:10 PM ET, ~3h 50m to the close).
+- Wed Jun 24 is a normal trading day — no holiday, no early close. (Next US market holiday is July 4.)
+- Nothing on the calendar is stopping Trezo's day-only orders today.
+
+## 2. Account health (equity / cash / buying power / options level / day-trades / blocks)
+**Unavailable this run — broker section skipped.** Without the Alpaca connector I can't read equity, cash, buying power, options-approval level, day-trade count, or any trading/account blocks. Not substituting another account.
+
+_Background only (NOT today's data): Trezo's Alpaca paper account is small (~$5k) and has often been fully deployed — which can look like "not trading" but is legitimate, not a fault. Context only, not a 6/24 reading._
+
+## 3. Today's orders & fills
+**Unavailable this run — broker section skipped** (same reason as §2). Can't list filled / pending / rejected / canceled orders without the Alpaca connector.
+
+## 4. Open positions
+**Unavailable this run — broker section skipped.** Can't list stock/option holdings or run any Trezo-vs-broker reconciliation without the Alpaca connector.
+
+## 5. Today's P&L
+**Unavailable this run — broker section skipped.** No realized/unrealized P&L or movers available without the Alpaca connector.
+
+## 6. Why so few orders? (diagnosis)
+Can't run the order diagnosis (needs the Alpaca account). The one thing I can see for certain is that **the snapshot has no broker link this run** — that's the visibility blocker, **not** a confirmed trading problem. Whether the account is out of buying power, gated, or just finding no qualifying setups can't be judged from here today.
+
+## 7. Scan / gate detail (deep)
+**Activity ledger not found — and the broker side is also unavailable, so no gate detail this run.**
+
+- No `activity-2026-06-24.jsonl` in `C:\Trezo\trezo-platform\logs\`. The most recent ledgers are still **6/17 and 6/18** — nothing written since 6/18, and the logs folder hasn't changed since then.
+- The local backend (`localhost:8001`) was not reachable from this run (HTTP 000 — expected; scheduled/sandboxed runs execute off-machine, not on Mike's PC).
+- Per the wiring notes, the ledger only fills once the agents are restarted with the activity-log feature and have gated live signals. The ongoing gap suggests that restart may not have happened yet (or the agents simply haven't gated/logged since 6/18). I did **not** invent any counts.
+
+## 8. Verdict
+**Inconclusive from the broker side — a connector/visibility gap, not a confirmed fault.** The market is open and the calendar is clear, so nothing external is blocking Trezo today; I just can't see the Alpaca account or any gate activity from this run, and that's now spanned three consecutive snapshots. The agents may well be running fine with the account fully deployed — there's no evidence either way, and the missing connector must **not** be read as "the bot is broken" or "there's no money."
+
+**Next steps for Mike (all read-only / safe during market hours):**
+1. **[Cowork chat]** Re-attach / reconnect the **Trezo Alpaca** connector — it's been unavailable to the snapshot three runs in a row, so future runs can actually read the real account (equity, buying power, orders, P&L).
+2. **[PowerShell]** To confirm the agents are alive independently of the connector: `Invoke-RestMethod http://localhost:8001/health` — if it answers, the service is up; if not, see the service-dead playbook (don't restart mid-session unless it's confirmed down).
+3. Optional, after close: the activity ledger hasn't updated since 6/18 — worth confirming the activity-log wiring is actually live on the running agents.
+
+---
+_Generated by the Trezo Midday Snapshot task (scheduled noon run). Broker data (Alpaca) was unavailable this run; market status is from public exchange hours. No Interactive Brokers data was used._

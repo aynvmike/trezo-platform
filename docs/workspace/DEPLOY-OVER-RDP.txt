@@ -1,0 +1,99 @@
+==============================================================
+ DEPLOY THE PROFIT-LADDER FIX OVER RDP  (no SSH, no GitHub)
+==============================================================
+You are RDP-ing into the server anyway to rotate the password.
+This piggybacks on that. Two files move, three commands run.
+
+WHY A BUNDLE: `trezo-deploy.bundle` is the whole git repo --
+every commit, including the new one -- packed into ONE 4 MB
+file. The server can pull straight out of it, so nothing needs
+GitHub, SSH or a password.
+
+--------------------------------------------------------------
+STEP 1 -- on YOUR PC, before you connect
+--------------------------------------------------------------
+Open Remote Desktop Connection -> "Show Options" -> Local
+Resources tab -> "More..." -> tick DRIVES (or at least your
+C: drive) -> OK. Then connect.
+
+That makes your PC's C: visible on the server as something like
+  \\tsclient\C\Trezo\trezo-deploy.bundle
+
+--------------------------------------------------------------
+STEP 2 -- on the SERVER, copy the bundle over
+--------------------------------------------------------------
+Open PowerShell as Administrator and paste:
+
+  copy \\tsclient\C\Trezo\trezo-deploy.bundle C:\Trezo\
+
+If \\tsclient isn't there, drive redirection didn't take -- go
+back to step 1. (Plain copy-paste of a FILE through the RDP
+clipboard also works: copy it in Explorer on your PC, paste
+into C:\Trezo on the server.)
+
+--------------------------------------------------------------
+STEP 3 -- on the SERVER, deploy
+--------------------------------------------------------------
+Paste this whole block into the same PowerShell window:
+
+cd C:\Trezo\trezo-platform
+git stash -u
+git fetch C:\Trezo\trezo-deploy.bundle main
+git reset --hard FETCH_HEAD
+git log --oneline -1
+
+  `git stash -u` parks anything the engine has scribbled in the
+  working tree so the fetch cannot be blocked by it. `reset
+  --hard` is safe: your PC is source of truth, and the server's
+  copy arrived by tar, not by git.
+
+The last line should print:
+  7307716 profit ladder: scope every broker read to its own book...
+
+--------------------------------------------------------------
+STEP 4 -- run the guard tests BEFORE restarting
+--------------------------------------------------------------
+cd C:\Trezo\trezo-platform\agents
+.venv\Scripts\python.exe tests\test_asset_policy.py
+.venv\Scripts\python.exe tests\test_book_scope.py
+.venv\Scripts\python.exe tests\test_position_status.py
+
+Each should end with "all green (0 failures)".
+
+test_position_status WILL FAIL until the migration in step 6 is
+applied -- that is the test doing its job. The other two must
+pass. If either of those fails, STOP and send Nova the output;
+do not restart the engine.
+
+--------------------------------------------------------------
+STEP 5 -- restart the engine (AFTER 16:00 ET)
+--------------------------------------------------------------
+C:\ProgramData\chocolatey\bin\nssm.exe restart TrezoAgents
+Start-Sleep 12
+C:\ProgramData\chocolatey\bin\nssm.exe status TrezoAgents
+Invoke-RestMethod http://localhost:8001/health
+
+Expect: SERVICE_RUNNING, and a health response.
+
+--------------------------------------------------------------
+STEP 6 -- the migration (Supabase, from any browser)
+--------------------------------------------------------------
+Supabase -> SQL Editor -> paste the contents of
+  C:\Trezo\trezo-platform\db\migrations\0051_position_status_partial.sql
+and run it.
+
+THIS IS THE HALF THAT MATTERS. Without it every profit step
+still sells at the broker and records nothing -- which is the
+bug we spent the afternoon on. Do it even if you skip
+everything else.
+
+Re-run test_position_status.py afterwards; it should go green.
+
+--------------------------------------------------------------
+WHAT TO EXPECT ONCE IT IS LIVE
+--------------------------------------------------------------
+Within a tick or two of the restart, the log should show
+`position_adopted` lines as the 25k and 75k books take back the
+positions Alpaca has been holding without them. Those are the
+nine and eight positions from Flag 2. After that, stops,
+targets and the ladder apply to them again.

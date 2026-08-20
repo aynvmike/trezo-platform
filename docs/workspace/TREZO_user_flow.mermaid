@@ -1,0 +1,15 @@
+flowchart TD
+  V([Visitor]) --> L["Landing — Woven Basket hero (/)"]
+  L -->|Begin weaving| SU["Sign up"]
+  L -->|I have an account| SI["Sign in"]
+  SU --> OB["Onboarding — profile (name, capital, risk, tax)"]
+  OB --> D["Dashboard — Overview (redesign, LIVE data)"]
+  SI --> D
+  D --> NAV{"Sidebar — 4 groups"}
+  NAV -->|What's happening| MON["Overview · Trading · Agents"]
+  NAV -->|Wealth layers| LAY["Layers 1-7 (Crypto to KINDRIP)"]
+  NAV -->|Plan and research| PLAN["Strategy Lab · Watchlists · Grasping Wallet · Capital Sleeves · Tax"]
+  NAV -->|Configure| CFG["Connections · Bot Tuning · Live Trading · Filters · Profile · Help"]
+  CFG -->|Setup Wizard| TOUR["/onboarding/tour — 5-step animated wizard"]
+  TOUR --> D
+  CFG -->|Connections| CONN["Connect Alpaca / broker"]

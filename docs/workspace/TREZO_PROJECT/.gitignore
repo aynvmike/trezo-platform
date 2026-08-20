@@ -1,0 +1,122 @@
+# ──────────────────────────────────────────────────────────────
+# TREZO — .gitignore
+# Files and folders listed here will NEVER be committed to git.
+# This protects secrets, keeps the repo small, and avoids noise.
+# ──────────────────────────────────────────────────────────────
+
+# ── SECRETS (most important) ──────────────────────────────────
+# Never commit anything containing API keys, tokens, passwords.
+.env
+.env.*
+!.env.example          # allow a template file with placeholder values
+*.pem
+*.key
+secrets/
+credentials.json
+
+# ── NODE.JS ───────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+.yarn/
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.nuxt/
+.vercel/
+.turbo/
+*.tsbuildinfo
+
+# ── PYTHON ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build
+*.egg
+*.egg-info/
+.eggs/
+build/
+develop-eggs/
+dist/
+downloads/
+sdist/
+wheels/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# ── DATABASES & DATA ──────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+data/local/
+backups/
+
+# ── LOGS ──────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── EDITORS / IDE ─────────────────────────────────────────────
+.vscode/
+!.vscode/settings.json    # share team settings if you want
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# ── OPERATING SYSTEM ──────────────────────────────────────────
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ── CLAUDE CODE / TOOLING ─────────────────────────────────────
+.claude/cache/
+.claude/logs/
+
+# ── MISC ──────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+.cache/
+coverage/
