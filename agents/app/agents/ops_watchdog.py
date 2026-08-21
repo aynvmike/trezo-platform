@@ -75,6 +75,7 @@ EXPECTED_AGENTS: list[tuple[str, int]] = [
     ("kindrip", 360 + 60),
     ("strategy_discovery", 360 + 60),
     ("user_support", 1440),       # cold-path agent
+    ("relay_ingest", 60),         # drains Nova's briefings every 5 min
     ("ops_watchdog", 10),         # this agent itself - silence detector
 ]
 
