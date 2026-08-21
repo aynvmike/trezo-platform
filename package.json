@@ -20,5 +20,9 @@
     "node": ">=20.0.0"
   },
   "author": "Trezo (Mike + Nova)",
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "allowScripts": {
+    "unrs-resolver@1.12.0": true,
+    "esbuild@0.28.0": true
+  }
 }
