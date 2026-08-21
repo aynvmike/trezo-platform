@@ -6,7 +6,9 @@
 # The stick is FOUND, not assumed: the drive letter changes between the
 # desktop and the laptop, so this looks at every removable drive for a
 # TREZO-USB.json marker at its root (written on the first successful
-# mirror) or, failing that, an existing Trezo\REBUILD-FROM-USB.md.
+# mirror, or by double-clicking CLAIM-TREZO-USB.cmd on the stick), a
+# volume label of TREZO, or, failing both, an existing
+# Trezo\REBUILD-FROM-USB.md.
 #
 # Run by hand:       & C:\Trezo\BACKUP-USB.ps1
 # Force a letter:    & C:\Trezo\BACKUP-USB.ps1 -Drive F
@@ -26,6 +28,9 @@ function Find-TrezoUsb {
   $removable = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" -ErrorAction SilentlyContinue
   foreach ($d in $removable) {
     if (Test-Path (Join-Path $d.DeviceID "TREZO-USB.json")) { return $d.DeviceID }
+  }
+  foreach ($d in $removable) {
+    if ($d.VolumeName -eq "TREZO") { return $d.DeviceID }
   }
   foreach ($d in $removable) {
     if (Test-Path (Join-Path $d.DeviceID "Trezo\REBUILD-FROM-USB.md")) { return $d.DeviceID }
@@ -66,6 +71,8 @@ robocopy $src $dst /MIR /R:1 /W:2 /NP /NFL /NDL `
 $code = $LASTEXITCODE
 # Robocopy: 0-7 = success flavours, 8+ = real failures.
 if ($code -lt 8) {
+  # Keep the one-click claim file on the stick so any machine can re-claim it.
+  Copy-Item "C:\Trezo\CLAIM-TREZO-USB.cmd" "$root\CLAIM-TREZO-USB.cmd" -Force -ErrorAction SilentlyContinue
   @{ head = $head; mirrored_at = (Get-Date -Format s); from = $env:COMPUTERNAME; robocopy = $code } |
     ConvertTo-Json | Out-File $marker -Encoding utf8
   Say "USB mirror complete on $root (robocopy code $code, head $head). Log: $log"
