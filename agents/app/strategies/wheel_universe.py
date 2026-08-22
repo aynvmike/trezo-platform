@@ -161,6 +161,10 @@ class WheelCandidate:
     ticker: str
     source: str        # 'seed' | 'watchlist' | 'position' | 'market_wide'
     yield_pct: float
+    # Tier drives lane rule #4 (GROWTH names never wear a covered call).
+    # 'UNKNOWN' for legacy sources that predate the §4 screen — callers
+    # must treat UNKNOWN as not-call-eligible, same as UNVERIFIED.
+    tier: str = "UNKNOWN"
 
 
 # Per-user cache: user_id -> (candidates, fetched_at)
@@ -333,29 +337,40 @@ async def get_wheel_universe(user_id: Optional[str]) -> list[WheelCandidate]:
     #    should all be able to see all the stocks not a limited few").
     #    This is the SAME dynamic universe Pattern Detection scans
     #    (Alpaca movers, gainers + losers, padded with sector leaders),
-    #    so the Wheel's ceiling now tracks the stock side automatically
-    #    instead of stopping at the curated 64-name pool. Every name
-    #    still passes the same dividend-yield quality gate -- the gate
-    #    decides wheel-worthiness, the pool is no longer the cage.
-    #    Live AV yield lookups are budgeted per build to protect the
-    #    25/day free tier; unknown names simply wait for a later tick.
+    #    so the Wheel's ceiling tracks the stock side automatically.
+    #
+    #    THE GATE (rewritten 2026-08-22, Mike: "analyze it for market wide
+    #    and not a default list only"). The pool was already market-wide;
+    #    the GATE was not, and the gate is what decides. It asked a
+    #    40-name dict, then fell back to Alpha Vantage with a budget of
+    #    FIVE calls per build against a 25-per-DAY tier — so any name we
+    #    had not pre-listed effectively could not qualify, and the
+    #    market-wide pool collapsed back to the curated list every tick.
+    #
+    #    Now: the §4 entry screen (dividend_screen) judges ANY ticker on
+    #    Finnhub fundamentals — payout ratio, raise streak, cut history —
+    #    at 60 calls/MINUTE, with results cached in Supabase for a week.
+    #    The covered universe therefore RATCHETS: every name screened
+    #    once is free thereafter, so coverage grows toward the whole
+    #    market instead of resetting. Names the screen cannot verify are
+    #    skipped, not admitted — silence is not consent.
     try:
         from app.data.market_universe import market_wide_candidates as _stock_pool
-        live_budget = 5
-        for sym in await _stock_pool(limit=50):
-            sym = sym.upper().strip()
-            if not sym or sym in seen:
-                continue
-            y = DIVIDEND_YIELDS.get(sym)
-            if y is None:
-                if live_budget <= 0:
-                    continue
-                live_budget -= 1
-                y = await yield_for(sym)
-            if y is None or y < MIN_QUALIFYING_YIELD:
+        from app.strategies.dividend_screen import screen_many
+
+        _pool = [s.upper().strip() for s in await _stock_pool(limit=80)]
+        _unseen = [s for s in _pool if s and s not in seen]
+        _verdicts = await screen_many(_unseen)
+        for sym, verdict in _verdicts.items():
+            # Ladder-eligible admits BOTH tiers into the universe; the
+            # GROWTH/HIGH_YIELD split decides what may be DONE with a
+            # name (lane rule #4), not whether the lane may hold it.
+            if not verdict.ladder_eligible:
                 continue
             seen[sym] = WheelCandidate(
-                ticker=sym, source="market_wide", yield_pct=y,
+                ticker=sym, source="market_wide",
+                yield_pct=verdict.yield_pct or 0.0,
+                tier=verdict.tier,
             )
     except Exception as e:  # noqa: BLE001
         log.warning("wheel_universe.stock_pool_failed", error=str(e)[:200])
