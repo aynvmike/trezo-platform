@@ -698,6 +698,15 @@ class RiskManagerAgent(Agent):
         # extra confidence (+3 at 4 open, +6 at 6, +9 at 8+), bounded
         # like every other bump. Never a ban: a crowded lane that is
         # earning can still trade -- it just has to be better.
+        # PER-BOOK crowding (Mike 2026-08-21: "the open positions was
+        # supposed to be for each pocket available in the book, not the
+        # total"). The old query pooled every book's open rows into one
+        # read, so the 25k was penalized for what the 75k held -- the
+        # veto lines said "17 positions" when no single book held 17.
+        # A veto here kills the signal for ALL books, so the honest
+        # per-book judgement is the MINIMUM bump across active books:
+        # if any book still has room in this basket, the signal stays
+        # alive and the per-book gates downstream decide who takes it.
         crowding_bump_v = 0
         crowding_note = ""
         try:
@@ -710,14 +719,27 @@ class RiskManagerAgent(Agent):
 
                 def _q_book():
                     return (_pr_cl.table("paper_positions")
-                            .select("ticker, asset_type, strategy")
-                            .eq("status", "open").limit(60).execute())
+                            .select("user_id, ticker, asset_type, strategy")
+                            .eq("status", "open").limit(120).execute())
                 _bk = (await _aio_pr.to_thread(_q_book)).data or []
-                _read = concentration_read(_bk)
+                _by_book: dict[str, list] = {}
+                for _row in _bk:
+                    _u = str(_row.get("user_id") or "")
+                    if _u:
+                        _by_book.setdefault(_u, []).append(_row)
                 _bask = basket_of(
                     ticker, str(message.payload.get("asset_type") or ""),
                     strategy)
-                crowding_bump_v, crowding_note = crowding_bump(_bask, _read)
+                if _by_book:
+                    _best: tuple[int, str] | None = None
+                    for _rows in _by_book.values():
+                        _bv, _bn = crowding_bump(
+                            _bask, concentration_read(_rows))
+                        if _best is None or _bv < _best[0]:
+                            _best = (_bv, _bn)
+                        if _best[0] == 0:
+                            break  # some book has room - no bump
+                    crowding_bump_v, crowding_note = _best
         except Exception:  # noqa: BLE001
             crowding_bump_v = 0
 

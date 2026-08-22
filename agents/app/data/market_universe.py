@@ -42,7 +42,7 @@ _cache: dict[str, list[str]] = {}
 _cached_at: float = 0.0
 
 
-async def market_wide_candidates(limit: int = 50) -> list[str]:
+async def market_wide_candidates(limit: int = 80) -> list[str]:
     """Today's broad tradeable pool beyond a user's watchlist.
 
     Returns up to `limit` tickers — top gainers + top losers from the
@@ -70,7 +70,9 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
 
     try:
         from app.brokers.alpaca_data import get_market_movers, get_most_actives
-        movers = await get_market_movers(top=30)
+        # 30 -> 50 per side (Mike 2026-08-21: "it would be looking at
+        # more of the market") - wider net before the junk filter.
+        movers = await get_market_movers(top=50)
     except Exception:  # noqa: BLE001
         movers = {}
         get_most_actives = None  # type: ignore[assignment]
@@ -83,12 +85,15 @@ async def market_wide_candidates(limit: int = 50) -> list[str]:
     actives: list[str] = []
     if get_most_actives is not None:
         try:
-            _deep = [s for s in await get_most_actives(top=60) if _clean(s)]
-            _head, _tail = _deep[:12], _deep[12:]
+            # 60 -> 100 deep, 12+13 -> 18+20 kept, rotation now hourly
+            # AND half-hourly offset so more of the tail cycles through
+            # each session (Mike 2026-08-21: widen the market view).
+            _deep = [s for s in await get_most_actives(top=100) if _clean(s)]
+            _head, _tail = _deep[:18], _deep[18:]
             if _tail:
                 import time as _t
-                _off = (int(_t.time() // 3600)) % max(len(_tail), 1)
-                _rot = (_tail[_off:] + _tail[:_off])[:13]
+                _off = (int(_t.time() // 1800)) % max(len(_tail), 1)
+                _rot = (_tail[_off:] + _tail[:_off])[:20]
             else:
                 _rot = []
             actives = _head + _rot

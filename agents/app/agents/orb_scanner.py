@@ -69,7 +69,7 @@ class ORBScannerAgent(Agent):
         try:
             from app.data.market_universe import expanded_scan_pool
             scan_pool, _pool_info = await expanded_scan_pool(
-                list(ORB_WATCHLIST), limit=40)
+                list(ORB_WATCHLIST), limit=60)
         except Exception:  # noqa: BLE001
             scan_pool, _pool_info = list(ORB_WATCHLIST), {}
         for symbol in scan_pool:

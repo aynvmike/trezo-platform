@@ -156,7 +156,7 @@ class TradeExecutionAgent(Agent):
 
             def _fetch():
                 return (client.table("paper_positions")
-                        .select("user_id, ticker")
+                        .select("user_id, ticker, asset_type")
                         .eq("status", "open").execute())
 
             res = await asyncio.to_thread(_fetch)
@@ -164,11 +164,50 @@ class TradeExecutionAgent(Agent):
             for row in (res.data or []):
                 u = str(row.get("user_id") or "")
                 t = (row.get("ticker") or "").strip().upper()
+                a = (row.get("asset_type") or "stock").strip().lower()
                 if u and t:
-                    out.setdefault(u, set()).add(t)
+                    out.setdefault(u, {})[t] = a
             return out
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _pocket_cap(cfg, asset_type: str, book_cap: int) -> int:
+        """How many of this book's slots belong to THIS pocket.
+
+        Per-pocket capacity (Mike 2026-08-21: "the open positions was
+        supposed to be for each pocket available in the book, not the
+        total amount of the positions possible"). The book-wide cap
+        fixed on 08-20 stopped books from judging each other, but one
+        hot lane could still fill all 14 slots and starve the rest.
+        Slots now split across the pockets the book actually funds, in
+        proportion to allocation_overrides; every funded pocket keeps
+        at least 1 slot. A book with no allocation_overrides keeps the
+        old behavior (book-wide cap only).
+        """
+        pockets = getattr(cfg, "allocation_overrides", None) or {}
+        if not isinstance(pockets, dict) or not pockets:
+            return book_cap
+        # settings pockets are keyed stocks/options/crypto/forex/income;
+        # paper_positions.asset_type says stock/option/crypto/forex.
+        _key = {"stock": "stocks", "option": "options",
+                "crypto": "crypto", "forex": "forex",
+                "income": "income"}.get(asset_type, "stocks")
+        total = sum(float(v or 0) for v in pockets.values())
+        alloc = float(pockets.get(_key, 0) or 0)
+        if total <= 0:
+            return book_cap
+        if alloc <= 0:
+            return 0  # pocket not funded on this book
+        return max(1, round(book_cap * alloc / total))
+
+    @staticmethod
+    def _pocket_open(held: dict, asset_type: str) -> int:
+        """Open positions in this pocket. `held` maps TICKER->asset_type."""
+        _norm = {"stock": "stock", "option": "option", "crypto": "crypto",
+                 "forex": "forex", "income": "income"}
+        want = _norm.get(asset_type, "stock")
+        return sum(1 for a in held.values() if a == want)
 
     async def _execute_for_all_users(
         self,
@@ -270,10 +309,19 @@ class TradeExecutionAgent(Agent):
                     # THIS book's slot count vs THIS book's cap. A book
                     # already holding the ticker may still add to it
                     # (accumulation) - a full book only refuses NEW names.
+                    # And within the book, THIS POCKET's count vs THIS
+                    # POCKET's share of the slots (Mike 2026-08-21) - a
+                    # crypto run can no longer occupy the stock pocket's
+                    # chairs.
                     if _v.ok and open_by_book is not None:
-                        _held = open_by_book.get(str(uid), set())
+                        _held = open_by_book.get(str(uid), {})
                         _cap = int(getattr(_cfg, "max_open_positions", 14)
                                    or 14)
+                        _atype = ("crypto" if ticker.upper() in CRYPTO_SYMBOLS
+                                  else str(source_payload.get("asset_type")
+                                           or "stock")).lower()
+                        _pcap = self._pocket_cap(_cfg, _atype, _cap)
+                        _popen = self._pocket_open(_held, _atype)
                         if (ticker.upper() not in _held
                                 and len(_held) >= _cap):
                             out.append(AgentMessage(
@@ -286,6 +334,21 @@ class TradeExecutionAgent(Agent):
                                                   f"{len(_held)}/{_cap} open "
                                                   f"positions - no free "
                                                   f"slot")}))
+                            continue
+                        if (ticker.upper() not in _held
+                                and _popen >= _pcap):
+                            out.append(AgentMessage(
+                                agent=self.name, kind="info",
+                                confidence=1.0,
+                                payload={"user_id": uid, "ticker": ticker,
+                                         "side": side,
+                                         "event": "pocket_at_capacity",
+                                         "note": (f"{ticker}: '{_atype}' "
+                                                  f"pocket holds "
+                                                  f"{_popen}/{_pcap} of this "
+                                                  f"book's slots - other "
+                                                  f"pockets keep their "
+                                                  f"chairs")}))
                             continue
                     if not _v.ok:
                         out.append(AgentMessage(

@@ -133,7 +133,7 @@ class PatternDetectionAgent(Agent):
             try:
                 from app.data.market_universe import expanded_scan_pool
                 pool, _info = await expanded_scan_pool(
-                    list(self.watchlist), limit=40)
+                    list(self.watchlist), limit=60)
                 if pool:
                     return [(None, list(pool))]
             except Exception:  # noqa: BLE001
@@ -232,7 +232,7 @@ class PatternDetectionAgent(Agent):
 
             threshold = int(cfg.tcs_threshold or self.signal_threshold)
 
-            pool, breakdown = await expanded_scan_pool(tickers, limit=50)
+            pool, breakdown = await expanded_scan_pool(tickers, limit=70)
 
             ukey = str(user_id or "global")
             summary = scan_summary.setdefault(ukey, {
