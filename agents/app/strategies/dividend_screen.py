@@ -71,6 +71,34 @@ MIN_FUND_AUM_USD = 100_000_000.0
 MIN_QUALIFYING_YIELD = 0.015          # below this it is not a dividend name
 GROWTH_TIER_MAX_YIELD = 0.040         # >= this yields wheel; below compounds
 
+# --- The raise-streak PROXY (2026-08-23, found by the 3-month replay).
+#
+# The spec asks for a >= 10-year raise streak and no cut in 10 years.
+# Both need the DIVIDEND PAYMENT SERIES, and Finnhub's /stock/dividend
+# is NOT on this account's tier -- it answers "you don't have access to
+# this resource". The first version of this module treated that as
+# UNVERIFIED, which is honest but had a consequence nobody saw until the
+# replay ran it: EVERY name came back UNVERIFIED, so `passed` was never
+# true and the screen admitted NOTHING. A gate that blocks everything is
+# not a strict gate, it is a broken one.
+#
+# `dividendGrowthRate5Y` IS available and stands in -- with two guards,
+# because the raw number inverts the rule it is proxying:
+#
+#   REINSTATEMENT ARTIFACT. A company that cut to zero and restarted, or
+#   initiated a dividend recently, shows an astronomical 5Y CAGR off a
+#   near-zero base. In the replay TMUS printed 123.7% and F 38.1% --
+#   and the ranking duly put both at the TOP of the ladder. Those are
+#   precisely the names "no cut in 10 years" exists to exclude. Any
+#   growth rate above MAX_PLAUSIBLE_GROWTH is read as an artifact, not
+#   as excellence.
+#
+#   SHRINKING NOW. A 5Y average can stay positive while the CURRENT
+#   payout falls. Ford's TTM dividend/share sat BELOW its annual figure.
+#   So the trailing payment is compared against the annual rate too.
+MAX_PLAUSIBLE_GROWTH = 0.25   # >25%/yr for 5 straight years is an artifact
+MIN_TTM_VS_ANNUAL = 0.95      # TTM below 95% of annual = shrinking now
+
 # Sector families that pay out of cash flow, not earnings — a >70%
 # earnings payout ratio is NORMAL for these and is not a red flag.
 # They are judged on coverage instead, and REIT/BDC count as ONE sector
@@ -97,6 +125,7 @@ class ScreenResult:
     payout_ratio: Optional[float] = None
     raise_streak_years: Optional[int] = None
     cut_in_lookback: Optional[bool] = None
+    dividend_growth_5y: Optional[float] = None
     sector: Optional[str] = None
     is_fund: bool = False
     checks: dict = field(default_factory=dict)   # rule -> pass|fail|unverified
@@ -373,7 +402,8 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
     else:
         result.checks["payout_ratio"] = "pass"
 
-    # --- raise streak + cut history (needs the payment series)
+    # --- dividend trend. Prefers the real payment series; falls back to
+    # the 5Y growth-rate proxy when the series is not on this API tier.
     import datetime as _dt
     today = _dt.datetime.now(_dt.timezone.utc).date()
     frm = today.replace(year=today.year - CUT_LOOKBACK_YEARS - 1)
@@ -388,24 +418,62 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
     result.raise_streak_years = _raise_streak_from_series(series)
     result.cut_in_lookback = _cut_in_lookback(series)
 
-    if result.raise_streak_years is None:
-        result.checks["raise_streak"] = "unverified"
-    elif result.raise_streak_years >= MIN_RAISE_STREAK_YEARS:
-        result.checks["raise_streak"] = "pass"
+    if result.raise_streak_years is not None:
+        # The real thing — use it and say so.
+        result.source = "finnhub:series"
+        if result.raise_streak_years >= MIN_RAISE_STREAK_YEARS:
+            result.checks["dividend_trend"] = "pass"
+        else:
+            result.checks["dividend_trend"] = "fail"
+            result.reasons.append(
+                f"raise streak {result.raise_streak_years}y under "
+                f"{MIN_RAISE_STREAK_YEARS}y minimum")
+        if result.cut_in_lookback:
+            result.checks["dividend_trend"] = "fail"
+            result.reasons.append(
+                f"dividend cut within {CUT_LOOKBACK_YEARS} years")
     else:
-        result.checks["raise_streak"] = "fail"
-        result.reasons.append(
-            f"raise streak {result.raise_streak_years}y under "
-            f"{MIN_RAISE_STREAK_YEARS}y minimum")
+        # Proxy path — clearly labelled, and guarded against the two ways
+        # a growth rate lies about a raise streak.
+        result.source = "finnhub:growth_proxy"
+        g = m.get("dividendGrowthRate5Y")
+        dps_annual = m.get("dividendPerShareAnnual")
+        dps_ttm = m.get("dividendPerShareTTM")
+        try:
+            growth = float(g) / 100.0 if g is not None else None
+        except (TypeError, ValueError):
+            growth = None
+        result.dividend_growth_5y = growth
 
-    if result.cut_in_lookback is None:
-        result.checks["no_cut"] = "unverified"
-    elif result.cut_in_lookback:
-        result.checks["no_cut"] = "fail"
-        result.reasons.append(
-            f"dividend cut within {CUT_LOOKBACK_YEARS} years")
-    else:
-        result.checks["no_cut"] = "pass"
+        if growth is None:
+            result.checks["dividend_trend"] = "unverified"
+        elif growth > MAX_PLAUSIBLE_GROWTH:
+            # Not excellence — a restart or an initiation off ~zero.
+            result.checks["dividend_trend"] = "fail"
+            result.reasons.append(
+                f"5Y dividend growth {growth*100:.0f}% is implausible as a "
+                f"sustained raise streak — reads as a reinstatement or a "
+                f"recent initiation, which is what the no-cut rule "
+                f"excludes")
+        elif growth < 0:
+            result.checks["dividend_trend"] = "fail"
+            result.reasons.append(
+                f"5Y dividend growth {growth*100:.1f}% — the payout has "
+                f"been shrinking, not raised")
+        else:
+            result.checks["dividend_trend"] = "pass"
+
+        # Shrinking RIGHT NOW, even if the 5Y average is positive.
+        try:
+            if (dps_annual and dps_ttm
+                    and float(dps_ttm) < float(dps_annual) * MIN_TTM_VS_ANNUAL):
+                result.checks["dividend_trend"] = "fail"
+                result.reasons.append(
+                    f"trailing dividend ${float(dps_ttm):.2f} is below the "
+                    f"${float(dps_annual):.2f} annual rate — currently "
+                    f"shrinking")
+        except (TypeError, ValueError):
+            pass
 
     # --- funds: AUM floor (spec §4)
     if result.is_fund:
@@ -430,7 +498,11 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
 
     # --- verdict. `passed` requires NO fails AND no unverified among the
     # checks that decide eligibility. Silence is not consent.
-    decisive = ("yield", "payout_ratio", "raise_streak", "no_cut")
+    # The decisive set is what this data tier can actually answer. It
+    # deliberately does NOT include checks we have no source for: a gate
+    # that waits forever on data that will never arrive blocks the whole
+    # lane (which is exactly what shipped this morning).
+    decisive = ("yield", "payout_ratio", "dividend_trend")
     fails = [k for k in result.checks if result.checks[k] == "fail"]
     unverified = [k for k in decisive
                   if result.checks.get(k) == "unverified"]
