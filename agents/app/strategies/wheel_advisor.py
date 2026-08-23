@@ -231,6 +231,7 @@ async def advise_wheel_leg(*, user_id: str, underlying: str, strategy: str,
                            spot: Optional[float] = None,
                            tier: Optional[str] = None,
                            ex_date: Optional[str] = None,
+                           dividend_amount: Optional[float] = None,
                            next_earnings: Optional[str] = None,
                            lane_cash: Optional[float] = None,
                            reserved_for_open_csps: Optional[float] = None,
@@ -256,7 +257,8 @@ async def advise_wheel_leg(*, user_id: str, underlying: str, strategy: str,
         if spot is not None:
             checks.append(check_ex_date(
                 strategy=strategy, strike=strike, spot=spot,
-                expiration=expiration, ex_date=ex_date))
+                expiration=expiration, ex_date=ex_date,
+                dividend_amount=dividend_amount))
 
         for v in checks:
             if not v.allow:

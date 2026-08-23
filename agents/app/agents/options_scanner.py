@@ -1915,13 +1915,44 @@ class OptionsScannerAgent(Agent):
         # and this asks whether now is the moment.
         try:
             from app.strategies.wheel_advisor import advise_wheel_leg
+            # 2026-08-23: ex_date and tier used to come off `leg` via
+            # getattr, and leg carries neither -- so BOTH were None on
+            # every call and lane rules 3 and 4 could never fire. The
+            # gate was live and structurally silent. Fetched from their
+            # real sources now: ex-dates from Alpaca corporate actions,
+            # tier from the dividend screen's cache.
+            _ex_date = None
+            _last_div = None
+            try:
+                from app.data.corporate_actions import (
+                    dividend_history, last_dividend_rate, next_ex_date)
+                _rows = await dividend_history(underlying)
+                _ex_date = next_ex_date(_rows)
+                _last_div = last_dividend_rate(_rows)
+            except Exception:  # noqa: BLE001
+                pass
+            _tier = None
+            try:
+                from app.strategies.dividend_screen import screen as _scr
+                _tier = (await _scr(underlying)).tier
+            except Exception:  # noqa: BLE001
+                pass
+            _spot = float(getattr(leg, "spot", 0) or 0) or None
+            if _spot is None:
+                try:
+                    from app.data.candles import fetch_candles_for
+                    _cd = await fetch_candles_for(underlying, "stock")
+                    _spot = float(_cd[-1].close) if _cd else None
+                except Exception:  # noqa: BLE001
+                    _spot = None
             _adv = await advise_wheel_leg(
                 user_id=user_id, underlying=underlying, strategy=strategy,
                 strike=float(pick.strike), expiration=str(leg.expiration),
                 contracts=int(leg.contracts or 1),
-                spot=float(getattr(leg, "spot", 0) or 0) or None,
-                tier=getattr(leg, "tier", None),
-                ex_date=getattr(leg, "ex_date", None),
+                spot=_spot,
+                tier=_tier,
+                ex_date=_ex_date,
+                dividend_amount=_last_div,
                 next_earnings=getattr(leg, "next_earnings", None),
             )
             if not _adv.allow:

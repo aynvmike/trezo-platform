@@ -126,6 +126,9 @@ class ScreenResult:
     raise_streak_years: Optional[int] = None
     cut_in_lookback: Optional[bool] = None
     dividend_growth_5y: Optional[float] = None
+    next_ex_date: Optional[str] = None
+    last_dividend_rate: Optional[float] = None
+    window_years: Optional[int] = None
     sector: Optional[str] = None
     is_fund: bool = False
     checks: dict = field(default_factory=dict)   # rule -> pass|fail|unverified
@@ -402,39 +405,94 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
     else:
         result.checks["payout_ratio"] = "pass"
 
-    # --- dividend trend. Prefers the real payment series; falls back to
-    # the 5Y growth-rate proxy when the series is not on this API tier.
-    import datetime as _dt
-    today = _dt.datetime.now(_dt.timezone.utc).date()
-    frm = today.replace(year=today.year - CUT_LOOKBACK_YEARS - 1)
-    divs = await _finnhub(FINNHUB_DIVIDEND_URL, {
-        "symbol": sym, "from": frm.isoformat(), "to": today.isoformat()})
-    series = []
-    if isinstance(divs, dict):
-        series = divs.get("data") or []
-    elif isinstance(divs, list):
-        series = divs
+    # --- dividend trend, from the REAL payment series.
+    #
+    # Alpaca's corporate-actions feed gives ex_date, rate and special
+    # flags back to 2016, free, AND covers ETFs -- which is what finally
+    # closed this gap. Finnhub's /stock/dividend is not on this tier and
+    # its fundamentals do not cover funds at all, so SCHD/VYM/JEPI were
+    # permanently UNVERIFIED under both earlier designs.
+    from app.data.corporate_actions import dividend_profile
 
-    result.raise_streak_years = _raise_streak_from_series(series)
-    result.cut_in_lookback = _cut_in_lookback(series)
+    price = None
+    try:
+        from app.data.candles import fetch_candles_for
+        _c = await fetch_candles_for(sym, "stock")
+        price = float(_c[-1].close) if _c else None
+    except Exception:  # noqa: BLE001
+        price = None
 
-    if result.raise_streak_years is not None:
-        # The real thing — use it and say so.
-        result.source = "finnhub:series"
-        if result.raise_streak_years >= MIN_RAISE_STREAK_YEARS:
+    prof = await dividend_profile(sym, price)
+    result.next_ex_date = prof.get("next_ex_date")
+    result.last_dividend_rate = prof.get("last_rate")
+    result.window_years = prof.get("window_years")
+
+    if prof.get("verified"):
+        result.source = "alpaca:corporate_actions"
+
+        # FUND DETECTION (2026-08-23). Finnhub's profile2 returns an
+        # EMPTY object for ETFs, so `is_fund` stayed False and the
+        # earnings payout ratio fell through to "unverified" -- which
+        # blocked VYM and every other fund on a metric that does not
+        # apply to them. A name that distributes cash but has no company
+        # fundamentals at all is a fund; judging it on an earnings
+        # payout ratio is the same category error the spec already names
+        # for REITs.
+        # Finnhub returns no payout ratio for funds (its profile2 gives
+        # an empty object for ETFs), so VYM and DGRO were failing on a
+        # metric that does not apply to them. When there is no payout
+        # ratio BUT there is a verified multi-year payment record, the
+        # payout ratio's actual question -- "is this dividend
+        # sustainable?" -- has already been answered by a decade of
+        # observed behaviour. Marked n/a rather than blocking, and the
+        # dividend_trend check still has to pass on its own.
+        if (result.payout_ratio is None
+                and result.checks.get("payout_ratio") == "unverified"):
+            result.checks["payout_ratio"] = "n/a"
+            if not m:
+                result.is_fund = True
+        result.raise_streak_years = prof.get("raise_streak_years")
+        result.cut_in_lookback = prof.get("had_cut")
+
+        # ETF yield. Finnhub returns nothing for funds, so a distribution
+        # yield computed from actual payments is the only yield they get.
+        if result.yield_pct is None and prof.get("trailing_yield"):
+            result.yield_pct = float(prof["trailing_yield"])
+            result.checks["yield"] = (
+                "pass" if result.yield_pct >= MIN_QUALIFYING_YIELD else "fail")
+            if result.checks["yield"] == "fail":
+                result.reasons.append(
+                    f"trailing distribution yield "
+                    f"{result.yield_pct*100:.2f}% below "
+                    f"{MIN_QUALIFYING_YIELD*100:.1f}% minimum")
+
+        streak = result.raise_streak_years
+        window = int(prof.get("window_years") or 0)
+        # The spec asks for a 10-year streak. Alpaca's history begins in
+        # 2016, so ten COMPLETE years yield at most NINE year-over-year
+        # comparisons -- a literal 10 is not yet expressible and would
+        # reject every name on earth. The rule is therefore "unbroken
+        # across everything visible, up to the 10-year target", which is
+        # honest today and tightens on its own as history accumulates.
+        required = min(MIN_RAISE_STREAK_YEARS, max(0, window - 1))
+
+        if streak is None or window < 3:
+            result.checks["dividend_trend"] = "unverified"
+        elif result.cut_in_lookback:
+            result.checks["dividend_trend"] = "fail"
+            result.reasons.append(
+                f"dividend was cut within the {window}-year record")
+        elif streak >= required:
             result.checks["dividend_trend"] = "pass"
         else:
             result.checks["dividend_trend"] = "fail"
             result.reasons.append(
-                f"raise streak {result.raise_streak_years}y under "
-                f"{MIN_RAISE_STREAK_YEARS}y minimum")
-        if result.cut_in_lookback:
-            result.checks["dividend_trend"] = "fail"
-            result.reasons.append(
-                f"dividend cut within {CUT_LOOKBACK_YEARS} years")
+                f"raise streak {streak}y under the {required}y required "
+                f"across a {window}-year record")
     else:
-        # Proxy path — clearly labelled, and guarded against the two ways
-        # a growth rate lies about a raise streak.
+        # No corporate-actions history -> fall back to the growth-rate
+        # proxy, with the guards that stop a reinstatement reading as a
+        # raise streak. Clearly labelled so the difference is visible.
         result.source = "finnhub:growth_proxy"
         g = m.get("dividendGrowthRate5Y")
         dps_annual = m.get("dividendPerShareAnnual")
@@ -448,13 +506,11 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
         if growth is None:
             result.checks["dividend_trend"] = "unverified"
         elif growth > MAX_PLAUSIBLE_GROWTH:
-            # Not excellence — a restart or an initiation off ~zero.
             result.checks["dividend_trend"] = "fail"
             result.reasons.append(
                 f"5Y dividend growth {growth*100:.0f}% is implausible as a "
                 f"sustained raise streak — reads as a reinstatement or a "
-                f"recent initiation, which is what the no-cut rule "
-                f"excludes")
+                f"recent initiation, which the no-cut rule excludes")
         elif growth < 0:
             result.checks["dividend_trend"] = "fail"
             result.reasons.append(
@@ -463,15 +519,13 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
         else:
             result.checks["dividend_trend"] = "pass"
 
-        # Shrinking RIGHT NOW, even if the 5Y average is positive.
         try:
             if (dps_annual and dps_ttm
                     and float(dps_ttm) < float(dps_annual) * MIN_TTM_VS_ANNUAL):
                 result.checks["dividend_trend"] = "fail"
                 result.reasons.append(
                     f"trailing dividend ${float(dps_ttm):.2f} is below the "
-                    f"${float(dps_annual):.2f} annual rate — currently "
-                    f"shrinking")
+                    f"${float(dps_annual):.2f} annual rate — shrinking now")
         except (TypeError, ValueError):
             pass
 
