@@ -142,6 +142,12 @@ class ScreenResult:
     # Fund-only evidence (spec §4's fund rule). Kept on the result so
     # the UI can show the actual arithmetic behind "this fund is paying
     # you back your own capital" -- a claim that has to show its work.
+    # A cut that has been fully repaired (back above the pre-cut peak,
+    # raising every year since the trough, and at least CUT_HEAL_YEARS
+    # old). Carried on the result rather than buried, because a name in
+    # the ladder ON A REPAIR is a different proposition from one that
+    # never cut, and the reader deserves to see which they are holding.
+    cut_repaired: bool = False
     dist_yield: Optional[float] = None
     trailing_total_return: Optional[float] = None
     reverse_split_24m: bool = False
@@ -169,11 +175,25 @@ class ScreenResult:
                     f"{', '.join(missing) or 'the entry screen'}")
         if not self.passed:
             return f"{self.ticker}: fails screen — {'; '.join(self.reasons)}"
+        if self.is_fund:
+            # A fund has no earnings payout ratio and its distribution
+            # is not a "raise streak" -- printing either invites exactly
+            # the category error the fund branch exists to avoid.
+            paid = (f"{self.dist_yield*100:.1f}%"
+                    if self.dist_yield is not None else "?")
+            earned = (f"{self.trailing_total_return*100:+.1f}%"
+                      if self.trailing_total_return is not None else "?")
+            return (f"{self.ticker}: {self.tier} fund — paid {paid} over "
+                    f"the last year, earned {earned}")
         streak = (f"{self.raise_streak_years}y raises"
                   if self.raise_streak_years is not None else "streak n/a")
+        repaired = (" — admitted on a REPAIRED cut: back above its "
+                    "pre-cut peak and raising since" if self.cut_repaired
+                    else "")
         return (f"{self.ticker}: {self.tier} — "
                 f"{(self.yield_pct or 0)*100:.1f}% yield, "
-                f"payout {(self.payout_ratio or 0)*100:.0f}%, {streak}")
+                f"payout {(self.payout_ratio or 0)*100:.0f}%, {streak}"
+                f"{repaired}")
 
 
 def _supabase():
@@ -559,14 +579,41 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
             # is therefore "unbroken across everything visible, up to the
             # 10-year target", which is honest today and tightens on its
             # own as history accumulates.
-            required = min(MIN_RAISE_STREAK_YEARS, max(0, window - 1))
+            # A CUT THAT HAS BEEN REPAIRED NO LONGER DISQUALIFIES.
+            #
+            # Mike, on the four REITs a flat no-cut rule was excluding
+            # until roughly 2030: "do not cut — if we can get in at a low
+            # price until 2030 we will be building a positive net income
+            # over time." He is right that the flat rule is correct about
+            # the risk and wrong about the opportunity: it throws away
+            # the cheap entry precisely while the record is healing.
+            #
+            # Repair is PROVEN, not assumed — see cut_profile() for the
+            # three conditions. And when a name is admitted on a repair,
+            # its raise streak is measured from the TROUGH rather than
+            # from the start of the window; asking for nine straight
+            # raises from a company that bottomed four years ago is
+            # asking for a number that does not exist yet, which is the
+            # same "gate that can never open" mistake as before.
+            cp = prof.get("cut_profile") or {}
+            result.cut_repaired = bool(cp.get("repaired"))
+            if result.cut_repaired:
+                required = max(1, int(cp.get("years_since_trough") or 1))
+            else:
+                required = min(MIN_RAISE_STREAK_YEARS, max(0, window - 1))
 
             if streak is None or window < 3:
                 result.checks["dividend_trend"] = "unverified"
-            elif result.cut_in_lookback:
+            elif result.cut_in_lookback and not result.cut_repaired:
                 result.checks["dividend_trend"] = "fail"
-                result.reasons.append(
-                    f"dividend was cut within the {window}-year record")
+                why = f"dividend was cut within the {window}-year record"
+                if cp.get("recovered") is False and cp.get("pre_cut_peak"):
+                    why += (f" and still pays less than before it "
+                            f"({cp['latest']:.2f} vs {cp['pre_cut_peak']:.2f})")
+                elif cp.get("recovered") and not cp.get("repaired"):
+                    why += (" — back to its old level but not raising "
+                            "consistently since the trough")
+                result.reasons.append(why)
             elif streak >= required:
                 result.checks["dividend_trend"] = "pass"
             else:

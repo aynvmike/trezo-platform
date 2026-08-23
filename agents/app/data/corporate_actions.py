@@ -119,8 +119,185 @@ async def dividend_history(symbol: str, years: int = 11) -> list:
         return []
 
     rows.sort(key=lambda r: str(r.get("ex_date") or ""))
+    # Restate every payment in today's shares BEFORE anything compares
+    # two years to each other. Without this a 4-for-1 split reads as a
+    # 75% dividend cut (see `splits` for the NextEra case).
+    _apply_split_adjustment(rows, await splits(sym))
     _cache[sym] = (rows, now)
     return rows
+
+
+_split_cache: dict[str, tuple[list, float]] = {}
+
+
+async def splits(symbol: str, years: int = 12) -> list:
+    """Every split — forward and reverse — over the window, oldest first.
+
+    WHY THIS EXISTS (2026-08-23). Alpaca reports each dividend at the
+    rate DECLARED AT THE TIME, unadjusted for later splits. NextEra split
+    4-for-1 on 2020-10-27, so its payment series reads
+
+        2019: 5.00   2020: 4.55   2021: 1.54
+
+    and the cut rule saw a 66% dividend cut at a company that has raised
+    every year for two decades. Nothing about the dividend changed; the
+    share count did. Every name that has split is misread the same way,
+    which is a whole cohort of quality payers silently excluded.
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return []
+    now = time.time()
+    hit = _split_cache.get(sym)
+    if hit and (now - hit[1]) < _CACHE_TTL:
+        return hit[0]
+    headers = _auth()
+    if headers is None:
+        return []
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    start = today.replace(year=today.year - years)
+    out: list = []
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(CA_URL, headers=headers, params={
+                "symbols": sym, "types": "forward_split,reverse_split",
+                "start": start.isoformat(), "end": today.isoformat(),
+                "limit": 500})
+            if r.status_code != 200:
+                return []
+            block = (r.json() or {}).get("corporate_actions") or {}
+            out = list(block.get("forward_splits") or [])
+            out += list(block.get("reverse_splits") or [])
+    except Exception as e:  # noqa: BLE001
+        log.warning("corporate_actions.splits_failed",
+                    symbol=sym, error=str(e)[:160])
+        return []
+    out.sort(key=lambda r: str(r.get("ex_date") or ""))
+    _split_cache[sym] = (out, now)
+    return out
+
+
+def _apply_split_adjustment(rows: list, split_rows: list) -> None:
+    """Stamp every dividend with `adj_rate` — the payment restated in
+    TODAY's shares — and leave `rate` untouched as the declared figure.
+
+    A dividend paid before a 4-for-1 split was paid on shares that later
+    became four, so per today's share it was worth a quarter as much.
+    Dividing by the product of every split ratio that came AFTER the
+    payment puts the whole series on one comparable basis. Reverse splits
+    fall out of the same arithmetic with a ratio below 1, which is what
+    makes a fund's pre-reverse-split distribution look as large as it
+    really was.
+    """
+    ratios = []
+    for sp in split_rows:
+        try:
+            new = float(sp.get("new_rate") or 0)
+            old = float(sp.get("old_rate") or 0)
+            when = _dt.date.fromisoformat(str(sp.get("ex_date"))[:10])
+        except (TypeError, ValueError):
+            continue
+        if new > 0 and old > 0 and abs(new / old - 1.0) > 1e-9:
+            ratios.append((when, new / old))
+    for r in rows:
+        try:
+            rate = float(r.get("rate") or 0)
+            ex = _dt.date.fromisoformat(str(r.get("ex_date"))[:10])
+        except (TypeError, ValueError):
+            r["adj_rate"] = r.get("rate")
+            continue
+        factor = 1.0
+        for when, ratio in ratios:
+            if when > ex:
+                factor *= ratio
+        r["adj_rate"] = rate / factor if factor else rate
+
+
+def _rate(r: dict) -> float:
+    """The split-adjusted payment. Falls back to the declared rate so a
+    row that predates the adjustment still reads sensibly."""
+    v = r.get("adj_rate")
+    if v is None:
+        v = r.get("rate")
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# A payment this many times the median of its OWN year is a one-off.
+SPECIAL_MULTIPLE = 3.0
+
+
+# ...and a payment this far BELOW the year's median is a fragment: a
+# stub, an adjustment, a partial record. Not part of the regular policy.
+MINOR_FRACTION = 1.0 / 3.0
+
+
+def _is_special(row: dict, year_rates: list) -> bool:
+    """Is this payment something other than a REGULAR dividend?
+
+    Two kinds of not-regular, caught at opposite ends of the same
+    comparison. Above the norm: a special. Below it: a fragment.
+
+    The fragments matter as much as the specials, because they corrupt
+    the payment COUNT and the count is what drives the timing
+    normalisation. Allstate's 2023 record carries four 0.89 dividends
+    and a stray 0.08; counted as five payments against a norm of four,
+    the year was scaled by 4/5 down to 2.91 and Allstate -- which has
+    never cut -- came back as a 14% cut. Ares Capital's 2019 record
+    holds two 0.40 regulars and two 0.02 fragments, which counts to four
+    and hides the fact that half the year is simply missing.
+
+    Alpaca's `special` flag is set on barely any of them -- across a
+    120-name universe only 9 rows carried it, and Costco's $7.00 in 2017
+    and Equity Residential's $8.00 in 2016 were both unflagged. Left
+    uncorrected each one lands in an annual total and the NEXT year reads
+    as a 75-85% dividend cut at a company that has never cut.
+
+    Trusting the flag is therefore not an option, and neither is
+    comparing against the median of the whole window: a company that
+    reinstated a dividend has recent payments many times its ten-year
+    median (GE's $0.28 against a $0.08 median) and a company that moved
+    from monthly to quarterly has larger payments for the same annual
+    cash (STAG). Both would be stripped as "specials" and both are real.
+
+    The discriminator is the payment's own YEAR. A special is an
+    outlier among its siblings -- one payment several times the others
+    in the same twelve months. A reinstatement or a frequency change
+    lifts every payment in the year together, so nothing stands out.
+    """
+    if bool(row.get("special")):
+        return True
+    if len(year_rates) < 3:
+        return False           # too few siblings to call anything odd
+    rate = _rate(row)
+    # The plain median of EVERY payment in the year, the payment itself
+    # included. An earlier version excluded equal values and indexed the
+    # middle of what was left, which inverted on a bimodal year: Ares
+    # Capital pays four ~0.43 regulars alongside four 0.03 supplementals,
+    # the 0.03s became "the norm", and all four REGULAR dividends were
+    # stripped as specials -- turning a $1.87 year into $0.12 and
+    # manufacturing the deepest cut in the universe.
+    ordered = sorted(year_rates)
+    n = len(ordered)
+    mid = (ordered[n // 2] if n % 2
+           else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0)
+    if mid <= 0:
+        return False
+    return bool(rate > SPECIAL_MULTIPLE * mid
+                or rate < MINOR_FRACTION * mid)
+
+
+def _year_rate_index(rows: list) -> dict:
+    out: dict = defaultdict(list)
+    for r in rows:
+        try:
+            out[int(str(r.get("ex_date"))[:4])].append(_rate(r))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _by_year(rows: list, *, include_special: bool = False) -> dict:
@@ -130,15 +307,20 @@ def _by_year(rows: list, *, include_special: bool = False) -> dict:
     and folding it in would invent a streak that breaks next year.
     """
     out: dict = defaultdict(float)
+    index = _year_rate_index(rows)
     for r in rows:
-        if not include_special and bool(r.get("special")):
+        try:
+            _y = int(str(r.get("ex_date"))[:4])
+        except (TypeError, ValueError):
+            continue
+        if not include_special and _is_special(r, index.get(_y, [])):
             continue
         ex = str(r.get("ex_date") or "")
         try:
             year = int(ex[:4])
-            rate = float(r.get("rate") or 0)
         except (TypeError, ValueError):
             continue
+        rate = _rate(r)          # split-adjusted; see _apply_split_adjustment
         if rate > 0:
             out[year] += rate
     return dict(out)
@@ -171,13 +353,15 @@ def _complete_years(rows: list) -> dict:
     """
     counts: dict = defaultdict(int)
     totals = _by_year(rows)
+    index = _year_rate_index(rows)
     for r in rows:
-        if bool(r.get("special")):
-            continue
         try:
-            counts[int(str(r.get("ex_date"))[:4])] += 1
+            y = int(str(r.get("ex_date"))[:4])
         except (TypeError, ValueError):
             continue
+        if _is_special(r, index.get(y, [])):
+            continue
+        counts[y] += 1
     if not counts:
         return {}
     current = _dt.datetime.now(_dt.timezone.utc).year
@@ -187,11 +371,22 @@ def _complete_years(rows: list) -> dict:
             freq[n] += 1
     if not freq:
         return {}
-    modal = max(freq.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    # On a tie, take the SMALLER count -- that is the base cadence. The
+    # other way round, a single year carrying two supplementals sets the
+    # norm at 6, every ordinary 4-payment year is then scaled UP by 1.5x,
+    # and the supplemental year reads as a cut against its own inflated
+    # neighbours.
+    modal = max(freq.items(), key=lambda kv: (kv[1], -kv[0]))[0]
 
     # Within this many payments of the norm = a timing shift, normalise.
     # Beyond it = a real change in payout behaviour, leave it alone.
-    TIMING_TOLERANCE = 2
+    # The band has to scale with the payment frequency. A fixed +/-2 was
+    # right for a monthly payer (Realty Income's 11-and-13 problem) and
+    # badly wrong for a quarterly one: Accenture's early years hold only
+    # TWO of four payments in Alpaca's record, |2-4| = 2 passed the test,
+    # and the year was scaled up by 2x on the strength of missing data.
+    # A quarter off the norm is the honest boundary either way.
+    band = max(1, int(round(modal * 0.25)))
 
     out: dict = {}
     for y, total in totals.items():
@@ -202,10 +397,23 @@ def _complete_years(rows: list) -> dict:
             continue
         if n == modal:
             out[y] = total
-        elif abs(n - modal) <= TIMING_TOLERANCE:
+        elif abs(n - modal) <= band:
+            # A payment slipped across a year boundary. Correct the
+            # timing; the dividend itself did not change.
             out[y] = total * (modal / float(n))
+        elif n < modal:
+            # Materially FEWER payments than the norm. Either the record
+            # is truncated (Alpaca's history for a name can start
+            # mid-series) or the payout was suspended. We cannot tell
+            # which from the count alone, and guessing either way
+            # invents a cut or hides one -- so the year is DROPPED and
+            # the streak simply does not reach past the gap. Saying
+            # "unknown" is the only honest option here.
+            continue
         else:
-            out[y] = total                 # genuinely irregular — raw
+            # MORE payments than the norm -- a supplemental or a
+            # frequency change. That is real cash and it is kept raw.
+            out[y] = total
     return out
 
 
@@ -264,6 +472,84 @@ def had_cut(rows: list, lookback_years: int = 10) -> Optional[bool]:
     return False
 
 
+# A cut has to be OLD before recovery from it means anything. Three
+# complete years of rising payments is the shortest run that is a policy
+# rather than a rebound.
+CUT_HEAL_YEARS = 3
+
+
+def cut_profile(rows: list, lookback_years: int = 10) -> dict:
+    """Everything about a cut: when, how deep, and whether it is REPAIRED.
+
+    WHY REPAIR MATTERS (2026-08-23). A flat "no cut in ten years" is
+    correct about the risk and wrong about the opportunity. It excluded
+    Simon Property and Main Street — both of which cut in the pandemic,
+    both of which have since climbed back ABOVE where they were and kept
+    raising — and would have kept excluding them until roughly 2030, by
+    which time the cheap entry is long gone. Mike's read: if we can
+    accumulate at a low price while the record is still healing, the
+    income compounds for the whole wait.
+
+    So a cut is not forgiven, it is REPAIRED, and repair has to be
+    proven on three counts:
+
+      1. RECOVERED  — the annual dividend is back at or above its
+                      pre-cut peak. Not "recovering". Back.
+      2. RISING     — it has gone up every complete year since the
+                      trough, with no second wobble.
+      3. HEALED     — at least CUT_HEAL_YEARS complete years have passed
+                      since the trough, so this is a policy and not a
+                      one-year rebound.
+
+    All three, or the cut still disqualifies. On live data that admits
+    SPG (trough 2021, back above its 2019 peak, four straight raises)
+    and MAIN (trough 2022, +25% past its peak, three straight), while
+    T, F, NLY, VTR, WELL and KHC — every one still paying LESS than
+    before its cut — stay out. The rule discriminates between a company
+    that recovered and a company that merely stopped falling.
+    """
+    empty = {"had_cut": None, "cut_year": None, "trough_year": None,
+             "pre_cut_peak": None, "latest": None, "recovered": None,
+             "repaired": False, "years_since_trough": None}
+    by_year = _complete_years(rows)
+    if len(by_year) < 2:
+        return empty
+    current = _dt.datetime.now(_dt.timezone.utc).year
+    years = sorted(y for y in by_year
+                   if y < current and y >= current - lookback_years)
+    if len(years) < 2:
+        return empty
+
+    cut_year = None
+    for a, b in zip(years, years[1:]):
+        if b - a == 1 and by_year[b] < by_year[a] * 0.95:
+            cut_year = b
+    latest = years[-1]
+    if cut_year is None:
+        return {**empty, "had_cut": False, "latest": by_year[latest]}
+
+    pre_cut_peak = max(by_year[y] for y in years if y < cut_year)
+    post = [y for y in years if y >= cut_year]
+    trough_year = min(post, key=lambda y: by_year[y])
+
+    recovered = by_year[latest] >= pre_cut_peak
+    years_since_trough = latest - trough_year
+    streak = raise_streak_years(rows) or 0
+    rising_since_trough = streak >= years_since_trough
+    healed = years_since_trough >= CUT_HEAL_YEARS
+
+    return {
+        "had_cut": True,
+        "cut_year": cut_year,
+        "trough_year": trough_year,
+        "pre_cut_peak": pre_cut_peak,
+        "latest": by_year[latest],
+        "recovered": recovered,
+        "years_since_trough": years_since_trough,
+        "repaired": bool(recovered and rising_since_trough and healed),
+    }
+
+
 def trailing_12mo_dividends(rows: list) -> Optional[float]:
     """Sum of the last 12 months of dividends, specials INCLUDED.
 
@@ -280,9 +566,9 @@ def trailing_12mo_dividends(rows: list) -> Optional[float]:
     for r in rows:
         try:
             ex = _dt.date.fromisoformat(str(r.get("ex_date"))[:10])
-            rate = float(r.get("rate") or 0)
         except (TypeError, ValueError):
             continue
+        rate = _rate(r)
         if ex >= cutoff and rate > 0:
             total += rate
             seen = True
@@ -327,10 +613,7 @@ def last_dividend_rate(rows: list) -> Optional[float]:
     """Most recent per-share payment — the amount an early exercise would
     take, which is what the ex-date guard weighs against time value."""
     for r in reversed(rows):
-        try:
-            rate = float(r.get("rate") or 0)
-        except (TypeError, ValueError):
-            continue
+        rate = _rate(r)
         if rate > 0:
             return rate
     return None
@@ -349,6 +632,7 @@ async def dividend_profile(symbol: str, price: Optional[float] = None) -> dict:
         "payments": len(rows),
         "raise_streak_years": raise_streak_years(rows),
         "had_cut": had_cut(rows),
+        "cut_profile": cut_profile(rows),
         "ttm_dividends": trailing_12mo_dividends(rows),
         "trailing_yield": (trailing_yield(rows, price)
                            if price is not None else None),
@@ -394,26 +678,25 @@ async def dividend_profile(symbol: str, price: Optional[float] = None) -> dict:
 async def reverse_splits(symbol: str, months: int = 24) -> list:
     """Reverse splits in the window. In a distribution fund a reverse
     split is a tell: it usually means NAV has collapsed far enough that
-    the share price needed rescuing. TSLY did 5:1 on 2025-12-01."""
-    sym = (symbol or "").upper().strip()
-    headers = _auth()
-    if not sym or headers is None:
-        return []
-    today = _dt.datetime.now(_dt.timezone.utc).date()
-    start = today - _dt.timedelta(days=int(months * 30.5))
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(CA_URL, headers=headers, params={
-                "symbols": sym, "types": "reverse_split",
-                "start": start.isoformat(), "end": today.isoformat(),
-                "limit": 100})
-            if r.status_code != 200:
-                return []
-            block = (r.json() or {}).get("corporate_actions") or {}
-            return block.get("reverse_splits") or []
-    except Exception:  # noqa: BLE001
-        return []
+    the share price needed rescuing. TSLY did 5:1 on 2025-12-01.
+
+    Reads the shared split feed rather than issuing its own request, so
+    the fund test and the split adjustment cannot disagree about what
+    happened to a symbol.
+    """
+    cutoff = (_dt.datetime.now(_dt.timezone.utc).date()
+              - _dt.timedelta(days=int(months * 30.5)))
+    out = []
+    for sp in await splits(symbol):
+        try:
+            new_r = float(sp.get("new_rate") or 0)
+            old_r = float(sp.get("old_rate") or 0)
+            when = _dt.date.fromisoformat(str(sp.get("ex_date"))[:10])
+        except (TypeError, ValueError):
+            continue
+        if old_r > 0 and new_r > 0 and new_r < old_r and when >= cutoff:
+            out.append(sp)
+    return out
 
 
 async def trailing_total_return(symbol: str, days: int = 365
