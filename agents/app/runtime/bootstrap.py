@@ -19,6 +19,7 @@ from app.agents.portfolio_architect import PortfolioArchitectAgent
 from app.agents.relay_ingest import RelayIngestAgent
 from app.agents.dividend_manager import DividendManagerAgent
 from app.agents.dividend_lt_agent import DividendLTAgent
+from app.agents.broker_truth_agent import BrokerTruthAgent
 from app.agents.extended_scanner import ExtendedScannerAgent
 from app.agents.kindrip_agent import KindripAgent
 from app.agents.market_horizon import MarketHorizonAgent
@@ -66,6 +67,7 @@ def bootstrap_agents() -> None:
     discovery = StrategyDiscoveryAgent()
     dividend  = DividendManagerAgent()
     dividend_lt = DividendLTAgent()
+    broker_truth = BrokerTruthAgent()
     horizon   = MarketHorizonAgent()
     cycles    = CycleAwarenessAgent()
     exit_adv  = ExitAdvisorAgent()
@@ -96,6 +98,7 @@ def bootstrap_agents() -> None:
     registry.register(discovery, "Computes win/loss performance metrics and flags a review every 25 trades.",          role="observer")
     registry.register(dividend,  "Dividend Manager. Credits modeled distributions on dividend holdings and reinvests them (DRIP) so positions compound.", role="actor")
     registry.register(dividend_lt, "Dividends (Long-Term) lane (2026-08-22). Every 30 min sizes the lane from each book's income pocket, screens the MARKET-WIDE pool through the spec's entry screen (payout ratio, raise streak, cut history) rather than a curated list, and proposes ladder entries under the per-name concentration cap. Signals only -- Risk Manager still judges every one. Never writes covered calls: GROWTH-tier names are held for their payout growth, not called away.", role="observer")
+    registry.register(broker_truth, "Broker Truth (2026-08-23). Every 15 min asks Alpaca what option positions it ACTUALLY holds and makes the ledger agree. Closes only the unambiguous case -- expired, settled out of the money, nothing to move -- and loudly flags everything else: a live contract missing at the broker is a routing incident, an expired ITM one is an assignment, and neither gets guessed at. Written after four short puts expired 8/21 and sat open all weekend, holding collateral hostage on two books.", role="observer")
     registry.register(horizon,   "Market Horizon. Every 15 min reads the whole landscape - stocks, crypto, gold, USD, bonds, income ETFs - and notes who leads and whether the classic cross-asset relationships still hold.", role="observer")
     registry.register(cycles,    "Cycle Awareness (Phase 13). Every 6h reads upcoming earnings + ex-dividend dates per watchlist ticker; tags signals with cycle context so the bot picks strategies around the rhythm pros watch (IV crush, dividend capture).", role="observer")
     registry.register(exit_adv,  "Exit Advisor (Phase 13d). Every 5 min watches every open position for the held-too-long pattern - tracks the running peak unrealized P&L and raises a dashboard alert when the position gives back 30%+ of its peak gain. Never closes a trade; surfaces suggestions for the user to act on.", role="observer")
