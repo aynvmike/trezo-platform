@@ -35,6 +35,24 @@ export function AccountSizeSim({
 }: {
   brokerConnected?: boolean;
 } = {}) {
+  // HOOKS FIRST (2026-08-23). These seven hooks used to sit BELOW the
+  // brokerConnected early-return, so they were called on some renders
+  // and skipped on others. React identifies hook state by call ORDER,
+  // so the first render after a broker connects or disconnects would
+  // read another hook's state -- the "rendered fewer hooks than
+  // expected" crash. ESLint (react-hooks/rules-of-hooks) had been
+  // failing the CI build over exactly this.
+  //
+  // Hooks are cheap and unconditional; the early return below still
+  // renders the same disabled notice.
+  const router = useRouter();
+  const [picked, setPicked] = useState<number>(10_000);
+  const [custom, setCustom] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [done, setDone] = useState<{ equity: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
   if (brokerConnected) {
     return (
       <section className="rounded-xl border border-weave-100 bg-weave-50/40 p-4 text-xs text-weave-600 leading-relaxed">
@@ -51,14 +69,6 @@ export function AccountSizeSim({
       </section>
     );
   }
-
-  const router = useRouter();
-  const [picked, setPicked] = useState<number>(10_000);
-  const [custom, setCustom] = useState("");
-  const [confirming, setConfirming] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [done, setDone] = useState<{ equity: number } | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   const target = (() => {
     const c = Number(custom);
