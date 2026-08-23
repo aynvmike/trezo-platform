@@ -363,3 +363,147 @@ async def dividend_profile(symbol: str, price: Optional[float] = None) -> dict:
         # own as the history deepens.
         "window_years": window_years(rows),
     }
+
+
+# --- The FUND path (spec §4: "for any fund: AUM >= $100M, no reverse
+# split in 24 months, trailing payout <= trailing total return").
+#
+# WHY FUNDS NEED THEIR OWN TEST (2026-08-23, Mike asked the right
+# question: "is it going to possibly do this to other Dividend Funds and
+# not just fix for REIT?"). It was. Running the raise-streak rule over
+# every fund type failed SEVEN OF EIGHT covered-call ETFs -- JEPI, QYLD,
+# RYLD, XYLD, FEPI, NVDY, TSLY -- because a variable distribution is
+# their DESIGN, not a cut. NVDY paid 5.05, then 19.53, then 12.14: that
+# is option premium tracking volatility, and calling it a dividend cut is
+# a category error. It would have rejected the entire asset class the
+# original 24-fund capture study was built on.
+#
+# The spec already knew. For a fund the question is not "did it raise
+# every year" but "IS THE DISTRIBUTION FUNDED BY RETURNS, OR IS IT
+# EATING NAV?" -- which is precisely the finding from Mike's own book:
+# cash yield 17.6% near-uniform across six positions, total return
+# -17.0% to +22.6%. The payout carried no information about the outcome.
+# This test is what makes the payout informative.
+#
+# Measured live 2026-08-23:
+#   JEPI  paid  7.9%, earned  9.4%  -> earned it
+#   QYLD  paid 11.6%, earned 22.9%  -> earned it
+#   NVDY  paid 57.2%, earned 21.8%  -> EATING NAV (price -25.6%)
+#   TSLY  paid 64.1%, earned  8.6%  -> EATING NAV, and reverse split 5:1
+
+async def reverse_splits(symbol: str, months: int = 24) -> list:
+    """Reverse splits in the window. In a distribution fund a reverse
+    split is a tell: it usually means NAV has collapsed far enough that
+    the share price needed rescuing. TSLY did 5:1 on 2025-12-01."""
+    sym = (symbol or "").upper().strip()
+    headers = _auth()
+    if not sym or headers is None:
+        return []
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    start = today - _dt.timedelta(days=int(months * 30.5))
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(CA_URL, headers=headers, params={
+                "symbols": sym, "types": "reverse_split",
+                "start": start.isoformat(), "end": today.isoformat(),
+                "limit": 100})
+            if r.status_code != 200:
+                return []
+            block = (r.json() or {}).get("corporate_actions") or {}
+            return block.get("reverse_splits") or []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def trailing_total_return(symbol: str, days: int = 365
+                                ) -> Optional[float]:
+    """Total return over the window, distributions included.
+
+    Alpaca's adjustment=all folds distributions into the price series, so
+    this is the honest denominator for the fund test -- no reconstruction
+    from payment dates, no assumption about reinvestment timing.
+    """
+    sym = (symbol or "").upper().strip()
+    headers = _auth()
+    if not sym or headers is None:
+        return None
+    # End the window YESTERDAY, never today. This account's market-data
+    # subscription refuses recent SIP bars -- asking for today returns
+    # 403 "subscription does not permit querying recent SIP data", which
+    # silently made every fund's total return None and left the whole
+    # asset class UNVERIFIED. One day of lag costs nothing on a 365-day
+    # measurement and keeps the request inside what the tier allows.
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    end = today - _dt.timedelta(days=1)
+    start = end - _dt.timedelta(days=days)
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            r = await client.get(
+                "https://data.alpaca.markets/v2/stocks/bars",
+                headers=headers,
+                params={"symbols": sym, "timeframe": "1Day",
+                        "start": start.isoformat(), "end": end.isoformat(),
+                        "limit": 10000, "adjustment": "all"})
+            if r.status_code != 200:
+                return None
+            bars = ((r.json() or {}).get("bars") or {}).get(sym) or []
+    except Exception:  # noqa: BLE001
+        return None
+    if len(bars) < 2:
+        return None
+    first, last = bars[0].get("c"), bars[-1].get("c")
+    if not first or not last or first <= 0:
+        return None
+    return last / first - 1.0
+
+
+async def fund_health(symbol: str, price: Optional[float] = None) -> dict:
+    """The spec's fund test. Returns the verdict plus the numbers behind
+    it, because "this fund is returning your own capital to you" is a
+    claim that has to show its work.
+    """
+    rows = await dividend_history(symbol)
+    ttm = trailing_12mo_dividends(rows)
+    tr = await trailing_total_return(symbol)
+    splits = await reverse_splits(symbol, 24)
+
+    dist_yield = None
+    if ttm is not None and price:
+        dist_yield = ttm / float(price)
+
+    checks: dict = {}
+    reasons: list = []
+
+    if splits:
+        when = (splits[0].get("process_date")
+                or splits[0].get("ex_date") or "recently")
+        checks["reverse_split"] = "fail"
+        reasons.append(
+            f"reverse split on {when} — in a distribution fund that "
+            f"usually means NAV fell far enough to need rescuing")
+    else:
+        checks["reverse_split"] = "pass"
+
+    if dist_yield is None or tr is None:
+        checks["payout_vs_return"] = "unverified"
+    elif dist_yield > tr:
+        checks["payout_vs_return"] = "fail"
+        reasons.append(
+            f"paid out {dist_yield*100:.1f}% while earning "
+            f"{tr*100:+.1f}% — the distribution is eating NAV, not "
+            f"funded by returns")
+    else:
+        checks["payout_vs_return"] = "pass"
+
+    return {
+        "symbol": (symbol or "").upper().strip(),
+        "dist_yield": dist_yield,
+        "trailing_total_return": tr,
+        "reverse_splits": len(splits),
+        "checks": checks,
+        "reasons": reasons,
+        "passed": not any(v == "fail" for v in checks.values()),
+        "verified": checks["payout_vs_return"] != "unverified",
+    }

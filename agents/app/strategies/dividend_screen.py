@@ -68,6 +68,14 @@ MIN_RAISE_STREAK_YEARS = 10
 PREFERRED_RAISE_STREAK_YEARS = 25
 CUT_LOOKBACK_YEARS = 10
 MIN_FUND_AUM_USD = 100_000_000.0
+# Finnhub returns NO market cap / NAV for funds on this tier (see the
+# fund branch below: an ETF comes back with 19 price-technical keys and
+# not one company fundamental), so the spec's AUM floor is not directly
+# measurable. Average daily DOLLAR VOLUME is measurable, and it answers
+# the question the AUM floor was actually asked to answer -- can this
+# lane get in and out without wearing the spread. Named for what it is
+# rather than dressed up as AUM.
+MIN_FUND_DOLLAR_VOLUME = 2_000_000.0
 MIN_QUALIFYING_YIELD = 0.015          # below this it is not a dividend name
 GROWTH_TIER_MAX_YIELD = 0.040         # >= this yields wheel; below compounds
 
@@ -131,6 +139,12 @@ class ScreenResult:
     window_years: Optional[int] = None
     sector: Optional[str] = None
     is_fund: bool = False
+    # Fund-only evidence (spec §4's fund rule). Kept on the result so
+    # the UI can show the actual arithmetic behind "this fund is paying
+    # you back your own capital" -- a claim that has to show its work.
+    dist_yield: Optional[float] = None
+    trailing_total_return: Optional[float] = None
+    reverse_split_24m: bool = False
     checks: dict = field(default_factory=dict)   # rule -> pass|fail|unverified
     reasons: list = field(default_factory=list)
     as_of: float = 0.0
@@ -338,10 +352,26 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
     metric = await _finnhub(FINNHUB_METRIC_URL,
                             {"symbol": sym, "metric": "all"})
     if metric is None:
+        # Finnhub is down, rate-limited (60/min, and each name costs TWO
+        # calls), or the key is missing.
+        #
+        # We deliberately do NOT fall through to the Alpaca-only path
+        # here, even though Alpaca could answer most of it. Without the
+        # metric payload there is no way to tell a FUND from a COMPANY:
+        # the discriminator is WHICH company fundamentals are absent, and
+        # an outage makes ALL of them absent. Guessing would route stocks
+        # through the fund rule and funds through the raise-streak rule —
+        # the exact category error this screen was just fixed for. Saying
+        # "not measured" is the smaller failure.
         result.tier = "UNVERIFIED"
+        # These keys must stay in step with `decisive` below; they were
+        # out of step ("raise_streak", "no_cut") since the trend checks
+        # were consolidated, which made this branch's checks dict a dead
+        # letter that no downstream reader could match.
         result.checks = {k: "unverified" for k in
-                         ("yield", "payout_ratio", "raise_streak", "no_cut")}
-        result.reasons = ["no fundamentals available"]
+                         ("yield", "payout_ratio", "dividend_trend")}
+        result.reasons = ["no fundamentals available "
+                          "(Finnhub unavailable or rate-limited)"]
         # Do NOT cache an unverified miss for the full week — a transient
         # API failure should not blind the lane to a name for 7 days.
         _mem_cache[sym] = (result, time.time() - _CACHE_TTL_SECONDS + 3600)
@@ -449,7 +479,18 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
         if (result.payout_ratio is None
                 and result.checks.get("payout_ratio") == "unverified"):
             result.checks["payout_ratio"] = "n/a"
-            if not m:
+            # A name that distributes cash but has NO issuer fundamentals
+            # at all is a fund. Verified live 2026-08-23: Finnhub returns
+            # exactly 19 keys for an ETF -- 52-week high/low, beta,
+            # relative-strength, average volume -- and not one company
+            # figure. Stocks come back with 126-133. So the discriminator
+            # is not a `type` field (profile2 returns {} for funds on
+            # this tier, which is why the old `if not m` test never fired
+            # and every ETF was silently judged as a company).
+            if (m.get("marketCapitalization") is None
+                    and m.get("payoutRatioAnnual") is None
+                    and m.get("payoutRatioTTM") is None
+                    and m.get("dividendYieldIndicatedAnnual") is None):
                 result.is_fund = True
         result.raise_streak_years = prof.get("raise_streak_years")
         result.cut_in_lookback = prof.get("had_cut")
@@ -468,27 +509,71 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
 
         streak = result.raise_streak_years
         window = int(prof.get("window_years") or 0)
-        # The spec asks for a 10-year streak. Alpaca's history begins in
-        # 2016, so ten COMPLETE years yield at most NINE year-over-year
-        # comparisons -- a literal 10 is not yet expressible and would
-        # reject every name on earth. The rule is therefore "unbroken
-        # across everything visible, up to the 10-year target", which is
-        # honest today and tightens on its own as history accumulates.
-        required = min(MIN_RAISE_STREAK_YEARS, max(0, window - 1))
 
-        if streak is None or window < 3:
-            result.checks["dividend_trend"] = "unverified"
-        elif result.cut_in_lookback:
-            result.checks["dividend_trend"] = "fail"
-            result.reasons.append(
-                f"dividend was cut within the {window}-year record")
-        elif streak >= required:
-            result.checks["dividend_trend"] = "pass"
+        if result.is_fund:
+            # ---- THE FUND RULE (spec §4: "for any fund: AUM >= $100M,
+            # no reverse split in 24 months, trailing payout <= trailing
+            # total return").
+            #
+            # Mike asked the question that found this: "is it going to
+            # possibly do this to other Dividend Funds and not just fix
+            # for REIT?" It was. Running the raise-streak rule over every
+            # fund type failed SEVEN OF EIGHT covered-call ETFs -- JEPI,
+            # QYLD, RYLD, XYLD, FEPI, NVDY, TSLY -- because a variable
+            # distribution is their DESIGN, not a cut. NVDY paid 5.05,
+            # then 19.53, then 12.14: that is option premium tracking
+            # volatility, and reading it as a dividend cut is a category
+            # error. It would have rejected the entire asset class the
+            # original 24-fund capture study was built on.
+            #
+            # For a fund the question is not "did it raise every year"
+            # but "IS THE DISTRIBUTION FUNDED BY RETURNS, OR IS IT EATING
+            # NAV?" -- which is exactly the finding from that study: cash
+            # yield near-uniform at ~17.6% across six positions while
+            # total return ran -17.0% to +22.6%. The payout carried no
+            # information about the outcome. THIS is the test that makes
+            # the payout informative.
+            from app.data.corporate_actions import fund_health
+            fh = await fund_health(sym, price)
+            result.dist_yield = fh.get("dist_yield")
+            result.trailing_total_return = fh.get("trailing_total_return")
+            result.reverse_split_24m = bool(fh.get("reverse_splits"))
+
+            if not fh.get("verified"):
+                result.checks["dividend_trend"] = "unverified"
+            elif not fh.get("passed"):
+                result.checks["dividend_trend"] = "fail"
+                result.reasons.extend(fh.get("reasons") or [])
+            else:
+                result.checks["dividend_trend"] = "pass"
         else:
-            result.checks["dividend_trend"] = "fail"
-            result.reasons.append(
-                f"raise streak {streak}y under the {required}y required "
-                f"across a {window}-year record")
+            # ---- THE COMPANY RULE. An operating business that cuts its
+            # dividend has told you something about the business; a fund
+            # whose distribution moved has told you about its inputs.
+            # Different instruments, deliberately.
+            #
+            # The spec asks for a 10-year streak. Alpaca's history begins
+            # in 2016, so ten COMPLETE years yield at most NINE
+            # year-over-year comparisons -- a literal 10 is not yet
+            # expressible and would reject every name on earth. The rule
+            # is therefore "unbroken across everything visible, up to the
+            # 10-year target", which is honest today and tightens on its
+            # own as history accumulates.
+            required = min(MIN_RAISE_STREAK_YEARS, max(0, window - 1))
+
+            if streak is None or window < 3:
+                result.checks["dividend_trend"] = "unverified"
+            elif result.cut_in_lookback:
+                result.checks["dividend_trend"] = "fail"
+                result.reasons.append(
+                    f"dividend was cut within the {window}-year record")
+            elif streak >= required:
+                result.checks["dividend_trend"] = "pass"
+            else:
+                result.checks["dividend_trend"] = "fail"
+                result.reasons.append(
+                    f"raise streak {streak}y under the {required}y required "
+                    f"across a {window}-year record")
     else:
         # No corporate-actions history -> fall back to the growth-rate
         # proxy, with the guards that stop a reinstatement reading as a
@@ -529,7 +614,12 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
         except (TypeError, ValueError):
             pass
 
-    # --- funds: AUM floor (spec §4)
+    # --- funds: size floor (spec §4). AUM where we can get it, average
+    # daily dollar volume where we cannot -- which on this tier is
+    # always, because Finnhub returns no market cap or NAV for a fund.
+    # The substitution is stated rather than hidden: a liquidity floor
+    # and an AUM floor are not the same measurement, they merely fail
+    # the same tiny funds.
     if result.is_fund:
         aum = None
         for k in ("marketCapitalization", "netAssetValue"):
@@ -540,15 +630,33 @@ async def screen(ticker: str, *, force: bool = False) -> ScreenResult:
                     break
                 except (TypeError, ValueError):
                     pass
-        if aum is None:
-            result.checks["fund_aum"] = "unverified"
-        elif aum < MIN_FUND_AUM_USD:
-            result.checks["fund_aum"] = "fail"
-            result.reasons.append(
-                f"fund AUM ${aum/1e6:.0f}M under "
-                f"${MIN_FUND_AUM_USD/1e6:.0f}M floor")
+        if aum is not None:
+            if aum < MIN_FUND_AUM_USD:
+                result.checks["fund_size"] = "fail"
+                result.reasons.append(
+                    f"fund AUM ${aum/1e6:.0f}M under "
+                    f"${MIN_FUND_AUM_USD/1e6:.0f}M floor")
+            else:
+                result.checks["fund_size"] = "pass"
         else:
-            result.checks["fund_aum"] = "pass"
+            dollar_vol = None
+            try:
+                # Finnhub reports this in MILLIONS of shares.
+                vol_m = m.get("10DayAverageTradingVolume")
+                if vol_m is not None and price:
+                    dollar_vol = float(vol_m) * 1e6 * float(price)
+            except (TypeError, ValueError):
+                dollar_vol = None
+            if dollar_vol is None:
+                result.checks["fund_size"] = "unverified"
+            elif dollar_vol < MIN_FUND_DOLLAR_VOLUME:
+                result.checks["fund_size"] = "fail"
+                result.reasons.append(
+                    f"fund trades ${dollar_vol/1e6:.1f}M/day, under the "
+                    f"${MIN_FUND_DOLLAR_VOLUME/1e6:.0f}M liquidity floor "
+                    f"standing in for the AUM floor")
+            else:
+                result.checks["fund_size"] = "pass"
 
     # --- verdict. `passed` requires NO fails AND no unverified among the
     # checks that decide eligibility. Silence is not consent.
@@ -624,7 +732,15 @@ def sector_capped(results: list, max_per_sector: int = 2) -> list:
     counts: dict = {}
     for r in results:
         sector = r.sector or "UNKNOWN"
-        if any(c.lower() in sector.lower() for c in CASHFLOW_PAYERS):
+        # Funds get their OWN bucket. Finnhub returns no industry for a
+        # fund, so before this every ETF fell into "UNKNOWN" -- sharing
+        # one 2-slot bucket with any STOCK whose profile lookup happened
+        # to fail. A network blip on one name could therefore evict a
+        # fund from the ladder, which is a concentration cap enforcing
+        # something that is not a concentration.
+        if getattr(r, "is_fund", False):
+            sector = "FUND"
+        elif any(c.lower() in sector.lower() for c in CASHFLOW_PAYERS):
             sector = "CASHFLOW_PAYER"     # REIT + BDC share one bucket
         if counts.get(sector, 0) >= max_per_sector:
             continue
