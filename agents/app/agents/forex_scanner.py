@@ -55,6 +55,45 @@ class ForexScannerAgent(Agent):
                 },
             )]
 
+        # CONVERTIBILITY GATE (2026-08-22, from the engine audit).
+        # Risk Manager vetoes EVERY forex signal when broker-only is on
+        # and modeled forex is not explicitly allowed -- Alpaca has no FX
+        # venue. This scanner was ticking every 180s, fetching Kraken OHLC
+        # on 10 pairs, and handing Risk Manager signals that were
+        # structurally guaranteed to be rejected: pure overhead, plus
+        # veto noise that buried real rejections in the feed.
+        #
+        # Asking the SAME question Risk Manager asks, before doing the
+        # work. Self-correcting: wire an FX venue or set
+        # TREZO_FOREX_MODELED_OK=true and the lane resumes on its own.
+        try:
+            from app.config import get_settings as _gs_fx
+            _c = _gs_fx()
+            if (bool(getattr(_c, "trezo_broker_only", False))
+                    and not bool(getattr(_c, "trezo_forex_modeled_ok",
+                                         False))):
+                import time as _t
+                now = _t.time()
+                # Say it once an hour, not every 3 minutes.
+                if now - (self._last_hb or 0) < 3600:
+                    return []
+                self._last_hb = now
+                return [AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={
+                        "ticker": "FOREX",
+                        "event": "forex_lane_dormant",
+                        "note": ("Forex lane dormant: broker-only mode is "
+                                 "on and modeled forex is not allowed, so "
+                                 "Risk Manager would veto every signal. "
+                                 "Skipping the scan rather than "
+                                 "manufacturing guaranteed vetoes. Set "
+                                 "TREZO_FOREX_MODELED_OK=true, or wire an "
+                                 "FX venue, to wake it."),
+                    })]
+        except Exception:  # noqa: BLE001
+            pass
+
         from app.data.forex import FOREX_MAJORS, fetch_forex_candles
         from app.patterns.scoring import calculate_score, MarketContext
         from app.strategies.market_filter import atr as _atr

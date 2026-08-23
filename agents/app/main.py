@@ -2098,15 +2098,17 @@ async def _on_startup() -> None:
         raise
 
     try:
-        start_scheduler(app=app, registry=registry)
+        # 2026-08-22: this used to call start_scheduler(app=app,
+        # registry=registry). No such signature has ever existed -- the
+        # only definition takes NO arguments -- so every boot since this
+        # line was written raised TypeError into its own fallback. The
+        # engine started correctly the whole time, but "scheduler.started"
+        # never once fired and every boot logged ".fallback" instead. The
+        # log was lying about the boot path. Calling it correctly now;
+        # the fallback branch is gone because there is nothing to fall
+        # back FROM.
+        start_scheduler()
         log.info("agents.scheduler.started")
-    except TypeError:
-        # Older signature with no kwargs
-        try:
-            start_scheduler()
-            log.info("agents.scheduler.started.fallback")
-        except Exception as e:
-            log.error("agents.scheduler.FAILED", error=str(e))
     except Exception as e:
         log.error("agents.scheduler.FAILED", error=str(e))
 

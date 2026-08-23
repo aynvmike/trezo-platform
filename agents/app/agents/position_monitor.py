@@ -2020,9 +2020,14 @@ class PositionMonitorAgent(Agent):
 
             # Continuous re-evaluation (Mike 6/29). Re-judges this position
             # with the shared capability library and actively manages it
-            # (tighten stop / lower target / rotate / advise add). Master-
-            # flagged OFF, so this is a no-op until enabled -- live behavior
-            # is unchanged today.
+            # (tighten stop / lower target / rotate / advise add).
+            # 2026-08-22: this comment used to say "Master-flagged OFF, so
+            # this is a no-op until enabled -- live behavior is unchanged
+            # today." That has been FALSE since the flag was flipped:
+            # TREZO_REEVAL_ENABLED=true in production, so this path is LIVE
+            # and 395 lines of reevaluator.py are actively managing open
+            # positions. Anyone reading the old note would have believed
+            # otherwise while debugging a moved stop.
             reeval_close: str | None = None
             if reeval_is_enabled():
                 try:
