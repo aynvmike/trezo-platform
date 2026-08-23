@@ -1905,6 +1905,35 @@ class OptionsScannerAgent(Agent):
                 },
             )
 
+        # ---- WHEEL ADVISOR GATE (2026-08-23, Mike: "a gate for an
+        # agent at the end of it... we are adding a variable so it should
+        # be able to work with the system and not have to change it all
+        # the way"). ONE call, at the end of the Wheel's own reasoning.
+        # It can only DEFER a leg, never create or enlarge one, and it
+        # FAILS OPEN on any error or with TREZO_WHEEL_ADVISOR=0. Nothing
+        # above this line changed; the Wheel decides exactly as before
+        # and this asks whether now is the moment.
+        try:
+            from app.strategies.wheel_advisor import advise_wheel_leg
+            _adv = await advise_wheel_leg(
+                user_id=user_id, underlying=underlying, strategy=strategy,
+                strike=float(pick.strike), expiration=str(leg.expiration),
+                contracts=int(leg.contracts or 1),
+                spot=float(getattr(leg, "spot", 0) or 0) or None,
+                tier=getattr(leg, "tier", None),
+                ex_date=getattr(leg, "ex_date", None),
+                next_earnings=getattr(leg, "next_earnings", None),
+            )
+            if not _adv.allow:
+                return AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={
+                        "user_id": user_id, "routed_via": routed,
+                        **_adv.as_block_payload(underlying, strategy),
+                    })
+        except Exception:  # noqa: BLE001
+            pass  # advisor must never block the lane it advises
+
         # Pre-gates (2026-06-12): yesterday produced 120x "options market
         # orders are only allowed during market hours" (fired at night)
         # and 190x "insufficient options buying power" (retried every
