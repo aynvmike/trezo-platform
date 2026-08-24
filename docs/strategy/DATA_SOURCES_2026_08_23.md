@@ -4,7 +4,7 @@
 Mike: *"verify where we can get all information from a single source, and
 then find ways to cover the missed data."*
 
-**Answer: two sources, not six.** Alpaca answers everything about the
+**Answer: three sources, not six** *(rev. 2026-08-24 — Twelve Data earned its place back for forex)*. Alpaca answers everything about the
 market and about corporate actions. Finnhub answers company fundamentals.
 Three keys in `.env` answer nothing at all and should be retired.
 
@@ -15,6 +15,7 @@ Three keys in `.env` answer nothing at all and should be retired.
 | what the platform needs | source | status |
 |---|---|---|
 | bars / prices, historical + live | **Alpaca** | ✅ incl. `adjustment=all` for total return |
+| **forex candles, 4h + daily** | **Twelve Data** | ✅ free tier; Kraken OHLC fallback (2026-08-24) |
 | market movers, most-actives | **Alpaca** | ✅ |
 | crypto bars + trading | **Alpaca** / Kraken | ✅ |
 | option chains, quotes | **Alpaca** | ✅ `/v1beta1/options/snapshots` |
@@ -30,7 +31,7 @@ Three keys in `.env` answer nothing at all and should be retired.
 
 | key | probe result |
 |---|---|
-| `TWELVE_DATA_API_KEY` | `/dividends`, `/earnings`, `/statistics` all **403 — paid plans only**. Nothing usable on this tier. |
+| `TWELVE_DATA_API_KEY` | ~~retire~~ **KEEP — correction 2026-08-24.** The 08-23 probe tested `/dividends`, `/earnings`, `/statistics` (all 403) and never tried forex. `time_series` works free for FX: 4h bars to ~2023, daily to 2007, 1000+ pairs, 8 credits/min. Now the forex lane's primary candle source (`app/data/forex.py`). |
 | `NASDAQ_DATA_LINK_API_KEY` | **403** on the WIKI dataset. Discontinued years ago. |
 | `ALPHA_VANTAGE_API_KEY` | `EARNINGS_CALENDAR` works, but at **25 calls/day** vs Finnhub's 60/**minute** for the same data. Keep as a cold backup; use it for nothing. |
 
