@@ -149,4 +149,36 @@ def bootstrap_agents() -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("capabilities.seed.failed", error=str(e))
 
+    # BOOT BEACON (2026-08-26). Three deploys this week were marked
+    # "done" while the OLD process kept running -- the relay's restart
+    # handler dies with the service it restarts, and nothing verified
+    # that a new process actually came up. The engine ran Tuesday-morning
+    # code for two days while every deploy reported success.
+    #
+    # This line is the proof-of-boot: an activity event stamped with the
+    # pid and the EXACT commit the process loaded. The log push carries
+    # it to ops_log_tail within minutes, where `relay.py deploy` now
+    # polls for it and refuses to claim success without it. A deploy is
+    # not done when the restart command returns; it is done when a new
+    # process says hello and names the commit it is running.
+    try:
+        import os as _os
+        import subprocess as _sp
+        _commit = "unknown"
+        try:
+            _commit = _sp.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+                cwd=str(__import__("pathlib").Path(__file__).resolve()
+                        .parents[2]),
+            ).stdout.strip() or "unknown"
+        except Exception:  # noqa: BLE001
+            pass
+        from app.agents.activity_log import record as _arec
+        _arec("engine_boot", "SYSTEM",
+              reason=(f"engine process started: pid={_os.getpid()} "
+                      f"commit={_commit} agents={len(registry.all())}"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("boot_beacon.failed", error=str(e))
+
     log.info("agents.bootstrap.complete", count=len(registry.all()))

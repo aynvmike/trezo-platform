@@ -239,6 +239,53 @@ def cmd_log(minutes: int, event: str | None, grep: str | None, limit: int) -> in
     return 0
 
 
+def verify_boot(window_min: int = 6, poll_s: int = 30,
+                timeout_s: int = 420) -> int:
+    """A deploy is done when a NEW process says hello -- not when the
+    restart command returns.
+
+    WHY (2026-08-26): three deploys this week reported "done" while the
+    old engine kept running. The restart handler runs inside the service
+    it kills, and its detached child does not reliably survive; nothing
+    downstream checked. The engine ran two-day-old code, every fix in
+    that window silently absent, and every deploy log said success.
+
+    This polls ops_log_tail for an `engine_boot` beacon newer than the
+    moment we started asking (the bootstrap emits one per process, with
+    pid and commit). Beacon found -> prints it, exit 0. No beacon inside
+    the timeout -> LOUD failure and exit 3, with the one command that is
+    known to land. Failing loudly here is the entire point: a deploy
+    that cannot prove a boot must not look like a deploy that did.
+    """
+    from datetime import datetime, timezone, timedelta
+    started = datetime.now(timezone.utc)
+    since = (started - timedelta(minutes=window_min)).isoformat()
+    print(f"verifying boot (engine_boot beacon, up to {timeout_s}s; the "
+          f"log push runs on a ~5 min cadence)...")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            q = ("/rest/v1/ops_log_tail?select=ts,line"
+                 f"&ts=gte.{urllib.parse.quote(since)}&order=ts.desc&limit=50")
+            for r in get(q):
+                ln = r.get("line") or {}
+                if str(ln.get("event")) == "engine_boot":
+                    print(f"BOOT VERIFIED  {_short(r['ts'])}  "
+                          f"{ln.get('reason', '')[:100]}")
+                    return 0
+        except Exception as e:  # noqa: BLE001
+            print(f"  (poll error, retrying: {e})")
+        time.sleep(poll_s)
+    print("!" * 66)
+    print("! BOOT NOT VERIFIED -- the restart very likely did NOT land.")
+    print("! The old process is still running whatever code it had.")
+    print("! Fix (the one restart that always lands), over RDP:")
+    print("!     nssm restart TrezoAgents")
+    print("! Then re-run:  python3 ops/relay.py watchboot")
+    print("!" * 66)
+    return 3
+
+
 def cmd_jobs(limit: int) -> int:
     rows = get("/rest/v1/ops_tasks?select=id,kind,status,attempts,created_at,finished_at,note"
                f"&order=created_at.desc&limit={limit}")
@@ -363,11 +410,18 @@ def main(argv: list[str]) -> int:
     }
     if cmd in shortcuts:
         kind, args = shortcuts[cmd]
-        return wait(queue(kind, args, note=cmd)) if do_wait else 0
+        rc = wait(queue(kind, args, note=cmd)) if do_wait else 0
+        if cmd == "deploy" and do_wait and rc == 0:
+            rc = verify_boot()
+        return rc
     if cmd == "restart":
         if not rest:
             raise SystemExit("restart needs a service: TrezoAgents | TrezoApi | TrezoWeb")
-        return wait(queue("restart_service", {"service": rest[0]}, note=f"restart {rest[0]}"))
+        rc = wait(queue("restart_service", {"service": rest[0]},
+                        note=f"restart {rest[0]}"))
+        if rest[0] == "TrezoAgents" and rc == 0:
+            rc = verify_boot()
+        return rc
     if cmd == "install":
         if not rest:
             raise SystemExit("install needs a package name")
@@ -385,6 +439,11 @@ def main(argv: list[str]) -> int:
 
     if cmd == "watch":
         return wait(rest[0]) if rest else 1
+
+    if cmd == "watchboot":
+        # Standalone boot verification -- run after a manual nssm restart
+        # to confirm the new process actually came up.
+        return verify_boot()
 
     print(__doc__)
     return 1
