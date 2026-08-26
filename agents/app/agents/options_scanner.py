@@ -603,6 +603,34 @@ class OptionsScannerAgent(Agent):
             _max_sym = int(_oso.getenv("TREZO_DAY_OPT_PER_SYM", "3"))
             _min_mv = float(_oso.getenv("TREZO_DAY_OPT_MIN_MOVE", "0.008"))
 
+            # MARKET-REPORT AWARENESS (2026-08-25, Mike: "I hope the
+            # market reports are being reviewed by the agents...
+            # especially for the Dailies"). They were not: relay_ingest
+            # filed every briefing into memory scope relay:market and
+            # NOTHING ever read it back -- a mailbox with no recipient.
+            # The dailies are the fastest, most regime-sensitive lane,
+            # so they read it first.
+            #
+            # Advisory and one-directional, wheel-advisor style: a
+            # risk_off report TIGHTENS (bigger move required, one fewer
+            # concurrent position); risk_on/mixed changes nothing, and
+            # a missing or stale report means "no opinion", never a
+            # gate. A dead market-report pipeline must leave the lane
+            # exactly as it was before this existed.
+            try:
+                from app.agents.relay_ingest import latest_market_regime
+                _regime = await latest_market_regime()
+                if _regime == "risk_off":
+                    _min_mv = _min_mv * 1.5
+                    _max_open = max(1, _max_open - 1)
+                    from app.agents.activity_log import record as _arec
+                    _arec("day_opt_regime", "MARKET",
+                          reason=(f"risk_off per market report: min move "
+                                  f"raised to {_min_mv*100:.1f}%, max "
+                                  f"open lowered to {_max_open}"))
+            except Exception:  # noqa: BLE001
+                pass
+
             def _q_open():
                 return (client.table("options_positions")
                         .select("id").eq("user_id", uid)

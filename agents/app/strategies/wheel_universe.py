@@ -375,11 +375,47 @@ async def get_wheel_universe(user_id: Optional[str]) -> list[WheelCandidate]:
     except Exception as e:  # noqa: BLE001
         log.warning("wheel_universe.stock_pool_failed", error=str(e)[:200])
 
-    universe = sorted(seen.values(), key=lambda c: (c.source != "position",
-                                                    c.source != "seed",
-                                                    c.ticker))
+    universe = _ordered(list(seen.values()))
     _cache[user_id] = (universe, now)
     return universe
+
+
+def _ordered(cands: list, ordinal: Optional[int] = None) -> list:
+    """Positions first; everything else on ONE rotating bench.
+
+    WHY (2026-08-25, Mike: "the options are looking quite the same
+    market pool as before, a lot of Ford and AGNC"). The old sort was
+    (position, seed, ticker) -- which did two bad things at once:
+
+      1. The 22-name curated seed permanently outranked every
+         market-wide candidate, so the names Task #5 added "to be more
+         open to the markets" sorted LAST and, with 1-3 CSP slots,
+         were never reached. Market-wide in the pool, whitelist in
+         effect -- the same costume the 08-22 audit caught elsewhere.
+      2. Sorting by ticker WITHIN the seed group silently undid the
+         2026-07-16 seed rotation. That fix shipped, worked, and was
+         then re-alphabetized to death by this line: with cheap names
+         winning the affordability check, alphabetical order made
+         AGNC (~$9) the permanent front of the queue, with F close
+         behind. Exactly the two names Mike noticed.
+
+    Now: open positions keep priority (they carry obligations), and
+    the ENTIRE remaining bench -- seed, watchlist and market-wide
+    together -- rotates by calendar day, so every affordable name gets
+    its turn at the head regardless of which list it came from or what
+    letter it starts with.
+    """
+    if ordinal is None:
+        from datetime import date as _d
+        ordinal = _d.today().toordinal()
+    positions = sorted((c for c in cands if c.source == "position"),
+                       key=lambda c: c.ticker)
+    bench = sorted((c for c in cands if c.source != "position"),
+                   key=lambda c: c.ticker)
+    if bench:
+        r = int(ordinal) % len(bench)
+        bench = bench[r:] + bench[:r]
+    return positions + bench
 
 
 def _fetch_watchlist_tickers(client, user_id: str):

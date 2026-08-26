@@ -41,7 +41,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, Optional
 
 from app.config import get_settings
 
@@ -164,6 +164,57 @@ def summarize(kind: str, payload: dict) -> str:
             }[kind]
     body = str(payload["summary"]).strip()
     return f"{head} as_of={payload['as_of']} :: {body}"[:SUMMARY_MAX]
+
+
+def parse_market_regime(content: str) -> tuple:
+    """(regime, as_of_iso) from a filed market_context memory line, or
+    (None, None). The line format is summarize()'s own:
+
+        [pre_open] regime=risk_off as_of=2026-08-25T12:30:00Z :: ...
+
+    Written here, next to summarize(), so the writer and the reader of
+    this format live in the same file and cannot drift apart silently
+    -- the exact failure mode the ex-date guard taught us.
+    """
+    try:
+        text = str(content or "")
+        regime = None
+        for tok in ("risk_off", "risk_on", "mixed", "unknown"):
+            if f"regime={tok}" in text:
+                regime = tok
+                break
+        as_of = None
+        if "as_of=" in text:
+            as_of = text.split("as_of=", 1)[1].split(" ", 1)[0].strip()
+        return regime, as_of
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+async def latest_market_regime(max_age_hours: float = 24.0) -> Optional[str]:
+    """The most recent ingested market regime, or None when there is
+    nothing fresh. Consumers treat None as "no opinion" -- an absent or
+    stale report must never gate anything shut."""
+    try:
+        from app.runtime.memory import recall
+        rows = await recall(scope="relay:market", limit=5)
+        best = None
+        for row in rows:
+            regime, as_of = parse_market_regime(row.get("content"))
+            if not regime or not as_of:
+                continue
+            try:
+                stamp = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+                age_h = (datetime.now(timezone.utc) - stamp).total_seconds() / 3600.0
+            except Exception:  # noqa: BLE001
+                continue
+            if age_h > max_age_hours:
+                continue
+            if best is None or stamp > best[1]:
+                best = (regime, stamp)
+        return best[0] if best else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _supabase():
