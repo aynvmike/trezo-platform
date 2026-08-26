@@ -16,6 +16,7 @@ from app.agents.archivist import ArchivistAgent
 from app.agents.book_health import BookHealthAgent
 from app.agents.ops_watchdog import OpsWatchdogAgent
 from app.agents.portfolio_architect import PortfolioArchitectAgent
+from app.agents.market_desk import MarketDeskAgent
 from app.agents.relay_ingest import RelayIngestAgent
 from app.agents.dividend_manager import DividendManagerAgent
 from app.agents.dividend_lt_agent import DividendLTAgent
@@ -77,6 +78,7 @@ def bootstrap_agents() -> None:
     archivist  = ArchivistAgent()
     architect = PortfolioArchitectAgent()
     relay_in  = RelayIngestAgent()
+    mkt_desk  = MarketDeskAgent()
 
     registry.register(pattern,   "Detects candlestick patterns and scores trade confidence (0-1000).",                  role="observer")
     registry.register(stms,      "Small-cap momentum scanner. Active 7-11 AM ET. Looks for $1-$20 stocks up 10%+ on 5x volume with TCS 750+.", role="observer")
@@ -106,6 +108,7 @@ def bootstrap_agents() -> None:
     registry.register(watchdog,  "Operations Watchdog (Task #31, 21st agent). Every 5 min checks the runtime registry vs the expected-agent list and the last-tick time of every registered agent. Raises ops_health_alerts when an agent is missing or has gone silent during market hours.", role="observer")
     registry.register(bookhealth, "Book integrity monitor (2026-08-18). Every 5 min asks one question per book: does it add up? Alarms on UNMANAGED NOTIONAL (broker holds it, the ledger has no row -- nothing is stopping it), positions sitting past their own stop, and a halt whose condition has already cleared. Sends OUT through the alert webhook rather than into a table nobody reads.", role="observer")
     registry.register(relay_in,  "Relay Ingest (2026-08-21). Every 5 min drains Nova's skill briefings (relay_briefings: market context, daily wrap, health verdicts), validates each against its schema, files it into shared agent memory separated by kind, and announces it. Context only -- never emits events, never changes scope/posture/sizing. A brief that doesn't fit is rejected with the reason, never dropped.", role="observer")
+    registry.register(mkt_desk,  "Market Desk (2026-08-25, Mike: 'an agent that can go through the reports and process for each agent'). Every 5 min digests the newest market_context briefing -- regime, indices, vix, breadth, movers, catalysts -- into ONE MarketView served via current_market_view(). Consumers may only TIGHTEN on it; a missing or stale report is 'no opinion' and leaves every lane untouched. Holds no opinions, moves no levers.", role="observer")
     registry.register(archivist, "Archivist (2026-08-18). Hourly: activity logs, runtime caches and a point-in-time copy of every book to Supabase Storage. Weekly: the same bundle to Dropbox, a deliberately different vendor. Nothing should exist only on the server -- then the server is disposable and you rebuild rather than restore.", role="observer")
 
     # Wire on_message handlers - agents react to each other's messages.

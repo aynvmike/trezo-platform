@@ -225,6 +225,38 @@ def check_collateral(*, strategy: str, strike: float, contracts: int,
                   "an existing CSP closing, or fewer contracts")
 
 
+def check_market_pressure(strategy: str, underlying: str,
+                          movers_down: Optional[list] = None,
+                          slot: str = "") -> WheelVerdict:
+    """Defer a NEW cash-secured put on a name today's market report
+    lists under pressure (2026-08-25, the Market Desk's first wheel
+    consumer).
+
+    A CSP is a promise to buy at the strike; writing that promise on a
+    name the day's report says is being actively sold is catching a
+    falling knife and calling it income. Deferral only -- tomorrow's
+    report clears it, and covered calls are untouched (they REDUCE
+    exposure on a falling name, which is the correct direction).
+
+    `movers_down=None` means no fresh report: allow. Six tickers on a
+    twice-daily report is context, not a blacklist -- the same name
+    screened and steady tomorrow wheels normally.
+    """
+    if strategy != "wheel_csp":
+        return _allow("market_pressure: only CSPs are gated")
+    if not movers_down:
+        return _allow("market_pressure: no fresh report — no opinion")
+    sym = (underlying or "").upper().strip()
+    if sym in {str(m).upper() for m in movers_down}:
+        return _defer(
+            rule="market_report.under_pressure",
+            reason=(f"{sym} is on today's market report as under "
+                    f"pressure [{slot or 'report'}] — a new CSP is a "
+                    f"promise to buy a name the tape is selling"),
+            clears_when="the next report no longer lists it under pressure")
+    return _allow("market_pressure: not under pressure today")
+
+
 async def advise_wheel_leg(*, user_id: str, underlying: str, strategy: str,
                            strike: float, expiration: str,
                            contracts: int = 1,
@@ -247,9 +279,21 @@ async def advise_wheel_leg(*, user_id: str, underlying: str, strategy: str,
         return _allow(f"advisor: disabled via {ENV_FLAG}")
 
     try:
+        _movers_down = None
+        _slot = ""
+        try:
+            from app.agents.market_desk import current_market_view
+            _mv = current_market_view()
+            if _mv is not None:
+                _movers_down = _mv.movers_down
+                _slot = _mv.slot
+        except Exception:  # noqa: BLE001
+            pass
         checks = [
             check_schedule(expiration, next_earnings),
             check_tier(strategy, tier),
+            check_market_pressure(strategy, underlying,
+                                  movers_down=_movers_down, slot=_slot),
             check_collateral(strategy=strategy, strike=strike,
                              contracts=contracts, lane_cash=lane_cash,
                              reserved_for_open_csps=reserved_for_open_csps),

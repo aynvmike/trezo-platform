@@ -59,6 +59,7 @@ EXPECTED_AGENTS: list[tuple[str, int]] = [
     ("orb_scanner", 35),
     ("extended_scanner", 35),
     ("crypto_scanner", 60),       # 24/7 strategy, lower urgency
+    ("market_desk", 35),          # the report reader must never go quiet unnoticed
     ("options_scanner", 65),      # 30-min tick + occasional skip
     ("risk_manager", 240),        # event-driven, may sit quiet legitimately
     ("trade_execution", 240),     # event-driven downstream of risk_manager

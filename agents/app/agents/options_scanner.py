@@ -618,8 +618,20 @@ class OptionsScannerAgent(Agent):
             # gate. A dead market-report pipeline must leave the lane
             # exactly as it was before this existed.
             try:
-                from app.agents.relay_ingest import latest_market_regime
-                _regime = await latest_market_regime()
+                # The Market Desk's digested view first; the raw memory
+                # line as fallback for the window right after a restart
+                # before the desk's first tick.
+                _regime = None
+                try:
+                    from app.agents.market_desk import current_market_view
+                    _mv_view = current_market_view()
+                    if _mv_view is not None:
+                        _regime = _mv_view.regime
+                except Exception:  # noqa: BLE001
+                    _regime = None
+                if _regime is None:
+                    from app.agents.relay_ingest import latest_market_regime
+                    _regime = await latest_market_regime()
                 if _regime == "risk_off":
                     _min_mv = _min_mv * 1.5
                     _max_open = max(1, _max_open - 1)

@@ -566,6 +566,28 @@ class RiskManagerAgent(Agent):
             cycle_bump = 15
             cycle_reason = " (earnings TODAY +150)"
 
+        # Market-report bump (2026-08-25, Mike: reports processed "for
+        # each agent"). When the Market Desk holds a FRESH report calling
+        # the tape risk_off, every EQUITY and OPTIONS entry needs +5 more
+        # conviction. Same additive family as the earnings bump above.
+        # Tighten-only by construction: risk_on and mixed add nothing --
+        # the report can raise the bar, never lower it. Crypto and forex
+        # are deliberately exempt: a 24/7 book gated by a 9:30-4:00
+        # equity read would be borrowing context across market hours,
+        # and crypto already carries its own floor (35).
+        report_bump = 0
+        report_reason = ""
+        try:
+            if not str(strategy or "").startswith(("crypto", "forex")):
+                from app.agents.market_desk import current_market_view
+                _mv = current_market_view()
+                if _mv is not None and _mv.regime == "risk_off":
+                    report_bump = 5
+                    report_reason = (f" (market report [{_mv.slot}] "
+                                     f"risk_off +5)")
+        except Exception:  # noqa: BLE001
+            pass
+
         # Experience-driven floor nudge (2026-06-16, OPT-IN, default OFF).
         # When enabled, the user's realized record moves the bar per strategy:
         # a proven winner ("favor") trades a bit more freely, a proven loser
@@ -748,13 +770,13 @@ class RiskManagerAgent(Agent):
         # banked-paycheck bump, the margin-territory bump, and crowding.
         effective_min_tcs = (min_tcs + scope.tcs_bump + cycle_bump
                              + outcome_delta + goal_bump + probation_bump
-                             + leverage_bump + crowding_bump_v)
+                             + leverage_bump + crowding_bump_v + report_bump)
         if tcs < effective_min_tcs:
             extra = (
-                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note}{leverage_note}{crowding_note})"
+                f" (regime +{scope.tcs_bump}{cycle_reason}{outcome_reason}{goal_reason}{probation_note}{leverage_note}{crowding_note}{report_reason})"
                 if (scope.tcs_bump or cycle_bump or outcome_delta
                         or goal_bump or probation_bump or leverage_bump
-                        or crowding_bump_v)
+                        or crowding_bump_v or report_bump)
                 else ""
             )
             return [self._veto(
