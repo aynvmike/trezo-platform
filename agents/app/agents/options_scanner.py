@@ -471,6 +471,37 @@ class OptionsScannerAgent(Agent):
             return 0.0
         return hopeful_capital / total_capital
 
+    async def _step(self, name: str, coro, out: list,
+                    budget_s: float) -> None:
+        """Run one tick step ISOLATED (2026-08-27). The scanner went
+        silent for 7+ hours across three boots because the tick ran its
+        eight steps as one straight line: any step that raised — or
+        hung — discarded EVERY earlier step's messages and the tick
+        produced nothing, forever, with no error on the bus (the last
+        successful tick burst 40+ wheel suggestions at 09:01Z; even the
+        'no actions' fallback never appeared again). Now each step gets
+        its own exception wall and a wall-clock budget: a failure or a
+        hang costs that one step and says its own name out loud."""
+        try:
+            res = await asyncio.wait_for(coro, timeout=budget_s)
+            out.extend(res or [])
+        except asyncio.TimeoutError:
+            log.warning("options_scanner.step_timeout", step=name,
+                        budget_s=budget_s)
+            out.append(AgentMessage(
+                agent=self.name, kind="error",
+                payload={"event": "scanner_step_timeout", "step": name,
+                         "note": (f"step '{name}' exceeded its "
+                                  f"{int(budget_s)}s budget and was "
+                                  f"abandoned — later steps still ran")}))
+        except Exception as e:  # noqa: BLE001
+            log.warning("options_scanner.step_failed", step=name,
+                        error=str(e)[:300])
+            out.append(AgentMessage(
+                agent=self.name, kind="error",
+                payload={"event": "scanner_step_failed", "step": name,
+                         "error": f"{type(e).__name__}: {str(e)[:220]}"}))
+
     async def tick(self) -> list[AgentMessage]:
         client = _supabase()
         if not client:
@@ -480,36 +511,32 @@ class OptionsScannerAgent(Agent):
         out: list[AgentMessage] = []
 
         # --- 1. SETTLE expired positions -----------------------------------
-        settled = await self._settle_expired(client)
-        out.extend(settled)
+        await self._step("settle_expired", self._settle_expired(client),
+                         out, 240)
 
         # --- 2. RECONCILE modeled book vs broker (per user) ---------------
-        reconciled = await self._reconcile_with_broker(client)
-        out.extend(reconciled)
+        await self._step("reconcile_with_broker",
+                         self._reconcile_with_broker(client), out, 300)
 
         # --- 3. WHEEL: open CSPs where missing -----------------------------
-        opened = await self._run_wheel(client)
-        out.extend(opened)
+        await self._step("run_wheel", self._run_wheel(client), out, 900)
 
         # --- 3b. CC OVERLAY: Rulebook 5.5 arithmetic-gate covered calls ----
-        overlay = await self._run_cc_overlay(client)
-        out.extend(overlay)
+        await self._step("cc_overlay", self._run_cc_overlay(client),
+                         out, 300)
 
         # --- 4. Options-strategy IDEAS (suggestions only) ------------------
-        ideas = await self._options_ideas()
-        out.extend(ideas)
+        await self._step("options_ideas", self._options_ideas(), out, 300)
 
         # --- 5. DIRECTIONAL: long calls/puts on the leading generals -------
-        longs = await self._run_directional(client)
-        out.extend(longs)
+        await self._step("directional", self._run_directional(client),
+                         out, 300)
 
         # --- 6. SPREADS: defined-risk multi-leg, one ticket at Alpaca ------
-        spreads = await self._run_spreads(client)
-        out.extend(spreads)
+        await self._step("spreads", self._run_spreads(client), out, 240)
 
         # --- 7. SAME-DAY options: morning gamma, managed on a 60s leash ----
-        dayopts = await self._run_same_day(client)
-        out.extend(dayopts)
+        await self._step("same_day", self._run_same_day(client), out, 240)
 
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",
