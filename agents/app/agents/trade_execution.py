@@ -1060,7 +1060,7 @@ class TradeExecutionAgent(Agent):
         )
         if err or not order:
             from app.paper.killswitch import record_broker_reject
-            record_broker_reject()
+            record_broker_reject(str(user_id))  # THIS book's reject, not the platform's
             try:
                 from app.agents.activity_log import record as _arec
                 _arec("broker_reject", ticker, strategy=strategy,
@@ -1296,7 +1296,7 @@ class TradeExecutionAgent(Agent):
         )
         if err or not order:
             from app.paper.killswitch import record_broker_reject
-            record_broker_reject()
+            record_broker_reject(str(user_id))  # THIS book's reject, not the platform's
             try:
                 from app.agents.activity_log import record as _arec
                 _arec("broker_reject", ticker, strategy=strategy,

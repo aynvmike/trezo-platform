@@ -3,13 +3,20 @@
 Phase 8c, from TREZO_NOVA_BOT_TRADE_RULES.md Section 1. When any switch
 trips, the Risk Manager vetoes every new signal:
 
-  - Daily:   today's realized loss reaches 3% of the day-start equity
+  - Daily:   today's realized loss reaches 3% of the day-start equity (HARD stop)
   - Weekly:  this week's realized loss reaches 6% of the week-start equity
-  - Streak:  3 losing trades in a row
-  - Rejects: 3+ broker order rejects in one session
+             — RECOVERY mode since 2026-08-27, never a full stop
+  - Streak:  3 losing trades in a row (hard stop)
+  - Rejects: 3+ broker order rejects in a rolling 60-minute window
 
-Daily and streak halts clear at the next daily roll; the weekly halt
-clears at the next weekly roll (Monday).
+Every switch is PER BOOK (Mike 2026-08-27: "every single book or
+account should be treated as its own... I would not want it to
+interrupt each other in general"): counted per book, enforced per
+book — one account's trouble never interrupts another's trading.
+
+Daily and streak halts clear at the next daily roll; weekly recovery
+clears the moment the book earns back above the line, or at the
+Monday roll.
 
 The reject window is ROLLING (default 60 minutes, TREZO_REJECT_WINDOW),
 not session-scoped — the session-scoped version once silenced a whole
@@ -33,6 +40,7 @@ MAX_BROKER_REJECTS = 3
 MAX_SLIPPAGE_BREACHES = 3   # fills slipping worse than the limit / session
 
 _ROWSUM_CACHE: dict[str, tuple] = {}   # user -> (ts, wk, dy, streak) 30s TTL
+_LAST_MODE: dict[str, str] = {}        # user -> last seen mode, for transition records
 
 
 class _RowsumCached(Exception):
@@ -50,7 +58,13 @@ class _RowsumCached(Exception):
 import os as _os_ks
 import time as _time_ks
 
-_broker_reject_ts: list[float] = []
+# PER BOOK (Mike 2026-08-27: "every single book or account should be
+# treated as its own when it comes to the broker... I would not want it
+# to interrupt each other in general"). Rejects happen on ONE book's
+# brokerage account; a reject storm there must never bench the others.
+# Key "" holds legacy unattributed rejects — those count toward every
+# book (they cannot be pinned, so conservative is correct).
+_broker_reject_ts: dict[str, list[float]] = {}
 
 
 def _reject_window_s() -> float:
@@ -63,19 +77,29 @@ def _reject_window_s() -> float:
 
 def _prune_rejects() -> None:
     cutoff = _time_ks.time() - _reject_window_s()
-    while _broker_reject_ts and _broker_reject_ts[0] < cutoff:
-        _broker_reject_ts.pop(0)
+    for _b in list(_broker_reject_ts):
+        _lst = _broker_reject_ts[_b]
+        while _lst and _lst[0] < cutoff:
+            _lst.pop(0)
+        if not _lst:
+            _broker_reject_ts.pop(_b, None)
 
 
-def record_broker_reject() -> int:
+def record_broker_reject(user_id: str | None = None) -> int:
     _prune_rejects()
-    _broker_reject_ts.append(_time_ks.time())
-    return len(_broker_reject_ts)
+    _b = str(user_id or "")
+    _broker_reject_ts.setdefault(_b, []).append(_time_ks.time())
+    return broker_reject_count(user_id)
 
 
-def broker_reject_count() -> int:
+def broker_reject_count(user_id: str | None = None) -> int:
+    """THIS book's rejects plus any unattributed ones. Called with no
+    user_id it returns the platform-wide total (old behavior)."""
     _prune_rejects()
-    return len(_broker_reject_ts)
+    if user_id is None:
+        return sum(len(v) for v in _broker_reject_ts.values())
+    return (len(_broker_reject_ts.get(str(user_id), []))
+            + len(_broker_reject_ts.get("", [])))
 
 
 def reset_broker_rejects() -> None:
@@ -88,10 +112,11 @@ def reset_broker_rejects() -> None:
 # broker's avg fill) and feeds breaches here. "Session-scoped" means
 # process lifetime — cleared only by /admin/clear-session-halt or a
 # restart, never by the daily roll.
-_slippage_breaches: list[float] = []
+# Per book, same isolation rule as the reject counter above.
+_slippage_breaches: dict[str, list[float]] = {}
 
 
-def record_fill_slippage(bps: float) -> int:
+def record_fill_slippage(bps: float, user_id: str | None = None) -> int:
     """Track one measured fill's ADVERSE slippage (bps, positive = worse
     than the decision price). Counts a breach when it exceeds
     TREZO_SLIPPAGE_HALT_BPS (default 75). Returns the session breach count."""
@@ -101,12 +126,15 @@ def record_fill_slippage(bps: float) -> int:
     except (TypeError, ValueError):
         limit = 75.0
     if bps > limit:
-        _slippage_breaches.append(float(bps))
-    return len(_slippage_breaches)
+        _slippage_breaches.setdefault(str(user_id or ""), []).append(float(bps))
+    return slippage_breach_count(user_id)
 
 
-def slippage_breach_count() -> int:
-    return len(_slippage_breaches)
+def slippage_breach_count(user_id: str | None = None) -> int:
+    if user_id is None:
+        return sum(len(v) for v in _slippage_breaches.values())
+    return (len(_slippage_breaches.get(str(user_id), []))
+            + len(_slippage_breaches.get("", [])))
 
 
 def reset_slippage_breaches() -> None:
@@ -272,7 +300,7 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
                           f"{cl} losing trades in a row (limit {consec_limit})",
                           mode="halt")
 
-    rj = broker_reject_count()
+    rj = broker_reject_count(str(account.get("user_id")) if account.get("user_id") else None)
     if rj >= MAX_BROKER_REJECTS:
         _mins = int(_reject_window_s() / 60)
         return KillSwitch(True, "session",
@@ -280,7 +308,7 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
                           f"min - trading pauses until they age out",
                           mode="halt")
 
-    sb = slippage_breach_count()
+    sb = slippage_breach_count(str(account.get("user_id")) if account.get("user_id") else None)
     if sb >= MAX_SLIPPAGE_BREACHES:
         return KillSwitch(True, "session",
                           f"{sb} fills slipped past the limit this session "
@@ -403,6 +431,44 @@ async def check_states(client) -> dict[str, KillSwitch]:
 
         ks = evaluate(acct, consec_limit)
         states[str(acct.get("user_id") or "")] = ks
+
+        # RECOVERY AS A LEARNED SKILL (Mike 2026-08-27: "the way the
+        # agents have recovered from a loss when they were under the 5k
+        # portfolio start was a recovery method that is a skill... to
+        # understand that they can get past and make it forward"). The
+        # transitions INTO and OUT of recovery are recorded — the exit
+        # note is the lesson: this book worked its way back before, so
+        # a drawdown is a condition to trade through, not an ending.
+        try:
+            _uid_t = str(acct.get("user_id") or "")
+            _cur = ks.mode or ("halt" if ks.halted else "clear")
+            _prev = _LAST_MODE.get(_uid_t)
+            if _prev != _cur:
+                _LAST_MODE[_uid_t] = _cur
+                _wk_now = _f(acct.get("week_realized_pnl_usd"))
+                if _cur == "recovery":
+                    from app.agents.activity_log import record as _rrec
+                    _rrec("recovery_entered", _uid_t[:8] or "BOOK",
+                          reason=(ks.reason or "weekly limit")[:200])
+                elif _prev == "recovery" and _cur == "clear":
+                    from app.agents.activity_log import record as _rrec
+                    _rrec("recovery_completed", _uid_t[:8] or "BOOK",
+                          reason=(f"worked back above the weekly line "
+                                  f"(week now ${_wk_now:+,.0f}) — "
+                                  f"suspended lanes restored"))
+                    try:
+                        from app.memory.mem0_client import get_memory
+                        get_memory().queue_note(
+                            "killswitch",
+                            (f"recovery[{_uid_t[:8]}]: book entered "
+                             f"weekly recovery and traded its way back "
+                             f"(week ${_wk_now:+,.0f}). The method works "
+                             f"— drawdowns are conditions to trade "
+                             f"through, tightened, not endings."))
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
 
         # Heal a stale PERSISTED weekly halt (written by the pre-08-27
         # behavior): the weekly limit is recovery now, so the hard flag

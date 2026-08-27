@@ -334,7 +334,8 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     _n_breach = 0
                     if _bps > 0:
                         from app.paper.killswitch import record_fill_slippage
-                        _n_breach = record_fill_slippage(_bps)
+                        _n_breach = record_fill_slippage(
+                            _bps, user_id=str(user_id))
                     from app.agents.activity_log import record as _arec3
                     _arec3("fill_slippage", sym,
                            reason=(f"decision {trezo_entry:g} -> fill "
