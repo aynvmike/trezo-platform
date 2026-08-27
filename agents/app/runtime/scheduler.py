@@ -30,6 +30,19 @@ def _tick_timeout_for(impl) -> float:
     max_instances=1 a hung tick silences that agent for the rest of the
     process lifetime -- no error, no log, nothing. Bound every tick so
     a hang becomes a visible last_error and the next fire can run."""
+    # 2026-08-27: an agent may declare its own ceiling. The 900s cap
+    # silently CANCELLED options_scanner's every tick once its wheel
+    # pass outgrew 15 minutes (85-name market-wide universe x 3 books)
+    # -- messages discarded, error only on stdout, agent "silent" for
+    # 9+ hours across four boots. An explicit tick_timeout_seconds
+    # beats the formula; max_instances=1 + coalesce keep a long tick
+    # from ever overlapping the next fire.
+    own = getattr(impl, "tick_timeout_seconds", None)
+    if own:
+        try:
+            return float(max(120.0, float(own)))
+        except (TypeError, ValueError):
+            pass
     interval = getattr(impl, "tick_interval_seconds", 60) or 60
     return float(min(max(2 * interval, 120), 900))
 
@@ -43,6 +56,24 @@ async def _tick_agent(state: AgentState) -> None:
     except asyncio.TimeoutError:
         state.last_error = f"tick timed out after {timeout_s:.0f}s (hung await or blocked I/O)"
         log.error("agent.tick.timeout", agent=state.name, timeout_s=timeout_s)
+        # 2026-08-27: say it ON THE BUS, not just stdout. A cancelled
+        # tick used to discard its messages and leave nothing anywhere
+        # a human or the watchdog reads -- the scanner was cancelled
+        # every tick for 9 hours and the only trace was a stdout line
+        # nobody can reach remotely. Never again silently.
+        try:
+            from app.agents.base import AgentMessage as _AM
+            await bus.publish(_AM(
+                agent=state.name, kind="error",
+                payload={"event": "tick_cancelled_timeout",
+                         "timeout_s": int(timeout_s),
+                         "note": (f"tick exceeded {int(timeout_s)}s and "
+                                  f"was cancelled - all its messages "
+                                  f"were lost; raise "
+                                  f"tick_timeout_seconds or shrink the "
+                                  f"tick")}))
+        except Exception:  # noqa: BLE001
+            pass
         return
     except Exception as e:  # noqa: BLE001
         state.last_error = str(e)

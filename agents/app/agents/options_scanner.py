@@ -471,6 +471,12 @@ class OptionsScannerAgent(Agent):
             return 0.0
         return hopeful_capital / total_capital
 
+    # 2026-08-27: the scheduler's default 900s ceiling cancelled this
+    # tick wholesale once the market-wide wheel pass outgrew 15 minutes.
+    # 45 minutes of headroom; the per-step budgets below sum to 2400s,
+    # so every step concludes (works or names itself) well inside it.
+    tick_timeout_seconds = 2700
+
     async def _step(self, name: str, coro, out: list,
                     budget_s: float) -> None:
         """Run one tick step ISOLATED (2026-08-27). The scanner went
@@ -512,31 +518,31 @@ class OptionsScannerAgent(Agent):
 
         # --- 1. SETTLE expired positions -----------------------------------
         await self._step("settle_expired", self._settle_expired(client),
-                         out, 240)
+                         out, 180)
 
         # --- 2. RECONCILE modeled book vs broker (per user) ---------------
         await self._step("reconcile_with_broker",
-                         self._reconcile_with_broker(client), out, 300)
+                         self._reconcile_with_broker(client), out, 240)
 
         # --- 3. WHEEL: open CSPs where missing -----------------------------
         await self._step("run_wheel", self._run_wheel(client), out, 900)
 
         # --- 3b. CC OVERLAY: Rulebook 5.5 arithmetic-gate covered calls ----
         await self._step("cc_overlay", self._run_cc_overlay(client),
-                         out, 300)
+                         out, 240)
 
         # --- 4. Options-strategy IDEAS (suggestions only) ------------------
-        await self._step("options_ideas", self._options_ideas(), out, 300)
+        await self._step("options_ideas", self._options_ideas(), out, 240)
 
         # --- 5. DIRECTIONAL: long calls/puts on the leading generals -------
         await self._step("directional", self._run_directional(client),
-                         out, 300)
+                         out, 240)
 
         # --- 6. SPREADS: defined-risk multi-leg, one ticket at Alpaca ------
-        await self._step("spreads", self._run_spreads(client), out, 240)
+        await self._step("spreads", self._run_spreads(client), out, 180)
 
         # --- 7. SAME-DAY options: morning gamma, managed on a 60s leash ----
-        await self._step("same_day", self._run_same_day(client), out, 240)
+        await self._step("same_day", self._run_same_day(client), out, 180)
 
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",

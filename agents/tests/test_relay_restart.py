@@ -45,9 +45,19 @@ def test_the_detached_restart_rides_task_scheduler():
     flat = [" ".join(c) for c in calls]
     assert any("schtasks" in f and "/Create" in f for f in flat), (
         "no scheduled task was created; the restart would run in-tree")
-    assert any("schtasks" in f and "/Run" in f for f in flat), (
-        "the one-shot is never triggered; a minute-granular /ST alone "
-        "can wait 59 seconds or roll to tomorrow")
+    # 2026-08-27 live lesson, second edition: /Run + the /ST trigger on a
+    # FIXED-NAME task double-fired (boots 82s apart), and the lingering
+    # instance then made schtasks IGNORE the next deploy entirely. The
+    # helper now creates a UNIQUELY NAMED one-shot with a single /ST
+    # trigger and must NOT immediate-/Run it.
+    assert not any("schtasks" in f and "/Run" in f for f in flat), (
+        "/Run is back - that is the double-boot + stuck-instance bug")
+    _creates = [f for f in flat if "/Create" in f]
+    assert any("TrezoRelayRestart_" in f for f in _creates), (
+        "the one-shot must be uniquely named (TrezoRelayRestart_<HHMMSS>) "
+        "so a lingering instance can never swallow the next restart")
+    assert any("/Delete" in f and "TrezoRelayRestart" in f for f in flat), (
+        "the legacy fixed-name task must be cleaned up best-effort")
     assert not any(f.lower().startswith(relay.NSSM.lower()) for f in flat), (
         "the helper still execs nssm itself instead of via schtasks")
 
