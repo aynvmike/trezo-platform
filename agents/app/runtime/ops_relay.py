@@ -70,16 +70,28 @@ def _restart_detached() -> str:
     # /RU and no run level, and minute-granular /ST could land in the
     # already-elapsed minute. Boots kept not happening while every row
     # said done. Now: SYSTEM account, highest run level, scheduled two
-    # minutes out so the timestamp is always in the future, and /Run
-    # fires it immediately anyway -- the /ST is only the fallback.
-    out = _run(["schtasks", "/Create", "/F", "/TN", "TrezoRelayRestart",
+    # minutes out so the timestamp is always in the future.
+    #
+    # 2026-08-27 #2, from the first live test: a FIXED task name plus
+    # BOTH /Run and the /ST trigger caused (a) a double restart when
+    # both fired (boots 82s apart) and then (b) NOTHING at all — the
+    # first run's instance can linger as "running" (nssm restart blocks
+    # inside it), and schtasks' default multiple-instance policy
+    # IGNORES every later trigger on that task. The 17:41Z deploy
+    # scheduled "SUCCESS" twice and the old process kept running.
+    # Now: end + delete any lingering legacy task (best-effort), then
+    # create a UNIQUELY NAMED one-shot with a single /ST trigger and no
+    # immediate /Run — exactly one fire, on a task nothing can block.
+    _run(["schtasks", "/End", "/TN", "TrezoRelayRestart"], timeout=30)
+    _run(["schtasks", "/Delete", "/TN", "TrezoRelayRestart", "/F"],
+         timeout=30)
+    _task = "TrezoRelayRestart_" + datetime.now().strftime("%H%M%S")
+    out = _run(["schtasks", "/Create", "/F", "/TN", _task,
                 "/TR", f"{NSSM} restart TrezoAgents",
                 "/SC", "ONCE", "/RU", "SYSTEM", "/RL", "HIGHEST",
                 "/ST", (datetime.now() + timedelta(minutes=2)).strftime("%H:%M")],
                timeout=60)
-    out += "\n" + _run(["schtasks", "/Run", "/TN", "TrezoRelayRestart"],
-                        timeout=60)
-    return out
+    return f"[task {_task}]\n{out}"
 
 
 def _run(cmd: list[str], timeout: int = 900, cwd: str | None = None) -> str:
