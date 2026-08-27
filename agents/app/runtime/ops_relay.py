@@ -263,6 +263,26 @@ def _h_report_status(args: dict) -> str:
         lines.append("mem0 SDK: installed")
     except Exception:  # noqa: BLE001
         lines.append("mem0 SDK: NOT installed")
+    # 2026-08-27: the scheduler's per-agent truth (last tick, message
+    # count, last_error) lives only in this process and the localhost
+    # dashboard — the day options_scanner went silent, nothing remote
+    # could read WHY. Now the relay can. Runs in the SAME process as
+    # the scheduler, so this is the live registry, not a copy.
+    try:
+        from app.runtime.registry import registry as _reg
+        import datetime as _dt_rs
+        for _st in _reg.all():
+            _lt = getattr(_st, "last_tick_at", None)
+            if isinstance(_lt, _dt_rs.datetime):
+                _lt = _lt.isoformat()[:19]
+            _err = str(getattr(_st, "last_error", None) or "")[:160]
+            lines.append(
+                f"agent {_st.name}: enabled={getattr(_st, 'enabled', '?')} "
+                f"ticks={getattr(_st, 'tick_count', '?')} "
+                f"msgs={getattr(_st, 'message_count', '?')} "
+                f"last_tick={_lt} err={_err or '-'}")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"agent states: error {str(e)[:160]}")
     return "\n".join(lines)
 
 

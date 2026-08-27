@@ -78,6 +78,16 @@ async def _tick_agent(state: AgentState) -> None:
     except Exception as e:  # noqa: BLE001
         state.last_error = str(e)
         log.error("agent.tick.failed", agent=state.name, error=str(e))
+        # 2026-08-27: same visibility rule as the timeout branch — a
+        # tick that dies must say so ON THE BUS, not only on stdout.
+        try:
+            from app.agents.base import AgentMessage as _AM
+            await bus.publish(_AM(
+                agent=state.name, kind="error",
+                payload={"event": "tick_failed",
+                         "error": f"{type(e).__name__}: {str(e)[:220]}"}))
+        except Exception:  # noqa: BLE001
+            pass
         return
 
     state.mark_ticked()
