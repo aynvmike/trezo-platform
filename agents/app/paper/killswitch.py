@@ -146,6 +146,41 @@ class KillSwitch:
     halted: bool
     scope: str | None       # 'day' | 'week' | 'session' | None
     reason: str | None
+    # 2026-08-27 (Mike): "we should not have a weekly kill limit that
+    # truly stops all trading — it should suspend the lane from making
+    # any crazy investment and tighten up the spread to make things work
+    # away from the loss." mode='halt' = the old behavior (daily, streak,
+    # session halts — hard stops). mode='recovery' = the weekly limit's
+    # new behavior: the book keeps trading, but speculative lanes are
+    # suspended and everything else runs at half size, +RECOVERY_TCS_BUMP
+    # conviction, and tighter stops. Recovery is recomputed from row
+    # sums on every check, so a book that earns its way back above the
+    # line exits recovery immediately — no waiting for Monday.
+    mode: str | None = None  # 'halt' | 'recovery' | None
+
+
+# --- Weekly recovery policy (Mike 2026-08-27, chosen explicitly) -------
+# Suspended while a book is in weekly recovery — the "no crazy
+# investments" list: same-day options, small-cap momentum, opening-range
+# breakouts, directional option buys, crypto scalping.
+RECOVERY_SUSPENDED_PREFIXES: tuple = (
+    "option_day", "stms", "orb", "crypto_scalp",
+    "long_call", "long_put", "bull_call_spread", "butterfly",
+)
+RECOVERY_TCS_BUMP = 10        # extra conviction required in recovery
+RECOVERY_SIZE_FACTOR = 0.5    # half size
+RECOVERY_STOP_FACTOR = 0.75   # stops 25% tighter — cut losers faster
+
+
+def recovery_policy(strategy: str) -> str:
+    """'suspend' | 'tighten' for a strategy on a book in weekly
+    recovery. Everything not on the suspended list keeps trading with
+    the tightened rules — the point is to work AWAY from the loss, not
+    to freeze."""
+    s = str(strategy or "").lower()
+    if s.startswith(RECOVERY_SUSPENDED_PREFIXES):
+        return "suspend"
+    return "tighten"
 
 
 def period_updates(account: dict,
@@ -188,8 +223,18 @@ def period_updates(account: dict,
 def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillSwitch:
     """Evaluate every kill-switch for one (already period-rolled) account."""
     if account.get("trading_halted"):
+        # A PERSISTED weekly halt is a leftover from the pre-2026-08-27
+        # behavior (weekly used to hard-halt and write trading_halted).
+        # Soften it to recovery here so the change takes effect without
+        # waiting for Monday's roll; check_states clears the stale flag.
+        if str(account.get("halt_scope") or "") == "week":
+            return KillSwitch(False, "week",
+                              account.get("halt_reason")
+                              or "Weekly loss limit — recovery mode",
+                              mode="recovery")
         return KillSwitch(True, account.get("halt_scope"),
-                          account.get("halt_reason") or "Trading halted")
+                          account.get("halt_reason") or "Trading halted",
+                          mode="halt")
 
     wse = _f(account.get("week_start_equity_usd"))
     wpnl = _f(account.get("week_realized_pnl_usd"))
@@ -197,9 +242,16 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
     if _tw > 0 and wse > 0 and wse < 0.5 * _tw:
         wse = _tw
     if wse > 0 and wpnl <= -WEEKLY_DRAWDOWN_PCT * wse:
-        return KillSwitch(True, "week",
+        # RECOVERY, not a halt (Mike 2026-08-27). The book keeps trading:
+        # speculative lanes suspended, the rest at half size / +10 TCS /
+        # tighter stops. Recomputed from row sums every check, so
+        # clawing back above the line ends recovery on its own.
+        return KillSwitch(False, "week",
                           f"Weekly loss limit: down ${abs(wpnl):,.0f} "
-                          f"({wpnl / wse * 100:.1f}%) this week")
+                          f"({wpnl / wse * 100:.1f}%) this week — "
+                          f"recovery mode (speculative lanes suspended, "
+                          f"half size, +{RECOVERY_TCS_BUMP} TCS)",
+                          mode="recovery")
 
     dse = _f(account.get("day_start_equity_usd"))
     dpnl = _f(account.get("today_realized_pnl_usd"))
@@ -212,34 +264,46 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
     if dse > 0 and dpnl <= -DAILY_DRAWDOWN_PCT * dse:
         return KillSwitch(True, "day",
                           f"Daily loss limit: down ${abs(dpnl):,.0f} "
-                          f"({dpnl / dse * 100:.1f}%) today")
+                          f"({dpnl / dse * 100:.1f}%) today", mode="halt")
 
     cl = int(account.get("consecutive_losses") or 0)
     if cl >= consec_limit:
-        return KillSwitch(True, "day", f"{cl} losing trades in a row (limit {consec_limit})")
+        return KillSwitch(True, "day",
+                          f"{cl} losing trades in a row (limit {consec_limit})",
+                          mode="halt")
 
     rj = broker_reject_count()
     if rj >= MAX_BROKER_REJECTS:
         _mins = int(_reject_window_s() / 60)
         return KillSwitch(True, "session",
                           f"{rj} broker order rejects in the last {_mins} "
-                          f"min - trading pauses until they age out")
+                          f"min - trading pauses until they age out",
+                          mode="halt")
 
     sb = slippage_breach_count()
     if sb >= MAX_SLIPPAGE_BREACHES:
         return KillSwitch(True, "session",
                           f"{sb} fills slipped past the limit this session "
-                          f"- execution quality halt")
+                          f"- execution quality halt",
+                          mode="halt")
 
     return KillSwitch(False, None, None)
 
 
-async def check_all(client) -> KillSwitch:
-    """Roll periods, evaluate, and persist any new halt across all paper
-    accounts. Returns the active halt (single-user assumption) or a
-    not-halted KillSwitch."""
+async def check_states(client) -> dict[str, KillSwitch]:
+    """Roll periods and evaluate every kill-switch PER BOOK.
+
+    2026-08-27 (Mike): "the agents are not treating each book as their
+    own book and it is causing major issues." The old check_all summed
+    each book's own rows — the MEASUREMENT was always per book — but
+    returned a single verdict ("single-user assumption"), so one tripped
+    book vetoed every book's signals. On 2026-08-27 the primary's -8.0%
+    week froze two healthy books (25k at -1.6%, 75k at -2.7%) for 1,162
+    vetoes. This returns {user_id: KillSwitch} so the Risk Manager and
+    the execution fan-out can treat each book as its own book.
+    """
     if not client:
-        return KillSwitch(False, None, None)
+        return {}
 
     def _fetch():
         return client.table("paper_accounts").select("*").execute()
@@ -247,9 +311,9 @@ async def check_all(client) -> KillSwitch:
     try:
         res = await asyncio.to_thread(_fetch)
     except Exception:  # noqa: BLE001
-        return KillSwitch(False, None, None)
+        return {}
 
-    active = KillSwitch(False, None, None)
+    states: dict[str, KillSwitch] = {}
     # 2026-08-18 (Mike: "the agents are not responding to each book's own
     # setting"). He was right. consecutive_loss_limit was read ONCE, here,
     # OUTSIDE the loop, with no book bound -- so get_bot_settings() fell
@@ -338,22 +402,60 @@ async def check_all(client) -> KillSwitch:
             pass
 
         ks = evaluate(acct, consec_limit)
-        if ks.halted:
-            if not acct.get("trading_halted") and ks.scope in ("day", "week"):
-                def _persist(uid=acct["user_id"], k=ks):
-                    return client.table("paper_accounts").update({
-                        "trading_halted": True,
-                        "halt_reason": k.reason,
-                        "halt_scope": k.scope,
-                        "halted_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("user_id", uid).execute()
+        states[str(acct.get("user_id") or "")] = ks
 
-                try:
-                    await asyncio.to_thread(_persist)
-                except Exception:  # noqa: BLE001
-                    pass
-            active = ks
-    return active
+        # Heal a stale PERSISTED weekly halt (written by the pre-08-27
+        # behavior): the weekly limit is recovery now, so the hard flag
+        # comes off the row — evaluate() already softened the verdict.
+        if (acct.get("trading_halted")
+                and str(acct.get("halt_scope") or "") == "week"):
+            def _unhalt(uid=acct["user_id"]):
+                return client.table("paper_accounts").update({
+                    "trading_halted": False,
+                    "halt_reason": None,
+                    "halt_scope": None,
+                }).eq("user_id", uid).execute()
+            try:
+                await asyncio.to_thread(_unhalt)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Persist only HARD day-scope halts (daily drawdown / streak).
+        # Weekly recovery is never persisted — it is recomputed from row
+        # sums each check so a claw-back clears it immediately; session
+        # halts live in-process by nature.
+        if (ks.halted and ks.mode == "halt" and ks.scope == "day"
+                and not acct.get("trading_halted")):
+            def _persist(uid=acct["user_id"], k=ks):
+                return client.table("paper_accounts").update({
+                    "trading_halted": True,
+                    "halt_reason": k.reason,
+                    "halt_scope": k.scope,
+                    "halted_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("user_id", uid).execute()
+
+            try:
+                await asyncio.to_thread(_persist)
+            except Exception:  # noqa: BLE001
+                pass
+    return states
+
+
+async def check_all(client) -> KillSwitch:
+    """Back-compat wrapper: the WORST single state across books.
+
+    Prefer check_states() — this collapses per-book truth back into the
+    old single-verdict shape (a hard halt anywhere wins, else a recovery
+    anywhere, else clear) and exists only so older callers keep working.
+    """
+    states = await check_states(client)
+    worst = KillSwitch(False, None, None)
+    for ks in states.values():
+        if ks.halted and ks.mode != "recovery":
+            return ks
+        if ks.mode == "recovery" and worst.mode is None:
+            worst = ks
+    return worst
 
 
 # --- QW6: per-coin crypto daily loss limit -----------------------------

@@ -278,6 +278,17 @@ class TradeExecutionAgent(Agent):
         # 14/14 and 516 entries died in a day with every book holding
         # spare slots. Count each book by name, once per signal.
         open_by_book = await self._book_open_tickers()
+        # PER-BOOK kill-switch states (Mike 2026-08-27: "the agents are
+        # not treating each book as their own book"). Fetched once per
+        # signal (row sums are 30s-cached inside); each book is then
+        # judged on ITS OWN halt/recovery below — a tripped primary no
+        # longer decides anything for the 25k or the 75k.
+        _book_ks: dict = {}
+        try:
+            from app.paper.killswitch import check_states as _ck_states
+            _book_ks = await _ck_states(client)
+        except Exception:  # noqa: BLE001
+            _book_ks = {}
         for uid in users:
             try:
                 # Each book's order must go to ITS OWN broker account.
@@ -299,13 +310,68 @@ class TradeExecutionAgent(Agent):
                     # scanner read. This is the first line where a book
                     # has a name, so it is where its own answer counts.
                     _cfg = _bot_settings(uid)
+                    # THIS book's own kill-switch verdict (2026-08-27).
+                    # Hard halt (daily / streak / session) -> this book
+                    # sits out; the others keep working. Weekly recovery
+                    # -> speculative lanes sit out and everything else
+                    # trades tightened (half size, tighter stops, done
+                    # via the per-book payload below).
+                    _ks_b = _book_ks.get(str(uid))
+                    _sp_uid = source_payload
+                    if _ks_b is not None:
+                        if _ks_b.halted and _ks_b.mode != "recovery":
+                            out.append(AgentMessage(
+                                agent=self.name, kind="info", confidence=1.0,
+                                payload={"user_id": uid, "ticker": ticker,
+                                         "side": side,
+                                         "event": "book_halted_skip",
+                                         "note": (f"[{_ks_b.scope}] "
+                                                  f"{_ks_b.reason}")}))
+                            continue
+                        if _ks_b.mode == "recovery":
+                            from app.paper.killswitch import (
+                                RECOVERY_SIZE_FACTOR, recovery_policy)
+                            _strat_b = str(source_payload.get("strategy")
+                                           or "")
+                            if recovery_policy(_strat_b) == "suspend":
+                                out.append(AgentMessage(
+                                    agent=self.name, kind="info",
+                                    confidence=1.0,
+                                    payload={"user_id": uid,
+                                             "ticker": ticker,
+                                             "side": side,
+                                             "event":
+                                             "recovery_suspend_skip",
+                                             "strategy": _strat_b,
+                                             "note": (f"weekly recovery "
+                                                      f"suspends "
+                                                      f"{_strat_b}: "
+                                                      f"{_ks_b.reason}")}))
+                                continue
+                            # Tighten, per THIS book: half the book's own
+                            # risk fraction (risk_pct_override is honored
+                            # by every execution path) and flag the
+                            # payload so stops tighten downstream. Copy,
+                            # never mutate — the dict is shared across
+                            # the fan-out.
+                            try:
+                                _base_risk = float(
+                                    source_payload.get("risk_pct_override")
+                                    or getattr(_cfg, "risk_per_trade_pct",
+                                               0.05) or 0.05)
+                            except (TypeError, ValueError):
+                                _base_risk = 0.05
+                            _sp_uid = {**source_payload,
+                                       "_recovery_mode": True,
+                                       "risk_pct_override":
+                                       _base_risk * RECOVERY_SIZE_FACTOR}
                     _v = _admits(
                         _cfg,
                         asset_type=("crypto" if ticker.upper() in CRYPTO_SYMBOLS
-                                    else str(source_payload.get("asset_type")
+                                    else str(_sp_uid.get("asset_type")
                                              or "stock")),
-                        strategy=str(source_payload.get("strategy") or ""),
-                        tcs=source_payload.get("tcs"))
+                        strategy=str(_sp_uid.get("strategy") or ""),
+                        tcs=_sp_uid.get("tcs"))
                     # THIS book's slot count vs THIS book's cap. A book
                     # already holding the ticker may still add to it
                     # (accumulation) - a full book only refuses NEW names.
@@ -318,7 +384,7 @@ class TradeExecutionAgent(Agent):
                         _cap = int(getattr(_cfg, "max_open_positions", 14)
                                    or 14)
                         _atype = ("crypto" if ticker.upper() in CRYPTO_SYMBOLS
-                                  else str(source_payload.get("asset_type")
+                                  else str(_sp_uid.get("asset_type")
                                            or "stock")).lower()
                         _pcap = self._pocket_cap(_cfg, _atype, _cap)
                         _popen = self._pocket_open(_held, _atype)
@@ -361,7 +427,7 @@ class TradeExecutionAgent(Agent):
                                      "note": f"{ticker}: {_v.reason}"}))
                         continue
                     msgs = await self._execute_for_user(uid, ticker, side,
-                                                        source_payload)
+                                                        _sp_uid)
                 out.extend(msgs or [])
             except Exception as e:  # noqa: BLE001
                 out.append(AgentMessage(
@@ -411,6 +477,20 @@ class TradeExecutionAgent(Agent):
 
         stop_pct = source_payload.get("stop_pct")
         target_pct = source_payload.get("target_pct")
+
+        # Weekly recovery (Mike 2026-08-27): stops 25% tighter for a
+        # recovering book — "tighten up the spread to make things work
+        # away from the loss". Applied here, the one point every
+        # execution path (internal, Alpaca stock, both crypto routes)
+        # flows through. Size halving rides risk_pct_override, set at
+        # the fan-out from THIS book's own risk fraction.
+        if (source_payload or {}).get("_recovery_mode"):
+            try:
+                from app.paper.killswitch import RECOVERY_STOP_FACTOR
+                if isinstance(stop_pct, (int, float)) and stop_pct > 0:
+                    stop_pct = float(stop_pct) * RECOVERY_STOP_FACTOR
+            except Exception:  # noqa: BLE001
+                pass
 
         from app.brokers.alpaca import alpaca_configured
         from app.brokers.alpaca import alpaca_crypto_supports
@@ -729,7 +809,12 @@ class TradeExecutionAgent(Agent):
             "market_price": market_price,
             "strategy": strategy,
             "source_payload": source_payload,
-            "risk_pct": get_bot_settings(user_id).risk_per_trade_pct,
+            # 2026-08-27: honor risk_pct_override like the Alpaca paths
+            # already do — it is how per-book recovery halves size on
+            # the internal engine too.
+            "risk_pct": (float(source_payload.get("risk_pct_override"))
+                         if (source_payload or {}).get("risk_pct_override")
+                         else get_bot_settings(user_id).risk_per_trade_pct),
             # AUDIT 2026-08-27: this key used to be assigned `remaining`
             # unconditionally, OVERWRITING any cap the signal itself
             # carried -- the dividend lane's U3 per-name concentration
