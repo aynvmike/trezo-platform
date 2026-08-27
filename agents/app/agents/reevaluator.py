@@ -181,6 +181,20 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
     try:
         if not reeval_is_enabled():
             return None
+        # THE LONG-TERM LANE IS EXEMPT (AUDIT 2026-08-27, priority #2).
+        # This function reads price-only gain -- no dividend term -- and
+        # returns early on winners, so it acts ONLY on losers. An
+        # ex-dividend date drops the price by the dividend and puts a
+        # perfectly healthy ladder holding exactly where this code
+        # looks for broken ones; reeval_tcs_collapse can then close it
+        # outright after one day held. A buy-and-hold income position
+        # judged by an intraday momentum lens on the one morning its
+        # price mechanically dips is not a re-evaluation, it is a
+        # misreading. The ladder manages its own exits (screen-based,
+        # cut-triggered); the reevaluator manages the trading lanes.
+        _rl_strat = str(strat or r.get("strategy") or "").lower()
+        if _rl_strat.startswith(("dividend", "wheel", "income")):
+            return None
         pid = str(r.get("id"))
         now = _time.monotonic()
         last = _last_action.get(pid)

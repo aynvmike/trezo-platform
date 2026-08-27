@@ -104,9 +104,13 @@ async def market_wide_dividend_candidates() -> list[str]:
 
 
 # Task #49 (2026-06-05): live yield lookup for names not in DIVIDEND_YIELDS.
-# Uses Alpha Vantage COMPANY_OVERVIEW when an AV key is configured;
-# results cached for 24h to stay under the 25/day free tier. Falls back
-# to None on any failure -> consumer treats as ineligible.
+# REWRITTEN 2026-08-27 (audit): this used Alpha Vantage COMPANY_OVERVIEW
+# on a 25-call/DAY free tier while the market-wide pool could ask for 40+
+# uncached names in one build — the fallback exhausted the day's budget
+# mid-build and every name after the cap silently failed to qualify.
+# Now computed from the broker's corporate-actions feed (the same source
+# the §4 screen trusts): trailing 12-month cash dividends / spot. No
+# daily cap, split-adjusted, and cached 24h per name.
 import time
 _yield_cache: dict[str, tuple[float, float]] = {}  # ticker -> (yield_pct, fetched_at)
 _YIELD_CACHE_TTL = 86400  # 24h
@@ -119,26 +123,25 @@ async def _yield_live_lookup(ticker: str) -> Optional[float]:
     if hit and (now - hit[1]) < _YIELD_CACHE_TTL:
         return hit[0]
     try:
-        from app.config import get_settings as _gs_yield
-        key = (getattr(_gs_yield(), "alpha_vantage_api_key", "") or "").strip()
-        if not key:
+        from app.data.corporate_actions import (
+            dividend_history, trailing_yield)
+        rows = await dividend_history(t)
+        if not rows:
+            # [] means "no evidence" (non-payer OR feed failure — the
+            # feed deliberately does not distinguish). Never cache it
+            # and never call it 0.0: the consumer skips the name, and a
+            # transient failure gets to retry next build.
             return None
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://www.alphavantage.co/query",
-                params={"function": "COMPANY_OVERVIEW", "symbol": t, "apikey": key},
-            )
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            div_yield = data.get("DividendYield")
-            if div_yield in (None, "", "None"):
-                _yield_cache[t] = (0.0, now)
-                return 0.0
-            v = float(div_yield)
-            _yield_cache[t] = (v, now)
-            return v
+        from app.data.candles import fetch_stock_candles
+        cs = await fetch_stock_candles(t)
+        spot = float(cs[-1].close) if cs else 0.0
+        if spot <= 0:
+            return None
+        v = trailing_yield(rows, spot)
+        if v is None:
+            return None
+        _yield_cache[t] = (float(v), now)
+        return float(v)
     except Exception:  # noqa: BLE001
         return None
 
@@ -202,17 +205,13 @@ async def get_wheel_universe(user_id: Optional[str]) -> list[WheelCandidate]:
     if hit and (now - hit[1]) < _CACHE_TTL_SECONDS:
         return hit[0]
 
-    # 1) Seed list (always present). Rotated by the calendar day
-    # (Mike 2026-07-16): the scan used to walk the list in a FIXED
-    # order, so with one CSP slot the first affordable name (F) won
-    # every single cycle. Rotation gives every affordable name a turn.
-    from datetime import date as _rot_d
-    _seed = list(WHEEL_WATCHLIST)
-    if _seed:
-        _r = _rot_d.today().toordinal() % len(_seed)
-        _seed = _seed[_r:] + _seed[:_r]
+    # 1) Seed list (always present). NOTE on ordering (audit 2026-08-27):
+    # a per-seed rotation used to live here, but `seen` is a dict handed
+    # to _ordered(), which re-sorts and rotates the WHOLE bench at the
+    # end — so any slicing done here was dead code the moment _ordered()
+    # shipped (2026-08-25). Rotation lives in _ordered() and only there.
     seen: dict[str, WheelCandidate] = {}
-    for sym in _seed:
+    for sym in WHEEL_WATCHLIST:
         y = DIVIDEND_YIELDS.get(sym, 0.02)
         seen[sym] = WheelCandidate(ticker=sym, source="seed", yield_pct=y)
 

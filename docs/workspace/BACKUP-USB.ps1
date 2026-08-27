@@ -62,13 +62,26 @@ if ($OnlyIfStale -and (Test-Path $marker)) {
 
 Say "Mirroring C:\Trezo -> $dst. SILENCE IS NORMAL - a full pass can take"
 Say "10+ quiet minutes on a USB stick. Do NOT close this window; wait for 'complete'."
+# SECRETS STAY OFF THE STICK (2026-08-27). The mirror used to carry
+# every .env — live broker keys on an unencrypted USB, refreshed every
+# pass. /XF hides .env* from the copy, and because /MIR does NOT purge
+# destination files that /XF excludes, any .env* a previous pass already
+# put on the stick is deleted explicitly below.
 robocopy $src $dst /MIR /R:1 /W:2 /NP /NFL /NDL `
   /XD "$src\_to_delete" "$src\trezo-platform\agents\.venv" `
       "$src\trezo-platform\web\node_modules" "$src\trezo-platform\web\.next" `
       "System Volume Information" `
-  /XF "*.lock" `
+  /XF "*.lock" ".env" ".env.*" "*.env" `
   /LOG:$log
 $code = $LASTEXITCODE
+if (Test-Path $dst) {
+  Get-ChildItem $dst -Recurse -Force -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -like "*.env" } |
+    ForEach-Object {
+      Say "Removing secret file from stick: $($_.FullName)" "Yellow"
+      Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
 # Robocopy: 0-7 = success flavours, 8+ = real failures.
 if ($code -lt 8) {
   # Keep the one-click claim file on the stick so any machine can re-claim it.

@@ -221,6 +221,29 @@ def check_collateral(*, strategy: str, strike: float, contracts: int,
             reserved_for_open_csps=reserved_for_open_csps)
     if c.ok:
         return _allow(f"advisor: collateral honest ({c.reason})")
+
+    # 2026-08-27 (audit): "defer or shrink" was documented in design rule
+    # 2 but max_contracts was never set by any check. The full request
+    # does not fit — before deferring, ask whether a SMALLER one does.
+    # Same arithmetic the lane rule uses: one contract reserves 100
+    # shares at the strike.
+    try:
+        _free = float(lane_cash) - float(reserved_for_open_csps)
+        _per = float(strike) * 100.0
+        affordable = int(_free // _per) if _per > 0 else 0
+    except (TypeError, ValueError, ZeroDivisionError):
+        affordable = 0
+    if 1 <= affordable < int(contracts):
+        return WheelVerdict(
+            allow=True,
+            reason=(f"advisor: {contracts} contracts do not fit the "
+                    f"ledger (${_free:,.0f} free), but {affordable} "
+                    f"do{'es' if affordable == 1 else ''} — shrinking "
+                    f"instead of deferring"),
+            rule="lane_rule_5.collateral_shrink",
+            max_contracts=affordable,
+            notes=[f"collateral shrink: {contracts} -> {affordable} "
+                   f"(free ${_free:,.0f}, ${_per:,.0f}/contract)"])
     return _defer("lane_rule_5.collateral", c.reason,
                   "an existing CSP closing, or fewer contracts")
 
@@ -311,7 +334,26 @@ async def advise_wheel_leg(*, user_id: str, underlying: str, strategy: str,
                          rule=v.rule, reason=v.reason[:160])
                 return v
 
+        # Propagate the tightest shrink any allowing check produced
+        # (2026-08-27, audit: max_contracts was declared, documented and
+        # never set — the final verdict rebuilt here silently dropped it).
+        # Min of the set values: shrink-only composition, never a raise.
+        _shrinks = [int(v.max_contracts) for v in checks
+                    if v.max_contracts is not None
+                    and int(v.max_contracts) >= 1]
+        _mc = min(_shrinks) if _shrinks else None
         notes = [n for v in checks for n in v.notes]
+        if _mc is not None and _mc < int(contracts):
+            _why = next((v.reason for v in checks
+                         if v.max_contracts is not None
+                         and int(v.max_contracts) == _mc),
+                        "advisor: shrink")
+            log.info("wheel_advisor.shrunk", user_id=str(user_id)[:8],
+                     underlying=underlying, strategy=strategy,
+                     requested=int(contracts), max_contracts=_mc)
+            return WheelVerdict(allow=True, reason=_why,
+                                rule="advisor.shrink",
+                                max_contracts=_mc, notes=notes)
         return WheelVerdict(allow=True, reason="advisor: no objection",
                             notes=notes)
     except Exception as e:  # noqa: BLE001

@@ -60,6 +60,16 @@ EXPECTED_AGENTS: list[tuple[str, int]] = [
     ("extended_scanner", 35),
     ("crypto_scanner", 60),       # 24/7 strategy, lower urgency
     ("market_desk", 35),          # the report reader must never go quiet unnoticed
+    # AUDIT 2026-08-27: six agents were registered but never
+    # silence-checked -- including the BACKUP agent, whose death would
+    # have stopped the hourly Supabase and weekly Dropbox copies with
+    # no alarm. Tolerances sized to each tick interval.
+    ("archivist", 45),            # 15-min tick; the backups must not die quietly
+    ("broker_truth", 45),         # 15-min tick; options ledger truth
+    ("book_health", 20),          # 5-min tick
+    ("dividend_lt", 75),          # 30-min tick
+    ("portfolio_architect", 750), # 6-hour tick
+    ("forex_scanner", 20),        # 3-min tick; ticks even while dormant
     ("options_scanner", 65),      # 30-min tick + occasional skip
     ("risk_manager", 240),        # event-driven, may sit quiet legitimately
     ("trade_execution", 240),     # event-driven downstream of risk_manager
@@ -171,6 +181,45 @@ class OpsWatchdogAgent(Agent):
             from datetime import timedelta as _td
             from datetime import timezone as _tz
             _today = _d.today().isoformat()
+
+            # MARKET BRIEFS (Mike 2026-08-12: "do it the right way --
+            # everything self reliant"). Pre-market and pre-close reads
+            # computed BY the engine. Weekdays only; once each per day;
+            # ET approximated the same way is_market_hours does.
+            #
+            # AUDIT 2026-08-27: this block used to live INSIDE the
+            # once-a-day janitor gate below. The gate trips when the
+            # calendar flips -- 8 PM ET on a 24/7 engine -- and the
+            # brief windows want 8:30 AM and 3:25 PM, so the two could
+            # never coincide and the engine-side briefs had never fired
+            # once. Same indentation failure as the 08-22 drain_once
+            # bug, one function over. Now checked EVERY tick; the
+            # _BRIEF_*_DAY latches already make it once-per-day.
+            try:
+                global _BRIEF_AM_DAY, _BRIEF_PM_DAY
+                _bnow = _dt.now(_tz.utc)
+                _bet_h = (_bnow.hour - 4) % 24
+                _bet_m = _bnow.minute
+                _bday = _bnow.date().isoformat()
+                _bwk = _bnow.weekday() < 5
+                if _bwk and (_BRIEF_AM_DAY != _bday or _BRIEF_PM_DAY != _bday):
+                    from app.runtime.settings import _supabase as _bsb
+                    _bcl = _bsb()
+                    if _bcl is not None:
+                        if (_BRIEF_AM_DAY != _bday
+                                and (_bet_h == 8 and _bet_m >= 30
+                                     or _bet_h == 9 and _bet_m <= 25)):
+                            _BRIEF_AM_DAY = _bday
+                            from app.knowledge.market_brief import build_brief
+                            await build_brief(_bcl, "pre_market")
+                        if (_BRIEF_PM_DAY != _bday
+                                and _bet_h == 15 and _bet_m >= 25):
+                            _BRIEF_PM_DAY = _bday
+                            from app.knowledge.market_brief import build_brief
+                            await build_brief(_bcl, "pre_close")
+            except Exception:  # noqa: BLE001
+                pass
+
             if _JANITOR_DAY != _today:
                 _JANITOR_DAY = _today
                 from app.runtime.settings import _supabase as _sb
@@ -191,32 +240,6 @@ class OpsWatchdogAgent(Agent):
                               extra={})
                     except Exception:  # noqa: BLE001
                         pass
-                # MARKET BRIEFS (Mike 2026-08-12: "do it the right way --
-                # everything self reliant"). Pre-market and pre-close reads
-                # computed BY the engine, landed in the brief file, the
-                # activity log, and agent memory. Weekdays only; once each
-                # per day; ET approximated the same way is_market_hours
-                # does (DST ignored, erring toward running).
-                try:
-                    global _BRIEF_AM_DAY, _BRIEF_PM_DAY
-                    _bnow = _dt.now(_tz.utc)
-                    _bet_h = (_bnow.hour - 4) % 24
-                    _bet_m = _bnow.minute
-                    _bday = _bnow.date().isoformat()
-                    _bwk = _bnow.weekday() < 5
-                    if (_bwk and _BRIEF_AM_DAY != _bday
-                            and (_bet_h == 8 and _bet_m >= 30
-                                 or _bet_h == 9 and _bet_m <= 25)):
-                        _BRIEF_AM_DAY = _bday
-                        from app.knowledge.market_brief import build_brief
-                        await build_brief(_cl, "pre_market")
-                    if (_bwk and _BRIEF_PM_DAY != _bday
-                            and _bet_h == 15 and _bet_m >= 25):
-                        _BRIEF_PM_DAY = _bday
-                        from app.knowledge.market_brief import build_brief
-                        await build_brief(_cl, "pre_close")
-                except Exception:  # noqa: BLE001
-                    pass
                 # Knowledge drop-folder sweep (Mike 2026-07-16): anything
                 # dropped into C:\Trezo\Quantconnect (or the external-
                 # research folder) joins the library within a day -- no

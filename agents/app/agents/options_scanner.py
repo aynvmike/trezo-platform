@@ -1945,65 +1945,6 @@ class OptionsScannerAgent(Agent):
                 },
             )
 
-        # ---- WHEEL ADVISOR GATE (2026-08-23, Mike: "a gate for an
-        # agent at the end of it... we are adding a variable so it should
-        # be able to work with the system and not have to change it all
-        # the way"). ONE call, at the end of the Wheel's own reasoning.
-        # It can only DEFER a leg, never create or enlarge one, and it
-        # FAILS OPEN on any error or with TREZO_WHEEL_ADVISOR=0. Nothing
-        # above this line changed; the Wheel decides exactly as before
-        # and this asks whether now is the moment.
-        try:
-            from app.strategies.wheel_advisor import advise_wheel_leg
-            # 2026-08-23: ex_date and tier used to come off `leg` via
-            # getattr, and leg carries neither -- so BOTH were None on
-            # every call and lane rules 3 and 4 could never fire. The
-            # gate was live and structurally silent. Fetched from their
-            # real sources now: ex-dates from Alpaca corporate actions,
-            # tier from the dividend screen's cache.
-            _ex_date = None
-            _last_div = None
-            try:
-                from app.data.corporate_actions import (
-                    dividend_history, last_dividend_rate, next_ex_date)
-                _rows = await dividend_history(underlying)
-                _ex_date = next_ex_date(_rows)
-                _last_div = last_dividend_rate(_rows)
-            except Exception:  # noqa: BLE001
-                pass
-            _tier = None
-            try:
-                from app.strategies.dividend_screen import screen as _scr
-                _tier = (await _scr(underlying)).tier
-            except Exception:  # noqa: BLE001
-                pass
-            _spot = float(getattr(leg, "spot", 0) or 0) or None
-            if _spot is None:
-                try:
-                    from app.data.candles import fetch_candles_for
-                    _cd = await fetch_candles_for(underlying, "stock")
-                    _spot = float(_cd[-1].close) if _cd else None
-                except Exception:  # noqa: BLE001
-                    _spot = None
-            _adv = await advise_wheel_leg(
-                user_id=user_id, underlying=underlying, strategy=strategy,
-                strike=float(pick.strike), expiration=str(leg.expiration),
-                contracts=int(leg.contracts or 1),
-                spot=_spot,
-                tier=_tier,
-                ex_date=_ex_date,
-                dividend_amount=_last_div,
-                next_earnings=getattr(leg, "next_earnings", None),
-            )
-            if not _adv.allow:
-                return AgentMessage(
-                    agent=self.name, kind="info",
-                    payload={
-                        "user_id": user_id, "routed_via": routed,
-                        **_adv.as_block_payload(underlying, strategy),
-                    })
-        except Exception:  # noqa: BLE001
-            pass  # advisor must never block the lane it advises
 
         # Pre-gates (2026-06-12): yesterday produced 120x "options market
         # orders are only allowed during market hours" (fired at night)
@@ -2019,6 +1960,11 @@ class OptionsScannerAgent(Agent):
                 return None  # market closed - try again next tick
         except Exception:  # noqa: BLE001
             pass  # clock unavailable -> let Alpaca decide
+        # Advisor inputs, populated by the CSP collateral gate below when
+        # it runs; None = "could not measure", which the advisor treats
+        # as no-opinion rather than a block.
+        _adv_lane_cash = None
+        _adv_reserved = None
         if strategy == "wheel_csp":
             try:
                 collateral = float(pick.strike) * 100.0 * int(leg.contracts or 1)
@@ -2125,6 +2071,10 @@ class OptionsScannerAgent(Agent):
                             pass
                         _eff_csp_n = max(len(_open_csp), _brk_csp_n)
                         _eff_coll = max(_held_coll, _brk_coll)
+                        # Feed the advisor the SAME ledger the hard cap
+                        # uses -- one source, no drift.
+                        _adv_lane_cash = _cap_pct * _eq
+                        _adv_reserved = _eff_coll
                         # Concurrent-CSP gate (posture-scaled).
                         if _eff_csp_n >= _max_csp:
                             from app.agents.activity_log import record as _arecc
@@ -2191,6 +2141,112 @@ class OptionsScannerAgent(Agent):
                     )
             except Exception:  # noqa: BLE001
                 pass
+
+        # ---- WHEEL ADVISOR GATE (2026-08-23; RELOCATED 2026-08-27).
+        # The audit found it judging the MODELED leg before the real
+        # pre-gates ran. It now sits directly before submission, where
+        # the live pick, the account equity and the reserved collateral
+        # are all known -- so lane rule 5 finally receives real numbers
+        # instead of None, and the verdict describes the actual order.
+        # (original header follows)
+        # ---- WHEEL ADVISOR GATE (2026-08-23, Mike: "a gate for an
+        # agent at the end of it... we are adding a variable so it should
+        # be able to work with the system and not have to change it all
+        # the way"). ONE call, at the end of the Wheel's own reasoning.
+        # It can only DEFER a leg, never create or enlarge one, and it
+        # FAILS OPEN on any error or with TREZO_WHEEL_ADVISOR=0. Nothing
+        # above this line changed; the Wheel decides exactly as before
+        # and this asks whether now is the moment.
+        try:
+            from app.strategies.wheel_advisor import advise_wheel_leg
+            # 2026-08-23: ex_date and tier used to come off `leg` via
+            # getattr, and leg carries neither -- so BOTH were None on
+            # every call and lane rules 3 and 4 could never fire. The
+            # gate was live and structurally silent. Fetched from their
+            # real sources now: ex-dates from Alpaca corporate actions,
+            # tier from the dividend screen's cache.
+            _ex_date = None
+            _last_div = None
+            try:
+                from app.data.corporate_actions import (
+                    dividend_history, last_dividend_rate, next_ex_date)
+                _rows = await dividend_history(underlying)
+                _ex_date = next_ex_date(_rows)
+                _last_div = last_dividend_rate(_rows)
+            except Exception:  # noqa: BLE001
+                pass
+            _tier = None
+            try:
+                from app.strategies.dividend_screen import screen as _scr
+                _tier = (await _scr(underlying)).tier
+            except Exception:  # noqa: BLE001
+                pass
+            # AUDIT 2026-08-27: next_earnings came off `leg` via getattr
+            # and leg has never carried it — the earnings-blackout check
+            # (schedule.earnings_blackout) was structurally silent, the
+            # same never-fires family as the old tier/ex_date bug. The
+            # 18th agent already fetches this calendar; read it from
+            # there (24h-cached, fail-open).
+            _next_earn = getattr(leg, "next_earnings", None)
+            if _next_earn is None:
+                try:
+                    from app.data.cycles import get_cycle_position
+                    _next_earn = (await get_cycle_position(
+                        underlying)).next_earnings_date
+                except Exception:  # noqa: BLE001
+                    pass
+            _spot = float(getattr(leg, "spot", 0) or 0) or None
+            if _spot is None:
+                try:
+                    from app.data.candles import fetch_candles_for
+                    _cd = await fetch_candles_for(underlying, "stock")
+                    _spot = float(_cd[-1].close) if _cd else None
+                except Exception:  # noqa: BLE001
+                    _spot = None
+            _adv = await advise_wheel_leg(
+                user_id=user_id, underlying=underlying, strategy=strategy,
+                # AUDIT 2026-08-27: judge the CONTRACT BEING SUBMITTED.
+                # The expiration used to come from the modeled leg while
+                # the strike came from the live pick -- the OCC actually
+                # sent could expire up to 12 days from what the schedule
+                # and ex-date checks judged.
+                strike=float(pick.strike),
+                expiration=str(getattr(pick, "expiration", None)
+                               or leg.expiration),
+                contracts=int(leg.contracts or 1),
+                spot=_spot,
+                tier=_tier,
+                ex_date=_ex_date,
+                dividend_amount=_last_div,
+                next_earnings=_next_earn,
+                lane_cash=_adv_lane_cash,
+                reserved_for_open_csps=_adv_reserved,
+            )
+            if not _adv.allow:
+                return AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={
+                        "user_id": user_id, "routed_via": routed,
+                        **_adv.as_block_payload(underlying, strategy),
+                    })
+            # Design rule 2's second half -- SHRINK, not just defer
+            # (AUDIT 2026-08-27: max_contracts was declared, documented,
+            # never set, never read). The advisor may only reduce.
+            try:
+                if (_adv.max_contracts is not None
+                        and int(_adv.max_contracts) >= 1
+                        and int(_adv.max_contracts) < int(leg.contracts or 1)):
+                    from app.agents.activity_log import record as _shrec
+                    _shrec("wheel_advisor_shrink", underlying,
+                           reason=(f"advisor shrank {strategy} from "
+                                   f"{int(leg.contracts or 1)} to "
+                                   f"{int(_adv.max_contracts)} contract(s): "
+                                   f"free lane cash covers no more"))
+                    leg.contracts = int(_adv.max_contracts)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass  # advisor must never block the lane it advises
 
         # SELL-TO-OPEN the put (CSP) or call (CC). Same call shape the
         # manual button uses - day time-in-force, no limit price (market).
@@ -2385,6 +2441,25 @@ class OptionsScannerAgent(Agent):
                     continue
                 if _wheel_in_cooldown(user_id, sym, "wheel_cc"):
                     continue
+
+                # Lane rule 4 (AUDIT 2026-08-27): the overlay wrote calls
+                # against ANY 100-share lot with no tier check, so a
+                # GROWTH compounder could get its upside sold for a
+                # month's premium — the exact capture-asymmetry mistake
+                # the rule exists to stop. Skip confirmed GROWTH here
+                # (same stance as the advisor: UNKNOWN allows, absence
+                # must not freeze the overlay) so it neither burns the
+                # one-per-day slot on a name the advisor would defer nor
+                # emits a suggestion a human might act on. The advisor
+                # gate in _wheel_auto_fire remains the backstop.
+                try:
+                    from app.strategies.dividend_screen import (
+                        screen as _ov_scr)
+                    _ov_tier = ((await _ov_scr(sym)).tier or "UNKNOWN")
+                    if str(_ov_tier).upper() == "GROWTH":
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass  # screen unreachable — advisor still backstops
 
                 candles = await fetch_candles_for(sym, "stock")
                 if not candles:
@@ -2746,7 +2821,21 @@ class OptionsScannerAgent(Agent):
     async def _options_ideas(self) -> list[AgentMessage]:
         """Surface — but don't auto-execute — directional options plays."""
         out: list[AgentMessage] = []
-        for underlying in WHEEL_WATCHLIST[:3]:  # keep the heartbeat light
+        # AUDIT 2026-08-27: this walked WHEEL_WATCHLIST[:3] — the first
+        # three names of a static list, so the SAME three names got all
+        # eight structure builders every tick forever while the dynamic
+        # universe (built for exactly this purpose) sat unread. Walk the
+        # universe instead: still three names per tick to keep the
+        # heartbeat light, but _ordered() rotates the bench daily, so
+        # every name takes a turn at idea generation.
+        try:
+            from app.strategies.wheel_universe import get_wheel_universe
+            _ideas_pool = [c.ticker for c in await get_wheel_universe(None)]
+        except Exception:  # noqa: BLE001
+            _ideas_pool = list(WHEEL_WATCHLIST)
+        if not _ideas_pool:
+            _ideas_pool = list(WHEEL_WATCHLIST)
+        for underlying in _ideas_pool[:3]:  # keep the heartbeat light
             candles = await fetch_candles_for(underlying, "stock")
             if not candles:
                 continue
@@ -2759,7 +2848,6 @@ class OptionsScannerAgent(Agent):
                             build_iron_condor, build_butterfly):
                 play = builder(underlying, candles)
                 if not play:
-                    continue
                     continue
                 # Phase D: tag the bucket. Ideas are broadcast (no
                 # user_id), so per-user cap enforcement happens

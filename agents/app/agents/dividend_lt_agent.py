@@ -92,11 +92,17 @@ def _lane_inputs_for(row: dict, equity: float) -> Optional[LaneInputs]:
     w_ladder = max(0.50, min(0.90, 1.0 - w_wheel - w_buffer))
 
     try:
+        _ppct = 0.0
+        try:
+            _ppct = float(row.get("dividend_lane_partial_pct") or 0.0)
+        except (TypeError, ValueError):
+            _ppct = 0.0
         return LaneInputs(
             capital=capital,
             w_ladder=w_ladder, w_wheel=w_wheel, w_buffer=w_buffer,
             wheel_delta=0.25,
             mode=str(row.get("dividend_lane_mode") or "ACCUMULATE").upper(),
+            partial_pct=_ppct,
         )
     except LaneGuardrailError:
         # A book configured outside the guardrails does not get a
@@ -119,9 +125,24 @@ class DividendLTAgent(Agent):
                                  payload={"note": "Supabase not configured"})]
 
         def _books():
-            return (client.table("bot_settings")
-                    .select("user_id, allocation_overrides, auto_trade_enabled")
-                    .execute())
+            # AUDIT 2026-08-27: dividend_lane_mode was read off this row
+            # but never SELECTed (and, until migration 0058, never
+            # existed) — so the lane was permanently ACCUMULATE and the
+            # §6 INCOME branch could not execute. The wildcard-free
+            # select now names both lane columns. Until 0058 is applied
+            # PostgREST rejects unknown columns, so fall back to the old
+            # shape rather than killing the whole lane.
+            try:
+                return (client.table("bot_settings")
+                        .select("user_id, allocation_overrides, "
+                                "auto_trade_enabled, dividend_lane_mode, "
+                                "dividend_lane_partial_pct")
+                        .execute())
+            except Exception:  # noqa: BLE001 — column not migrated yet
+                return (client.table("bot_settings")
+                        .select("user_id, allocation_overrides, "
+                                "auto_trade_enabled")
+                        .execute())
         try:
             rows = (await asyncio.to_thread(_books)).data or []
         except Exception as e:  # noqa: BLE001

@@ -66,10 +66,16 @@ def _restart_detached() -> str:
     typed the start by hand. A Task Scheduler one-shot runs under the
     Task Scheduler service, not under us, so it survives our death and
     issues the restart on our grave."""
+    # AUDIT 2026-08-27: the original ran as the service account with no
+    # /RU and no run level, and minute-granular /ST could land in the
+    # already-elapsed minute. Boots kept not happening while every row
+    # said done. Now: SYSTEM account, highest run level, scheduled two
+    # minutes out so the timestamp is always in the future, and /Run
+    # fires it immediately anyway -- the /ST is only the fallback.
     out = _run(["schtasks", "/Create", "/F", "/TN", "TrezoRelayRestart",
                 "/TR", f"{NSSM} restart TrezoAgents",
-                "/SC", "ONCE",
-                "/ST", (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")],
+                "/SC", "ONCE", "/RU", "SYSTEM", "/RL", "HIGHEST",
+                "/ST", (datetime.now() + timedelta(minutes=2)).strftime("%H:%M")],
                timeout=60)
     out += "\n" + _run(["schtasks", "/Run", "/TN", "TrezoRelayRestart"],
                         timeout=60)
@@ -114,8 +120,13 @@ def _tell(message: str, key: str = "deploy_blocked") -> None:
     """Say it out loud. A deploy that fails quietly is how the server
     ended up eight commits behind with every row marked done."""
     try:
-        from app.runtime.alerts import notify
-        notify(key, message, severity="urgent")
+        # AUDIT 2026-08-27: this used to call the ASYNC notify() from a
+        # worker thread without awaiting it -- a coroutine was built,
+        # never run, and the except below ate the RuntimeWarning. Every
+        # "deploy aborted/blocked" alert since 08-20 was silent.
+        # notify_sync exists precisely for non-async contexts.
+        from app.runtime.alerts import notify_sync
+        notify_sync(key, message, severity="urgent")
     except Exception:  # noqa: BLE001
         pass
 
@@ -191,8 +202,23 @@ def _h_git_pull_restart(args: dict) -> str:
 
 
 def _h_web_rebuild(args: dict) -> str:
+    """AUDIT 2026-08-27: this used to restart TrezoWeb unconditionally
+    after the build -- a failed `npm run build` restarted the site onto
+    whatever half-state .next held, with the row marked done. The engine
+    tier had a guard for exactly this; the web tier never got one. Now:
+    no restart unless the build output says it compiled, and the refusal
+    is stated in the row AND alerted."""
     web = REPO / "web"
     out = _run(["npm", "--prefix", str(web), "run", "build"], timeout=1800)
+    ok = ("[exit 0]" in out) and ("Compiled successfully" in out
+                                  or "compiled successfully" in out
+                                  or "Generating static pages" in out)
+    if not ok:
+        out += "\nNOT restarted - build did not succeed"
+        _tell(f"Web rebuild FAILED; TrezoWeb was NOT restarted and is "
+              f"still serving the previous build. Tail: {out[-400:]}",
+              key="web_rebuild_failed")
+        return out
     out += "\n" + _run([NSSM, "restart", "TrezoWeb"], timeout=300)
     return out
 
@@ -310,7 +336,29 @@ async def drain_once(client) -> dict | None:
                 # Everything above is durable now. Safe to be killed --
                 # but the restart itself must NOT be: hand it to Task
                 # Scheduler so it survives this process's death.
-                await asyncio.to_thread(_restart_detached)
+                #
+                # AUDIT 2026-08-27: the return value used to be assigned
+                # to nothing, so an "Access is denied" from Task
+                # Scheduler existed nowhere. Now it is logged, and a
+                # non-SUCCESS output raises an urgent alert -- the boot
+                # beacon proves a restart happened; this proves the
+                # scheduling of one was even accepted.
+                _rd_out = ""
+                try:
+                    _rd_out = await asyncio.to_thread(_restart_detached)
+                except Exception as _rd_e:  # noqa: BLE001
+                    _rd_out = f"EXCEPTION: {_rd_e}"
+                try:
+                    from app.agents.activity_log import record as _rrec
+                    _rrec("restart_scheduled", "SYSTEM",
+                          reason=f"schtasks -> {_rd_out[:200]}")
+                except Exception:  # noqa: BLE001
+                    pass
+                if "SUCCESS" not in _rd_out.upper():
+                    _tell(f"restart scheduling FAILED -- engine will "
+                          f"keep running old code until a manual nssm "
+                          f"restart: {_rd_out[:300]}",
+                          key="restart_not_scheduled")
             return {"kind": kind, "status": "done"}
         except Exception as e:  # noqa: BLE001
             final = "failed" if attempts >= MAX_ATTEMPTS else "queued"

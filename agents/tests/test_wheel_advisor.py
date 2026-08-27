@@ -172,6 +172,59 @@ def test_covered_call_is_not_collateral_gated():
     assert v.allow is True
 
 
+# --- shrink (design rule 2: "defer or SHRINK it") ------------------------
+
+def test_partial_fit_shrinks_instead_of_deferring():
+    """3 contracts need $10,500; only $6,500 is free — but ONE fits.
+    The audit found max_contracts documented and never set; this is the
+    branch that sets it."""
+    v = check_collateral(strategy="wheel_csp", strike=35.0, contracts=3,
+                         lane_cash=10_000, reserved_for_open_csps=3_500)
+    assert v.allow is True
+    assert v.max_contracts == 1
+    assert v.rule == "lane_rule_5.collateral_shrink"
+
+
+def test_zero_fit_still_defers_not_shrinks():
+    """$1,500 free cannot back even one $3,500 contract — a shrink to
+    zero is a defer, and must say so."""
+    v = check_collateral(strategy="wheel_csp", strike=35.0, contracts=2,
+                         lane_cash=5_000, reserved_for_open_csps=3_500)
+    assert v.allow is False
+    assert v.max_contracts is None
+
+
+def test_inconsistent_ledger_never_shrinks():
+    """More reserved than exists is a bookkeeping fault; sizing a trade
+    from it would launder the inconsistency into an order."""
+    v = check_collateral(strategy="wheel_csp", strike=35.0, contracts=2,
+                         lane_cash=3_000, reserved_for_open_csps=5_000)
+    assert v.allow is False
+    assert v.max_contracts is None
+
+
+def test_shrink_propagates_through_the_gate():
+    """The end-to-end promise: the final verdict from advise_wheel_leg
+    carries the check's max_contracts instead of rebuilding a bare
+    allow (the exact drop the audit flagged)."""
+    v = _run(advise_wheel_leg(
+        user_id="u", underlying="O", strategy="wheel_csp",
+        strike=35.0, expiration=_days_out(20), contracts=3,
+        lane_cash=10_000, reserved_for_open_csps=3_500))
+    assert v.allow is True
+    assert v.max_contracts == 1
+    assert v.rule == "advisor.shrink"
+
+
+def test_full_fit_sets_no_shrink():
+    v = _run(advise_wheel_leg(
+        user_id="u", underlying="O", strategy="wheel_csp",
+        strike=35.0, expiration=_days_out(20), contracts=1,
+        lane_cash=10_000, reserved_for_open_csps=3_500))
+    assert v.allow is True
+    assert v.max_contracts is None
+
+
 # --- payload shape -------------------------------------------------------
 
 def test_block_payload_matches_the_scanners_existing_shape():

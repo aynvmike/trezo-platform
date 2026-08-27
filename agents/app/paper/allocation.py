@@ -150,6 +150,13 @@ def market_type_for(strategy: str, asset_type: str) -> str:
         return "crypto"
     if s.startswith("wheel"):
         return "income"
+    # AUDIT 2026-08-27: dividend_lt fell through to "stocks", so the
+    # lane SIZED its sleeves from the income pocket while its buys were
+    # FUNDED from (and capped against) the stocks budget — two books
+    # disagreeing about the same dollar. The dividend lane is the income
+    # lane; route it where its sizing already lives.
+    if s.startswith("dividend"):
+        return "income"
     if s.startswith("options") or at == "option" or s in (
         "long_call", "bull_call_spread", "cash_secured_put"
     ):

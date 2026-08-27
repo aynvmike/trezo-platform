@@ -45,9 +45,11 @@ Mark-to-market strategy (Phase B v1):
       get_alpaca_options_positions helper. v1 falls back to modeled
       MTM when the broker snapshot isn't available within the tick.
 
-Activation: not yet registered in bootstrap. To turn on, add to
-the bootstrap.AGENT_CLASSES list (or equivalent). Until then this
-file imports cleanly but the agent does not tick.
+Activation: REGISTERED in bootstrap and ticking every 5 minutes
+(comment corrected 2026-08-27 — the line above said "not yet
+registered / does not tick" for weeks while the watchdog was
+silence-checking it at a 30-minute tolerance; the agent has been
+live the whole time).
 """
 
 from __future__ import annotations

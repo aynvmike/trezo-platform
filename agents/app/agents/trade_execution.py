@@ -481,6 +481,22 @@ class TradeExecutionAgent(Agent):
                 price=market_price, stop_pct=stop_pct, target_pct=target_pct,
             )
         except NotImplementedError:
+            # AUDIT 2026-08-27: this fallback used to be silent -- the
+            # connector's own header calls exit management "the step that
+            # risks real money", and routing to the modeled engine
+            # without saying so made a modeled fill indistinguishable
+            # from a venue fill in the feed. The fallback is correct;
+            # the silence was not.
+            try:
+                from app.agents.activity_log import record as _kfrec
+                _kfrec("venue_fallback_modeled", ticker,
+                       strategy=strategy,
+                       reason=("Kraken order path not implemented -- "
+                               "routed to the MODELED engine instead. "
+                               "This fill is simulated, not a venue "
+                               "fill."))
+            except Exception:  # noqa: BLE001
+                pass
             return await self._execute_internal(
                 user_id, ticker, "crypto", side, market_price,
                 stop_pct, target_pct, strategy, source_payload,
@@ -714,8 +730,21 @@ class TradeExecutionAgent(Agent):
             "strategy": strategy,
             "source_payload": source_payload,
             "risk_pct": get_bot_settings(user_id).risk_per_trade_pct,
+            # AUDIT 2026-08-27: this key used to be assigned `remaining`
+            # unconditionally, OVERWRITING any cap the signal itself
+            # carried -- the dividend lane's U3 per-name concentration
+            # cap (spec: "enforced, not warned") was set upstream and
+            # never read. The binding rule: the tighter of the pocket's
+            # remaining budget and whatever the lane asked for.
             "max_notional": remaining,
         }
+        try:
+            _lane_cap = (source_payload or {}).get("max_notional")
+            if _lane_cap is not None and float(_lane_cap) > 0:
+                kwargs["max_notional"] = min(float(remaining),
+                                             float(_lane_cap))
+        except (TypeError, ValueError):
+            pass
         if isinstance(stop_pct, (int, float)) and stop_pct > 0:
             kwargs["stop_pct"] = float(stop_pct)
         if isinstance(target_pct, (int, float)) and target_pct > 0:

@@ -97,8 +97,12 @@ class Settings(BaseSettings):
     # all strategies. Replaces the Risk Manager class constant.
     max_open_signals: int = 20
 
-    # Task #77 (2026-06-05): forex_enabled toggle. Default off because
-    # data source for FX isn't wired yet (scaffold only).
+    # Task #77 (2026-06-05): forex_enabled toggle. Comment corrected
+    # 2026-08-27: the FX data source IS wired (Twelve Data adapter with
+    # Kraken fallback, app/data/forex.py, 2026-08-24) and forex_scanner
+    # registers at bootstrap. Default stays OFF as Mike's explicit
+    # choice — the lane goes live when he says so, not when the
+    # plumbing does.
     forex_enabled: bool = False
 
     # Task #92 (2026-06-10, Mike's rule): Exit Advisor auto-action.

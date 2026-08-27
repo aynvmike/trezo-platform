@@ -9,9 +9,15 @@ trips, the Risk Manager vetoes every new signal:
   - Rejects: 3+ broker order rejects in one session
 
 Daily and streak halts clear at the next daily roll; the weekly halt
-clears at the next weekly roll (Monday). The slippage and market-data
-quality halts from the document are deferred until real (non-modeled)
-fills exist to measure.
+clears at the next weekly roll (Monday).
+
+The reject window is ROLLING (default 60 minutes, TREZO_REJECT_WINDOW),
+not session-scoped — the session-scoped version once silenced a whole
+weekend. The slippage halt is LIVE (2026-07-02, comment corrected
+2026-08-27 — this line said "deferred" for seven weeks after the
+tracker below shipped): stocks_reconcile measures every real fill and
+feeds record_fill_slippage(). Only the market-data quality halt from
+the rules doc remains deferred.
 """
 
 from __future__ import annotations
@@ -77,9 +83,11 @@ def reset_broker_rejects() -> None:
 
 
 # --- Session-scoped slippage tracker (2026-07-02) ---------------------
-# Rules doc §1's slippage halt, deferred "until real (non-modeled) fills
-# exist to measure" -- they exist now. The reconciler measures each fill
-# (decision price vs the broker's avg fill) and feeds breaches here.
+# Rules doc §1's slippage halt, LIVE since 2026-07-02: the reconciler
+# (stocks_reconcile.py) measures each fill (decision price vs the
+# broker's avg fill) and feeds breaches here. "Session-scoped" means
+# process lifetime — cleared only by /admin/clear-session-halt or a
+# restart, never by the daily roll.
 _slippage_breaches: list[float] = []
 
 

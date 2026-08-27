@@ -55,7 +55,7 @@ Optimizer** is a dashed thread that wraps every ring (not a numbered layer).
 |---|---|---|
 | `/dashboard` | **Overview** | Redesign + live data (landing after login) |
 | `/dashboard/paper` | **Trading** | Workhorse: positions, close, manual trade, diagnostics |
-| `/dashboard/agents` | **Agents** | Workhorse: toggle/run the 21 agents |
+| `/dashboard/agents` | **Agents** | Workhorse: toggle/run the agents (30 as of 2026-08-27) |
 
 ### App — sidebar group **WEALTH LAYERS** (outer ring → inner vault)
 | Route | Layer | Screen |
