@@ -76,16 +76,47 @@ robocopy $src $dst /MIR /R:1 /W:2 /NP /NFL /NDL `
 $code = $LASTEXITCODE
 if (Test-Path $dst) {
   Get-ChildItem $dst -Recurse -Force -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -like "*.env" } |
+    Where-Object { ($_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -like "*.env") -and
+                   $_.Name -notlike "*.template" } |
     ForEach-Object {
       Say "Removing secret file from stick: $($_.FullName)" "Yellow"
       Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Write sanitized .env TEMPLATES to the stick (2026-08-27): key names
+# only, no values, so RESTORE-FROM-USB knows exactly which keys a
+# rebuild must refill without the stick ever carrying a secret. Skips
+# .bak copies and examples - stale key sets would only confuse a
+# restore.
+if (Test-Path $dst) {
+  Get-ChildItem $src -Recurse -Force -File -ErrorAction SilentlyContinue |
+    Where-Object {
+      ($_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -like "*.env") -and
+      $_.Name -notlike "*.bak*" -and $_.Name -notlike "*.template" -and
+      $_.Name -notlike "*example*" -and
+      $_.FullName -notmatch '\\(\.venv|node_modules|_to_delete|\.next)\\'
+    } |
+    ForEach-Object {
+      $rel  = $_.FullName.Substring($src.Length).TrimStart('\')
+      $tpl  = Join-Path $dst ($rel + ".template")
+      $tdir = Split-Path $tpl -Parent
+      if (-not (Test-Path $tdir)) { New-Item -ItemType Directory -Path $tdir -Force | Out-Null }
+      $keys = Get-Content $_.FullName -ErrorAction SilentlyContinue |
+        ForEach-Object { if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') { "$($matches[1])=" } }
+      @("# Sanitized template written by BACKUP-USB.ps1 - key names only, no values.",
+        "# On restore, RESTORE-FROM-USB recreates the real file from this skeleton;",
+        "# fill the values from the password manager.") + $keys |
+        Set-Content $tpl -Encoding utf8
     }
 }
 # Robocopy: 0-7 = success flavours, 8+ = real failures.
 if ($code -lt 8) {
   # Keep the one-click claim file on the stick so any machine can re-claim it.
   Copy-Item "C:\Trezo\CLAIM-TREZO-USB.cmd" "$root\CLAIM-TREZO-USB.cmd" -Force -ErrorAction SilentlyContinue
+  # And the one-click restore at the stick ROOT, so starting back up
+  # from this stick is a double-click (2026-08-27, Mike's ask).
+  Copy-Item "C:\Trezo\RESTORE-FROM-USB.cmd" "$root\RESTORE-FROM-USB.cmd" -Force -ErrorAction SilentlyContinue
   @{ head = $head; mirrored_at = (Get-Date -Format s); from = $env:COMPUTERNAME; robocopy = $code } |
     ConvertTo-Json | Out-File $marker -Encoding utf8
   Say "USB mirror complete on $root (robocopy code $code, head $head). Log: $log"
