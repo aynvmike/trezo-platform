@@ -2,8 +2,10 @@
 
 Phase 5 stub. Eventually answers user questions via the Anthropic API
 ("why was this trade blocked?", "what does this YieldMax distribution mean?",
-"how is my tax estimate calculated?"). Today it's an idle sentinel so the
-agent registry has all 8 entries.
+"how is my tax estimate calculated?"). Today it's an idle sentinel in a
+registry that has grown to 30 agents (count corrected 2026-08-27; this
+line said 8 for months — see ops_watchdog.EXPECTED_AGENTS for the
+authoritative roster).
 """
 
 from __future__ import annotations

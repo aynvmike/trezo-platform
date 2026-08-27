@@ -1,4 +1,6 @@
-"""Operations Watchdog - 21st agent. The supervisor.
+"""Operations Watchdog - the supervisor. (It was the 21st agent when
+written; the registry holds 30 as of 2026-08-27 — EXPECTED_AGENTS below
+is the authoritative roster.)
 
 Mike's insight 2026-06-03: when the bootstrap silently registers 0
 agents (and we don't notice for 4 days), the system fails open. No
@@ -127,7 +129,7 @@ _BRIEF_PM_DAY = ""
 
 
 class OpsWatchdogAgent(Agent):
-    """The 21st agent. Supervisor / health monitor."""
+    """Supervisor / health monitor (roster: EXPECTED_AGENTS, 30 strong)."""
 
     name = "ops_watchdog"
     tick_interval_seconds = 300  # every 5 minutes
