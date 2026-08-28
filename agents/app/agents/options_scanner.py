@@ -31,10 +31,14 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 
+import structlog
+
 from app.config import get_settings
 from app.data.candles import fetch_candles_for
 from app.memory import get_memory, AgentDecision
 from app.learning.recall_helpers import recall_decision_context
+log = structlog.get_logger("trezo.options_scanner")
+
 from app.strategies.wheel import (
     WHEEL_WATCHLIST, evaluate_csp, evaluate_cc, refine_csp_live,
     evaluate_cc_recovery, decay_rate_monthly, RECOVERY_DISTRESS,
