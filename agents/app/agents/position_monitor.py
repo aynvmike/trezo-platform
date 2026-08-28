@@ -1300,6 +1300,11 @@ async def _throttled_liquidate(symbol: str, asset_type: str = "stock"):
 class PositionMonitorAgent(Agent):
     name = "position_monitor"
     tick_interval_seconds = 60  # Throttled 2026-06-05 (was 30) to cut API load
+    # 2026-08-28: today's bus-visible cancellations showed this agent
+    # blowing the default scheduler ceiling on a live market day
+    # (cancelled 9x at 120s — the EXIT manager must finish its pass) — every cancelled tick discarded its signals. Honest
+    # ceiling; max_instances=1 + coalesce prevent overlap.
+    tick_timeout_seconds = 300
 
     # Task #32: auto-reconcile stocks every ~60 min (60 ticks * 60s).
     # Counter is class-level - ticks are sequential so no race risk.

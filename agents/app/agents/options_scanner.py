@@ -479,7 +479,7 @@ class OptionsScannerAgent(Agent):
     # tick wholesale once the market-wide wheel pass outgrew 15 minutes.
     # 45 minutes of headroom; the per-step budgets below sum to 2400s,
     # so every step concludes (works or names itself) well inside it.
-    tick_timeout_seconds = 2700
+    tick_timeout_seconds = 3600  # raised 08-28: run_wheel legitimately needs >900s live
 
     async def _step(self, name: str, coro, out: list,
                     budget_s: float) -> None:
@@ -529,7 +529,7 @@ class OptionsScannerAgent(Agent):
                          self._reconcile_with_broker(client), out, 240)
 
         # --- 3. WHEEL: open CSPs where missing -----------------------------
-        await self._step("run_wheel", self._run_wheel(client), out, 900)
+        await self._step("run_wheel", self._run_wheel(client), out, 1500)
 
         # --- 3b. CC OVERLAY: Rulebook 5.5 arithmetic-gate covered calls ----
         await self._step("cc_overlay", self._run_cc_overlay(client),

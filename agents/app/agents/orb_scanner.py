@@ -24,6 +24,11 @@ from .base import Agent, AgentMessage
 class ORBScannerAgent(Agent):
     name = "orb_scanner"
     tick_interval_seconds = 120  # Throttled 2026-06-05 (was 60) to cut API load
+    # 2026-08-28: today's bus-visible cancellations showed this agent
+    # blowing the default scheduler ceiling on a live market day
+    # (cancelled 23x at 240s — zero ORB signals reached risk) — every cancelled tick discarded its signals. Honest
+    # ceiling; max_instances=1 + coalesce prevent overlap.
+    tick_timeout_seconds = 900
 
     def __init__(self) -> None:
         self._alerted: set[str] = set()   # symbols alerted today

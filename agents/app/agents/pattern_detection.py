@@ -57,6 +57,11 @@ def _supabase():
 class PatternDetectionAgent(Agent):
     name = "pattern_detection"
     tick_interval_seconds = 180  # Throttled 2026-06-05 (was 60) to cut API load
+    # 2026-08-28: today's bus-visible cancellations showed this agent
+    # blowing the default scheduler ceiling on a live market day
+    # (cancelled 7x at 360s) — every cancelled tick discarded its signals. Honest
+    # ceiling; max_instances=1 + coalesce prevent overlap.
+    tick_timeout_seconds = 900
 
     # TCS at/above this triggers a signal.
     signal_threshold: int = 70   # 0-100 scale

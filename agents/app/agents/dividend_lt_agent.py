@@ -113,6 +113,11 @@ def _lane_inputs_for(row: dict, equity: float) -> Optional[LaneInputs]:
 class DividendLTAgent(Agent):
     name = "dividend_lt"
     tick_interval_seconds = TICK_SECONDS
+    # 2026-08-28: today's bus-visible cancellations showed this agent
+    # blowing the default scheduler ceiling on a live market day
+    # (cancelled 1x at 900s) — every cancelled tick discarded its signals. Honest
+    # ceiling; max_instances=1 + coalesce prevent overlap.
+    tick_timeout_seconds = 1800
 
     # ticker -> last observed state, per book. Used to notice graduations.
     _last_states: dict = {}
