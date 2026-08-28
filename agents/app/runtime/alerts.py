@@ -61,6 +61,16 @@ _EMOJI = {"urgent": "🔴", "warn": "🟠", "info": "🔵", "good": "🟢"}
 
 
 def webhook_url() -> str:
+    # Settings FIRST (that is where agents/.env values actually live;
+    # see config.py trezo_alert_webhook, 2026-08-28), env as fallback
+    # for ad-hoc shells that export it.
+    try:
+        from app.config import get_settings
+        v = (getattr(get_settings(), "trezo_alert_webhook", "") or "").strip()
+        if v:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
     return (os.getenv("TREZO_ALERT_WEBHOOK", "") or "").strip()
 
 

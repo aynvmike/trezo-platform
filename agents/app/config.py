@@ -105,6 +105,14 @@ class Settings(BaseSettings):
     # plumbing does.
     forex_enabled: bool = False
 
+    # 2026-08-28 (re-audit root cause): the alert webhook lived ONLY in
+    # agents/.env, which pydantic reads into Settings — never into
+    # os.environ — so alerts.webhook_url()'s bare os.getenv returned ""
+    # and every notify() died at its first line. Same bug as
+    # primary_user_id (8/09) and the 7/06 settings value. The field the
+    # engine actually reads:
+    trezo_alert_webhook: str = ""
+
     # Task #92 (2026-06-10, Mike's rule): Exit Advisor auto-action.
     # Off = surface alerts only (legacy spec). On = bot acts on its own
     # giveback rules: urgent -> close, warn -> trim 50%.

@@ -138,7 +138,10 @@ def _tell(message: str, key: str = "deploy_blocked") -> None:
         # "deploy aborted/blocked" alert since 08-20 was silent.
         # notify_sync exists precisely for non-async contexts.
         from app.runtime.alerts import notify_sync
-        notify_sync(key, message, severity="urgent")
+        # key= as a KEYWORD (re-audit: it was bound positionally to
+        # title, defeating the dedupe the module exists for, and the
+        # alert title read literally "deploy_blocked").
+        notify_sync("Trezo deploy", message, severity="urgent", key=key)
     except Exception:  # noqa: BLE001
         pass
 
@@ -222,9 +225,9 @@ def _h_web_rebuild(args: dict) -> str:
     is stated in the row AND alerted."""
     web = REPO / "web"
     out = _run(["npm", "--prefix", str(web), "run", "build"], timeout=1800)
-    ok = ("[exit 0]" in out) and ("Compiled successfully" in out
-                                  or "compiled successfully" in out
-                                  or "Generating static pages" in out)
+    ok = "[exit 0]" in out  # exit code only (2026-08-28): _run keeps the
+        # LAST 4000 chars and Next prints "Compiled successfully" BEFORE an
+        # ~8KB route table, so the string match refused every good build
     if not ok:
         out += "\nNOT restarted - build did not succeed"
         _tell(f"Web rebuild FAILED; TrezoWeb was NOT restarted and is "
@@ -237,6 +240,17 @@ def _h_web_rebuild(args: dict) -> str:
 
 def _h_report_status(args: dict) -> str:
     lines = []
+    # 2026-08-28: queue report_status with {"send_test": true} to prove
+    # the alert channel end to end — send_test() had zero callers while
+    # its docstring claimed the relay used it.
+    if args.get("send_test"):
+        try:
+            import asyncio as _aio_rs
+            from app.runtime import alerts as _al
+            _res = _aio_rs.run(_al.send_test())
+            lines.append(f"send_test: {_res}")
+        except Exception as _e:  # noqa: BLE001
+            lines.append(f"send_test: FAILED {str(_e)[:160]}")
     for svc in sorted(SERVICES):
         lines.append(f"{svc}: {_run([NSSM, 'status', svc], timeout=60)}")
     try:
