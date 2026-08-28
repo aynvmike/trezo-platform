@@ -43,6 +43,17 @@ CRYPTO_SYMBOLS = _all_crypto_symbols()
 _ROTATIONS_TODAY: dict = {"day": "", "n": 0}
 
 
+def _lane_cap_f(source_payload) -> float | None:
+    """The lane's own max_notional, if the signal carries one (>0)."""
+    try:
+        v = (source_payload or {}).get("max_notional")
+        if v is not None and float(v) > 0:
+            return float(v)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 class TradeExecutionAgent(Agent):
     name = "trade_execution"
     tick_interval_seconds = 0  # event-driven
@@ -587,6 +598,21 @@ class TradeExecutionAgent(Agent):
                 payload={"user_id": user_id, "ticker": ticker,
                          "error": f"crypto_exchange submit failed: {e}"},
             )]
+        # REACHABLE silent path (re-audit 2026-08-28): submit_order in
+        # validate-only mode returns successfully and we fall through to
+        # a MODELED fill — the NotImplementedError branch above is
+        # unreachable by construction (router requires is_configured,
+        # the raise requires credentials ABSENT). Say it here, where it
+        # actually happens.
+        try:
+            from app.agents.activity_log import record as _kfrec2
+            _kfrec2("venue_fallback_modeled", ticker,
+                    strategy=strategy,
+                    reason=("crypto_exchange connector accepted the "
+                            "order in validate-only mode -- the FILL is "
+                            "from the MODELED engine, not the venue."))
+        except Exception:  # noqa: BLE001
+            pass
         return await self._execute_internal(
             user_id, ticker, "crypto", side, market_price,
             stop_pct, target_pct, strategy, source_payload,
@@ -941,7 +967,12 @@ class TradeExecutionAgent(Agent):
             target_price=target_price,
             risk_pct=float(risk_pct),
             asset_type="stock",
-            buying_power=min(acct.buying_power, remaining),
+            # Tightest of broker BP, pocket remainder, and the lane's own
+            # cap (2026-08-28 — the cap used to die in _execute_internal,
+            # a function the live stock path never calls).
+            buying_power=min([x for x in (
+                acct.buying_power, remaining,
+                _lane_cap_f(source_payload)) if x is not None]),
         )
         # Coverage trades stay SMALL (Mike 2026-07-02): one labeled test
         # position per strategy, capped near TREZO_COVERAGE_TRADE_USD.
@@ -1252,7 +1283,9 @@ class TradeExecutionAgent(Agent):
             target_price=target_price,
             risk_pct=float(risk_pct),
             asset_type="crypto",
-            buying_power=min(_crypto_usd, remaining, _cx_slice),
+            buying_power=min([x for x in (
+                _crypto_usd, remaining, _cx_slice,
+                _lane_cap_f(source_payload)) if x is not None]),
         )
         if plan.ok and (source_payload or {}).get("coverage_trade"):
             try:

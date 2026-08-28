@@ -155,7 +155,9 @@ def market_type_for(strategy: str, asset_type: str) -> str:
     # FUNDED from (and capped against) the stocks budget — two books
     # disagreeing about the same dollar. The dividend lane is the income
     # lane; route it where its sizing already lives.
-    if s.startswith("dividend"):
+    if s.startswith("dividend_lt"):
+        # EXACT lane prefix (2026-08-28): bare "dividend" swept the
+        # dividend_capture_long swing strategy into the income pocket.
         return "income"
     if s.startswith("options") or at == "option" or s in (
         "long_call", "bull_call_spread", "cash_secured_put"

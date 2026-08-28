@@ -193,7 +193,11 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         # misreading. The ladder manages its own exits (screen-based,
         # cut-triggered); the reevaluator manages the trading lanes.
         _rl_strat = str(strat or r.get("strategy") or "").lower()
-        if _rl_strat.startswith(("dividend", "wheel", "income")):
+        # "dividend_lt" EXACT lane prefix (2026-08-28): bare "dividend"
+        # also matched dividend_capture_long — a live 2-7 day SWING with
+        # a stop and target that NEEDS this management. Only the
+        # buy-and-hold lane is exempt.
+        if _rl_strat.startswith(("dividend_lt", "wheel", "income")):
             return None
         pid = str(r.get("id"))
         now = _time.monotonic()

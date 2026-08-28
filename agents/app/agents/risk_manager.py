@@ -1071,6 +1071,12 @@ class RiskManagerAgent(Agent):
             "reason": f"TCS {tcs} clears threshold; {direction} bias [{strategy}]",
             "accumulation": accumulation_add,
         }
+        # Lane caps travel WITH the approval (re-audit 2026-08-28: the
+        # execution-side min() was dead because this whitelist never
+        # carried the key — the U3 per-name cap could not bind).
+        _mn_pass = message.payload.get("max_notional")
+        if _mn_pass is not None:
+            approve_payload["max_notional"] = _mn_pass
         if crowding_bump_v:
             approve_payload["crowding_bump"] = crowding_bump_v
             approve_payload["reason"] += (
