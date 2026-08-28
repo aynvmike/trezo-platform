@@ -24,7 +24,21 @@ param(
 function Say($msg, $color = "Cyan") { if (-not $Quiet) { Write-Host "  $msg" -ForegroundColor $color } }
 
 function Find-TrezoUsb {
-  if ($Drive) { return ($Drive.TrimEnd(':', '\') + ":") }
+  if ($Drive) {
+    $d = ($Drive.TrimEnd(':', '\') + ":")
+    # GUARD (2026-08-28 audit): -Drive C would make $dst = C:\Trezo, and
+    # the post-mirror secret purge would then delete the LIVE .env files.
+    # A typo must never be able to do that.
+    if ($d -ieq (Split-Path $src -Qualifier)) {
+      Say "-Drive $d is the SOURCE drive - refusing to mirror $src onto itself." "Red"
+      exit 1
+    }
+    if (-not (Test-Path "$d\")) {
+      Say "-Drive $d does not exist - plug the stick in or drop the flag." "Red"
+      exit 1
+    }
+    return $d
+  }
   $removable = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" -ErrorAction SilentlyContinue
   foreach ($d in $removable) {
     if (Test-Path (Join-Path $d.DeviceID "TREZO-USB.json")) { return $d.DeviceID }
@@ -74,7 +88,11 @@ robocopy $src $dst /MIR /R:1 /W:2 /NP /NFL /NDL `
   /XF "*.lock" ".env" ".env.*" "*.env" `
   /LOG:$log
 $code = $LASTEXITCODE
-if (Test-Path $dst) {
+# GUARD (2026-08-28 audit): the purge deletes .env* files. It must only
+# ever run against a DESTINATION that is not the source tree, and only
+# after a mirror that actually succeeded (robocopy 8+ = failure; who
+# knows what $dst holds then). Belt and braces with the -Drive refusal.
+if (($dst -ne $src) -and ($code -lt 8) -and (Test-Path $dst)) {
   Get-ChildItem $dst -Recurse -Force -File -ErrorAction SilentlyContinue |
     Where-Object { ($_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -like "*.env") -and
                    $_.Name -notlike "*.template" } |
@@ -88,8 +106,8 @@ if (Test-Path $dst) {
 # only, no values, so RESTORE-FROM-USB knows exactly which keys a
 # rebuild must refill without the stick ever carrying a secret. Skips
 # .bak copies and examples - stale key sets would only confuse a
-# restore.
-if (Test-Path $dst) {
+# restore. Same guard as the purge: never when $dst is the source tree.
+if (($dst -ne $src) -and ($code -lt 8) -and (Test-Path $dst)) {
   Get-ChildItem $src -Recurse -Force -File -ErrorAction SilentlyContinue |
     Where-Object {
       ($_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -like "*.env") -and

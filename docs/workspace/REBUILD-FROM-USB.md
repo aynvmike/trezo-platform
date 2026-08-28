@@ -19,8 +19,15 @@ C:\Trezo, then run C:\Trezo\RESTORE-FROM-USB.ps1 yourself.)
 The stick carries NO keys, by design. Every value lives in Mike's
 password manager — fill in the skeletons the restore just listed
 (trezo-platform\agents\.env, trezo-platform\api\.env,
-trezo-platform\web\.env.local). Only rotate keys if the password
-manager itself is in doubt, not because the stick traveled.
+trezo-platform\web\.env.local).
+
+**Rotation — read this once.** Backup passes BEFORE 2026-08-27 put the
+real .env files on this stick unencrypted. If the Alpaca + Supabase
+keys have not been rotated since then, rotate them ONCE now — the old
+values must be treated as having traveled in the clear. After that
+one-time rotation, the standing rule applies: this stick never carries
+keys, so a lost or traveled stick is not by itself a reason to rotate —
+only doubt about the password manager is.
 
 ## 3. Reinstall the machine-specific parts (skipped by the mirror)
 In PowerShell:
