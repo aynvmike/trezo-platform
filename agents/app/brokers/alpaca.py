@@ -13,6 +13,7 @@ string, so the rest of Trezo can fall back to its internal paper ledger.
 from __future__ import annotations
 
 import os
+import re
 
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -1091,9 +1092,15 @@ async def ratchet_crypto_stop(
     # on purpose, not qty_available: units parked under a resting target
     # are freed by the cancel-and-retry below, and a stop clamped to
     # qty_available would silently under-protect.
+    # NOTE the spelling: ORDERS take "DOT/USD", the POSITIONS endpoint
+    # takes "DOTUSD" (probed 2026-08-29 -- the slashed and %2F forms both
+    # 404, and a 404 here silently left the ledger quantity in place,
+    # which is how the first version of this fix shipped and changed
+    # nothing).
     _qty_s = str(qty)
+    _pos_sym = pair.replace("/", "")
     try:
-        _bp = await _get(f"/v2/positions/{pair.replace('/', '%2F')}")
+        _bp = await _get(f"/v2/positions/{_pos_sym}")
         _bq_raw = (_bp or {}).get("qty")
         _bq = float(_bq_raw) if _bq_raw is not None else 0.0
         if _bq > 0 and (abs(qty - _bq) / _bq < 1e-3 or qty > _bq):
@@ -1107,6 +1114,20 @@ async def ratchet_crypto_stop(
         "limit_price": str(limit_px), "time_in_force": "gtc",
     }
     _o, err = await _post("/v2/orders", body)
+    if err and "insufficient balance" in str(err).lower():
+        # Alpaca states the exact holdable amount in the rejection --
+        # "requested: 13060.38462492, available: 13060.384624917". Take
+        # the venue at its word and retry once. This is the last line of
+        # defence behind the position probe above: between them, a
+        # rounding hair can no longer leave a coin with no floor.
+        _m = re.search(r"available:\s*([0-9.]+)", str(err))
+        if _m and _m.group(1) != body["qty"]:
+            body["qty"] = _m.group(1)
+            _o, err = await _post("/v2/orders", body)
+            if not err:
+                return True, (f"crypto stop resting at {new_stop:g} (limit "
+                              f"{limit_px:g}) - quantity taken from the "
+                              f"venue's own balance ({body['qty']})")
     if not err:
         return True, f"crypto stop resting at {new_stop:g} (limit {limit_px:g})"
 

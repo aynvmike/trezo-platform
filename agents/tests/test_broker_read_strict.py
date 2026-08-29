@@ -147,6 +147,74 @@ def test_a_crypto_stop_carries_the_brokers_own_quantity():
     assert posted.get("qty") == "13060.384624917", posted
 
 
+def test_the_position_probe_uses_the_endpoints_own_spelling():
+    """ORDERS take DOT/USD; the POSITIONS endpoint takes DOTUSD. The
+    first cut of this fix asked for DOT%2FUSD, got a 404, silently kept
+    the ledger quantity -- and shipped changing nothing. Pin the URL."""
+    seen = {}
+
+    async def _no_orders(sym):
+        return []
+
+    async def _get(path, token=None):
+        seen["path"] = path
+        return {"qty": "13060.384624917"}
+
+    async def _post(path, body, token=None):
+        return {"id": "ord-p"}, None
+
+    with _patched(alp, open_crypto_orders=_no_orders, _get=_get, _post=_post):
+        _run(alp.ratchet_crypto_stop("DOT", 0.7999, qty=13060.38462492))
+    assert seen.get("path") == "/v2/positions/DOTUSD", seen
+
+
+def test_an_insufficient_balance_403_is_retried_at_the_venues_number():
+    """Alpaca states the holdable amount in the rejection. Take it."""
+    bodies = []
+
+    async def _no_orders(sym):
+        return []
+
+    async def _get(path, token=None):
+        return None                     # probe unavailable: force the retry
+
+    async def _post(path, body, token=None):
+        bodies.append(dict(body))
+        if len(bodies) == 1:
+            return None, ("HTTP 403: insufficient balance for DOT "
+                          "(requested: 13060.38462492, available: "
+                          "13060.384624917)")
+        return {"id": "ord-r"}, None
+
+    with _patched(alp, open_crypto_orders=_no_orders, _get=_get, _post=_post):
+        ok, note = _run(alp.ratchet_crypto_stop("DOT", 0.7999,
+                                                qty=13060.38462492))
+    assert ok, note
+    assert len(bodies) == 2, bodies
+    assert bodies[1]["qty"] == "13060.384624917", bodies[1]
+
+
+def test_the_403_retry_does_not_loop_on_the_same_number():
+    """If the venue repeats itself, fail honestly -- never retry forever."""
+    calls = {"n": 0}
+
+    async def _no_orders(sym):
+        return []
+
+    async def _get(path, token=None):
+        return None
+
+    async def _post(path, body, token=None):
+        calls["n"] += 1
+        return None, ("HTTP 403: insufficient balance for DOT "
+                      "(requested: 5.0, available: 5.0)")
+
+    with _patched(alp, open_crypto_orders=_no_orders, _get=_get, _post=_post):
+        ok, note = _run(alp.ratchet_crypto_stop("DOT", 0.7999, qty=5.0))
+    assert not ok
+    assert calls["n"] == 1, calls          # same number -> no pointless retry
+
+
 def test_a_stop_is_still_placed_when_the_venue_read_fails():
     """A 403 retry next tick beats silently skipping protection."""
     posted = {}
