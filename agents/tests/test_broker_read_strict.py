@@ -1,107 +1,154 @@
-"""Pin the 2026-08-28 phantom-close fixes.
+"""Guards for the 2026-08-28 phantom-close loop.
 
-The DOT/QYLD/AMZN loop: a FAILED broker positions read used to come back
-as [] ("holds nothing"), book_scope cached it as truth, and Position
-Monitor closed every broker-held row on the book at modeled prices while
-Alpaca kept holding them. Separately, the ledger's 8-decimal quantity
-rounded UP past the broker's 9-decimal holding, so every crypto stop
-placement 403'd "insufficient balance" and the position sat with no
-floor. These tests pin both repairs.
+The case these replay is real: the 75k book's broker held AMZN, DOT and
+QYLD while the ledger kept closing them. The phantom was in the CLOSES.
+A FAILED positions read (429/timeout/5xx) came back as [] --
+indistinguishable from a flat account -- book_scope cached that as
+broker truth, and Position Monitor read "symbol gone at broker" as "the
+bracket filled", closing every broker-held row at modeled prices. The
+reconciler re-adopted them and the loop booked ~-$5.8k of realized P/L
+on DOT alone that never happened at the broker.
+
+Second bug, same loop: the ledger's 8-decimal quantity rounded UP past
+the broker's 9-decimal holding, so every crypto stop 403'd
+"insufficient balance" and $10.9k of coin rode with no floor.
+
+What matters here is the ASYMMETRY, the same one broker_truth.py is
+built on: an answerless read must never be readable as an answer.
+
+Deliberately dependency-free (no pytest, no .env, no network) so the
+deploy guard can run them in a bare checkout.
 """
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import sys
+from pathlib import Path
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.brokers import alpaca as alp
-from app.runtime import book_scope
+from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+
+stub_config()
+alp = load_module("app.brokers.alpaca")
+book_scope = load_module("app.runtime.book_scope")
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
-# ---------------------------------------------------------------- strict read
+@contextlib.contextmanager
+def _patched(mod, **attrs):
+    """Swap module attributes and always put the originals back."""
+    old = {k: getattr(mod, k, None) for k in attrs}
+    try:
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                if hasattr(mod, k):
+                    delattr(mod, k)
+            else:
+                setattr(mod, k, v)
 
-def test_strict_read_returns_none_on_failure(monkeypatch):
+
+# --- the strict read -----------------------------------------------------
+
+def test_a_failed_read_is_none_not_empty():
     async def _fail(path, token=None):
-        return None                      # what _get yields on 429/timeout/5xx
-    monkeypatch.setattr(alp, "_get", _fail)
-    assert _run(alp.get_positions_strict()) is None
+        return None                  # what _get yields on 429/timeout/5xx
+    with _patched(alp, _get=_fail):
+        assert _run(alp.get_positions_strict()) is None
 
 
-def test_strict_read_passes_lists_through(monkeypatch):
+def test_a_real_answer_passes_through():
     rows = [{"symbol": "DOTUSD", "qty": "13060.384624917"}]
 
     async def _ok(path, token=None):
         return rows
-    monkeypatch.setattr(alp, "_get", _ok)
-    assert _run(alp.get_positions_strict()) == rows
-    assert _run(alp.get_positions_strict([])) if False else True
+    with _patched(alp, _get=_ok):
+        assert _run(alp.get_positions_strict()) == rows
 
 
-def test_plain_read_keeps_empty_list_compat(monkeypatch):
+def test_an_empty_account_is_still_an_empty_list():
+    """Flat is an ANSWER. Only a failure is answerless."""
+    async def _flat(path, token=None):
+        return []
+    with _patched(alp, _get=_flat):
+        assert _run(alp.get_positions_strict()) == []
+
+
+def test_the_plain_read_keeps_its_old_shape():
     async def _fail(path, token=None):
         return None
-    monkeypatch.setattr(alp, "_get", _fail)
-    # Non-destructive callers keep the old [] shape...
-    assert _run(alp.get_positions()) == []
+    with _patched(alp, _get=_fail):
+        assert _run(alp.get_positions()) == []
 
 
-def test_book_scope_treats_failed_read_as_answerless(monkeypatch):
-    """A failed fetch must surface as None (do-not-act), never as
-    'holds nothing' -- and must NOT be cached as an answer."""
+# --- book_scope: the cache that fed the loop -----------------------------
+
+def test_book_scope_reports_a_failed_read_as_could_not_check():
     calls = {"n": 0}
 
     async def _boom():
         calls["n"] += 1
         return None
+
     book_scope.new_cycle()
-    monkeypatch.setattr(book_scope, "_fetch_positions", _boom)
-    monkeypatch.setattr(
-        book_scope, "bind",
-        lambda uid, where="": __import__("contextlib").nullcontext("book"))
-    got = _run(book_scope.held_symbols("some-book", where="test"))
-    assert got is None
-    # not cached: a second ask re-fetches instead of replaying the failure
-    _run(book_scope.held_symbols("some-book", where="test"))
-    assert calls["n"] == 2
+    with _patched(book_scope, _fetch_positions=_boom,
+                  bind=lambda uid, where="": contextlib.nullcontext("book")):
+        assert _run(book_scope.held_symbols("book-a", where="guard")) is None
+        # AND it is not cached: a failure must not be replayed as truth
+        _run(book_scope.held_symbols("book-a", where="guard"))
+        assert calls["n"] == 2, calls
     book_scope.new_cycle()
 
 
-# ------------------------------------------------------------- stop qty clamp
+def test_book_scope_still_answers_when_the_broker_answers():
+    async def _rows():
+        return [{"symbol": "AMZN"}, {"symbol": "QYLD"}]
 
-def test_crypto_stop_clamps_qty_to_broker_holding(monkeypatch):
-    """Ledger 13060.38462492 (8dp, rounded up) vs broker
-    13060.384624917: the stop order must carry the BROKER's quantity
-    string, or Alpaca 403s and the coin rides unprotected."""
+    book_scope.new_cycle()
+    with _patched(book_scope, _fetch_positions=_rows,
+                  bind=lambda uid, where="": contextlib.nullcontext("book")):
+        got = _run(book_scope.held_symbols("book-b", where="guard"))
+        assert got == {"AMZN", "QYLD"}, got
+    book_scope.new_cycle()
+
+
+# --- the stop quantity ---------------------------------------------------
+
+def test_a_crypto_stop_carries_the_brokers_own_quantity():
+    """Ledger 13060.38462492 (8dp, rounded UP) vs broker
+    13060.384624917. Ask for ours and Alpaca 403s; the coin then rides
+    with no floor, which is exactly what happened to DOT."""
     posted = {}
 
     async def _no_orders(sym):
         return []
 
     async def _get(path, token=None):
-        assert "/v2/positions/" in path
+        assert "/v2/positions/" in path, path
         return {"qty": "13060.384624917"}
 
     async def _post(path, body, token=None):
         posted.update(body)
         return {"id": "ord-1"}, None
 
-    monkeypatch.setattr(alp, "open_crypto_orders", _no_orders)
-    monkeypatch.setattr(alp, "_get", _get)
-    monkeypatch.setattr(alp, "_post", _post)
-
-    ok, note = _run(alp.ratchet_crypto_stop(
-        "DOT", 0.7999, qty=13060.38462492))
+    with _patched(alp, open_crypto_orders=_no_orders, _get=_get, _post=_post):
+        ok, note = _run(alp.ratchet_crypto_stop("DOT", 0.7999,
+                                                qty=13060.38462492))
     assert ok, note
-    assert posted["qty"] == "13060.384624917"
+    assert posted.get("qty") == "13060.384624917", posted
 
 
-def test_crypto_stop_keeps_own_qty_when_broker_read_fails(monkeypatch):
-    """If the venue read fails, place with what we have -- a 403 retry
-    next tick beats silently skipping protection."""
+def test_a_stop_is_still_placed_when_the_venue_read_fails():
+    """A 403 retry next tick beats silently skipping protection."""
     posted = {}
 
     async def _no_orders(sym):
@@ -114,10 +161,11 @@ def test_crypto_stop_keeps_own_qty_when_broker_read_fails(monkeypatch):
         posted.update(body)
         return {"id": "ord-2"}, None
 
-    monkeypatch.setattr(alp, "open_crypto_orders", _no_orders)
-    monkeypatch.setattr(alp, "_get", _get)
-    monkeypatch.setattr(alp, "_post", _post)
-
-    ok, note = _run(alp.ratchet_crypto_stop("DOT", 0.7999, qty=5.0))
+    with _patched(alp, open_crypto_orders=_no_orders, _get=_get, _post=_post):
+        ok, note = _run(alp.ratchet_crypto_stop("DOT", 0.7999, qty=5.0))
     assert ok, note
-    assert posted["qty"] == "5.0"
+    assert posted.get("qty") == "5.0", posted
+
+
+if __name__ == "__main__":
+    sys.exit(run_tests(dict(vars())))
