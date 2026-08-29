@@ -184,10 +184,19 @@ async def _fetch_positions() -> Optional[list]:
         except Exception:  # noqa: BLE001
             return None
     try:
-        from app.brokers.alpaca import alpaca_configured, get_positions
+        from app.brokers.alpaca import (
+            alpaca_configured, get_positions_strict,
+        )
         if not alpaca_configured():
             return None
-        rows = await get_positions()
+        # STRICT read (2026-08-28): get_positions() returns [] on a
+        # FAILED fetch, and this module caches whatever it gets as
+        # broker truth for the whole tick -- one rate-limited read
+        # made every position on the book "gone" and Position Monitor
+        # phantom-closed them all (the DOT/QYLD/AMZN loop). The strict
+        # variant keeps failure as None, which callers already treat
+        # as "could not check, do not act".
+        rows = await get_positions_strict()
         return rows if isinstance(rows, list) else None
     except Exception:  # noqa: BLE001
         return None

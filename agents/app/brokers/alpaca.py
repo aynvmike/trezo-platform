@@ -364,11 +364,32 @@ def tradable_crypto_symbols() -> frozenset:
         return _CRYPTO_ASSETS["syms"] or frozenset()
 
 
+async def get_positions_strict(
+        token: Optional["UserToken"] = None) -> Optional[list]:
+    """Open positions, or None when the read FAILED (timeout, 429, 5xx).
+
+    2026-08-28, the DOT/QYLD/AMZN phantom-close loop: get_positions()
+    collapsed every failure into [] -- indistinguishable from a flat
+    account -- so one rate-limited read made book_scope cache "holds
+    nothing" and Position Monitor closed every broker-held row on the
+    book at modeled prices (alpaca_bracket / alpaca_external) while
+    Alpaca kept holding them. The reconciler then re-adopted them and
+    the loop booked phantom P/L for days. stocks_reconcile (2026-06-15)
+    and broker_truth both already learned this lesson; this is the same
+    fix at the source: a failed read is an ANSWERLESS read, never an
+    empty one. Callers that can act destructively must use this and
+    treat None as "do not act"."""
+    data = await _get("/v2/positions", token=token)
+    return data if isinstance(data, list) else None
+
+
 async def get_positions(token: Optional["UserToken"] = None) -> list[dict]:
     """Open positions on the Alpaca account ([] if none / unconfigured).
-    Optional `token` routes the call through the user's OAuth bearer."""
-    data = await _get("/v2/positions", token=token)
-    return data if isinstance(data, list) else []
+    Optional `token` routes the call through the user's OAuth bearer.
+    NOTE: [] here can also mean "the read failed" -- destructive callers
+    must use get_positions_strict() and honor its None."""
+    data = await get_positions_strict(token=token)
+    return data if data is not None else []
 
 
 async def get_option_positions(token: Optional["UserToken"] = None) -> list[dict]:
@@ -1059,8 +1080,29 @@ async def ratchet_crypto_stop(
     if not qty or qty <= 0:
         return False, "no resting stop and no quantity to protect"
 
+    # QTY PRECISION (2026-08-28, the DOT 403 loop): the ledger stores
+    # quantity at 8 decimals while Alpaca holds 9 -- the ledger's
+    # round-UP asked to sell 3e-9 more DOT than existed and every stop
+    # placement 403'd "insufficient balance", leaving $10.9k of coin
+    # with no floor for days (and the round-DOWN twin left dust crumbs
+    # on the other books). Ask the venue what it actually holds and use
+    # ITS quantity string verbatim whenever ours differs by a hair; if
+    # ours is outright larger, clamp to the venue's. Total position qty
+    # on purpose, not qty_available: units parked under a resting target
+    # are freed by the cancel-and-retry below, and a stop clamped to
+    # qty_available would silently under-protect.
+    _qty_s = str(qty)
+    try:
+        _bp = await _get(f"/v2/positions/{pair.replace('/', '%2F')}")
+        _bq_raw = (_bp or {}).get("qty")
+        _bq = float(_bq_raw) if _bq_raw is not None else 0.0
+        if _bq > 0 and (abs(qty - _bq) / _bq < 1e-3 or qty > _bq):
+            _qty_s = str(_bq_raw)
+    except Exception:  # noqa: BLE001
+        pass
+
     body = {
-        "symbol": pair, "qty": str(qty), "side": "sell",
+        "symbol": pair, "qty": _qty_s, "side": "sell",
         "type": "stop_limit", "stop_price": str(new_stop),
         "limit_price": str(limit_px), "time_in_force": "gtc",
     }
