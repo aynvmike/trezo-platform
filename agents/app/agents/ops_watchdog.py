@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os as _os
+import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -121,6 +123,12 @@ def _supabase():
 
 _BOOT_AT = datetime.now(timezone.utc)
 
+# APPROVAL STARVATION (2026-08-31). Dull on purpose: a window must be at
+# least this long and carry at least this many signals before silence
+# counts as evidence. Tunable by env for a noisy or a very thin book.
+FLOW_WINDOW_MIN = float(_os.getenv("TREZO_FLOW_WINDOW_MIN", "20") or 20)
+FLOW_MIN_SIGNALS = int(float(_os.getenv("TREZO_FLOW_MIN_SIGNALS", "15") or 15))
+
 
 _JANITOR_DAY = ""   # daily agent_messages purge marker (2026-07-07)
 _ALERT_ACK_HOUR = ""  # hourly stale-advisory auto-ack marker (2026-07-15)
@@ -138,9 +146,110 @@ class OpsWatchdogAgent(Agent):
         # In-memory dedupe: don't re-alert the same condition every tick
         # while it persists. Keyed by (alert_kind, target_name).
         self._open_alerts: set[tuple[str, str]] = set()
+        # APPROVAL STARVATION counters (2026-08-31). See _check_flow().
+        self._flow: dict[str, float] = {
+            "signals": 0, "approves": 0, "vetoes": 0,
+            "handler_fails": 0, "since": _time.time(),
+        }
 
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
+        # Count the shape of the decision pipeline. Deliberately free:
+        # no I/O, no awaits, just tallies read by _check_flow() on the
+        # 5-minute tick. This is the sensor for the outage that ran from
+        # 8/27 to 8/31 -- signals firing, nothing approved, and the only
+        # visible messages were vetoes from checks upstream of the crash.
+        try:
+            k = message.kind
+            if k == "signal":
+                self._flow["signals"] += 1
+            elif k == "approve":
+                self._flow["approves"] += 1
+            elif k == "veto":
+                self._flow["vetoes"] += 1
+            elif k == "error" and isinstance(message.payload, dict) and (
+                    message.payload.get("event") == "handler_failed"):
+                self._flow["handler_fails"] += 1
+        except Exception:  # noqa: BLE001
+            pass
         return []
+
+    async def _check_flow(self) -> list[AgentMessage]:
+        """Alarm when signals go in and NOTHING comes out.
+
+        THE CASE THIS EXISTS FOR (2026-08-31): risk_manager.on_message
+        raised on every signal carrying a real direction. The router
+        swallowed it, so there was no error to find -- the platform
+        simply approved nothing for four trading days while the log
+        looked merely quiet. Every other check here asks "is this agent
+        ticking?" and every one of them said yes.
+
+        So this check asks the question the outage would have failed:
+        did anything get APPROVED? A window with plenty of signals, zero
+        approvals and no explanatory vetoes is not a slow tape -- the
+        pipeline is broken somewhere between the scanners and execution.
+
+        Thresholds are deliberately dull: market hours only, at least
+        MIN_SIGNALS observed, and the window must be at least
+        FLOW_WINDOW_MIN long, so a quiet morning cannot cry wolf.
+        """
+        out: list[AgentMessage] = []
+        f = self._flow
+        window_min = (_time.time() - f["since"]) / 60.0
+        if window_min < FLOW_WINDOW_MIN:
+            return out
+        # Reset the window whatever we decide, so one bad window does not
+        # poison the next one.
+        signals, approves = int(f["signals"]), int(f["approves"])
+        vetoes, hfails = int(f["vetoes"]), int(f["handler_fails"])
+        self._flow = {"signals": 0, "approves": 0, "vetoes": 0,
+                      "handler_fails": 0, "since": _time.time()}
+
+        if not _us_market_open():
+            return out
+        if signals < FLOW_MIN_SIGNALS:
+            return out                      # too thin to conclude anything
+        if approves > 0:
+            self._open_alerts.discard(("approval_starvation", "pipeline"))
+            return out
+
+        # Zero approvals on real signal flow. Say which shape it is:
+        # accounted-for (every signal has a veto) vs UNACCOUNTED, which
+        # is the dangerous one -- signals going in and nothing at all
+        # coming out is a crash, not a decision.
+        unaccounted = max(0, signals - vetoes)
+        shape = (f"{vetoes} veto(es) explain them"
+                 if unaccounted == 0 else
+                 f"{unaccounted} of them produced NO verdict at all -- "
+                 f"not an approval, not a veto")
+        msg = (
+            f"APPROVAL STARVATION: {signals} signal(s) in "
+            f"{window_min:.0f} min of market hours produced ZERO "
+            f"approvals; {shape}"
+            + (f"; {hfails} handler crash(es) reported" if hfails else "")
+            + ". A silent pipeline is what the 8/27-8/31 outage looked "
+              "like: every agent ticking, nothing traded. Check "
+              "risk_manager first, then trade_execution."
+        )
+        key = ("approval_starvation", "pipeline")
+        if key not in self._open_alerts:
+            self._open_alerts.add(key)
+            await self._persist_alert(
+                kind="approval_starvation", target="pipeline",
+                severity="urgent" if unaccounted else "warn", message=msg)
+            try:
+                from app.runtime.alerts import notify
+                await notify("Trezo: nothing is being approved", msg,
+                             severity="urgent", key="approval_starvation")
+            except Exception:  # noqa: BLE001
+                pass
+        out.append(AgentMessage(
+            agent=self.name, kind="error",
+            payload={"event": "approval_starvation", "signals": signals,
+                     "approves": 0, "vetoes": vetoes,
+                     "unaccounted": unaccounted,
+                     "handler_failures": hfails,
+                     "window_min": round(window_min, 1), "note": msg}))
+        return out
 
     async def tick(self) -> list[AgentMessage]:
         # OPS RELAY -- EVERY TICK (Mike 2026-08-13). First version sat
@@ -520,6 +629,16 @@ class OpsWatchdogAgent(Agent):
             k for k in self._open_alerts
             if not (k[0] == "missing_agent" and k[1] not in missing)
         }
+
+        # --- Check 1b: is the DECISION PIPELINE producing anything? ---
+        # Every other check here asks "is this agent ticking?" -- and
+        # during the 8/27-8/31 outage every one of them said yes while
+        # the platform traded nothing. This one asks whether decisions
+        # come out the far end.
+        try:
+            out.extend(await self._check_flow())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ops_watchdog flow check failed: %s", e)
 
         # --- Check 2: scanner silence during market hours ------------
         market_open = _us_market_open()

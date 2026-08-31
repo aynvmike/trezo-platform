@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import structlog
 
+from app.agents.base import AgentMessage
 from app.agents.adaptive_scope import AdaptiveScopeAgent
 from app.agents.crypto_scanner import CryptoScannerAgent
 from app.agents.cycle_awareness import CycleAwarenessAgent
@@ -112,6 +113,18 @@ def bootstrap_agents() -> None:
     registry.register(archivist, "Archivist (2026-08-18). Hourly: activity logs, runtime caches and a point-in-time copy of every book to Supabase Storage. Weekly: the same bundle to Dropbox, a deliberately different vendor. Nothing should exist only on the server -- then the server is disposable and you rebuild rather than restore.", role="observer")
 
     # Wire on_message handlers - agents react to each other's messages.
+    #
+    # A HANDLER CRASH USED TO BE INVISIBLE (2026-08-31, the four-day
+    # approval outage). This except logged to stdout and continued, so
+    # when risk_manager.on_message raised UnboundLocalError on every
+    # actionable signal, the platform stopped trading for four days with
+    # no bus message, no activity row and no alert -- the log just looked
+    # quiet. A swallowed exception in the message path is now announced:
+    # onto the bus (so it lands in agent_messages and the dashboard),
+    # into the activity log, and -- first time per agent+error -- out
+    # through the alert webhook.
+    _handler_fail_seen: dict[tuple[str, str], int] = {}
+
     async def _route(message):
         # Don't loop back into the same agent's own messages
         for state in registry.all():
@@ -121,10 +134,71 @@ def bootstrap_agents() -> None:
                 follow_ups = await state.impl.on_message(message)
             except Exception as e:  # noqa: BLE001
                 log.error("agent.on_message.failed", agent=state.name, error=str(e))
+                await _announce_handler_failure(state, message, e)
                 continue
             for m in follow_ups or []:
                 state.message_count += 1
                 await bus.publish(m)
+
+    async def _announce_handler_failure(state, message, exc):
+        """Make a swallowed handler exception impossible to miss.
+
+        Everything here is best-effort and must never raise: the router
+        is the platform's spine, and a reporting bug cannot be allowed
+        to become a second outage.
+        """
+        try:
+            _payload_in = message.payload if isinstance(message.payload, dict) else {}
+            _key = (str(state.name), f"{type(exc).__name__}: {str(exc)[:80]}")
+            _n = _handler_fail_seen.get(_key, 0) + 1
+            _handler_fail_seen[_key] = _n
+            _note = (
+                f"{state.name}.on_message raised "
+                f"{type(exc).__name__}: {str(exc)[:160]} while handling a "
+                f"'{message.kind}' from {message.agent} "
+                f"(ticker {_payload_in.get('ticker') or '-'}). "
+                f"The message was DROPPED -- whatever this handler does "
+                f"for that message is not happening."
+            )
+            # 1. The bus. NOTE the agent name: this message is published
+            #    AS the failing agent so _route skips that agent when it
+            #    routes this one -- a handler that crashes on everything
+            #    cannot crash on its own failure report and loop.
+            try:
+                await bus.publish(AgentMessage(
+                    agent=state.name, kind="error",
+                    payload={"event": "handler_failed",
+                             "agent": state.name,
+                             "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                             "trigger_agent": message.agent,
+                             "trigger_kind": message.kind,
+                             "ticker": _payload_in.get("ticker"),
+                             "occurrences": _n,
+                             "note": _note}))
+            except Exception:  # noqa: BLE001
+                pass
+            # 2. The activity log (survives a bus/Supabase outage).
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("handler_failed", str(_payload_in.get("ticker") or "SYSTEM"),
+                      strategy=_payload_in.get("strategy"),
+                      reason=_note, extra={"agent": state.name,
+                                           "occurrences": _n})
+            except Exception:  # noqa: BLE001
+                pass
+            # 3. The webhook, ONCE per agent+error (dedupe key), because
+            #    the same crash repeats on every message and nobody needs
+            #    a thousand pings -- one is what four days were missing.
+            if _n == 1:
+                try:
+                    from app.runtime.alerts import notify
+                    await notify(f"Trezo: {state.name} is dropping messages",
+                                 _note, severity="urgent",
+                                 key=f"handler_failed:{state.name}")
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            return
 
     bus.subscribe(_route)
 
