@@ -765,6 +765,69 @@ class RiskManagerAgent(Agent):
         except Exception:  # noqa: BLE001
             crowding_bump_v = 0
 
+        # ORDERING (2026-08-31): this per-book gate MUST stay above the
+        # confidence-bar sum below, which reads recovery_bump. It was
+        # written 150 lines further down, so every signal with a real
+        # direction raised UnboundLocalError inside on_message, the bus
+        # router swallowed it to stdout, and the platform approved
+        # nothing at all from 8/27 12:36 ET until this fix. Only vetoes
+        # from checks ABOVE the sum (neutral direction, flagged ticker)
+        # were still visible, which is why the log looked merely quiet.
+        # PER-BOOK kill-switches + weekly RECOVERY (Mike 2026-08-27:
+        # "the agents are not treating each book as their own book").
+        # The old shape here was two platform-wide vetoes — ANY user in
+        # daily drawdown paused all signals, and check_all's single
+        # verdict let one book's tripped weekly limit freeze all three
+        # (2026-08-27: primary at -8.0% vetoed 1,162 signals while the
+        # 25k/-1.6% and 75k/-2.7% books were healthy). Now: a signal is
+        # vetoed only when NO book can take it. Hard halts (daily /
+        # streak / session) block their book; a weekly trip puts its
+        # book in RECOVERY (speculative lanes suspended, half size,
+        # tighter stops — enforced per book at the execution fan-out).
+        # When every eligible book is recovering, the conviction bar
+        # rises by RECOVERY_TCS_BUMP here as well.
+        recovery_bump = 0
+        recovery_reason = ""
+        try:
+            from app.paper.killswitch import (
+                RECOVERY_TCS_BUMP, check_states, recovery_policy)
+            _states = await check_states(_supabase())
+        except Exception:  # noqa: BLE001
+            _states = {}
+        if _states:
+            _daily_over = set()
+            try:
+                _daily_over = await _users_in_daily_drawdown()
+            except Exception:  # noqa: BLE001
+                pass
+            _blocked_notes: list[str] = []
+            _n_recovering = 0
+            _n_open = 0
+            for _uid_b, _st in _states.items():
+                if _st.halted and _st.mode != "recovery":
+                    _blocked_notes.append(f"[{_st.scope}] {_st.reason}")
+                    continue
+                if _uid_b in _daily_over:
+                    _blocked_notes.append("daily $ loss limit (user setting)")
+                    continue
+                if _st.mode == "recovery":
+                    if recovery_policy(strategy) == "suspend":
+                        _blocked_notes.append(
+                            f"recovery suspends {strategy or 'this lane'}")
+                        continue
+                    _n_recovering += 1
+                    continue
+                _n_open += 1
+            if _n_open == 0 and _n_recovering == 0:
+                _why = "; ".join(sorted(set(_blocked_notes))[:3]) or "all books halted"
+                return [self._veto(
+                    ticker, tcs, f"Kill-switch [all books] - {_why}")]
+            if _n_open == 0 and _n_recovering > 0:
+                recovery_bump = int(RECOVERY_TCS_BUMP)
+                recovery_reason = (f", weekly recovery +{recovery_bump} "
+                                   f"({_n_recovering} book(s) working back)")
+
+
         # The confidence bar can be raised by the current regime posture,
         # the cycle-aware bump, the per-strategy outcome nudge, the
         # banked-paycheck bump, the margin-territory bump, and crowding.
@@ -912,60 +975,6 @@ class RiskManagerAgent(Agent):
                 _pressure_note = []
         else:
             _pressure_note = []
-
-        # PER-BOOK kill-switches + weekly RECOVERY (Mike 2026-08-27:
-        # "the agents are not treating each book as their own book").
-        # The old shape here was two platform-wide vetoes — ANY user in
-        # daily drawdown paused all signals, and check_all's single
-        # verdict let one book's tripped weekly limit freeze all three
-        # (2026-08-27: primary at -8.0% vetoed 1,162 signals while the
-        # 25k/-1.6% and 75k/-2.7% books were healthy). Now: a signal is
-        # vetoed only when NO book can take it. Hard halts (daily /
-        # streak / session) block their book; a weekly trip puts its
-        # book in RECOVERY (speculative lanes suspended, half size,
-        # tighter stops — enforced per book at the execution fan-out).
-        # When every eligible book is recovering, the conviction bar
-        # rises by RECOVERY_TCS_BUMP here as well.
-        recovery_bump = 0
-        recovery_reason = ""
-        try:
-            from app.paper.killswitch import (
-                RECOVERY_TCS_BUMP, check_states, recovery_policy)
-            _states = await check_states(_supabase())
-        except Exception:  # noqa: BLE001
-            _states = {}
-        if _states:
-            _daily_over = set()
-            try:
-                _daily_over = await _users_in_daily_drawdown()
-            except Exception:  # noqa: BLE001
-                pass
-            _blocked_notes: list[str] = []
-            _n_recovering = 0
-            _n_open = 0
-            for _uid_b, _st in _states.items():
-                if _st.halted and _st.mode != "recovery":
-                    _blocked_notes.append(f"[{_st.scope}] {_st.reason}")
-                    continue
-                if _uid_b in _daily_over:
-                    _blocked_notes.append("daily $ loss limit (user setting)")
-                    continue
-                if _st.mode == "recovery":
-                    if recovery_policy(strategy) == "suspend":
-                        _blocked_notes.append(
-                            f"recovery suspends {strategy or 'this lane'}")
-                        continue
-                    _n_recovering += 1
-                    continue
-                _n_open += 1
-            if _n_open == 0 and _n_recovering == 0:
-                _why = "; ".join(sorted(set(_blocked_notes))[:3]) or "all books halted"
-                return [self._veto(
-                    ticker, tcs, f"Kill-switch [all books] - {_why}")]
-            if _n_open == 0 and _n_recovering > 0:
-                recovery_bump = int(RECOVERY_TCS_BUMP)
-                recovery_reason = (f", weekly recovery +{recovery_bump} "
-                                   f"({_n_recovering} book(s) working back)")
 
         # Market regime + symbol-quality filter (Phase 8d) - stocks only.
         # Crypto trades 24/7 and is not tied to the US equity session.
