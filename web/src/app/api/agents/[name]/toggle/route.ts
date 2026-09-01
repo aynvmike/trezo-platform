@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwner } from "@/lib/auth-guards";
 
 export const dynamic = "force-dynamic";
 
@@ -9,15 +10,11 @@ export async function POST(
   request: Request,
   { params }: { params: { name: string } }
 ) {
-  // Auth guard — toggling an agent on/off is a state change, so a valid
-  // signed-in session is required before the request is proxied.
+  // Owner guard — toggling an agent on/off is a global state change.
+  // ADM-02: owner-only (TREZO_OWNER_USER_IDS allowlist; unset => 403).
   const supabase = createClient();
-  const {
-    data: { user }
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Not signed in." }, { status: 401 });
-  }
+  const guard = await requireOwner(supabase);
+  if (!guard.ok) return guard.response;
 
   try {
     const body = await request.json();

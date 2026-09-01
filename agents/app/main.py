@@ -841,11 +841,17 @@ async def stocks_reconcile():
 async def admin_manual_trade(user_id: str, ticker: str, side: str = "long",
                               stop_pct: float | None = None,
                               target_pct: float | None = None):
-    """Trigger a manual trade through the full Trezo chain — Risk
-    Manager → Trade Execution → current venue. Venue is determined by
-    trading_mode (paper today, flips to live when go-live is signed off
-    and _LIVE_EXECUTOR_AVAILABLE is True). The same button works for
-    both — no UI rework when live ships.
+    """Place a manual trade for ONE book. Trade Execution sizes and
+    submits it to the current venue (trading_mode: paper today; live only
+    once go-live is signed off and _LIVE_EXECUTOR_AVAILABLE is True).
+
+    Honest scope (TE-10): this endpoint BYPASSES the Risk Manager by
+    design -- the user clicked Place, so no TCS floor, staleness or
+    conviction veto is applied. What it does NOT bypass is the book: the
+    order is placed under bind_for_user(user_id) with the route verified
+    first, so a manual order for the 25k/75k book goes to that book's own
+    broker account. A book that cannot be resolved/verified returns an
+    error and places nothing (never falls back to the primary).
 
     `side` = 'long' (buy) or 'short' (sell). `stop_pct` / `target_pct`
     fall back to Bot Tuning defaults when omitted."""
@@ -869,41 +875,62 @@ async def admin_manual_trade(user_id: str, ticker: str, side: str = "long",
         payload["target_pct"] = float(target_pct)
 
     exec_agent = TradeExecutionAgent()
-    try:
-        msgs = await exec_agent._execute_for_user(user_id, sym, side, payload)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"Trade Execution raised: {e}"}
-
-    # Manual-trade UX: if sizing rejected with "Sizing produced 0 shares"
-    # but the user has buying power for at least 1 share, RETRY once with
-    # a forced 1-share quantity. The user explicitly clicked Place — they
-    # want a trade, not a math rejection. The result toast discloses the
-    # override so they know.
-    first_err = next((m for m in (msgs or []) if m.kind == "error"), None)
-    risk_override_applied = False
-    if first_err and "Sizing produced 0 shares" in str(first_err.payload.get("error", "")):
+    # TE-10: this handler called _execute_for_user with NOTHING bound, so
+    # the broker calls inside it (sizing read, order submit, the 1-share
+    # retry's get_account) went to whatever the ContextVar held -- the
+    # PRIMARY account -- regardless of which book was requested. Bind the
+    # requesting book and verify the route BEFORE any broker call, exactly
+    # as trade_execution's own single/fan-out paths do. An unresolvable or
+    # mis-bound book is refused here; nothing is placed.
+    from app.brokers.accounts import bind_for_user as _bind_acct
+    from app.brokers.route_guard import check_route as _check_route
+    from app.brokers.route_guard import record_mismatch as _rec_mm
+    with _bind_acct(user_id):
+        _ok, _note = _check_route(user_id)
+        if not _ok:
+            _rec_mm(sym, user_id, _note, "manual_trade")
+            log.error("admin.manual_trade.route_refused",
+                      user_id=str(user_id)[:8], ticker=sym, note=_note)
+            return {"ok": False,
+                    "error": f"Book not resolvable for manual trade -- "
+                             f"refusing rather than placing on the "
+                             f"default account: {_note}"}
         try:
-            from app.brokers.alpaca import alpaca_configured, get_account as _alp_acct
-            from app.data.candles import fetch_candles_for as _fc
-            acct = await _alp_acct() if alpaca_configured() else None
-            candles = await _fc(sym, "stock")
-            spot = float(candles[-1].close) if candles else 0.0
-            bp = float(acct.buying_power) if acct else 0.0
-            if spot > 0 and bp >= spot:
-                # Calculate the risk_pct that yields exactly 1 share.
-                # 1 share × stop_distance = risk_usd → risk_pct = risk_usd / equity
-                sp = float(payload.get("stop_pct") or 0.05)
-                stop_distance = spot * sp
-                equity = float(acct.equity) if acct else bp
-                if equity > 0 and stop_distance > 0:
-                    # Bump risk to just enough for 1 share, capped at 25%.
-                    needed_risk = min(0.25, (stop_distance / equity) * 1.05)
-                    payload["risk_pct_override"] = needed_risk
-                    payload["force_min_qty"] = 1
-                    msgs = await exec_agent._execute_for_user(user_id, sym, side, payload)
-                    risk_override_applied = True
-        except Exception:  # noqa: BLE001
-            pass
+            msgs = await exec_agent._execute_for_user(user_id, sym, side, payload)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"Trade Execution raised: {e}"}
+
+        # Manual-trade UX: if sizing rejected with "Sizing produced 0 shares"
+        # but the user has buying power for at least 1 share, RETRY once with
+        # a forced 1-share quantity. The user explicitly clicked Place — they
+        # want a trade, not a math rejection. The result toast discloses the
+        # override so they know. Stays INSIDE the binding: get_account and
+        # the retry submit must read/write the same book (TE-10).
+        first_err = next((m for m in (msgs or []) if m.kind == "error"), None)
+        risk_override_applied = False
+        if first_err and "Sizing produced 0 shares" in str(first_err.payload.get("error", "")):
+            try:
+                from app.brokers.alpaca import alpaca_configured, get_account as _alp_acct
+                from app.data.candles import fetch_candles_for as _fc
+                acct = await _alp_acct() if alpaca_configured() else None
+                candles = await _fc(sym, "stock")
+                spot = float(candles[-1].close) if candles else 0.0
+                bp = float(acct.buying_power) if acct else 0.0
+                if spot > 0 and bp >= spot:
+                    # Calculate the risk_pct that yields exactly 1 share.
+                    # 1 share × stop_distance = risk_usd → risk_pct = risk_usd / equity
+                    sp = float(payload.get("stop_pct") or 0.05)
+                    stop_distance = spot * sp
+                    equity = float(acct.equity) if acct else bp
+                    if equity > 0 and stop_distance > 0:
+                        # Bump risk to just enough for 1 share, capped at 25%.
+                        needed_risk = min(0.25, (stop_distance / equity) * 1.05)
+                        payload["risk_pct_override"] = needed_risk
+                        payload["force_min_qty"] = 1
+                        msgs = await exec_agent._execute_for_user(user_id, sym, side, payload)
+                        risk_override_applied = True
+            except Exception:  # noqa: BLE001
+                pass
 
     # Publish onto the bus so Position Monitor / Tax Optimizer etc. see it.
     from app.runtime.bus import bus as _bus
@@ -2062,8 +2089,9 @@ async def _startup_auto_repair() -> None:
         pass
 
     # (3) Full integrity sweep vs broker truth so cash, stock positions and
-    # option drift are all correct the moment the service returns (not at
-    # tick 2 / the hourly sweep). Aligns the internal ledger to the broker.
+    # broker-held options missing from the ledger are all correct the
+    # moment the service returns (not at tick 2 / the hourly sweep).
+    # Aligns the internal ledger to the broker.
     try:
         from app.paper.stocks_reconcile import run_integrity_sweep
         res = await run_integrity_sweep()
@@ -2071,11 +2099,16 @@ async def _startup_auto_repair() -> None:
             bal = res.get("balances") or {}
             stk = res.get("stocks") or {}
             opt = res.get("options") or {}
+            # G13: the options step is import_orphan_options_all_users and
+            # returns {ok, imported, skipped, details}; "mismatches" was a
+            # key of the deleted detect_option_drift and always logged None.
             log.info("agents.startup_integrity_sweep.done",
                      cash_synced=bal.get("synced"),
                      stocks_closed=stk.get("closed"),
                      stocks_updated=stk.get("updated"),
-                     option_mismatches=opt.get("mismatches"))
+                     options_imported=opt.get("imported"),
+                     options_skipped=opt.get("skipped"),
+                     options_error=opt.get("error"))
     except Exception as e:  # noqa: BLE001
         log.error("agents.startup_integrity_sweep.FAILED", error=str(e))
 
@@ -2161,7 +2194,9 @@ async def account_check() -> dict:
 @app.get("/integrity-check", tags=["ops"])
 async def integrity_check() -> dict:
     """Run the full self-healing sweep on demand: sync the cash ledger to the
-    broker, reconcile stock positions, and report option-position drift.
+    broker, reconcile stock positions, and import broker-held option
+    positions the ledger is missing (the options step returns
+    {ok, imported, skipped, details} -- there is no drift report; G13).
     Idempotent and safe to call repeatedly."""
     from app.paper.stocks_reconcile import run_integrity_sweep
     return await run_integrity_sweep()

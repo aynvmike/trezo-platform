@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { LayerHero } from "@/components/dashboard/layer-hero";
 import { createClient } from "@/lib/supabase/server";
 import { CryptoCards } from "@/components/widgets/crypto-card";
+import { LoadError, loadResult } from "@/components/dashboard/load-error";
 import { cn } from "@/lib/utils";
 
 import { Disclosure } from "@/components/ui/disclosure";
@@ -44,12 +45,15 @@ export default async function CryptoPage() {
       .limit(15)
   ]);
 
-  const openCrypto = openRes.data ?? [];
-  const cryptoSignals = scanRes.data ?? [];
+  // PAGES-03: keep "read failed" distinct from "nothing there".
+  const openLoad = loadResult("paper_positions", openRes, []);
+  const scanLoad = loadResult("agent_messages", scanRes, []);
+  const openCrypto = openLoad.data ?? [];
+  const cryptoSignals = scanLoad.data ?? [];
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <LayerHero id={1} openCount={openCrypto.length} />
+      <LayerHero id={1} openCount={openLoad.failure ? undefined : openCrypto.length} />
 
       <section>
         <h2 className="font-serif text-xl text-weave-800 mb-3">Live prices</h2>
@@ -61,11 +65,13 @@ export default async function CryptoPage() {
         <h2 className="font-serif text-xl text-weave-800 mb-3">
           Recent crypto signals <span className="text-sm text-weave-500">({cryptoSignals.length})</span>
         </h2>
-        {cryptoSignals.length === 0 ? (
+        {scanLoad.failure ? (
+          <LoadError {...scanLoad.failure} />
+        ) : cryptoSignals.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No crypto signals yet. The scanner emits one when a coin&apos;s RSI,
             Bollinger width, and volume line up for a SCALP / SWING / DCA setup
-            and the Trade Confidence Score clears 650.
+            and the Trade Confidence Score clears the crypto floor (35 by default on the 0–100 scale, or the book&apos;s own threshold if lower).
           </div>
         ) : (
           <div className="rounded-xl border border-weave-100 bg-white overflow-hidden overflow-x-auto">
@@ -121,7 +127,9 @@ export default async function CryptoPage() {
         <h2 className="font-serif text-xl text-weave-800 mb-3">
           Open crypto positions <span className="text-sm text-weave-500">({openCrypto.length})</span>
         </h2>
-        {openCrypto.length === 0 ? (
+        {openLoad.failure ? (
+          <LoadError {...openLoad.failure} />
+        ) : openCrypto.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No open crypto positions.
           </div>

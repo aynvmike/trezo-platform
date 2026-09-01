@@ -14,6 +14,7 @@ import {
   type FilingStatus
 } from "@/lib/tax";
 import { TaxStrategySection } from "./_tax-strategy-section";
+import { LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -44,17 +45,26 @@ export default async function TaxPage() {
       .maybeSingle()
   ]);
 
-  const positions = (posRes.data ?? []) as ClosedPosition[];
+  // PAGES-03: this page used to show "$0 owed" when the positions query
+  // failed. Every input to the estimate is now checked; if any of them
+  // failed the estimate is not computed at all (see the early return).
+  const posLoad = loadResult<ClosedPosition[]>("paper_positions", posRes, []);
+  const positions = posLoad.data ?? [];
 
   // #122: closed options positions feed the tax math too. Each is
   // mapped to the closed-position shape the tax engine expects.
-  const { data: optRows } = await supabase
-    .from("options_positions")
-    .select("id, underlying, contracts, realized_pnl_usd, status, created_at, closed_at")
-    .eq("user_id", user.id)
-    .neq("status", "open")
-    .not("realized_pnl_usd", "is", null);
-  const optionPositions: ClosedPosition[] = (optRows ?? []).map((opt) => ({
+  const optLoad = loadResult(
+    "options_positions",
+    await supabase
+      .from("options_positions")
+      .select("id, underlying, contracts, realized_pnl_usd, status, created_at, closed_at")
+      .eq("user_id", user.id)
+      .neq("status", "open")
+      .not("realized_pnl_usd", "is", null),
+    []
+  );
+  const optRows = optLoad.data ?? [];
+  const optionPositions: ClosedPosition[] = optRows.map((opt) => ({
     id: opt.id as string,
     ticker: `${opt.underlying} (option)`,
     side: "option",
@@ -70,7 +80,9 @@ export default async function TaxPage() {
   // the price-based ledger below stay stock-only (options have no
   // comparable per-share entry/exit price).
   const allClosed: ClosedPosition[] = [...positions, ...optionPositions];
-  const profile = profRes.data ?? {
+  // A missing profile row is a legitimate "use defaults"; a failed read is not.
+  const profLoad = loadResult("profiles", profRes);
+  const profile = profLoad.data ?? {
     tax_filing_status: "single",
     annual_income_usd: 0,
     state_tax_rate_pct: 0,
@@ -91,33 +103,79 @@ export default async function TaxPage() {
   const withholdingPct = Number(profile.withholding_set_aside_pct ?? 25);
 
   // KINDRIP child-account contributions — feed the Tax Strategy section.
-  const { data: kChildren } = await supabase
-    .from("kindrip_children")
-    .select("id, total_contributed_usd")
-    .eq("user_id", user.id);
-  const kidIds = (kChildren ?? []).map((c) => c.id as string);
+  const kidsLoad = loadResult(
+    "kindrip_children",
+    await supabase
+      .from("kindrip_children")
+      .select("id, total_contributed_usd")
+      .eq("user_id", user.id),
+    []
+  );
+  const kChildren = kidsLoad.data ?? [];
+  const kidIds = kChildren.map((c) => c.id as string);
   let contributedYtd = 0;
+  let kTxnFailure = null as ReturnType<typeof loadResult>["failure"];
   if (kidIds.length > 0) {
     const yearStart = `${new Date().getFullYear()}-01-01`;
-    const { data: kTxns } = await supabase
-      .from("kindrip_transactions")
-      .select("amount_usd")
-      .in("child_id", kidIds)
-      .in("kind", ["contribution", "federal_seed"])
-      .gte("created_at", yearStart);
-    contributedYtd = (kTxns ?? []).reduce(
+    const kTxnLoad = loadResult(
+      "kindrip_transactions",
+      await supabase
+        .from("kindrip_transactions")
+        .select("amount_usd")
+        .in("child_id", kidIds)
+        .in("kind", ["contribution", "federal_seed"])
+        .gte("created_at", yearStart),
+      []
+    );
+    kTxnFailure = kTxnLoad.failure;
+    contributedYtd = (kTxnLoad.data ?? []).reduce(
       (sum, t) => sum + Number(t.amount_usd || 0),
       0
     );
   }
+  // Fatal for the estimate: anything that feeds gains or the bracket.
+  const estimateFailures = failuresOf(posLoad, optLoad, profLoad);
+  // Non-fatal: only the Tax Strategy child-account panel depends on these.
+  const sideFailures = [
+    ...failuresOf(kidsLoad),
+    ...(kTxnFailure ? [kTxnFailure] : [])
+  ];
   const childAccounts = {
-    childCount: (kChildren ?? []).length,
+    childCount: kChildren.length,
     contributedYtd,
-    totalContributed: (kChildren ?? []).reduce(
+    totalContributed: kChildren.reduce(
       (sum, c) => sum + Number(c.total_contributed_usd || 0),
       0
     )
   };
+
+  const pageHeader = (
+    <PageHeader
+      eyebrow="Tax Optimizer"
+      title="Tax position"
+      subtitle="Real-time tax-impact tracker — set-aside estimate, harvest opportunities, account-type explanations."
+      explainer="A running estimate of what this year's realized trading gains could cost you, so there are no April surprises. Built from every closed paper position."
+      action={
+        <a href="/api/tax/export" className="text-sm rounded-md border border-weave-300 px-4 py-2 text-weave-700 hover:bg-weave-50">
+          Export Schedule D CSV
+        </a>
+      }
+    />
+  );
+
+  if (estimateFailures.length > 0) {
+    // PAGES-03: no estimate at all rather than a confident "$0 owed".
+    return (
+      <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
+        {pageHeader}
+        <LoadErrors failures={[...estimateFailures, ...sideFailures]} />
+        <p className="text-sm text-weave-500 leading-relaxed">
+          The tax estimate needs every closed position and your profile to
+          be readable. Nothing has been computed for this page load.
+        </p>
+      </div>
+    );
+  }
 
   const gains = summarizeGains(allClosed);
   const washSales = detectWashSales(positions);
@@ -130,17 +188,9 @@ export default async function TaxPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <PageHeader
-        eyebrow="Tax Optimizer"
-        title="Tax position"
-        subtitle="Real-time tax-impact tracker — set-aside estimate, harvest opportunities, account-type explanations."
-        explainer="A running estimate of what this year's realized trading gains could cost you, so there are no April surprises. Built from every closed paper position."
-        action={
-          <a href="/api/tax/export" className="text-sm rounded-md border border-weave-300 px-4 py-2 text-weave-700 hover:bg-weave-50">
-            Export Schedule D CSV
-          </a>
-        }
-      />
+      {pageHeader}
+
+      <LoadErrors failures={sideFailures} />
 
       {/* Disclaimer — prominent, per Trezo brand + Nova's standards */}
       <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 leading-relaxed">

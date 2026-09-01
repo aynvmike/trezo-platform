@@ -2,19 +2,22 @@
 
 import { createClient } from "@/lib/supabase/server";
 
+/**
+ * PAGES-04: the wizard used to collect broker / paper-live mode / active
+ * layers too, and silently dropped all three. Only the daily loss cap
+ * maps to a real column, so only it is accepted here. Broker connect
+ * lives on Settings → Connections; trading mode is paper (the live
+ * executor does not exist); layers are switched on in Bot Tuning.
+ */
 export type TourConfig = {
-  broker: string;
-  mode: "paper" | "live";
-  activeLayers: number[];
   dailyRiskLimit: number;
 };
 
 /**
- * Persists what maps cleanly to a known column today: the daily loss cap
- * (profiles.daily_loss_limit_usd — the same value the Trading page + Risk
- * Manager read). Broker connect lives on the Connections page; paper/live
- * routing stays env-gated (Phase 10b); per-layer enablement is informational
- * here. Best-effort: never throws into the wizard.
+ * Persists the daily loss cap to profiles.daily_loss_limit_usd — the
+ * same value the Trading page and Risk Manager read. Best-effort: never
+ * throws into the wizard, but a failed write is reported as ok:false
+ * (and logged) rather than swallowed.
  */
 export async function saveTourSettings(config: TourConfig): Promise<{ ok: boolean }> {
   try {
@@ -24,7 +27,14 @@ export async function saveTourSettings(config: TourConfig): Promise<{ ok: boolea
     } = await supabase.auth.getUser();
     if (!user) return { ok: false };
     const limit = Math.max(0, Math.round(Number(config.dailyRiskLimit) || 0));
-    await supabase.from("profiles").update({ daily_loss_limit_usd: limit }).eq("user_id", user.id);
+    const { error } = await supabase
+      .from("profiles")
+      .update({ daily_loss_limit_usd: limit })
+      .eq("user_id", user.id);
+    if (error) {
+      console.error(`[onboarding/tour] profiles update failed: ${error.message}`);
+      return { ok: false };
+    }
     return { ok: true };
   } catch {
     return { ok: false };

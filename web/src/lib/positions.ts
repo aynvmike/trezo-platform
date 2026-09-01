@@ -134,9 +134,12 @@ export const YIELDMAX_LIBRARY: { ticker: string; name: string }[] =
 
 /**
  * The user's dividend-layer holdings — exactly what they hold. Returns
- * [] for a new user (nothing is auto-seeded).
+ * [] for a new user (nothing is auto-seeded) and `null` when the read
+ * itself failed, so a broken query can never look like an empty book
+ * (PAGES-03 — the page used to render "No dividend holdings yet" on a
+ * failed read). Callers must branch on null.
  */
-export async function getYieldMaxPositions(userId: string): Promise<PositionRow[]> {
+export async function getYieldMaxPositions(userId: string): Promise<PositionRow[] | null> {
   const supabase = createClient();
   const { data, error } = await supabase
     .from("user_positions")
@@ -147,6 +150,9 @@ export async function getYieldMaxPositions(userId: string): Promise<PositionRow[
     .eq("asset_type", "yieldmax")
     .order("ticker");
 
-  if (error) return [];
+  if (error) {
+    console.error(`[load] user_positions: ${error.message}`);
+    return null;
+  }
   return (data ?? []) as PositionRow[];
 }

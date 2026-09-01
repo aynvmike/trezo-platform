@@ -43,6 +43,12 @@ from .base import Agent, AgentMessage
 
 
 def _autonomy_mode() -> str:
+    # BI-03 (reviewed, deliberately left per-primary): scope adjustments
+    # are ONE engine-wide posture (`scope_state`), not a per-book
+    # decision, so there is no per-book value to read here. The anchor
+    # book's autonomy_mode governs whether the shared scope may act.
+    # Per-book gating of what each book actually TRADES happens in the
+    # fan-out (book_gate), which reads that book's own row.
     try:
         from app.runtime.settings import get_bot_settings
         return getattr(get_bot_settings(), "autonomy_mode", "guarded") or "guarded"

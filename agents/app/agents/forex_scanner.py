@@ -41,11 +41,16 @@ class ForexScannerAgent(Agent):
     _last_hb: float = 0.0
 
     async def tick(self) -> list[AgentMessage]:
-        from app.runtime.settings import get_bot_settings
-        cfg = get_bot_settings()
-        _setting = getattr(cfg, "forex_enabled", None)
-        enabled = (bool(_setting) if _setting is not None
-                   else os.getenv("TREZO_FOREX_ENABLED", "1") != "0")
+        from app.runtime.settings import (
+            lane_enabled_any, min_tcs_floor_across_books,
+        )
+        # BI-03: a bare get_bot_settings() is the PRIMARY book's opinion;
+        # this scanner feeds every book. bot_settings has no forex toggle
+        # yet, so a book without the field counts as the env default --
+        # exactly the pre-existing behaviour, now asked of every book.
+        enabled = lane_enabled_any(
+            "forex_enabled",
+            default=os.getenv("TREZO_FOREX_ENABLED", "1") != "0")
         if not enabled:
             return [AgentMessage(
                 agent=self.name, kind="info",
@@ -103,7 +108,9 @@ class ForexScannerAgent(Agent):
         fired = 0
         top_tcs = 0
         detail: list[dict] = []
-        tcs_floor = int(getattr(cfg, "tcs_threshold", 70) or 70)
+        # BI-03: the LOWEST enabled book's floor; the fan-out re-applies
+        # each book's own.
+        tcs_floor = int(min_tcs_floor_across_books() or 70)
 
         for pair in FOREX_WATCHLIST:
             if pair not in FOREX_MAJORS:

@@ -80,6 +80,7 @@ def plan_position(
     risk_pct: Optional[float] = None,
     asset_type: str = "stock",
     buying_power: Optional[float] = None,
+    user_id: Optional[str] = None,
 ) -> SizingPlan:
     """Build a defined-risk position plan, sized off current account equity.
 
@@ -88,6 +89,12 @@ def plan_position(
     document default. The position is the risk-based size unless that would
     need more buying power than the account has, in which case it is capped
     (and `capped` is set so the caller can see the dialed risk was limited).
+
+    `user_id` (RR-3 / RM-6) names the BOOK being sized: its Bot Tuning row
+    supplies the concentration cap and the reward:risk floor. Execution
+    passes the executing book explicitly; a bare call (None) falls back to
+    get_bot_settings()' ambient resolution, which is only right when the
+    caller has already bound that book.
     """
     tier = account_tier(max(0.0, equity))
 
@@ -128,7 +135,7 @@ def plan_position(
         pass
     try:
         from app.runtime.settings import get_bot_settings as _gbs2
-        _bs = _gbs2()
+        _bs = _gbs2(user_id)   # RR-3: THIS book's cap, not the ambient row
         _user_cap = getattr(_bs, "max_position_pct", None)
         if _user_cap is not None and 0.01 <= float(_user_cap) <= 1.0:
             cap_pct = float(_user_cap)
@@ -173,9 +180,13 @@ def plan_position(
         reward_risk = round(reward / stop_distance, 2)
         # Per-user floor from Bot Tuning. Falls back to the seed (1.5)
         # if the settings module isn't reachable.
+        # RR-3 / RM-6: read THIS book's floor by name. The bare read judged
+        # every executing book against whatever row the ambient binding
+        # resolved to -- 134 rejections 'Reward:risk 0.4 below your 0.5
+        # floor' while the fan-out had already bound a different book.
         try:
             from app.runtime.settings import get_bot_settings as _gbs
-            floor = float(_gbs().min_reward_risk or MIN_REWARD_RISK)
+            floor = float(_gbs(user_id).min_reward_risk or MIN_REWARD_RISK)
         except Exception:  # noqa: BLE001
             floor = MIN_REWARD_RISK
         # Clamp to a sane band so a typo can't disable the floor entirely.

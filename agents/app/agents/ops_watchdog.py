@@ -13,18 +13,23 @@ This agent watches the agent layer. Every 5 minutes it:
      we EXPECT to be loaded. Any agent missing from the registry
      gets a critical alert.
 
-  2. For each registered agent, checks `last_tick_at` (or
-     last-message-seen as fallback). If a scanner has been silent
-     for more than its tick interval times a tolerance multiplier
-     during US market hours, raise an alert.
+  2. For each registered agent, checks `last_tick_at`. If a scanner
+     has been silent for longer than its tolerance during US market
+     hours, raise an alert. Event-driven agents (tick_interval_seconds
+     <= 0) never tick by design and are exempt from this check
+     outright (REG-05).
 
-  3. Persists alerts to the new `ops_health_alerts` table (RLS off
-     - this is platform-level monitoring, not per-user). The UI
-     surfaces these as a "System health" panel on the Trading page.
+  3. Persists alerts to the `ops_health_alerts` table (RLS off - this
+     is platform-level monitoring, not per-user). The UI surfaces
+     these as a "System health" panel on the Trading page.
 
-  4. When a scanner is stuck, can optionally force-tick it via the
-     internal `_tick_agent` helper. Gated by `OPS_AUTO_TICK_STUCK`
-     setting so Mike can choose between alert-only and auto-recover.
+  4. FLOW SENSOR, per lane (NET2-GLOBAL / NET2-COUNT-BEFORE-KILL):
+     tallies signals, approves, vetoes, executes, execution kills and
+     handler crashes off the bus, keyed by lane (stock / crypto /
+     option / ...), and alarms per lane when signals produce no
+     approvals or when approvals produce no fills (NET2-REV-01). See
+     _check_flow(). There is no auto-tick and never was: the watchdog
+     alerts, a human (or the ops relay) restarts.
 
 What this CANNOT do:
   - Recover from a complete bootstrap failure (it can't tick if it's
@@ -75,8 +80,8 @@ EXPECTED_AGENTS: list[tuple[str, int]] = [
     ("portfolio_architect", 750), # 6-hour tick
     ("forex_scanner", 20),        # 3-min tick; ticks even while dormant
     ("options_scanner", 65),      # 30-min tick + occasional skip
-    ("risk_manager", 240),        # event-driven, may sit quiet legitimately
-    ("trade_execution", 240),     # event-driven downstream of risk_manager
+    ("risk_manager", 240),        # event-driven (interval 0): Check 1 only, REG-05
+    ("trade_execution", 240),     # event-driven (interval 0): Check 1 only, REG-05
     ("position_monitor", 30),     # ticks frequently
     ("exit_advisor", 30),
     ("exit_advisor_options", 30),
@@ -89,7 +94,7 @@ EXPECTED_AGENTS: list[tuple[str, int]] = [
     ("tax_optimizer", 360 + 60),
     ("kindrip", 360 + 60),
     ("strategy_discovery", 360 + 60),
-    ("user_support", 1440),       # cold-path agent
+    ("user_support", 1440),       # event-driven (interval 0): Check 1 only, REG-05
     ("relay_ingest", 60),         # drains Nova's briefings every 5 min
     ("ops_watchdog", 10),         # this agent itself - silence detector
 ]
@@ -128,6 +133,67 @@ _BOOT_AT = datetime.now(timezone.utc)
 # counts as evidence. Tunable by env for a noisy or a very thin book.
 FLOW_WINDOW_MIN = float(_os.getenv("TREZO_FLOW_WINDOW_MIN", "20") or 20)
 FLOW_MIN_SIGNALS = int(float(_os.getenv("TREZO_FLOW_MIN_SIGNALS", "15") or 15))
+# NET2-COUNT-BEFORE-KILL: alarm B needs at least this many approvals in
+# the window before "every one of them died at execution" is evidence.
+FLOW_MIN_APPROVES_FOR_KILL = 3
+
+# NET2-GLOBAL: the flow counters are keyed by LANE. A single global
+# count let one crypto approve (24/7 lane) silence a starving stock lane
+# for the whole of the equity starvation. Lane comes from the payload:
+# "lane" on execution outcomes, "asset_type" on signal/approve/veto
+# (forex and dividend_lt stamp it); equity spellings fold to "stock".
+#
+# BOUND, not just built: the equity scanners (pattern_detection, stms,
+# orb, extended) and crypto_scanner stamp NO asset_type at all, so an
+# unlabelled message is classified exactly the way trade_execution
+# classifies it before routing (its line "crypto if ticker in
+# CRYPTO_SYMBOLS else stock", from the same COIN_MAP): the lanes the
+# watchdog counts are the lanes the executor trades. A message with no
+# ticker at all (heartbeats, import errors) is "unknown".
+_LANE_ALIASES = {"us_equity": "stock", "stock": "stock", "stocks": "stock",
+                 "etf": "stock", "equity": "stock"}
+_CRYPTO_SYMBOLS: Optional[set] = None
+
+
+def _crypto_symbols() -> set:
+    global _CRYPTO_SYMBOLS
+    if _CRYPTO_SYMBOLS is None:
+        try:
+            from app.data.candles import COIN_MAP
+            _CRYPTO_SYMBOLS = {str(s).upper() for s in COIN_MAP.keys()}
+        except Exception:  # noqa: BLE001
+            _CRYPTO_SYMBOLS = {"XRP", "ETH", "SOL", "BTC"}
+    return _CRYPTO_SYMBOLS
+
+
+def _lane_of(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "unknown"
+    raw = payload.get("lane") or payload.get("asset_type")
+    if raw:
+        raw = str(raw).strip().lower()
+        if raw:
+            return _LANE_ALIASES.get(raw, raw)
+    # Unlabelled: mirror trade_execution's own ticker-derived split.
+    if str(payload.get("strategy") or "").lower().startswith("crypto"):
+        return "crypto"
+    ticker = str(payload.get("ticker") or "").strip().upper()
+    if not ticker:
+        return "unknown"
+    if "/" in ticker or ticker in _crypto_symbols():
+        return "crypto"
+    return "stock"
+
+
+def _new_lane_counters() -> dict[str, Any]:
+    return {"signals": 0, "approves": 0, "vetoes": 0, "executes": 0,
+            "kills": 0, "handler_fails": 0, "kill_reasons": {}}
+
+
+def _lane_market_applies(lane: str, market_open: bool) -> bool:
+    """Crypto trades around the clock; every other lane is judged only
+    during US market hours so a quiet evening cannot cry wolf."""
+    return True if lane == "crypto" else market_open
 
 
 _JANITOR_DAY = ""   # daily agent_messages purge marker (2026-07-07)
@@ -146,35 +212,69 @@ class OpsWatchdogAgent(Agent):
         # In-memory dedupe: don't re-alert the same condition every tick
         # while it persists. Keyed by (alert_kind, target_name).
         self._open_alerts: set[tuple[str, str]] = set()
-        # APPROVAL STARVATION counters (2026-08-31). See _check_flow().
-        self._flow: dict[str, float] = {
-            "signals": 0, "approves": 0, "vetoes": 0,
-            "handler_fails": 0, "since": _time.time(),
-        }
+        # Flow counters (2026-08-31), keyed by LANE since NET2-GLOBAL.
+        # {"since": epoch, "lanes": {lane: _new_lane_counters()}}.
+        self._flow: dict[str, Any] = {"since": _time.time(), "lanes": {}}
+
+    def _lane(self, name: str) -> dict[str, Any]:
+        return self._flow["lanes"].setdefault(name, _new_lane_counters())
 
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
-        # Count the shape of the decision pipeline. Deliberately free:
-        # no I/O, no awaits, just tallies read by _check_flow() on the
-        # 5-minute tick. This is the sensor for the outage that ran from
-        # 8/27 to 8/31 -- signals firing, nothing approved, and the only
-        # visible messages were vetoes from checks upstream of the crash.
+        # Count the shape of the decision pipeline, PER LANE. Deliberately
+        # free: no I/O, no awaits, just tallies read by _check_flow() on
+        # the 5-minute tick. This is the sensor for the outage that ran
+        # from 8/27 to 8/31 -- signals firing, nothing approved, and the
+        # only visible messages were vetoes from checks upstream of the
+        # crash. It runs on EVERY bus message, so it must never raise.
         try:
             k = message.kind
+            p = message.payload if isinstance(message.payload, dict) else {}
+            lane = self._lane(_lane_of(p))
             if k == "signal":
-                self._flow["signals"] += 1
+                lane["signals"] += 1
             elif k == "approve":
-                self._flow["approves"] += 1
+                lane["approves"] += 1
             elif k == "veto":
-                self._flow["vetoes"] += 1
-            elif k == "error" and isinstance(message.payload, dict) and (
-                    message.payload.get("event") == "handler_failed"):
-                self._flow["handler_fails"] += 1
+                lane["vetoes"] += 1
+            elif k == "execute":
+                lane["executes"] += 1
+            elif k == "error":
+                ev = p.get("event")
+                if ev == "handler_failed":
+                    lane["handler_fails"] += 1
+                    # NET2-REV-01: the executor CRASHING on an approve is
+                    # an approve that died at execution, not "nothing".
+                    # bootstrap publishes handler_failed with agent +
+                    # trigger_kind; without this arm a trade_execution
+                    # that raised on every approve read as executes=0,
+                    # kills=0 -- the 8/27 shape, one agent downstream.
+                    if (str(p.get("agent") or "") == "trade_execution"
+                            and str(p.get("trigger_kind") or "") == "approve"):
+                        lane["kills"] += 1
+                        reason = str(p.get("error")
+                                     or "(executor crashed)")[:80]
+                        rs = lane["kill_reasons"]
+                        rs[reason] = rs.get(reason, 0) + 1
+                elif ev == "execute_error" or (
+                        ev is None
+                        and getattr(message, "agent", "") == "trade_execution"
+                        and "error" in p):
+                    # NET2-COUNT-BEFORE-KILL: an approve that died at
+                    # execution never came out the far end. Contract:
+                    # trade_execution kind="error" with
+                    # event="execute_error" and "lane"; the second arm
+                    # also accepts the older event-less error shape.
+                    lane["kills"] += 1
+                    reason = str(p.get("error") or p.get("reason")
+                                 or "(no reason given)")[:80]
+                    rs = lane["kill_reasons"]
+                    rs[reason] = rs.get(reason, 0) + 1
         except Exception:  # noqa: BLE001
             pass
         return []
 
     async def _check_flow(self) -> list[AgentMessage]:
-        """Alarm when signals go in and NOTHING comes out.
+        """Alarm, PER LANE, when signals go in and nothing comes out.
 
         THE CASE THIS EXISTS FOR (2026-08-31): risk_manager.on_message
         raised on every signal carrying a real direction. The router
@@ -183,14 +283,30 @@ class OpsWatchdogAgent(Agent):
         looked merely quiet. Every other check here asks "is this agent
         ticking?" and every one of them said yes.
 
-        So this check asks the question the outage would have failed:
-        did anything get APPROVED? A window with plenty of signals, zero
-        approvals and no explanatory vetoes is not a slow tape -- the
-        pipeline is broken somewhere between the scanners and execution.
+        Two shapes, each judged per lane:
 
-        Thresholds are deliberately dull: market hours only, at least
-        MIN_SIGNALS observed, and the window must be at least
-        FLOW_WINDOW_MIN long, so a quiet morning cannot cry wolf.
+          A. APPROVAL STARVATION -- at least FLOW_MIN_SIGNALS signals in
+             the lane and zero approvals. The original check.
+             NET2-GLOBAL: it used to count globally, so one crypto
+             approve (a 24/7 lane) silenced it while the stock lane
+             starved for days.
+          B. EXECUTION STARVATION -- at least FLOW_MIN_APPROVES_FOR_KILL
+             approvals and zero executes: the gate said yes and nothing
+             filled. The note splits them into killed-with-a-reason
+             (execute_error, or the executor crashing on the approve)
+             and vanished (no outcome at all: a kind="info" skip, a
+             disabled executor, a dropped message).
+             NET2-COUNT-BEFORE-KILL: approvals were counted at approve
+             time, so an approve killed at execution still read as "the
+             pipeline works" through the whole equity starvation. The
+             alert names the top kill reason. NET2-REV-01: the first
+             cut required kills >= approves, which an approve that
+             simply vanished could never satisfy.
+
+        Thresholds are deliberately dull: the window must be at least
+        FLOW_WINDOW_MIN long and each lane is judged only when its
+        market applies (stock/option/...: US market hours; crypto:
+        always), so a quiet morning cannot cry wolf.
         """
         out: list[AgentMessage] = []
         f = self._flow
@@ -199,57 +315,124 @@ class OpsWatchdogAgent(Agent):
             return out
         # Reset the window whatever we decide, so one bad window does not
         # poison the next one.
-        signals, approves = int(f["signals"]), int(f["approves"])
-        vetoes, hfails = int(f["vetoes"]), int(f["handler_fails"])
-        self._flow = {"signals": 0, "approves": 0, "vetoes": 0,
-                      "handler_fails": 0, "since": _time.time()}
+        lanes = dict(f.get("lanes") or {})
+        self._flow = {"since": _time.time(), "lanes": {}}
 
-        if not _us_market_open():
-            return out
-        if signals < FLOW_MIN_SIGNALS:
-            return out                      # too thin to conclude anything
-        if approves > 0:
-            self._open_alerts.discard(("approval_starvation", "pipeline"))
-            return out
-
-        # Zero approvals on real signal flow. Say which shape it is:
-        # accounted-for (every signal has a veto) vs UNACCOUNTED, which
-        # is the dangerous one -- signals going in and nothing at all
-        # coming out is a crash, not a decision.
-        unaccounted = max(0, signals - vetoes)
-        shape = (f"{vetoes} veto(es) explain them"
-                 if unaccounted == 0 else
-                 f"{unaccounted} of them produced NO verdict at all -- "
-                 f"not an approval, not a veto")
-        msg = (
-            f"APPROVAL STARVATION: {signals} signal(s) in "
-            f"{window_min:.0f} min of market hours produced ZERO "
-            f"approvals; {shape}"
-            + (f"; {hfails} handler crash(es) reported" if hfails else "")
-            + ". A silent pipeline is what the 8/27-8/31 outage looked "
-              "like: every agent ticking, nothing traded. Check "
-              "risk_manager first, then trade_execution."
-        )
-        key = ("approval_starvation", "pipeline")
-        if key not in self._open_alerts:
-            self._open_alerts.add(key)
-            await self._persist_alert(
-                kind="approval_starvation", target="pipeline",
-                severity="urgent" if unaccounted else "warn", message=msg)
+        market_open = _us_market_open()
+        for lane in sorted(lanes):
+            if not _lane_market_applies(lane, market_open):
+                continue
             try:
-                from app.runtime.alerts import notify
-                await notify("Trezo: nothing is being approved", msg,
-                             severity="urgent", key="approval_starvation")
-            except Exception:  # noqa: BLE001
-                pass
-        out.append(AgentMessage(
-            agent=self.name, kind="error",
-            payload={"event": "approval_starvation", "signals": signals,
-                     "approves": 0, "vetoes": vetoes,
-                     "unaccounted": unaccounted,
-                     "handler_failures": hfails,
-                     "window_min": round(window_min, 1), "note": msg}))
+                out.extend(await self._judge_lane(lane, lanes[lane], window_min))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ops_watchdog flow check failed for lane %s: %s",
+                               lane, e)
         return out
+
+    async def _judge_lane(self, lane: str, c: dict[str, Any],
+                          window_min: float) -> list[AgentMessage]:
+        out: list[AgentMessage] = []
+        signals, approves = int(c.get("signals", 0)), int(c.get("approves", 0))
+        vetoes, hfails = int(c.get("vetoes", 0)), int(c.get("handler_fails", 0))
+        executes, kills = int(c.get("executes", 0)), int(c.get("kills", 0))
+        key_a = ("approval_starvation", lane)
+        key_b = ("execution_starvation", lane)
+
+        # ---- A: signals in, nothing approved ---------------------------
+        if signals >= FLOW_MIN_SIGNALS and approves == 0:
+            # Say which shape it is: accounted-for (every signal has a
+            # veto) vs UNACCOUNTED, which is the dangerous one -- signals
+            # going in and nothing at all coming out is a crash, not a
+            # decision.
+            unaccounted = max(0, signals - vetoes)
+            shape = (f"{vetoes} veto(es) explain them"
+                     if unaccounted == 0 else
+                     f"{unaccounted} of them produced NO verdict at all -- "
+                     f"not an approval, not a veto")
+            msg = (
+                f"APPROVAL STARVATION [{lane}]: {signals} signal(s) in "
+                f"{window_min:.0f} min produced ZERO approvals on the "
+                f"{lane} lane; {shape}"
+                + (f"; {hfails} handler crash(es) reported" if hfails else "")
+                + ". A silent pipeline is what the 8/27-8/31 outage looked "
+                  "like: every agent ticking, nothing traded. Check "
+                  "risk_manager first, then trade_execution."
+            )
+            await self._raise_flow(
+                key_a, severity="urgent" if unaccounted else "warn",
+                title=f"Trezo: nothing is being approved ({lane})", msg=msg)
+            out.append(AgentMessage(
+                agent=self.name, kind="error",
+                payload={"event": "approval_starvation", "lane": lane,
+                         "signals": signals, "approves": 0,
+                         "vetoes": vetoes, "unaccounted": unaccounted,
+                         "handler_failures": hfails,
+                         "window_min": round(window_min, 1), "note": msg}))
+        elif approves > 0:
+            # NET2-REV-02: only RECOVERY (an approval) clears the dedupe.
+            # A thin or empty window is inconclusive; clearing on it
+            # re-pinged the webhook every other window while the lane
+            # stayed starved. (The pre-NET2 global check had this right.)
+            self._open_alerts.discard(key_a)
+
+        # ---- B: approved, and NOTHING filled ---------------------------
+        # NET2-REV-01: the audit shape was "kills >= approves", which is
+        # blind to an approve that simply VANISHES -- trade_execution
+        # crashing (handler_failed), disabled, or answering with a
+        # kind="info" skip ("no paper accounts", "Supabase unavailable").
+        # Approvals in, zero fills out is the alarm; the note says how
+        # many died with a reason and how many produced no outcome at
+        # all, the same accounted/unaccounted split alarm A makes.
+        if approves >= FLOW_MIN_APPROVES_FOR_KILL and executes == 0:
+            reasons = c.get("kill_reasons") or {}
+            top, top_n = (max(reasons.items(), key=lambda kv: kv[1])
+                          if reasons else ("(no reason given)", 0))
+            unaccounted_b = max(0, approves - kills)
+            shape_b = (
+                f"{kills} died at execution; top kill reason ({top_n}x): {top}"
+                if kills else "none of them produced an outcome at all")
+            if kills and unaccounted_b:
+                shape_b += (f"; {unaccounted_b} produced NO outcome at all "
+                            f"-- not a fill, not a rejection")
+            msg = (
+                f"EXECUTION STARVATION [{lane}]: {approves} approval(s) in "
+                f"{window_min:.0f} min produced ZERO fills on the {lane} "
+                f"lane; {shape_b}. The gate said yes and nothing filled "
+                f"-- check trade_execution (is it registered, enabled, "
+                f"crashing?), then the book's buying power and route."
+            )
+            await self._raise_flow(
+                key_b, severity="urgent",
+                title=f"Trezo: approvals are dying at execution ({lane})",
+                msg=msg)
+            out.append(AgentMessage(
+                agent=self.name, kind="error",
+                payload={"event": "execution_starvation", "lane": lane,
+                         "approves": approves, "executes": 0,
+                         "kills": kills, "unaccounted": unaccounted_b,
+                         "top_kill_reason": top,
+                         "window_min": round(window_min, 1), "note": msg}))
+        elif executes > 0:
+            # NET2-REV-02 (as above): a fill is recovery; silence is not.
+            self._open_alerts.discard(key_b)
+        return out
+
+    async def _raise_flow(self, key: tuple[str, str], *, severity: str,
+                          title: str, msg: str) -> None:
+        """Persist + webhook ONCE per (kind, lane) while it persists."""
+        if key in self._open_alerts:
+            return
+        self._open_alerts.add(key)
+        await self._persist_alert(kind=key[0], target=key[1],
+                                  severity=severity, message=msg)
+        try:
+            from app.runtime.alerts import notify
+            # NET2-REV-03: pass the severity through; it was pinned to
+            # "urgent" so a fully-vetoed (warn) window pinged as red.
+            await notify(title, msg, severity=severity,
+                         key=f"{key[0]}:{key[1]}")
+        except Exception:  # noqa: BLE001
+            pass
 
     async def tick(self) -> list[AgentMessage]:
         # OPS RELAY -- EVERY TICK (Mike 2026-08-13). First version sat
@@ -653,20 +836,24 @@ class OpsWatchdogAgent(Agent):
                 tolerance_min = max(tolerance_min, 1440)
 
             _st = registered.get(name)
+            # REG-05: event-driven agents (risk_manager, trade_execution,
+            # user_support) have tick_interval_seconds 0 and NEVER tick
+            # by design -- they react on the bus. The exemption used to
+            # sit inside the never-ticked branch only, so one forced tick
+            # set last_tick_at and hours later they read as "stuck".
+            # Skip Check 2 for them outright, whatever last_tick_at says.
+            interval_s = getattr(getattr(_st, "impl", None),
+                                 "tick_interval_seconds", 300)
+            if interval_s is not None and interval_s <= 0:
+                self._open_alerts.discard(("stuck_agent", name))
+                self._open_alerts.discard(("never_ticked", name))
+                continue
             last_dt = getattr(_st, "last_tick_at", None) if _st else None
             if last_dt is None:
                 # Registered but has NEVER ticked. On a fresh boot that's
                 # normal briefly; past 2x the agent's own interval it is
                 # exactly the silent-failure case this watchdog exists
                 # for (e.g. a tick that hangs or raises before returning).
-                interval_s = getattr(getattr(_st, "impl", None),
-                                     "tick_interval_seconds", 300)
-                if interval_s is not None and interval_s <= 0:
-                    # Event-driven agents (risk_manager, trade_execution,
-                    # user_support) have interval 0 and NEVER tick by
-                    # design -- they react on the bus. 2026-06-12: these
-                    # false-alarmed as never_ticked all morning.
-                    continue
                 interval_s = interval_s or 300
                 boot_grace_min = max((2 * interval_s) / 60.0, 10.0)
                 uptime_min = (now - _BOOT_AT).total_seconds() / 60.0

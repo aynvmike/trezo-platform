@@ -27,6 +27,79 @@ recorded here is a decision; one discovered later is a defect.
 
 ---
 
+## 2026-09-01 — the full-platform audit and its fix wave
+
+The 2026-09-01 audit (`TREZO_AUDIT_2026_09_01.md`: 23 auditors, 15
+adversarial verifiers, 33 CONFIRMED / 8 PARTIAL / 1 REFUTED) was
+followed the same day by a fix wave on branch `audit-fixes-2026-09-01`,
+under Mike's instruction: "fix everything and get it wired up; get the
+books independent especially." Trading mode stays PAPER; the live
+executor still does not exist and is not wired.
+
+### Fixed in this wave (schema, tooling, docs — this list's owner)
+
+- **QP-01 quantity precision** — migration `0059_quantity_scale.sql`:
+  `paper_positions.quantity`, `trades.quantity`, `trade_outcomes.quantity`
+  widen `numeric(20,8)` → `numeric(30,12)` so Alpaca's 9-dp crypto fills
+  are stored exactly (the round-up manufactured the DOT stop-placement
+  403s; the round-down left dust). The venue-quantity clamp in
+  `alpaca.py` stays as defence in depth. *Pending: Mike applies it.*
+- **AUTH-03 / AUTH-04 / AUTH-05** — migration `0060_security_authz.sql`:
+  `ops_health_alerts` readable by authenticated only (was `USING (true)`);
+  `ops_heartbeat_check()` EXECUTE revoked from anon/authenticated/public
+  and search_path pinned (0041 shape); `trading_accounts.owner_id` gets
+  its FK to `auth.users` — with a RUN-FIRST diagnostic, then NOT VALID +
+  VALIDATE so a mismatch fails loudly. *Pending: Mike applies it.*
+- **PH-2 / PH-5 phantom P&L unwind** — `agents/tools/unwind_phantom_pnl.py`.
+  Dry run verified 2026-09-01 against the live DB: 10 signature rows on
+  the 75k book sum −7,462.53 (exact), the primary's three rows sum
+  −13.12 (exact), 13 matching `trade_outcomes` rows; the ambiguous
+  `584cad86` row and the 25k book's three rows are listed as NOT IN
+  SCOPE and never touched. `--apply` zeroes `realized_pnl_usd` and keeps
+  the originals under a `phantom_unwind` tag; never deletes; never
+  touches `paper_accounts`. *Pending: Mike's approval to run `--apply`.*
+- **LIVE-6 / `.env.example` staleness** — every key name declared in
+  `agents/app/config.py` or present in the three `.env` files is now
+  documented (names only); the truncated Alpaca-live block is restored.
+- **db/README.md** rewritten around the migrations ledger and the
+  person → accounts → books model.
+
+The engine-side fixes of the same wave (book binding on the balance
+reconciler, options harvest exits, gap-check/pre-break resync, exit
+advisor, manual trade; strict option reads; Net 2 per-lane counting;
+kill-switch reach) are recorded by their own commits and by
+`PROJECT_STATUS.md`; they are not re-listed here.
+
+### Still open after this wave — decisions, not wiring
+
+24. **Options ledger of record** (audit §2.3 / §5.b) — `options_positions`
+    vs `paper_positions asset_type='option'`. The churn loop is stopped
+    by the binding fixes, but every option reader (exit advisor, wheel
+    keep-open, three dashboard surfaces) still watches a partial copy
+    until one table is chosen and the other becomes derived. Mike's
+    decision; then a one-shot reconcile + reader repoint.
+25. **Agent registry from a table, not a code constant** — the registry
+    still describes agents by hand (it said the exit advisor "never
+    closes a trade" while `auto_exit_advisor` could liquidate). Moving
+    it to a table the watchdog and the dashboard both read is a design
+    item, not a fix.
+26. **Credentials storage** (audit §2.13 / §5.n) — everything trades on
+    `agents/.env` slot keys; `broker_connections` is empty and the OAuth
+    surface is dead end-to-end. Fine for one owner; a wrong-account
+    time bomb for any real second user. Needs a decision on where
+    per-user broker credentials live before any multi-user step.
+27. **BI-08 same-ticker dedup left conservative** — the cross-book
+    same-ticker check was tightened only where the audit proved a
+    wrong-book action; the broader "one ticker, one book" rule was NOT
+    imposed, because fan-out deliberately puts shared symbols on every
+    book. Revisit once the binding fixes have a week of live history.
+28. **R:R floor: which control yields** (audit §2.2 / §5.a) — signal
+    user's floor 0.4 vs executing books' 0.5; the harmonizer emits
+    geometry exactly at the signal floor. The two-rows shape is a
+    defect; which floor governs is Mike's call.
+
+---
+
 ## Genuinely still open (recompiled 2026-08-27)
 
 ### Waiting on Mike's decision — not code

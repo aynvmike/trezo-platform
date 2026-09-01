@@ -27,6 +27,7 @@ import { VetoReasonsPanel } from "@/components/dashboard/veto-reasons-panel";
 import { SignalTracePanel } from "@/components/dashboard/signal-trace-panel";
 import { TodaysExecutionFeed } from "@/components/dashboard/todays-execution-feed";
 import { BotSettingsPanel } from "@/components/dashboard/bot-settings-panel";
+import { LoadError, LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
 import { requestClose } from "./_actions";
 
 export const dynamic = "force-dynamic";
@@ -187,9 +188,21 @@ export default async function PaperPage() {
     supabase.from("profiles").select("daily_loss_limit_usd").eq("user_id", user.id).maybeSingle(),
   ]);
 
-  const account = accountRes.data as Record<string, number> | null;
-  const open = (openRes.data ?? []) as OpenPos[];
-  const closed = (closedRes.data ?? []) as ClosedPos[];
+  // PAGES-03: keep "read failed" distinct from "nothing there". The
+  // account + open-position reads feed every headline number, so if
+  // either failed the trading view is replaced by the error card rather
+  // than rendering a $0 / flat book.
+  const accountLoad = loadResult<Record<string, number> | null>("paper_accounts", accountRes);
+  const openLoad = loadResult<OpenPos[]>("paper_positions", openRes, []);
+  const closedLoad = loadResult<ClosedPos[]>("paper_positions (closed)", closedRes, []);
+  const msgsLoad = loadResult<MsgRow[]>("agent_messages", msgsRes, []);
+  const botLoad = loadResult<{ auto_trade_enabled?: boolean } | null>("bot_settings", botRes);
+  const profileLoad = loadResult<{ daily_loss_limit_usd?: number } | null>("profiles", profileRes);
+  const coreFailures = failuresOf(accountLoad, openLoad);
+  const sideFailures = failuresOf(closedLoad, msgsLoad, botLoad, profileLoad);
+  const account = accountLoad.data ?? null;
+  const open = openLoad.data ?? [];
+  const closed = closedLoad.data ?? [];
   const fxSymbols = open
     .filter((p) => (p.asset_type ?? "").toLowerCase() === "forex")
     .map((p) => String(p.ticker).toUpperCase());
@@ -294,7 +307,7 @@ export default async function PaperPage() {
   const deployed = positionsAll.reduce((acc, p) => acc + p.entry * p.qty, 0);
   const deployedPct = portfolioValue > 0 ? (deployed / portfolioValue) * 100 : null;
 
-  const feed: TVFeed[] = ((msgsRes.data ?? []) as MsgRow[]).map((m) => {
+  const feed: TVFeed[] = (msgsLoad.data ?? []).map((m) => {
     const fm: FeedMessage = {
       id: String(m.id), agent_name: m.agent_name, kind: m.kind,
       payload: m.payload ?? {}, created_at: m.created_at,
@@ -305,8 +318,8 @@ export default async function PaperPage() {
     };
   });
 
-  const botRow = botRes.data as { auto_trade_enabled?: boolean } | null;
-  const profileRow = profileRes.data as { daily_loss_limit_usd?: number } | null;
+  const botRow = botLoad.data ?? null;
+  const profileRow = profileLoad.data ?? null;
 
   const data: TradingData = {
     portfolioValue, todayPnl, todayPct: null, deployed, deployedPct,
@@ -342,14 +355,21 @@ export default async function PaperPage() {
         )}
       </div>
 
-      <FadeIn>
-        <TradingViewRedesign data={data} closeAction={requestClose} />
-      </FadeIn>
+      <LoadErrors failures={sideFailures} />
+      {coreFailures.length > 0 ? (
+        <LoadErrors failures={coreFailures} />
+      ) : (
+        <FadeIn>
+          <TradingViewRedesign data={data} closeAction={requestClose} />
+        </FadeIn>
+      )}
 
       <CapitalPressurePanel userId={user.id} />
 
-      <Disclosure title={`Recent trades (${closed.length})`}>
-        {closed.length === 0 ? (
+      <Disclosure title={closedLoad.failure ? "Recent trades" : `Recent trades (${closed.length})`}>
+        {closedLoad.failure ? (
+          <LoadError {...closedLoad.failure} />
+        ) : closed.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-center text-sm text-weave-500">No closed trades yet.</div>
         ) : (
           <div className="rounded-xl border border-weave-100 bg-white overflow-hidden overflow-x-auto">

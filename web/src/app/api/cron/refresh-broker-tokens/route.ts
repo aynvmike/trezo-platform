@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import * as crypto from "crypto";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { decryptToken, encryptToken } from "@/lib/broker-connections";
 
 export const dynamic = "force-dynamic";
@@ -24,6 +25,12 @@ export const dynamic = "force-dynamic";
  * Auth: requires `Bearer ${CRON_SECRET}` header so external schedulers
  * (the agents service, Vercel Cron, a Windows Task Scheduler curl)
  * can hit it without a user session. CRON_SECRET lives in web/.env.local.
+ *
+ * AUTH-02 / OAUTH-1: no user session means the anon cookie client is
+ * blocked by RLS and this job would silently find zero candidates. All
+ * reads/writes go through the service-role client instead
+ * (SUPABASE_SERVICE_ROLE_KEY); the CRON_SECRET gate above is what
+ * authorizes that.
  */
 const HORIZON_MS = 60 * 60 * 1000; // refresh anything expiring in <1h
 const MAX_FAILURES = 3;
@@ -38,11 +45,28 @@ export async function POST(request: Request) {
       { status: 500 }
     );
   }
-  if (auth !== `Bearer ${secret}`) {
+  // OAUTH-7: constant-time compare, same as /api/internal/broker-token, so
+  // a byte-by-byte mismatch does not leak the secret via timing.
+  const presented = auth.startsWith("Bearer ")
+    ? auth.slice("Bearer ".length).trim()
+    : "";
+  const exp = Buffer.from(secret);
+  const got = Buffer.from(presented);
+  const authOk = exp.length === got.length && crypto.timingSafeEqual(exp, got);
+  if (!authOk) {
     return NextResponse.json({ ok: false, error: "Unauthorized." }, { status: 401 });
   }
 
-  const supabase = createClient();
+  // AUTH-02: service-role client — see the route docstring.
+  let supabase;
+  try {
+    supabase = createAdminClient();
+  } catch (e) {
+    return NextResponse.json(
+      { ok: false, error: e instanceof Error ? e.message : "Service-role client unavailable." },
+      { status: 500 }
+    );
+  }
   const horizon = new Date(Date.now() + HORIZON_MS).toISOString();
   const { data: rows, error } = await supabase
     .from("broker_connections")

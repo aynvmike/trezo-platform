@@ -8,7 +8,8 @@ green, rotate dead capital into a better setup, or (staged) average down.
 Design principles:
   * SAFE BY DEFAULT. The master switch TREZO_REEVAL_ENABLED defaults OFF, so
     importing/calling this module is a no-op until it is turned on. Every
-    sub-action has its own flag and every threshold is env-tunable.
+    sub-action has its own flag and every threshold is tunable through
+    pydantic Settings (agents/.env) with a process-env fallback (G19).
   * PROTECTIVE DIRECTION ONLY for stops: a tightened stop always moves CLOSER
     to price (cuts risk); it never widens.
   * GREEN-ONLY for targets: a lowered target must still sit in profit above
@@ -63,16 +64,47 @@ def reeval_is_enabled() -> bool:
     agents/.env (or the environment). Default OFF."""
     return _settings_flag("trezo_reeval_enabled", "TREZO_REEVAL_ENABLED", False)
 
+
+def _settings_num(attr: str, env: str, default: float) -> float:
+    """Numeric twin of _settings_flag: Settings attr -> env var -> default.
+    G19: the numeric tunables below were read with a bare os.getenv at
+    IMPORT time, which never sees agents/.env (pydantic loads that file
+    into Settings, not into os.environ) -- so every .env override was
+    silently ignored while the bool flags next to them worked."""
+    try:
+        from app.config import get_settings
+        v = getattr(get_settings(), attr, None)
+        if v is not None:
+            return float(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return _num(env, default)
+
+
 # --- tunable bounds --------------------------------------------------------
-COOLDOWN_SEC = _num("TREZO_REEVAL_COOLDOWN_SEC", 900)
-STALE_DAYS = _num("TREZO_REEVAL_STALE_DAYS", 3)
-ROTATE_DAYS = _num("TREZO_REEVAL_ROTATE_DAYS", 7)
-TIGHTEN_GIVEBACK = _num("TREZO_REEVAL_TIGHTEN_GIVEBACK", 0.30)
-TIGHTEN_BAND = _num("TREZO_REEVAL_TIGHTEN_BAND", 0.02)
-TARGET_FAR_PCT = _num("TREZO_REEVAL_TARGET_FAR_PCT", 0.08)
-TARGET_REACH_BAND = _num("TREZO_REEVAL_TARGET_REACH_BAND", 0.02)
-MIN_BANK_PROFIT = _num("TREZO_REEVAL_MIN_BANK_PROFIT", 0.005)
-AVGDOWN_TRIGGER = _num("TREZO_REEVAL_AVGDOWN_TRIGGER", 0.08)
+# name -> (Settings attr, env var, default). Read per call via tunable(),
+# never at import (G19). Defaults are unchanged from the import-time
+# constants they replace. NOTE: app/config.py does not yet declare the
+# numeric attrs, so until it does the Settings branch yields None and the
+# value comes from the process env, then the default -- same as before,
+# but now one config.py line away from honouring agents/.env.
+_TUNABLES: dict[str, tuple[str, str, float]] = {
+    "COOLDOWN_SEC": ("trezo_reeval_cooldown_sec", "TREZO_REEVAL_COOLDOWN_SEC", 900),
+    "STALE_DAYS": ("trezo_reeval_stale_days", "TREZO_REEVAL_STALE_DAYS", 3),
+    "ROTATE_DAYS": ("trezo_reeval_rotate_days", "TREZO_REEVAL_ROTATE_DAYS", 7),
+    "TIGHTEN_GIVEBACK": ("trezo_reeval_tighten_giveback", "TREZO_REEVAL_TIGHTEN_GIVEBACK", 0.30),
+    "TIGHTEN_BAND": ("trezo_reeval_tighten_band", "TREZO_REEVAL_TIGHTEN_BAND", 0.02),
+    "TARGET_FAR_PCT": ("trezo_reeval_target_far_pct", "TREZO_REEVAL_TARGET_FAR_PCT", 0.08),
+    "TARGET_REACH_BAND": ("trezo_reeval_target_reach_band", "TREZO_REEVAL_TARGET_REACH_BAND", 0.02),
+    "MIN_BANK_PROFIT": ("trezo_reeval_min_bank_profit", "TREZO_REEVAL_MIN_BANK_PROFIT", 0.005),
+    "AVGDOWN_TRIGGER": ("trezo_reeval_avgdown_trigger", "TREZO_REEVAL_AVGDOWN_TRIGGER", 0.08),
+}
+
+
+def tunable(name: str) -> float:
+    attr, env, default = _TUNABLES[name]
+    return _settings_num(attr, env, default)
+
 
 _last_action: dict[str, float] = {}
 _shadow_at: dict[str, float] = {}   # reprice-shadow log throttle (7/20)
@@ -173,6 +205,18 @@ async def _log(emit, agent_name, user_id, ticker, action, reason) -> None:
         pass
 
 
+def _collapse_bar(user_id):
+    """This book's TCS entry bar (0-100) for the collapse check, or None
+    when the settings read raises. G4: None means "do not judge" -- the
+    caller skips the collapse check rather than closing on a data
+    failure. A row with no threshold set falls to the 70 default."""
+    try:
+        from app.runtime.settings import get_bot_settings
+        return int(get_bot_settings(user_id).tcs_threshold or 70)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def reevaluate_position(r, price, side, at, strat, stop, target,
                               emit, agent_name="reevaluator"):
     """Re-judge one open position. Returns {"stop"?, "target"?, "close"?} when
@@ -199,6 +243,19 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         # buy-and-hold lane is exempt.
         if _rl_strat.startswith(("dividend_lt", "wheel", "income")):
             return None
+        # G19: read the numeric tunables NOW, through Settings -> env ->
+        # default, instead of the import-time os.getenv snapshot. These
+        # names deliberately shadow nothing at module level any more;
+        # every use below in this function resolves to these locals.
+        COOLDOWN_SEC = tunable("COOLDOWN_SEC")
+        STALE_DAYS = tunable("STALE_DAYS")
+        ROTATE_DAYS = tunable("ROTATE_DAYS")
+        TIGHTEN_GIVEBACK = tunable("TIGHTEN_GIVEBACK")
+        TIGHTEN_BAND = tunable("TIGHTEN_BAND")
+        TARGET_FAR_PCT = tunable("TARGET_FAR_PCT")
+        TARGET_REACH_BAND = tunable("TARGET_REACH_BAND")
+        MIN_BANK_PROFIT = tunable("MIN_BANK_PROFIT")
+        AVGDOWN_TRIGGER = tunable("AVGDOWN_TRIGGER")
         pid = str(r.get("id"))
         now = _time.monotonic()
         last = _last_action.get(pid)
@@ -249,7 +306,8 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
             if (now - _hb_at.get(pid, 0.0)) >= 3600.0:
                 _hb_at[pid] = now
                 fresh_tcs = None
-                if _flag("TREZO_REEVAL_TCS_RESCORE", "1"):
+                if _settings_flag("trezo_reeval_tcs_rescore",
+                                  "TREZO_REEVAL_TCS_RESCORE", True):  # G19
                     try:
                         from app.data.candles import fetch_candles_for
                         from app.patterns.scoring import calculate_score
@@ -260,21 +318,31 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                     except Exception:  # noqa: BLE001
                         fresh_tcs = None
                 collapsed = False
-                _thr = 70
+                _thr = None   # this book's entry bar (0-100); None = unknown
                 if fresh_tcs is not None:
-                    try:
-                        from app.runtime.settings import get_bot_settings
-                        _thr = int(get_bot_settings(user_id).tcs_threshold or 70)
-                    except Exception:  # noqa: BLE001
-                        _thr = 700
-                    _cfrac = _num("TREZO_REEVAL_TCS_COLLAPSE_FRAC", 0.5)
-                    collapsed = fresh_tcs < int(_thr * _cfrac)
+                    _thr = _collapse_bar(user_id)
+                    if _thr is None:
+                        # G4: the settings read FAILED. The old fallback
+                        # was 700 on a 0-100 scale, so fresh_tcs < 350
+                        # was always true and a data failure force-closed
+                        # the position. Cannot know the bar -> cannot
+                        # judge a collapse -> skip the check, say so.
+                        collapsed = False
+                    else:
+                        _cfrac = _settings_num(
+                            "trezo_reeval_tcs_collapse_frac",
+                            "TREZO_REEVAL_TCS_COLLAPSE_FRAC", 0.5)  # G19
+                        collapsed = fresh_tcs < int(_thr * _cfrac)
                 from app.agents.activity_log import record as _arec
                 _arec("reeval_check", ticker, tcs=fresh_tcs,
                       strategy=str(strat or ""),
                       reason=(f"down {abs(gain) * 100:.1f}%, held {held:.1f}d, "
                               f"giveback {giveback * 100:.0f}%, regime {regime}"
-                              + (f"; fresh TCS {fresh_tcs} vs bar {_thr}"
+                              + ((f"; fresh TCS {fresh_tcs} vs bar {_thr}"
+                                  if _thr is not None else
+                                  f"; fresh TCS {fresh_tcs}, bar UNKNOWN "
+                                  "(settings read failed) -- collapse "
+                                  "check skipped")
                                  if fresh_tcs is not None else "")
                               + (" -- thesis COLLAPSED" if collapsed else "")),
                       extra={"user_id": str(user_id or "shared")})
@@ -331,7 +399,8 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
             # last 30d sat UNDER it) -- but the knob does not move
             # without data. Log what a tighter trigger WOULD have done,
             # change nothing, and let the week's ledger decide.
-            _sh_far = _num("TREZO_REEVAL_SHADOW_FAR_PCT", 0.03)
+            _sh_far = _settings_num("trezo_reeval_shadow_far_pct",
+                                    "TREZO_REEVAL_SHADOW_FAR_PCT", 0.03)  # G19
             if _sh_far < TARGET_FAR_PCT and _sh_far < far <= TARGET_FAR_PCT:
                 _shk = f"sh:{pid}"
                 if now - _shadow_at.get(_shk, 0.0) > 6 * 3600:
@@ -375,7 +444,9 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                     # DB-side lowers left the stale sell at Alpaca).
                     try:
                         from app.paper.leg_sync import resync_alpaca_legs
-                        await resync_alpaca_legs(r, why=reason[:110])
+                        # TE-12: the resync binds the row's book itself.
+                        await resync_alpaca_legs(r, why=reason[:110],
+                                                 user_id=str(user_id or ""))
                     except Exception:  # noqa: BLE001
                         pass
                     _last_action[pid] = now
@@ -401,7 +472,9 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                 # Push the tightened stop to the BROKER too.
                 try:
                     from app.paper.leg_sync import resync_alpaca_legs
-                    await resync_alpaca_legs(r, why=reason[:110])
+                    # TE-12: the resync binds the row's book itself.
+                    await resync_alpaca_legs(r, why=reason[:110],
+                                             user_id=str(user_id or ""))
                 except Exception:  # noqa: BLE001
                     pass
                 _last_action[pid] = now

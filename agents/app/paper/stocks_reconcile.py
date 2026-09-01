@@ -126,6 +126,11 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             expires_at=bt.expires_at,
         ) if bt else None
 
+        # HONEST NOTE (audit 2026-09-01): get_positions() never raises --
+        # it collapses a failed read into [] -- so fetch_ok is always True
+        # here and cannot tell a 429 from a flat account. The real net is
+        # trust_close below, which refuses to phantom-close on an EMPTY
+        # list. Behaviour deliberately left as-is in this pass.
         fetch_ok = True
         try:
             alpaca_positions = await get_positions(token=token)
@@ -193,9 +198,10 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             alpaca_by_sym.pop(_sym_neg, None)
 
         # Trust a "broker doesn't list this symbol" signal as a real
-        # close ONLY when the fetch succeeded AND returned >=1 stock
-        # position. An empty list or a swallowed error must not
-        # phantom-close real rows at the open bell (2026-06-15 fix).
+        # close ONLY when the read returned >=1 stock position. An empty
+        # list -- which is also what a failed read looks like, see the
+        # fetch_ok note above -- must not phantom-close real rows at the
+        # open bell (2026-06-15 fix).
         trust_close = fetch_ok and bool(alpaca_by_sym)
 
         def _trezo_open(uid=user_id):
@@ -275,11 +281,14 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     notes_list.append(f"{sym} closed (phantom)")
                     # 2026-07-07: ghost rows CAUSE broker rejects (selling
                     # shares the broker no longer has). Once the ghosts are
-                    # reconciled the cause is gone -- clear the session
-                    # reject counter so the kill-switch can reopen the day.
+                    # reconciled the cause is gone -- clear the reject
+                    # window so the kill-switch can reopen the day.
+                    # KS-4: for THIS book only. A ghost reconciled on one
+                    # book must not wipe another book's reject history
+                    # (every book is its own book).
                     try:
                         from app.paper.killswitch import reset_broker_rejects
-                        reset_broker_rejects()
+                        reset_broker_rejects(str(user_id))
                         from app.agents.activity_log import record as _arec0
                         _arec0("halt_cleared", sym,
                                reason=("ghost position reconciled - broker-"
@@ -525,13 +534,22 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
 
 
 async def reconcile_account_balances_all_users() -> dict[str, Any]:
-    """Sync each user's internal cash ledger (paper_accounts.current_cash_usd)
-    to Alpaca broker truth, when a broker is connected. Fixes ledger drift
-    (e.g. the dashboard read $39k while the broker held ~$5k). Only runs when
-    Alpaca is configured for the user; paper-only/sim accounts are left alone
-    so the account-size simulator still works. Never overwrites on a failed/
-    empty broker read."""
+    """Sync each book's internal cash ledger (paper_accounts.current_cash_usd)
+    to ITS OWN Alpaca account's cash, when a broker is connected. Fixes
+    ledger drift (e.g. the dashboard read $39k while the broker held ~$5k).
+    Only runs when Alpaca is configured for the book; paper-only/sim accounts
+    are left alone so the account-size simulator still works. Never
+    overwrites on a failed/empty broker read.
+
+    TE-16 (audit 2026-09-01): this loop ran UNBOUND, so get_account()
+    resolved to the primary account for every book and stamped the
+    primary's cash onto all three paper_accounts rows hourly (live proof:
+    three books identical to the cent). Each book is now bound with
+    bind_for_user + check_route before its read; an unresolvable book is
+    skipped with a logged reason, never defaulted to the primary."""
     from app.brokers.alpaca import alpaca_configured, get_account, UserToken
+    from app.brokers.accounts import bind_for_user
+    from app.brokers.route_guard import check_route, record_mismatch
     from app.integrations.web_tokens import get_user_broker_token
     from app.config import get_settings
 
@@ -553,6 +571,7 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
     rows = (await asyncio.to_thread(_users)).data or []
 
     synced = 0
+    skipped: list[dict] = []
     per_user: list[dict] = []
     for u in rows:
         user_id = u.get("user_id")
@@ -567,12 +586,31 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
         # No broker at all for this user -> leave the modeled/sim ledger be.
         if token is None and not env_ok:
             continue
-        try:
-            acct = await get_account(token=token)
-        except Exception:
-            acct = None
+        # TE-16: the cash read MUST happen under this book's binding, and
+        # the write below only ever uses a value read under that binding.
+        with bind_for_user(str(user_id)):
+            _route_ok, _route_note = check_route(str(user_id))
+            if not _route_ok:
+                logger.warning(
+                    "balance_reconcile.skip user=%s reason=%s",
+                    str(user_id)[:8], _route_note)
+                record_mismatch("-", str(user_id), _route_note,
+                                "balance_reconcile")
+                skipped.append({"user_id": str(user_id),
+                                "reason": _route_note})
+                continue
+            try:
+                acct = await get_account(token=token)
+            except Exception:
+                acct = None
         if acct is None:
-            continue  # failed read: never overwrite on a hiccup
+            # Failed read: never overwrite on a hiccup -- and say so.
+            logger.warning(
+                "balance_reconcile.skip user=%s reason=broker account read "
+                "failed; ledger left untouched", str(user_id)[:8])
+            skipped.append({"user_id": str(user_id),
+                            "reason": "broker read failed"})
+            continue
         broker_cash = round(float(acct.cash or 0.0), 2)
         internal = round(float(u.get("current_cash_usd") or 0.0), 2)
         drift = round(broker_cash - internal, 2)
@@ -597,79 +635,24 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
         except Exception:
             continue
 
-    return {"ok": True, "synced": synced, "details": per_user}
+    return {"ok": True, "synced": synced, "details": per_user,
+            "skipped": skipped}
 
 
-async def detect_option_drift_all_users() -> dict[str, Any]:
-    """READ-ONLY drift report: compare each user's open options_positions
-    count against the broker's actual option positions. Flags phantoms
-    (tracked, not at broker) and orphans (at broker, untracked). Does NOT
-    close anything - the Options Scanner reconcile owns the close path."""
-    from app.brokers.alpaca import alpaca_configured, get_option_positions, UserToken
-    from app.integrations.web_tokens import get_user_broker_token
-    from app.config import get_settings
-
-    s = get_settings()
-    if not (s.supabase_url and s.supabase_service_role_key):
-        return {"ok": False, "error": "Supabase not configured."}
-    try:
-        from supabase import create_client
-        client = create_client(s.supabase_url, s.supabase_service_role_key)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"Supabase client error: {e}"}
-
-    env_ok = alpaca_configured()
-
-    def _users():
-        return client.table("paper_accounts").select("user_id").execute()
-    rows = (await asyncio.to_thread(_users)).data or []
-
-    flagged: list[dict] = []
-    for u in rows:
-        user_id = u.get("user_id")
-        if not user_id:
-            continue
-        bt = await get_user_broker_token(user_id, "alpaca")
-        token = UserToken(
-            access_token=bt.access_token,
-            refresh_token=bt.refresh_token,
-            expires_at=bt.expires_at,
-        ) if bt else None
-        if token is None and not env_ok:
-            continue
-        try:
-            broker_opts = await get_option_positions(token=token)
-        except Exception:
-            broker_opts = None
-        if broker_opts is None:
-            continue
-        broker_n = len(broker_opts)
-
-        def _trezo_opts(uid=user_id):
-            return (
-                client.table("options_positions")
-                .select("id").eq("user_id", uid).eq("status", "open").execute()
-            )
-        try:
-            trezo_n = len((await asyncio.to_thread(_trezo_opts)).data or [])
-        except Exception:
-            continue
-        if broker_n != trezo_n:
-            flagged.append({
-                "user_id": str(user_id),
-                "broker_options": broker_n,
-                "trezo_open_options": trezo_n,
-                "note": ("untracked broker options (orphans)" if broker_n > trezo_n
-                         else "tracked options not at broker (phantoms)"),
-            })
-    return {"ok": True, "mismatches": len(flagged), "details": flagged}
+# detect_option_drift_all_users used to live here. Deleted (audit 2026-09-01,
+# TE-17/LT-05): it had zero call sites and counted rows in options_positions,
+# a table that holds no open rows -- option legs live in paper_positions
+# with asset_type='option'. app/paper/broker_truth.py is the real
+# option-drift detector.
 
 
 async def run_integrity_sweep() -> dict[str, Any]:
     """One self-healing pass aligning Trezo to broker truth across every
-    dimension we can: cash ledger + stock positions (active repair) and a
-    read-only option-position drift report. Idempotent; safe at startup or in
-    a tick loop. Each step is independently guarded."""
+    dimension we can: cash ledger + stock positions (active repair) and an
+    orphan-option import (the "options" key is import_orphan_options'
+    {imported, skipped, details} report -- there is no drift report here;
+    broker_truth.py owns that). Idempotent; safe at startup or in a tick
+    loop. Each step is independently guarded."""
     report: dict[str, Any] = {"ok": True}
     try:
         report["balances"] = await reconcile_account_balances_all_users()
@@ -722,10 +705,24 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
     """Repair: import option positions that exist at the broker but are NOT
     tracked in Trezo (orphans - e.g. a Wheel CSP that fired but whose tracking
     insert failed). Mirrors the Wheel's own insert shape. Deduped on
-    (underlying, type, strike, expiration) so it never double-imports, and
-    never runs on a failed broker read. Short put -> wheel_csp, short call ->
-    wheel_cc, long -> reconciled_option. Added 2026-06-16."""
-    from app.brokers.alpaca import alpaca_configured, get_option_positions, UserToken
+    (underlying, type, strike, expiration) against open options_positions
+    AND against the book's open paper_positions option rows (matched by OCC
+    ticker or the same 4-tuple), so it never double-imports, and never runs
+    on a failed broker read. Short put -> wheel_csp, short call -> wheel_cc,
+    long -> reconciled_option. Added 2026-06-16.
+
+    TE-17 + LT-05 (audit 2026-09-01): this ran UNBOUND, so every book was
+    handed the PRIMARY's contracts, and it deduped only against
+    options_positions -- while real option legs live in paper_positions
+    (asset_type='option'). Result: 232 churn rows and phantom collateral on
+    acct3. Now: bind per book (skip unresolved, logged), read with the
+    strict variant (None -> skip the book), dedupe against the real ledger.
+    """
+    from app.brokers.alpaca import (
+        alpaca_configured, get_option_positions_strict, UserToken,
+    )
+    from app.brokers.accounts import bind_for_user
+    from app.brokers.route_guard import check_route, record_mismatch
     from app.integrations.web_tokens import get_user_broker_token
     from app.config import get_settings
 
@@ -758,11 +755,29 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
         ) if bt else None
         if token is None and not env_ok:
             continue
-        try:
-            broker_opts = await get_option_positions(token=token)
-        except Exception:
-            broker_opts = None
+        # TE-17: read THIS book's contracts under ITS binding. The strict
+        # read returns None on any failed read -> skip the book, say so.
+        with bind_for_user(str(user_id)):
+            _route_ok, _route_note = check_route(str(user_id))
+            if not _route_ok:
+                logger.warning(
+                    "orphan_options.skip user=%s reason=%s",
+                    str(user_id)[:8], _route_note)
+                record_mismatch("-", str(user_id), _route_note,
+                                "orphan_options")
+                details.append({"user_id": str(user_id),
+                                "skipped": _route_note})
+                continue
+            try:
+                broker_opts = await get_option_positions_strict(token=token)
+            except Exception:
+                broker_opts = None
         if broker_opts is None:
+            logger.warning(
+                "orphan_options.skip user=%s reason=broker option read "
+                "failed; nothing imported", str(user_id)[:8])
+            details.append({"user_id": str(user_id),
+                            "skipped": "broker read failed"})
             continue  # failed read: never import on a hiccup
 
         def _trezo_open(uid=user_id):
@@ -771,9 +786,24 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
                 .select("underlying, option_type, strike, expiration")
                 .eq("user_id", uid).eq("status", "open").execute()
             )
+
+        # LT-05: the REAL option ledger. Legs the engine trades live in
+        # paper_positions with asset_type='option' and ticker = OCC code.
+        def _ledger_open(uid=user_id):
+            return (
+                client.table("paper_positions")
+                .select("ticker")
+                .eq("user_id", uid).eq("status", "open")
+                .eq("asset_type", "option").execute()
+            )
         try:
             trezo_rows = (await asyncio.to_thread(_trezo_open)).data or []
+            ledger_rows = (await asyncio.to_thread(_ledger_open)).data or []
         except Exception:
+            # Cannot see what this book already tracks -> importing would
+            # be a guess. Skip the book.
+            details.append({"user_id": str(user_id),
+                            "skipped": "ledger read failed"})
             continue
 
         def _key(und, typ, strike, exp):
@@ -784,6 +814,16 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
                  r.get("strike"), r.get("expiration"))
             for r in trezo_rows
         }
+        have_occ: set[str] = set()
+        for r in ledger_rows:
+            _t = str(r.get("ticker") or "").upper().strip()
+            if not _t:
+                continue
+            have_occ.add(_t)
+            _p = _parse_occ(_t)
+            if _p:
+                have.add(_key(_p["underlying"], _p["option_type"],
+                              _p["strike"], _p["expiration"]))
 
         for op in broker_opts:
             occ = str(op.get("symbol") or "")
@@ -799,8 +839,8 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
                 continue
             k = _key(parsed["underlying"], parsed["option_type"],
                      parsed["strike"], parsed["expiration"])
-            if k in have:
-                continue  # already tracked
+            if k in have or occ.upper().strip() in have_occ:
+                continue  # already tracked (options_positions or ledger)
             is_short = qty < 0
             contracts = int(abs(qty)) or 1
             try:

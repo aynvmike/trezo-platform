@@ -55,7 +55,9 @@ export function LayerHero({
   action?: ReactNode;
 }) {
   const m = LAYER_META[id] ?? LAYER_META[2];
-  const st = status ?? (openCount == null ? "active" : openCount > 0 ? "active" : "idle");
+  // PAGES-05: no data is not "active". A page that passes no openCount
+  // (or whose read failed) gets "idle", never a green "Trading" badge.
+  const st = status ?? (openCount != null && openCount > 0 ? "active" : "idle");
   const stClass =
     st === "active" ? "text-emerald-500 bg-emerald-500/10"
       : st === "paused" ? "text-amber-500 bg-amber-500/10"

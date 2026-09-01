@@ -1,0 +1,487 @@
+"""Guards for the book-bound reconcilers (audit 2026-09-01: TE-16, TE-17,
+LT-05, KS-4).
+
+The live proof behind these: on 2026-09-01 all three books' paper_accounts
+rows read IDENTICAL cash to the cent, because the hourly balance reconcile
+looped every book with NO account bound -- get_account() resolved to the
+primary every time and stamped the primary's cash onto acct2 and acct3.
+The orphan-option importer had the same hole (primary's contracts imported
+into every book) plus a second one: it deduped only against
+options_positions while the engine's real option legs live in
+paper_positions(asset_type='option'), so it re-imported tracked legs
+every sweep -- 232 churn rows, phantom collateral on acct3.
+
+What these pin:
+  * every broker read happens INSIDE that book's binding,
+  * an unresolvable book is skipped with a logged reason (never the
+    primary's numbers),
+  * a failed (None) read writes nothing,
+  * a leg already open in the real ledger is never re-imported,
+  * a ghost close resets ONLY that book's reject window.
+
+The code under test is the REAL module (loaded via _bootstrap.load_module);
+only the seams -- Supabase client, account binding, route check, broker
+reads, token lookup -- are swapped, and always put back. No pytest, no
+.env, no network, so the deploy gate can run this in a bare checkout.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+
+stub_config()
+alp = load_module("app.brokers.alpaca")
+accounts = load_module("app.brokers.accounts")
+route_guard = load_module("app.brokers.route_guard")
+web_tokens = load_module("app.integrations.web_tokens")
+book_scope = load_module("app.runtime.book_scope")
+killswitch = load_module("app.paper.killswitch")
+sr = load_module("app.paper.stocks_reconcile")
+
+import supabase  # noqa: E402  -- real package; only create_client is swapped
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+@contextlib.contextmanager
+def _patched(mod, **attrs):
+    """Swap module attributes and always put the originals back."""
+    old = {k: getattr(mod, k, None) for k in attrs}
+    try:
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                if hasattr(mod, k):
+                    delattr(mod, k)
+            else:
+                setattr(mod, k, v)
+
+
+# --- a tiny in-memory Supabase stand-in -----------------------------------
+
+class _Resp:
+    def __init__(self, data):
+        self.data = data
+
+
+class _Query:
+    def __init__(self, client, table):
+        self.client = client
+        self.table_name = table
+        self.op = ("select", None)
+        self.eqs: list[tuple] = []
+        self.neqs: list[tuple] = []
+        self.single_row = False
+
+    def select(self, *_a, **_k):
+        self.op = ("select", None)
+        return self
+
+    def update(self, payload):
+        self.op = ("update", payload)
+        return self
+
+    def insert(self, payload):
+        self.op = ("insert", payload)
+        return self
+
+    def eq(self, k, v):
+        self.eqs.append((k, v))
+        return self
+
+    def neq(self, k, v):
+        self.neqs.append((k, v))
+        return self
+
+    def order(self, *_a, **_k):
+        return self
+
+    def limit(self, *_a, **_k):
+        return self
+
+    def single(self):
+        self.single_row = True
+        return self
+
+    def execute(self):
+        return self.client._execute(self)
+
+
+class FakeClient:
+    """Rows in, writes out. Every update/insert is recorded so a test can
+    assert 'nothing was written' -- the property that matters here."""
+
+    def __init__(self, tables: dict):
+        self.tables = {k: list(v) for k, v in tables.items()}
+        self.writes: list[dict] = []
+
+    def table(self, name):
+        return _Query(self, name)
+
+    def _execute(self, q: _Query):
+        kind, payload = q.op
+        if kind == "select":
+            rows = self.tables.get(q.table_name, [])
+            out = [r for r in rows
+                   if all(r.get(k) == v for k, v in q.eqs)
+                   and all(r.get(k) != v for k, v in q.neqs)]
+            if q.single_row:
+                return _Resp(out[0] if out else None)
+            return _Resp(out)
+        self.writes.append({"table": q.table_name, "op": kind,
+                            "payload": payload, "eq": list(q.eqs)})
+        return _Resp([payload] if kind == "insert" else [])
+
+
+async def _no_token(user_id, broker):
+    return None
+
+
+class _Acct:
+    def __init__(self, cash):
+        self.cash = cash
+        self.account_number = f"PA{int(cash)}"
+
+
+class _Binder:
+    """Records which book is bound while a broker read runs. bind_for_user
+    is a contextmanager in the real module; this one is too."""
+
+    def __init__(self):
+        self.bound = None
+        self.seen: list[str] = []
+
+    @contextlib.contextmanager
+    def __call__(self, user_id):
+        self.seen.append(str(user_id))
+        prev, self.bound = self.bound, str(user_id)
+        try:
+            yield str(user_id)
+        finally:
+            self.bound = prev
+
+
+# --- TE-16: balance reconcile ------------------------------------------------
+
+UIDS = ["primary-book", "acct2-book", "acct3-book"]
+BROKER_CASH = {"primary-book": 5000.0, "acct2-book": 25000.0,
+               "acct3-book": 75000.0}
+
+
+def _balance_tables():
+    return {"paper_accounts": [
+        {"user_id": u, "current_cash_usd": 1.0} for u in UIDS]}
+
+
+def test_each_book_reads_its_own_cash_under_its_own_binding():
+    """THE 2026-09-01 symptom: three books, one number. Each read must run
+    inside that book's binding and each write must carry the value read
+    under it -- not the primary's."""
+    binder = _Binder()
+    reads: list[tuple] = []
+
+    async def _get_account(token=None):
+        # the read is only meaningful if it happens while bound
+        assert binder.bound is not None, "get_account called UNBOUND"
+        reads.append((binder.bound, token))
+        return _Acct(BROKER_CASH[binder.bound])
+
+    client = FakeClient(_balance_tables())
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda *a, **k: None), \
+         _patched(alp, get_account=_get_account,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.reconcile_account_balances_all_users())
+
+    assert out["ok"], out
+    assert binder.seen == UIDS, binder.seen
+    assert [r[0] for r in reads] == UIDS, reads
+    written = {w["eq"][0][1]: w["payload"]["current_cash_usd"]
+               for w in client.writes if w["table"] == "paper_accounts"}
+    assert written == BROKER_CASH, written
+    assert out["synced"] == 3, out
+
+
+def test_a_failed_bound_read_writes_nothing_for_that_book():
+    """None from the broker is ANSWERLESS. The other books still sync."""
+    binder = _Binder()
+
+    async def _get_account(token=None):
+        if binder.bound == "acct2-book":
+            return None                       # 429 / timeout / 5xx
+        return _Acct(BROKER_CASH[binder.bound])
+
+    client = FakeClient(_balance_tables())
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda *a, **k: None), \
+         _patched(alp, get_account=_get_account,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.reconcile_account_balances_all_users())
+
+    touched = [w["eq"][0][1] for w in client.writes]
+    assert "acct2-book" not in touched, touched
+    assert sorted(touched) == ["acct3-book", "primary-book"], touched
+    assert {s["user_id"] for s in out["skipped"]} == {"acct2-book"}, out
+
+
+def test_an_unresolvable_book_is_skipped_and_logged_never_defaulted():
+    """route_guard refuses acct3: no read, no write, one loud mismatch
+    record naming the book. The primary's cash must NOT land on it."""
+    binder = _Binder()
+    reads: list[str] = []
+    mismatches: list[tuple] = []
+
+    async def _get_account(token=None):
+        reads.append(binder.bound)
+        return _Acct(BROKER_CASH.get(binder.bound, 5000.0))
+
+    def _check(uid):
+        if uid == "acct3-book":
+            return False, "unknown book acct3-bo -- refusing"
+        return True, "ok"
+
+    client = FakeClient(_balance_tables())
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard, check_route=_check,
+                  record_mismatch=lambda t, uid, note, where:
+                  mismatches.append((uid, note, where))), \
+         _patched(alp, get_account=_get_account,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.reconcile_account_balances_all_users())
+
+    assert "acct3-book" not in reads, reads
+    touched = [w["eq"][0][1] for w in client.writes]
+    assert "acct3-book" not in touched, touched
+    assert mismatches and mismatches[0][0] == "acct3-book", mismatches
+    assert mismatches[0][2] == "balance_reconcile", mismatches
+    assert out["skipped"] == [{"user_id": "acct3-book",
+                               "reason": "unknown book acct3-bo -- refusing"}]
+
+
+# --- TE-17 + LT-05: orphan option import --------------------------------------
+
+OCC_TRACKED = "AGNC260918P00010500"      # already open in paper_positions
+OCC_ORPHAN = "PG260918P00138000"         # genuinely untracked
+
+
+def _orphan_tables(ledger_rows=None):
+    return {
+        "paper_accounts": [{"user_id": "acct3-book"}],
+        "options_positions": [],
+        "paper_positions": ledger_rows if ledger_rows is not None else [
+            {"user_id": "acct3-book", "ticker": OCC_TRACKED,
+             "status": "open", "asset_type": "option"},
+        ],
+    }
+
+
+def _broker_rows():
+    return [
+        {"symbol": OCC_TRACKED, "asset_class": "us_option", "qty": "-2",
+         "avg_entry_price": "0.05"},
+        {"symbol": OCC_ORPHAN, "asset_class": "us_option", "qty": "-1",
+         "avg_entry_price": "1.20"},
+    ]
+
+
+def test_a_leg_open_in_the_real_ledger_is_never_reimported():
+    """LT-05 replay: AGNC is tracked in paper_positions (asset_type=option),
+    options_positions is empty. Only PG -- the true orphan -- is inserted."""
+    binder = _Binder()
+
+    async def _opts(token=None):
+        assert binder.bound == "acct3-book", "option read UNBOUND"
+        return _broker_rows()
+
+    client = FakeClient(_orphan_tables())
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda *a, **k: None), \
+         _patched(alp, get_option_positions_strict=_opts,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.import_orphan_options_all_users())
+
+    inserts = [w for w in client.writes if w["op"] == "insert"]
+    assert len(inserts) == 1, inserts
+    row = inserts[0]["payload"]
+    assert inserts[0]["table"] == "options_positions"
+    assert row["underlying"] == "PG" and row["strategy"] == "wheel_csp", row
+    assert row["user_id"] == "acct3-book", row
+    assert OCC_TRACKED not in row["notes"]
+    assert out["imported"] == 1, out
+
+
+def test_a_ledger_leg_matches_by_contract_key_not_just_ticker_spelling():
+    """Same contract, ledger ticker in lower case: still tracked."""
+    binder = _Binder()
+
+    async def _opts(token=None):
+        return [_broker_rows()[0]]
+
+    client = FakeClient(_orphan_tables(ledger_rows=[
+        {"user_id": "acct3-book", "ticker": OCC_TRACKED.lower(),
+         "status": "open", "asset_type": "option"}]))
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda *a, **k: None), \
+         _patched(alp, get_option_positions_strict=_opts,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.import_orphan_options_all_users())
+    assert client.writes == [], client.writes
+    assert out["imported"] == 0, out
+
+
+def test_a_failed_option_read_imports_nothing():
+    """None is answerless. Nothing is inserted, and the report says why."""
+    binder = _Binder()
+
+    async def _opts(token=None):
+        return None
+
+    client = FakeClient(_orphan_tables())
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda *a, **k: None), \
+         _patched(alp, get_option_positions_strict=_opts,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.import_orphan_options_all_users())
+    assert client.writes == [], client.writes
+    assert out["imported"] == 0
+    assert out["details"] == [{"user_id": "acct3-book",
+                               "skipped": "broker read failed"}], out
+
+
+def test_orphan_import_skips_an_unresolvable_book_without_reading():
+    binder = _Binder()
+    reads = {"n": 0}
+
+    async def _opts(token=None):
+        reads["n"] += 1
+        return _broker_rows()
+
+    client = FakeClient(_orphan_tables())
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder), \
+         _patched(route_guard,
+                  check_route=lambda uid: (False, "bound primary but book "
+                                                  "acct3-bo belongs to acct3"),
+                  record_mismatch=lambda *a, **k: None), \
+         _patched(alp, get_option_positions_strict=_opts,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.import_orphan_options_all_users())
+    assert reads["n"] == 0, "read the broker for a book it could not bind"
+    assert client.writes == [], client.writes
+    assert out["details"][0]["user_id"] == "acct3-book"
+    assert "belongs to acct3" in out["details"][0]["skipped"], out
+
+
+def test_the_wrong_table_drift_detector_is_gone():
+    """It had zero call sites and read options_positions (always empty).
+    A detector pointed at the wrong table reports confidently and wrongly;
+    broker_truth.py is the real one."""
+    assert not hasattr(sr, "detect_option_drift_all_users")
+
+
+# --- KS-4: the ghost-close reset is per book ---------------------------------
+
+def test_a_ghost_close_resets_only_that_books_reject_window():
+    """Broker holds AMZN; ledger holds AMZN + SOFI. SOFI is a ghost and is
+    closed; the reject reset that follows must name THIS book, not wipe
+    every book's window."""
+    resets: list = []
+
+    async def _positions(token=None):
+        return [{"symbol": "AMZN", "asset_class": "us_equity", "qty": "1",
+                 "avg_entry_price": "100"}]
+
+    async def _no_orders(sym, token=None):
+        return []
+
+    client = FakeClient({
+        "paper_accounts": [{"user_id": "acct2-book"}],
+        "paper_positions": [
+            {"id": 1, "user_id": "acct2-book", "ticker": "AMZN",
+             "side": "long", "quantity": 1, "entry_price": 100,
+             "status": "open", "asset_type": "stock"},
+            {"id": 2, "user_id": "acct2-book", "ticker": "SOFI",
+             "side": "long", "quantity": 5, "entry_price": 10,
+             "status": "open", "asset_type": "stock"},
+        ],
+    })
+    import os
+    _prev = os.environ.get("TREZO_ACTIVITY_LOG")
+    os.environ["TREZO_ACTIVITY_LOG"] = "0"      # no jsonl side-files
+    try:
+        with _patched(supabase, create_client=lambda *_a, **_k: client), \
+             _patched(accounts, set_account_for_user=lambda uid: True,
+                      should_skip_unresolved=lambda uid: False), \
+             _patched(book_scope, verify=lambda uid: (True, "ok"),
+                      invalidate=lambda uid=None: None), \
+             _patched(alp, get_positions=_positions,
+                      get_recent_closed_orders=_no_orders,
+                      alpaca_configured=lambda: True), \
+             _patched(killswitch,
+                      reset_broker_rejects=lambda user_id=None:
+                      resets.append(user_id)), \
+             _patched(web_tokens, get_user_broker_token=_no_token):
+            out = _run(sr.reconcile_stocks_all_users())
+    finally:
+        if _prev is None:
+            os.environ.pop("TREZO_ACTIVITY_LOG", None)
+        else:
+            os.environ["TREZO_ACTIVITY_LOG"] = _prev
+
+    assert out["closed"] == 1, out
+    closes = [w for w in client.writes if w["op"] == "update"
+              and w["payload"].get("status") == "closed_manual"]
+    assert [w["eq"][0][1] for w in closes] == [2], closes
+    assert resets == ["acct2-book"], resets
+
+
+def test_reset_broker_rejects_with_a_book_leaves_other_books_alone():
+    """The consumer side of KS-4, on the real killswitch: clearing one
+    book's window must not touch another's or the unattributed bucket."""
+    ts = killswitch._broker_reject_ts
+    saved = {k: list(v) for k, v in ts.items()}
+    try:
+        ts.clear()
+        ts["acct2-book"] = [1.0, 2.0]
+        ts["primary-book"] = [3.0]
+        ts[""] = [4.0]
+        killswitch.reset_broker_rejects("acct2-book")
+        assert "acct2-book" not in ts
+        assert ts["primary-book"] == [3.0] and ts[""] == [4.0], dict(ts)
+    finally:
+        ts.clear()
+        ts.update(saved)
+
+
+if __name__ == "__main__":
+    sys.exit(run_tests(dict(vars())))

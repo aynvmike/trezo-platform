@@ -9,10 +9,13 @@ the bus: the platform approved NOTHING from 8/27 12:36 ET to 8/31 12:45
 ET while the log looked merely quiet -- the only vetoes still visible
 were the ones raised ABOVE the sum (neutral direction, flagged ticker).
 
-These guards are static and dependency-free on purpose: the real
-on_message needs Supabase, a bus and broker keys, so the deploy gate
-cannot execute it. What it CAN do is prove the ordering invariant that
-broke, by reading the source.
+These guards are static and dependency-free on purpose: they prove the
+ordering invariant that broke by reading the source, so they hold even
+if every seam changes. The EXECUTED counterpart is
+tests/test_risk_manager_bookkeyed.py (2026-09-01), which drives the real
+on_message with the Supabase / broker / market-data seams stubbed at
+the module attribute and asserts a real direction reaches the gates
+below the bar without raising.
 """
 
 from __future__ import annotations

@@ -10,8 +10,9 @@ Rules:
   - Veto if the signal's ticker is flagged by Adaptive Scope
   - Veto if TCS below the user's threshold (raised by the regime posture)
   - Veto if too many open signals already (configurable cap)
-  - Veto for everyone today if a user's daily loss limit has been hit
-  - Veto for everyone if a safety kill-switch is tripped (Phase 8c)
+  - Veto only when NO book can take the signal: per-book kill-switches,
+    the user-set daily $ brake and the per-coin bench are judged book by
+    book here and enforced again, per book, at the execution fan-out
   - Otherwise approve, forwarding strategy + stop/target geometry, with
     stops tightened by the current Adaptive Scope posture
 """
@@ -19,10 +20,14 @@ Rules:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections import deque
 
+_log = logging.getLogger(__name__)
+
 _LAST_KS_LOG = 0.0   # kill-switch veto log throttle (2026-07-07)
+_LAST_KS_UNKNOWN_LOG = 0.0   # KS-11: "could not evaluate" log throttle
 
 from app.config import get_settings
 from app.memory import get_memory, AgentDecision
@@ -118,40 +123,33 @@ async def _find_rotation_candidate(
         return None
 
 
-async def _users_in_daily_drawdown() -> set[str]:
-    """Return user_ids whose today's realized loss meets/exceeds their limit."""
-    client = _supabase()
-    if not client:
-        return set()
-
-    def _sync():
-        accounts = client.table("paper_accounts").select("user_id, today_realized_pnl_usd").execute()
-        profiles = client.table("profiles").select("user_id, daily_loss_limit_usd").execute()
-        return accounts.data or [], profiles.data or []
-
-    accounts, profiles = await asyncio.to_thread(_sync)
-    limit_by_user: dict[str, float] = {}
-    for p in profiles:
-        try:
-            v = float(p.get("daily_loss_limit_usd") or 0)
-            if v > 0:
-                limit_by_user[p["user_id"]] = v
-        except (TypeError, ValueError):
-            pass
-
-    drawdown: set[str] = set()
-    for a in accounts:
-        uid = a["user_id"]
-        limit = limit_by_user.get(uid, 0)
-        if limit <= 0:
-            continue
-        try:
-            today = float(a.get("today_realized_pnl_usd") or 0)
-        except (TypeError, ValueError):
-            continue
-        if today <= -limit:
-            drawdown.add(uid)
-    return drawdown
+def _note_kill_switch_unknown(ticker: str) -> None:
+    """KS-11: check_states() came back None -- no client, or the
+    paper_accounts read failed. That is "could not evaluate", NOT "no
+    halts anywhere". The risk gate does not veto on it (the execution
+    fan-out fails closed for every book on the same None, and it is the
+    enforcement point), but it must never pass silently either: one
+    log line + one activity row per 10 minutes, so a dead database can
+    never look like a quiet tape."""
+    global _LAST_KS_UNKNOWN_LOG
+    import time as _t
+    now = _t.time()
+    if (now - _LAST_KS_UNKNOWN_LOG) < 600.0:
+        return
+    _LAST_KS_UNKNOWN_LOG = now
+    _log.error(
+        "risk_manager: kill-switch states unavailable (paper_accounts read "
+        "failed) - per-book halts NOT evaluated here for %s; the execution "
+        "fan-out fails closed until the read recovers", ticker)
+    try:
+        from app.agents.activity_log import record as _rec
+        _rec("kill_switch_unknown", ticker,
+             reason=("check_states returned None (paper_accounts read "
+                     "failed) - per-book halts not evaluated at the risk "
+                     "gate; the fan-out fails closed"),
+             extra={"user_id": "global"})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class RiskManagerAgent(Agent):
@@ -163,9 +161,11 @@ class RiskManagerAgent(Agent):
     # `get_bot_settings(user_id).tcs_threshold` so the user's Bot Tuning
     # slider drives the gate. The dead constant is gone on purpose.
     MAX_OPEN_SIGNALS = 3
-    DEFAULT_PCT_OF_ACCOUNT = 0.02
-    # Cached broker snapshot for the margin-territory gate (60s TTL).
-    _margin_snap: dict = {"ts": 0.0, "cash": None, "equity": None}
+    # TE-24: DEFAULT_PCT_OF_ACCOUNT / approve_payload["position_pct"] are
+    # gone -- no consumer ever read the key; sizing is per book at the
+    # fan-out (sizing.py / allocation.position_pct_for_equity).
+    # TE-19: the class-level _margin_snap broker cache is gone with the
+    # unbound margin gate (see the leverage_bump note in on_message).
 
     def __init__(self) -> None:
         # Patched 2026-06-04 stacking fix: set, not deque(maxlen=8).
@@ -347,10 +347,14 @@ class RiskManagerAgent(Agent):
     # Mike's design: urgent signals get fast processing, low-priority
     # signals can wait, and anything older than its tier gets vetoed
     # with timeout. Prevents queue buildup when APIs lag.
+    # EQ-5 / BI-18: TCS moved to a 0-100 scale on 2026-07-08 but these
+    # bands stayed at 700/500, so NO signal could ever reach a band above
+    # the 300s floor -- every untagged signal got the low-priority
+    # deadline. Same bands, rescaled.
     STALE_TIMEOUTS = (
-        (700, 60),    # TCS >= 700 -> 60-second deadline (urgent)
-        (500, 180),   # TCS 500-699 -> 180-second deadline (MIXED priority - Mike 2026-06-05: TCS in this band is misleading on urgency, will be refined by agent-tagged urgency over time)
-        (0,   300),   # TCS <  500 -> 300-second deadline (low priority)
+        (70, 60),     # TCS >= 70 -> 60-second deadline (urgent)
+        (50, 180),    # TCS 50-69 -> 180-second deadline (MIXED priority - Mike 2026-06-05: TCS in this band is misleading on urgency, will be refined by agent-tagged urgency over time)
+        (0,  300),    # TCS <  50 -> 300-second deadline (low priority)
     )
 
     # Agent-tagged urgency override mapping. Mike 2026-06-05: TCS alone
@@ -635,60 +639,20 @@ class RiskManagerAgent(Agent):
         except Exception:  # noqa: BLE001
             goal_bump = 0
 
-        # Margin-territory gate (Mike 2026-07-17): agents may dip into
-        # margin buying power -- but leverage multiplies BOTH directions,
-        # so it must be earned. When broker cash thins below
-        # TREZO_MARGIN_CASH_FRACTION of equity (default 15% -- roughly
-        # one position's notional), the next stock entry is margin
-        # territory and the bar rises +TREZO_MARGIN_TCS_BUMP (default 8)
-        # on top of every other bump. Crypto/forex exempt (no margin at
-        # the venue; the engine keeps them cash-only). Snapshot cached
-        # 60s; fail-open with no bump -- the engine's deployment ceiling
-        # (TREZO_MAX_DEPLOY_X x equity) still caps exposure.
+        # Margin-territory gate (Mike 2026-07-17) -- MOVED to the fan-out.
+        # TE-19: the block that lived here was dead where it stood. It
+        # read the broker account UNBOUND (no bind_for_user: always the
+        # primary, one class-level 60s cache shared by all three books)
+        # and then called .get() on the AlpacaAccount dataclass, which
+        # raised AttributeError straight into the bare except -- so
+        # leverage_bump was 0 on every signal, and had it ever computed a
+        # bump it would have judged every book by the primary's cash. A
+        # thin cash pile is a per-book fact; the bump now lives at the
+        # execution fan-out (trade_execution), where each book is bound.
+        # The two names stay assigned here because the confidence-bar
+        # sum and the approve payload below still read them.
         leverage_bump = 0
         leverage_note = ""
-        try:
-            from app.data.candles import COIN_MAP as _CM_LEV
-            _lev_exempt = (
-                ticker.upper() in _CM_LEV
-                or str(message.payload.get("asset_type") or "").lower()
-                in ("forex", "crypto")
-            )
-        except Exception:  # noqa: BLE001
-            _lev_exempt = False
-        if not _lev_exempt:
-            try:
-                import time as _lvt
-                _snap = type(self)._margin_snap
-                if _lvt.time() - float(_snap.get("ts") or 0) > 60:
-                    from app.brokers.alpaca import (
-                        get_account, alpaca_configured,
-                    )
-                    if alpaca_configured():
-                        _acct = await get_account()
-                        if _acct:
-                            _snap["cash"] = float(_acct.get("cash") or 0)
-                            _snap["equity"] = float(_acct.get("equity") or 0)
-                            _snap["ts"] = _lvt.time()
-                _lc, _le = _snap.get("cash"), _snap.get("equity")
-                if _lc is not None and _le and _le > 0:
-                    try:
-                        _lfrac = float(os.getenv(
-                            "TREZO_MARGIN_CASH_FRACTION", "0.15"))
-                    except (TypeError, ValueError):
-                        _lfrac = 0.15
-                    if _lc < _le * _lfrac:
-                        try:
-                            leverage_bump = int(float(os.getenv(
-                                "TREZO_MARGIN_TCS_BUMP", "8")))
-                        except (TypeError, ValueError):
-                            leverage_bump = 8
-                        leverage_note = (
-                            f", margin territory +{leverage_bump} "
-                            f"(cash ${_lc:,.0f} < {_lfrac:.0%} of "
-                            f"${_le:,.0f} equity)")
-            except Exception:  # noqa: BLE001
-                leverage_bump = 0
 
         # BROKER-ONLY consistency gate (Mike 2026-07-28: "I would like
         # to have more of a consistency... the platform would not
@@ -790,16 +754,33 @@ class RiskManagerAgent(Agent):
         recovery_reason = ""
         try:
             from app.paper.killswitch import (
-                RECOVERY_TCS_BUMP, check_states, recovery_policy)
-            _states = await check_states(_supabase())
+                RECOVERY_TCS_BUMP, check_states, daily_dollar_over,
+                recovery_policy)
+            _ks_client = _supabase()
+            _states = await check_states(_ks_client)
         except Exception:  # noqa: BLE001
-            _states = {}
-        if _states:
-            _daily_over = set()
+            _states = None
+        if _states is None:
+            # KS-11: None is "could not evaluate" (no client, or the
+            # paper_accounts read failed) -- NOT "no halts anywhere",
+            # which is what the old {} fallback read as. No veto from
+            # here (the fan-out fails closed for every book on the same
+            # None and is the enforcement point), but never silent.
+            _note_kill_switch_unknown(ticker)
+        elif _states:
+            # KS-12: the user-set daily $ brake, judged PER BOOK like the
+            # percent one (killswitch.daily_dollar_over, which the fan-out
+            # re-checks). None = the read failed = unknown: no veto here.
+            # RV-RM-2 (review 2026-09-01), so nobody reads this as
+            # fail-closed: the fan-out re-reads it per book and, on None
+            # there too, records daily_dollar_limit_unknown and proceeds
+            # on the percent brake alone -- fail-OPEN, never silent.
             try:
-                _daily_over = await _users_in_daily_drawdown()
+                _daily_over = await daily_dollar_over(_ks_client)
             except Exception:  # noqa: BLE001
-                pass
+                _daily_over = None
+            if _daily_over is None:
+                _daily_over = set()
             _blocked_notes: list[str] = []
             _n_recovering = 0
             _n_open = 0
@@ -830,7 +811,9 @@ class RiskManagerAgent(Agent):
 
         # The confidence bar can be raised by the current regime posture,
         # the cycle-aware bump, the per-strategy outcome nudge, the
-        # banked-paycheck bump, the margin-territory bump, and crowding.
+        # banked-paycheck bump, crowding, the market report and weekly
+        # recovery. leverage_bump is always 0 here since TE-19 (the
+        # per-book margin bump is applied at the fan-out).
         effective_min_tcs = (min_tcs + scope.tcs_bump + cycle_bump
                              + outcome_delta + goal_bump + probation_bump
                              + leverage_bump + crowding_bump_v + report_bump
@@ -981,13 +964,23 @@ class RiskManagerAgent(Agent):
         # Read the crypto set from COIN_MAP so the ISO 20022-aligned
         # coin expansion (Mike 2026-05-31) is picked up automatically.
         from app.data.candles import COIN_MAP as _COIN_MAP
+        # BI-04: books whose per-coin loss halt is tripped for THIS coin
+        # (scanner signals only -- a user-scoped signal is judged for its
+        # own book above). Travels on the approve payload so the fan-out
+        # skips them instead of the whole platform losing the coin.
+        benched_books: list[str] = []
         if ticker.upper() not in _COIN_MAP and not _is_forex:
             from app.strategies.market_filter import (
                 get_market_bias, direction_blocked, liquidity_check,
                 overextension_check, spread_quality_check,
             )
             from app.data.candles import fetch_candles_for
-            side = "long" if direction == "bullish" else "short"
+            # TE-07: 'long' / 'short' are real directions too (the options
+            # scanner emits "long"; the dividend_lt lane is long-only).
+            # Only 'bullish' mapped to long, so a "long" signal was judged
+            # as a SHORT here and blocked by an UP tape.
+            _dir = str(direction or "").lower()
+            side = "long" if _dir in ("bullish", "long") else "short"
             blocked = direction_blocked(await get_market_bias(), side)
             if blocked:
                 return [self._veto(ticker, tcs, blocked)]
@@ -1058,11 +1051,34 @@ class RiskManagerAgent(Agent):
         else:
             # Per-coin daily loss limit (QW6) - crypto only. Benches a
             # single coin without halting the rest of the book.
-            from app.paper.killswitch import coin_loss_halt
-            coin_veto = await coin_loss_halt(
-                _supabase(), ticker, message.payload.get("user_id"))
-            if coin_veto:
-                return [self._veto(ticker, tcs, coin_veto)]
+            # BI-04: PER BOOK. A user-scoped signal is judged for its own
+            # book (coin_loss_halt now filters by user_id). A scanner
+            # signal (no user_id) used to be judged on every book's losses
+            # summed against one book's budget and vetoed for ALL of them
+            # -- the primary's bad morning benched the 75k's coin. Now each
+            # book gets its own verdict: veto only when EVERY book is
+            # benched; otherwise carry the benched ones on the approval
+            # and let the fan-out skip just those.
+            from app.paper.killswitch import (
+                coin_loss_halt, coin_loss_halt_by_book)
+            _coin_uid = message.payload.get("user_id")
+            if _coin_uid:
+                coin_veto = await coin_loss_halt(
+                    _supabase(), ticker, _coin_uid)
+                if coin_veto:
+                    return [self._veto(ticker, tcs, coin_veto,
+                                       strategy=strategy,
+                                       user_id=_coin_uid)]
+            else:
+                _verdicts = await coin_loss_halt_by_book(_supabase(), ticker)
+                benched_books = sorted(
+                    u for u, (_h, _r) in _verdicts.items() if _h)
+                if _verdicts and len(benched_books) == len(_verdicts):
+                    _why = next(r for _h, r in _verdicts.values() if _h)
+                    return [self._veto(
+                        ticker, tcs,
+                        f"{_why} [all {len(_verdicts)} books benched]",
+                        strategy=strategy)]
 
         import time as _apt
         self._recent_approvals[ticker.upper()] = _apt.time()
@@ -1075,11 +1091,19 @@ class RiskManagerAgent(Agent):
             "ticker": ticker,
             "direction": direction,
             "tcs": tcs,
-            "position_pct": self.DEFAULT_PCT_OF_ACCOUNT,
             "strategy": strategy,
             "reason": f"TCS {tcs} clears threshold; {direction} bias [{strategy}]",
             "accumulation": accumulation_add,
         }
+        # TE-02: a signal pinned to ONE book (book_scoped=True) must stay
+        # pinned through the approval, or the fan-out walks every book.
+        # The key was never forwarded, so the pin could not bind.
+        if message.payload.get("book_scoped") is not None:
+            approve_payload["book_scoped"] = bool(
+                message.payload.get("book_scoped"))
+        # BI-04: per-coin bench, per book (see the crypto gate above).
+        if benched_books:
+            approve_payload["benched_books"] = list(benched_books)
         # Lane caps travel WITH the approval (re-audit 2026-08-28: the
         # execution-side min() was dead because this whitelist never
         # carried the key — the U3 per-name cap could not bind).

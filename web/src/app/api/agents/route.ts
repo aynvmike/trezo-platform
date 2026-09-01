@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth-guards";
 
 export const dynamic = "force-dynamic";
 
@@ -11,6 +13,11 @@ const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
  * a friendly empty state instead of throwing on `.map()`.
  */
 export async function GET() {
+  // AUTH-06: this route was reachable with no session at all.
+  const supabase = createClient();
+  const guard = await requireUser(supabase);
+  if (!guard.ok) return guard.response;
+
   try {
     const r = await fetch(`${AGENTS_BASE}/agents`, {
       cache: "no-store",

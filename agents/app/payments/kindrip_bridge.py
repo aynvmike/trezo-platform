@@ -58,23 +58,42 @@ def _supabase():
         return None
 
 
+_PLACEHOLDER_PARENT = "Trezo Parent"
+
+
 async def _parent_name(client, user_id: str) -> str:
     """Resolve the parent's display name from profiles, falling back
-    to a clean placeholder when nothing is set."""
+    to a clean placeholder ONLY when display_name is genuinely empty.
+
+    MIG-02 (audit 2026-09-01): this selected `full_name, email` --
+    neither column exists on profiles (0001 defines `display_name`;
+    email lives in auth.users), so PostgREST rejected the query on
+    every run, the error was swallowed, and every draft pain.001 was
+    stamped 'Trezo Parent'. The read failure is now logged so a schema
+    drift like this is visible instead of silently becoming the name.
+    """
     def _sync():
         return (
             client.table("profiles")
-            .select("full_name, email")
+            .select("display_name")
             .eq("user_id", user_id)
             .maybe_single()
             .execute()
         )
     try:
         res = await asyncio.to_thread(_sync)
-        row = res.data if res else {}
-    except Exception:  # noqa: BLE001
-        row = {}
-    return (row.get("full_name") or row.get("email") or "Trezo Parent").strip()
+    except Exception as e:  # noqa: BLE001
+        log.warning("kindrip_bridge.parent_name_failed",
+                    user_id=user_id, error=str(e)[:200])
+        return _PLACEHOLDER_PARENT
+    err = getattr(res, "error", None) if res is not None else None
+    if err:
+        log.warning("kindrip_bridge.parent_name_failed",
+                    user_id=user_id, error=str(err)[:200])
+        return _PLACEHOLDER_PARENT
+    row = (res.data if res is not None else None) or {}
+    name = str(row.get("display_name") or "").strip()
+    return name or _PLACEHOLDER_PARENT
 
 
 async def record_kindrip_draft(

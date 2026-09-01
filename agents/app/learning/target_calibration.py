@@ -11,7 +11,7 @@ instead of wishing for a number the tape hasn't been paying.
 
 Fail-open by design: fewer than MIN_SAMPLES closed trades, any query
 error, or a zero median -> None, and the strategy trades on its normal
-geometry. Cached in-process for an hour per lane.
+geometry. Cached in-process for an hour per (lane, book).
 
 Tunables (agents/.env):
   TREZO_LEARNED_TARGET_ENABLED       1 (default on)
@@ -42,7 +42,11 @@ async def achieved_move_pct(strategy: str, asset_type: str,
     not enough history -- callers must fail open."""
     if not enabled():
         return None, 0
-    lane = f"{(strategy or 'unknown').lower()}|{(asset_type or 'stock').lower()}"
+    # BI-09: the key must carry the book. The query below is filtered by
+    # user_id, but the cache was keyed by lane alone, so whichever book
+    # asked first set every other book's learned target for an hour.
+    lane = (f"{(strategy or 'unknown').lower()}|{(asset_type or 'stock').lower()}"
+            f"|{user_id or ''}")
     hit = _CACHE.get(lane)
     if hit and (_time.time() - hit[0]) < _TTL:
         return hit[1], hit[2]

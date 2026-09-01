@@ -54,6 +54,17 @@ def _lane_cap_f(source_payload) -> float | None:
     return None
 
 
+def _lane_of(ticker: str, payload) -> str:
+    """Lane label carried on execution outcome messages ('stock' |
+    'crypto' | 'option' | 'forex' | ...): the rule the fan-out has always
+    used for admission -- a COIN_MAP ticker is crypto whatever the payload
+    says, otherwise the signal's declared asset_type, else stock.
+    ops_watchdog keys its per-lane nets on payload["lane"]."""
+    if str(ticker or "").upper() in CRYPTO_SYMBOLS:
+        return "crypto"
+    return str((payload or {}).get("asset_type") or "stock").lower()
+
+
 class TradeExecutionAgent(Agent):
     name = "trade_execution"
     tick_interval_seconds = 0  # event-driven
@@ -66,9 +77,33 @@ class TradeExecutionAgent(Agent):
             return []
 
         ticker = message.payload.get("ticker", "?")
-        direction = message.payload.get("direction", "neutral")
-        side = "long" if direction == "bullish" else "short"
+        direction = str(message.payload.get("direction") or "").strip().lower()
         user_id = message.payload.get("user_id")
+        # TE-07: 'bullish' / 'long' -> long, 'bearish' / 'short' -> short,
+        # anything else is REFUSED. The old one-liner sent every value
+        # that was not exactly 'bullish' -- 'long' itself, 'income', a
+        # missing field, a typo -- SHORT, with nothing in the log.
+        if direction in ("bullish", "long"):
+            side = "long"
+        elif direction in ("bearish", "short"):
+            side = "short"
+        else:
+            _lane = _lane_of(ticker, message.payload)
+            _why = (f"unknown direction {direction!r} -- refusing rather "
+                    f"than defaulting to short")
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("execute_error", ticker,
+                      strategy=message.payload.get("strategy"),
+                      reason=_why[:180],
+                      extra={"user_id": str(user_id or ""), "lane": _lane})
+            except Exception:  # noqa: BLE001
+                pass
+            return [AgentMessage(
+                agent=self.name, kind="error", confidence=1.0,
+                payload={"user_id": user_id, "ticker": ticker,
+                         "event": "execute_error", "lane": _lane,
+                         "error": _why})]
 
         # Platform-default routing (Mike 2026-08-20): "by default all
         # accounts and books have access to the platform - we adjust in
@@ -147,6 +182,8 @@ class TradeExecutionAgent(Agent):
                 return [AgentMessage(
                     agent=self.name, kind="error", confidence=1.0,
                     payload={"user_id": user_id, "ticker": ticker,
+                             "event": "execute_error",
+                             "lane": _lane_of(ticker, message.payload),
                              "error": f"route check failed: {_note}"})]
             return await self._execute_for_user(user_id, ticker, side,
                                                 message.payload)
@@ -220,6 +257,72 @@ class TradeExecutionAgent(Agent):
         want = _norm.get(asset_type, "stock")
         return sum(1 for a in held.values() if a == want)
 
+    async def _margin_territory_bump(self, user_id, ticker: str,
+                                     asset_type: str) -> tuple[int, str]:
+        """TE-19: the margin-territory TCS bump, per book, under ITS binding.
+
+        Mike 2026-07-17: agents may dip into margin buying power, but
+        leverage multiplies both directions, so it must be earned. When
+        THIS book's broker cash thins below TREZO_MARGIN_CASH_FRACTION of
+        its equity (default 15% -- roughly one position's notional), its
+        next stock entry is margin territory and the bar rises
+        +TREZO_MARGIN_TCS_BUMP (default 8). Crypto/forex exempt (no
+        margin at the venue; the engine keeps them cash-only).
+
+        Copied from the Risk Manager block that never fired: it read the
+        account as a dict (`.get`) while get_account returns an
+        AlpacaAccount, so the AttributeError was swallowed and the bump
+        was 0 for every signal -- and it read ONE account for all books.
+        Snapshot cached 60s per book; a failed read (None) means no bump
+        and no cache, never a guess. Must be called inside
+        bind_for_user(user_id): get_account reads whichever account is
+        bound.
+        """
+        if str(asset_type or "").lower() in ("crypto", "forex"):
+            return 0, ""
+        try:
+            from app.data.candles import COIN_MAP as _CM
+            if str(ticker or "").upper() in _CM:
+                return 0, ""
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import os as _os
+            import time as _t
+            snaps = getattr(self, "_margin_snaps", None)
+            if snaps is None:
+                snaps = self._margin_snaps = {}
+            snap = snaps.get(str(user_id)) or {}
+            if _t.time() - float(snap.get("ts") or 0) > 60:
+                from app.brokers.alpaca import alpaca_configured, get_account
+                if not alpaca_configured():
+                    return 0, ""
+                acct = await get_account()
+                if acct is None:
+                    return 0, ""
+                snap = {"cash": float(getattr(acct, "cash", 0) or 0),
+                        "equity": float(getattr(acct, "equity", 0) or 0),
+                        "ts": _t.time()}
+                snaps[str(user_id)] = snap
+            cash, equity = snap.get("cash"), snap.get("equity")
+            if cash is None or not equity or float(equity) <= 0:
+                return 0, ""
+            try:
+                frac = float(_os.getenv("TREZO_MARGIN_CASH_FRACTION", "0.15"))
+            except (TypeError, ValueError):
+                frac = 0.15
+            if float(cash) < float(equity) * frac:
+                try:
+                    bump = int(float(_os.getenv("TREZO_MARGIN_TCS_BUMP", "8")))
+                except (TypeError, ValueError):
+                    bump = 8
+                return bump, (f"margin territory +{bump} (cash "
+                              f"${float(cash):,.0f} < {frac:.0%} of "
+                              f"${float(equity):,.0f} equity)")
+        except Exception:  # noqa: BLE001
+            pass
+        return 0, ""
+
     async def _execute_for_all_users(
         self,
         ticker: str,
@@ -234,6 +337,14 @@ class TradeExecutionAgent(Agent):
         Aggregates messages from every per-user call. If no paper_accounts
         exist (fresh install) we emit a single info row so the trace panel
         records what happened instead of silently dropping the approve.
+
+        Every per-book gate lives here, under bind_for_user(uid), because
+        this is the first line where a book has a name: route check, its
+        own kill-switch verdict (halt / recovery with the KS-5 bump), its
+        daily $ brake (KS-12), its per-coin bench (benched_books), its R:R
+        geometry against ITS floor (RR-2/RR-3), its margin-territory bump
+        (TE-19), then book_gate.admits and capacity. A kill-switch state
+        that cannot be read fails CLOSED for every book (KS-11).
         """
         import asyncio
         from app.runtime.persistence import _client
@@ -260,6 +371,8 @@ class TradeExecutionAgent(Agent):
                 payload={
                     "ticker": ticker,
                     "side": side,
+                    "event": "execute_error",
+                    "lane": _lane_of(ticker, source_payload),
                     "error": f"paper_accounts lookup failed: {e}",
                 },
             )]
@@ -294,12 +407,63 @@ class TradeExecutionAgent(Agent):
         # signal (row sums are 30s-cached inside); each book is then
         # judged on ITS OWN halt/recovery below — a tripped primary no
         # longer decides anything for the 25k or the 75k.
-        _book_ks: dict = {}
+        # KS-11: None (not {}) means the paper_accounts read FAILED --
+        # "cannot evaluate" -- and the fan-out is the enforcement point,
+        # so NO book executes on this approval. A dead database used to
+        # read as "no halts anywhere". An exception is the same answer.
+        _lane = _lane_of(ticker, source_payload)
+        _book_ks: dict | None = None
         try:
             from app.paper.killswitch import check_states as _ck_states
             _book_ks = await _ck_states(client)
         except Exception:  # noqa: BLE001
-            _book_ks = {}
+            _book_ks = None
+        if _book_ks is None:
+            _ks_err = ("kill-switch state unreadable — fail closed: "
+                       f"{ticker} {side} not executed for any of "
+                       f"{len(users)} book(s)")
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("execute_error", ticker,
+                      strategy=source_payload.get("strategy"),
+                      reason=_ks_err[:180],
+                      extra={"lane": _lane, "books": len(users)})
+            except Exception:  # noqa: BLE001
+                pass
+            return [AgentMessage(
+                agent=self.name, kind="error", confidence=1.0,
+                payload={"ticker": ticker, "side": side,
+                         "event": "execute_error", "lane": _lane,
+                         "reason": "kill-switch state unreadable — fail closed",
+                         "error": _ks_err})]
+        # KS-12: the per-book DOLLAR brake (profiles.daily_loss_limit_usd),
+        # read once per approval next to the percent brake above. None is
+        # "unknown" (read failed): say so and proceed -- the percent brake
+        # still holds and the risk gate already applied this one upstream.
+        _dollar_over: set | None = None
+        try:
+            from app.paper.killswitch import daily_dollar_over as _ddo
+            _dollar_over = await _ddo(client)
+        except Exception:  # noqa: BLE001
+            _dollar_over = None
+        if _dollar_over is None:
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("daily_dollar_limit_unknown", ticker,
+                      strategy=source_payload.get("strategy"),
+                      reason=("daily $ loss limits unreadable -- proceeding "
+                              "on the percent brake alone"),
+                      extra={"lane": _lane})
+            except Exception:  # noqa: BLE001
+                pass
+        # Per-coin loss halt, measured PER BOOK by Risk Manager
+        # (killswitch.coin_loss_halt_by_book) and carried on the approval
+        # as benched_books. Read defensively -- older producers omit it.
+        _benched = {str(b) for b in
+                    (source_payload.get("benched_books") or []) if b}
+        # RR-2 / RR-3 / RM-6: books whose stop was re-harmonized to THEIR
+        # floor, logged once per approval after the loop.
+        _rr_notes: list[str] = []
         for uid in users:
             try:
                 # Each book's order must go to ITS OWN broker account.
@@ -329,6 +493,8 @@ class TradeExecutionAgent(Agent):
                     # via the per-book payload below).
                     _ks_b = _book_ks.get(str(uid))
                     _sp_uid = source_payload
+                    _tcs_bump = 0    # KS-5 + TE-19, this book's own
+                    _lev_note = ""
                     if _ks_b is not None:
                         if _ks_b.halted and _ks_b.mode != "recovery":
                             out.append(AgentMessage(
@@ -341,7 +507,8 @@ class TradeExecutionAgent(Agent):
                             continue
                         if _ks_b.mode == "recovery":
                             from app.paper.killswitch import (
-                                RECOVERY_SIZE_FACTOR, recovery_policy)
+                                RECOVERY_SIZE_FACTOR, RECOVERY_TCS_BUMP,
+                                recovery_policy)
                             _strat_b = str(source_payload.get("strategy")
                                            or "")
                             if recovery_policy(_strat_b) == "suspend":
@@ -376,13 +543,96 @@ class TradeExecutionAgent(Agent):
                                        "_recovery_mode": True,
                                        "risk_pct_override":
                                        _base_risk * RECOVERY_SIZE_FACTOR}
+                            # KS-5: a recovering book's conviction bar
+                            # rises by RECOVERY_TCS_BUMP. Risk Manager
+                            # adds it only when EVERY book is recovering;
+                            # the per-book verdict belongs here.
+                            _tcs_bump += int(RECOVERY_TCS_BUMP)
+                    # KS-12 per book: at its own daily $ loss limit.
+                    if _dollar_over is not None and str(uid) in _dollar_over:
+                        out.append(AgentMessage(
+                            agent=self.name, kind="info", confidence=1.0,
+                            payload={"user_id": uid, "ticker": ticker,
+                                     "side": side, "lane": _lane,
+                                     "event": "daily_dollar_limit_skip",
+                                     "note": (f"{ticker}: this book is at "
+                                              f"its daily $ loss limit "
+                                              f"(profiles.daily_loss_limit"
+                                              f"_usd) - skipped")}))
+                        continue
+                    # Per-coin loss halt tripped on THIS book (benched_books).
+                    if str(uid) in _benched:
+                        out.append(AgentMessage(
+                            agent=self.name, kind="info", confidence=1.0,
+                            payload={"user_id": uid, "ticker": ticker,
+                                     "side": side, "lane": _lane,
+                                     "event": "coin_loss_halt_skip",
+                                     "note": (f"{ticker}: per-coin daily "
+                                              f"loss halt is tripped on "
+                                              f"this book (benched_books) "
+                                              f"- skipped")}))
+                        continue
+                    _atype = _lane_of(ticker, _sp_uid)
+                    # RR-2 / RR-3 / RM-6: Risk Manager harmonized the stop
+                    # against the SIGNAL user's min_reward_risk (0.4)
+                    # while sizing judges each EXECUTING book against its
+                    # own floor (0.5) -- 134 rejections 'Reward:risk 0.4
+                    # below your 0.5 floor' and a dark equity lane.
+                    # Re-harmonize per book, exactly as the global
+                    # harmonizer does: stop = max(target / floor, 0.004),
+                    # only ever tightening; crypto exempt there too. The
+                    # floor values and the learned target are untouched.
+                    if _atype != "crypto":
+                        try:
+                            _sf = _sp_uid.get("stop_pct")
+                            _tf = _sp_uid.get("target_pct")
+                            if _sf and _tf and float(_sf) > 0:
+                                _rrf = float(getattr(_cfg, "min_reward_risk",
+                                                     1.5) or 1.5)
+                                if float(_tf) / float(_sf) < _rrf:
+                                    _new_s = max(round(float(_tf)
+                                                       / max(_rrf, 0.1), 4),
+                                                 0.004)
+                                    # RV-1 (review 2026-09-01): round()
+                                    # can land the 4-dp stop half a bp
+                                    # ABOVE target/floor (0.0032/0.75 =
+                                    # 0.004266 -> 0.0043) and sizing's
+                                    # 2-dp ratio then reads 0.74 < 0.75
+                                    # -- the exact rejection this block
+                                    # exists to prevent. Judge it the way
+                                    # sizing will; one bp tighter always
+                                    # clears a half-bp round-up.
+                                    if (_new_s > 0.004
+                                            and round(float(_tf) / _new_s, 2)
+                                            < _rrf):
+                                        _new_s = round(_new_s - 0.0001, 4)
+                                    if _new_s < float(_sf):
+                                        _sp_uid = {
+                                            **_sp_uid, "stop_pct": _new_s,
+                                            "rr_reharmonized": {
+                                                "book_floor": _rrf,
+                                                "stop_pct_from": float(_sf),
+                                                "stop_pct_to": _new_s}}
+                                        _rr_notes.append(
+                                            f"{str(uid)[:8]}: floor {_rrf:g}, "
+                                            f"stop {float(_sf) * 100:.2f}% -> "
+                                            f"{_new_s * 100:.2f}% (target "
+                                            f"{float(_tf) * 100:.2f}%, R:R "
+                                            f"{float(_tf) / float(_sf):.2f} -> "
+                                            f"{float(_tf) / _new_s:.2f})")
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pass
+                    # TE-19: margin-territory bump -- THIS book's cash vs
+                    # THIS book's equity, read under its binding.
+                    _lev_bump, _lev_note = await self._margin_territory_bump(
+                        uid, ticker, _atype)
+                    _tcs_bump += int(_lev_bump or 0)
                     _v = _admits(
                         _cfg,
-                        asset_type=("crypto" if ticker.upper() in CRYPTO_SYMBOLS
-                                    else str(_sp_uid.get("asset_type")
-                                             or "stock")),
+                        asset_type=_atype,
                         strategy=str(_sp_uid.get("strategy") or ""),
-                        tcs=_sp_uid.get("tcs"))
+                        tcs=_sp_uid.get("tcs"),
+                        tcs_bump=_tcs_bump)
                     # THIS book's slot count vs THIS book's cap. A book
                     # already holding the ticker may still add to it
                     # (accumulation) - a full book only refuses NEW names.
@@ -394,9 +644,6 @@ class TradeExecutionAgent(Agent):
                         _held = open_by_book.get(str(uid), {})
                         _cap = int(getattr(_cfg, "max_open_positions", 14)
                                    or 14)
-                        _atype = ("crypto" if ticker.upper() in CRYPTO_SYMBOLS
-                                  else str(_sp_uid.get("asset_type")
-                                           or "stock")).lower()
                         _pcap = self._pocket_cap(_cfg, _atype, _cap)
                         _popen = self._pocket_open(_held, _atype)
                         if (ticker.upper() not in _held
@@ -431,11 +678,14 @@ class TradeExecutionAgent(Agent):
                         out.append(AgentMessage(
                             agent=self.name, kind="info", confidence=1.0,
                             payload={"user_id": uid, "ticker": ticker,
-                                     "side": side,
+                                     "side": side, "lane": _atype,
                                      "event": _v.event,
                                      "strategy": source_payload.get("strategy"),
                                      "tcs": source_payload.get("tcs"),
-                                     "note": f"{ticker}: {_v.reason}"}))
+                                     "tcs_bump": _tcs_bump,
+                                     "note": (f"{ticker}: {_v.reason}"
+                                              + (f"; {_lev_note}"
+                                                 if _lev_note else ""))}))
                         continue
                     msgs = await self._execute_for_user(uid, ticker, side,
                                                         _sp_uid)
@@ -447,9 +697,21 @@ class TradeExecutionAgent(Agent):
                         "user_id": uid,
                         "ticker": ticker,
                         "side": side,
+                        "event": "execute_error", "lane": _lane,
                         "error": f"execute failed for user: {e}",
                     },
                 ))
+        # RR-2 / RR-3 / RM-6: one line per approval naming each book whose
+        # geometry was re-harmonized to ITS floor (before -> after).
+        if _rr_notes:
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("rr_reharmonized", ticker,
+                      strategy=source_payload.get("strategy"),
+                      reason="; ".join(_rr_notes)[:290],
+                      extra={"lane": _lane, "books": len(_rr_notes)})
+            except Exception:  # noqa: BLE001
+                pass
         return out
 
     async def _execute_for_user(
@@ -482,7 +744,9 @@ class TradeExecutionAgent(Agent):
         if not candles:
             return [AgentMessage(
                 agent=self.name, kind="error",
-                payload={"user_id": user_id, "ticker": ticker, "error": "No price data"},
+                payload={"user_id": user_id, "ticker": ticker,
+                         "event": "execute_error", "lane": asset_type,
+                         "error": "No price data"},
             )]
         market_price = float(candles[-1].close)
 
@@ -596,6 +860,7 @@ class TradeExecutionAgent(Agent):
             return [AgentMessage(
                 agent=self.name, kind="error",
                 payload={"user_id": user_id, "ticker": ticker,
+                         "event": "execute_error", "lane": "crypto",
                          "error": f"crypto_exchange submit failed: {e}"},
             )]
         # REACHABLE silent path (re-audit 2026-08-28): submit_order in
@@ -863,9 +1128,13 @@ class TradeExecutionAgent(Agent):
 
         fill = await open_position(**kwargs)
         if not fill.ok:
+            # Outcome-message contract: every rejection carries
+            # event="execute_error" and its lane for ops_watchdog.
             return [AgentMessage(
                 agent=self.name, kind="error",
-                payload={"user_id": user_id, "ticker": ticker, "error": fill.error},
+                payload={"user_id": user_id, "ticker": ticker,
+                         "event": "execute_error", "lane": asset_type,
+                         "error": fill.error},
             )]
         return [AgentMessage(
             agent=self.name, kind="execute", confidence=1.0,
@@ -873,6 +1142,7 @@ class TradeExecutionAgent(Agent):
                 "user_id": user_id,
                 "ticker": ticker,
                 "side": side,
+                "lane": asset_type,
                 "fill_price": fill.fill_price,
                 "position_id": fill.position_id,
                 "strategy": strategy,
@@ -907,10 +1177,13 @@ class TradeExecutionAgent(Agent):
                       extra={"user_id": str(user_id)})
             except Exception:  # noqa: BLE001
                 pass
+            # Outcome-message contract: event + lane so ops_watchdog can
+            # count rejections per lane.
             return [AgentMessage(
                 agent=self.name, kind="error",
                 payload={"user_id": user_id, "ticker": ticker,
-                         "broker": "alpaca", "error": msg},
+                         "broker": "alpaca", "event": "execute_error",
+                         "lane": "stock", "error": msg},
             )]
 
         bt = await get_user_broker_token(user_id, "alpaca")
@@ -948,10 +1221,14 @@ class TradeExecutionAgent(Agent):
             stop_price = market_price * (1 - sp)
             target_price = market_price * (1 + tp)
             order_side = "buy"
-        else:
+        elif side == "short":
             stop_price = market_price * (1 + sp)
             target_price = market_price * (1 - tp)
             order_side = "sell"
+        else:
+            # TE-07: never let an unknown side become a SHORT sale.
+            return _err(f"unknown side {side!r} -- refusing rather than "
+                        f"defaulting to short")
 
         risk_pct = source_payload.get("risk_pct_override")
         if risk_pct is None:
@@ -967,6 +1244,8 @@ class TradeExecutionAgent(Agent):
             target_price=target_price,
             risk_pct=float(risk_pct),
             asset_type="stock",
+            # RR-3: THIS book's R:R floor and concentration cap, by name.
+            user_id=user_id,
             # Tightest of broker BP, pocket remainder, and the lane's own
             # cap (2026-08-28 — the cap used to die in _execute_internal,
             # a function the live stock path never calls).
@@ -1132,6 +1411,7 @@ class TradeExecutionAgent(Agent):
                     "user_id": user_id,
                     "ticker": ticker,
                     "side": side,
+                    "lane": "stock",
                     "broker": "alpaca",
                     "broker_order_id": order_id,
                     "strategy": strategy,
@@ -1174,10 +1454,13 @@ class TradeExecutionAgent(Agent):
                       extra={"user_id": str(user_id)})
             except Exception:  # noqa: BLE001
                 pass
+            # Outcome-message contract: event + lane so ops_watchdog can
+            # count rejections per lane.
             return [AgentMessage(
                 agent=self.name, kind="error",
                 payload={"user_id": user_id, "ticker": ticker,
                          "broker": "alpaca", "asset_type": "crypto",
+                         "event": "execute_error", "lane": "crypto",
                          "error": msg},
             )]
 
@@ -1207,10 +1490,14 @@ class TradeExecutionAgent(Agent):
             stop_price = market_price * (1 - sp)
             target_price = market_price * (1 + tp)
             order_side = "buy"
-        else:
+        elif side == "short":
             stop_price = market_price * (1 + sp)
             target_price = market_price * (1 - tp)
             order_side = "sell"
+        else:
+            # TE-07: never let an unknown side become a SHORT sale.
+            return _err(f"unknown side {side!r} -- refusing rather than "
+                        f"defaulting to short")
 
         risk_pct = source_payload.get("risk_pct_override")
         if risk_pct is None:
@@ -1283,6 +1570,8 @@ class TradeExecutionAgent(Agent):
             target_price=target_price,
             risk_pct=float(risk_pct),
             asset_type="crypto",
+            # RR-3: THIS book's R:R floor and concentration cap, by name.
+            user_id=user_id,
             buying_power=min([x for x in (
                 _crypto_usd, remaining, _cx_slice,
                 _lane_cap_f(source_payload)) if x is not None]),
@@ -1373,6 +1662,7 @@ class TradeExecutionAgent(Agent):
                     "ticker": ticker,
                     "side": side,
                     "asset_type": "crypto",
+                    "lane": "crypto",
                     "broker": "alpaca",
                     "broker_order_id": order_id,
                     "strategy": strategy,

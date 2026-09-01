@@ -12,6 +12,7 @@ import { WheelUniversePanel } from "@/components/dashboard/wheel-universe-panel"
 import { OpenOptionsTable } from "@/components/dashboard/open-options-table";
 import { WheelAcquisitionQueue } from "@/components/dashboard/wheel-acquisition-queue";
 import { OptionsApprovalBadge } from "@/components/dashboard/options-approval-badge";
+import { LoadError, loadResult } from "@/components/dashboard/load-error";
 import { fetchAlpacaSnapshot } from "@/lib/alpaca-snapshot";
 import {
   fetchWheelLiveSnapshot,
@@ -319,7 +320,11 @@ export default async function WheelPage() {
   // legs in the account yet.
   const liveSummary = summariseLiveWheel(wheelLive);
 
-  const positions = (rowsRes.data ?? []) as WheelRow[];
+  // PAGES-03: keep "read failed" distinct from "nothing there". A failed
+  // options_positions read blanks the modeled tiles/sections below; the
+  // live (Alpaca-backed) panels have their own snapshot and still render.
+  const rowsLoad = loadResult<WheelRow[]>("options_positions", rowsRes, []);
+  const positions = rowsLoad.data ?? [];
 
   // Idle reason — Mike feedback 2026-05-29. The cards used to all say
   // "Idle — ready to start the cycle" with no hint why. Now they
@@ -378,14 +383,26 @@ export default async function WheelPage() {
     }
   }
 
+  // PAGES-05: the hero used to get no count and defaulted to "active".
+  // Live broker legs win when present; otherwise the modeled book; and
+  // undefined (-> idle, "—") when the modeled read failed.
+  const heroOpenCount = liveSummary
+    ? liveSummary.open_csps + liveSummary.open_ccs
+    : rowsLoad.failure
+      ? undefined
+      : open.length;
+
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <LayerHero id={5} />
+      <LayerHero id={5} openCount={heroOpenCount} />
+
+      {rowsLoad.failure ? <LoadError {...rowsLoad.failure} /> : null}
 
       {/* Headline tiles — when Alpaca is connected and reports open
           option legs, these read from the broker (LIVE). Otherwise
           they fall back to the modeled `options_positions` table. The
           live badge tells the user which side of the line they're on. */}
+      {rowsLoad.failure && !liveSummary ? null : (
       <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <StatCard
           label="Open contracts"
@@ -413,10 +430,11 @@ export default async function WheelPage() {
         />
         <StatCard
           label="Realized P&L"
-          value={usd(realized)}
-          tone={realized >= 0 ? "good" : "bad"}
+          value={rowsLoad.failure ? "—" : usd(realized)}
+          tone={rowsLoad.failure ? undefined : realized >= 0 ? "good" : "bad"}
         />
       </section>
+      )}
       <p className="-mt-4 text-[11px] text-weave-500">
         Tiles reflect <span className="font-medium">currently open</span> legs
         only. Reconciled / settled legs roll into Realized P&L.
@@ -491,16 +509,19 @@ export default async function WheelPage() {
             value={usd(liveSummary?.premium_at_work_usd ?? creditOpen)}
             tone="good"
           />
+          {/* REVIEW PAGES-03 (2026-09-01): these two are derived only from
+              the options_positions read, so on a failed read they printed
+              a confident "$0.00". Blank them like the headline tile above. */}
           <IncomeCard
             label="Realized P&L"
             sub="Closed legs"
-            value={usd(realized)}
-            tone={realized >= 0 ? "good" : "bad"}
+            value={rowsLoad.failure ? "—" : usd(realized)}
+            tone={rowsLoad.failure ? "neutral" : realized >= 0 ? "good" : "bad"}
           />
           <IncomeCard
             label="Modeled hold income"
             sub="Dividend + FPSL (annualised on shares currently held)"
-            value={usd(modeledAnnualHeldIncome)}
+            value={rowsLoad.failure ? "—" : usd(modeledAnnualHeldIncome)}
             tone={modeledAnnualHeldIncome > 0 ? "good" : "neutral"}
           />
         </div>
@@ -511,7 +532,9 @@ export default async function WheelPage() {
           Open wheel positions{" "}
           <span className="text-sm text-weave-500">({open.length})</span>
         </h2>
-        {open.length === 0 ? (
+        {rowsLoad.failure ? (
+          <LoadError {...rowsLoad.failure} />
+        ) : open.length === 0 ? (
           <EmptyCard>
             No open wheel positions yet. The Options Scanner opens a modeled
             cash-secured put on each quality name every 30 minutes once your
@@ -527,7 +550,9 @@ export default async function WheelPage() {
           Settled positions{" "}
           <span className="text-sm text-weave-500">({closed.length})</span>
         </h2>
-        {closed.length === 0 ? (
+        {rowsLoad.failure ? (
+          <LoadError {...rowsLoad.failure} />
+        ) : closed.length === 0 ? (
           <EmptyCard>
             Nothing has settled yet. A wheel leg settles on its expiration date.
           </EmptyCard>

@@ -76,15 +76,22 @@ def ungated(asset_type: str, strategy: str) -> bool:
     return not any(g.applies(at, st) for g in GATES)
 
 
-def min_tcs_for(settings, strategy: str) -> int:
-    """This book's TCS floor for this strategy.
+def min_tcs_for(settings, strategy: str, *, tcs_bump: int = 0) -> int:
+    """This book's TCS floor for this strategy, plus any per-book bump.
 
     Mirrors the crypto carve-out Risk Manager and the crypto scanner
     both apply (Mike 2026-07-23: crypto runs under the stock floor
     because per-coin stops are tighter). Duplicating the rule is worse
     than sharing it, but the alternative here is importing Risk Manager
     into the execution path, and a floor that disagrees with the one
-    that approved the signal would reject everything crypto."""
+    that approved the signal would reject everything crypto.
+
+    `tcs_bump` (KS-5, TE-19): extra conviction THIS book demands on top
+    of its floor -- weekly recovery (+RECOVERY_TCS_BUMP) and margin
+    territory (+TREZO_MARGIN_TCS_BUMP), each decided per book at the
+    fan-out. Risk Manager adds the same bumps to its ONE global floor;
+    before this the per-book verdict ignored them, so a recovering book
+    was admitted at its ordinary bar."""
     floor = int(getattr(settings, "tcs_threshold", 70) or 70)
     if str(strategy or "").lower().startswith("crypto"):
         try:
@@ -99,6 +106,11 @@ def min_tcs_for(settings, strategy: str) -> int:
                 os.getenv("TREZO_COVERAGE_TCS", "40"))))
         except (TypeError, ValueError):
             floor = min(floor, 40)
+    # KS-5 / TE-19: the bump rides on top of every carve-out above.
+    try:
+        floor += max(0, int(tcs_bump or 0))
+    except (TypeError, ValueError):
+        pass
     return floor
 
 
@@ -122,12 +134,14 @@ class Verdict:
 
 
 def admits(settings, *, asset_type: str, strategy: str,
-           tcs: Optional[float] = None) -> Verdict:
+           tcs: Optional[float] = None, tcs_bump: int = 0) -> Verdict:
     """May this book take this signal?
 
     Takes the already-loaded settings object rather than a user_id, so
     it is pure and testable and cannot be handed the wrong book by
-    accident -- the caller has already bound one.
+    accident -- the caller has already bound one. `tcs_bump` is this
+    book's own extra conviction (recovery / margin territory, KS-5 and
+    TE-19) and is added to its floor before the TCS check.
 
     Fails OPEN on anything unexpected. A settings blip must not silently
     freeze a book; the historical behaviour was to trade, and a gate
@@ -149,11 +163,17 @@ def admits(settings, *, asset_type: str, strategy: str,
                     "book_declined")
 
         if tcs is not None:
-            floor = min_tcs_for(settings, st)
+            try:
+                _bump = max(0, int(tcs_bump or 0))
+            except (TypeError, ValueError):
+                _bump = 0
+            floor = min_tcs_for(settings, st, tcs_bump=_bump)
             if float(tcs) < floor:
+                _bump_note = f" (incl. +{_bump} bump)" if _bump else ""
                 return Verdict(
                     False,
-                    f"TCS {float(tcs):g} is under this book's floor of {floor}",
+                    f"TCS {float(tcs):g} is under this book's floor of "
+                    f"{floor}{_bump_note}",
                     "book_declined")
         return Verdict(True)
     except Exception:  # noqa: BLE001

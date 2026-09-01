@@ -2,6 +2,16 @@ import { createClient } from "@/lib/supabase/server";
 import { fetchAlpacaSnapshot, type AlpacaPosition } from "@/lib/alpaca-snapshot";
 import type { OverviewData, OVLayer, OVActivity } from "@/components/dashboard/overview-view-redesign";
 import type { HeroGoal } from "@/components/dashboard/woven-basket-hero";
+import { loadResult, failuresOf, type LoadFailure } from "@/components/dashboard/load-error";
+
+/**
+ * PAGES-03: `data` is null whenever any Supabase read failed, and
+ * `failures` says which table(s). The Overview must not render a
+ * $0 / all-idle basket on a broken query.
+ */
+export type OverviewLoad =
+  | { data: OverviewData; failures: [] }
+  | { data: null; failures: LoadFailure[] };
 
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
 
@@ -105,7 +115,7 @@ function layerOf(assetType: string, strategy: string): number {
   return 2;
 }
 
-export async function buildOverviewData(userId: string): Promise<OverviewData> {
+export async function buildOverviewData(userId: string): Promise<OverviewLoad> {
   const supabase = createClient();
   const sinceIso = new Date(Date.now() - 7 * 864e5).toISOString();
   const [accountRes, openRes, closedRes, alpaca, activity, goalInfo, optRes] = await Promise.all([
@@ -131,9 +141,16 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
       .eq("status", "open"),
   ]);
 
-  const account = accountRes.data as Record<string, number> | null;
-  const open = (openRes.data ?? []) as PaperPos[];
-  const closed = (closedRes.data ?? []) as ClosedRow[];
+  const accountLoad = loadResult<Record<string, number> | null>("paper_accounts", accountRes);
+  const openLoad = loadResult<PaperPos[]>("paper_positions", openRes, []);
+  const closedLoad = loadResult<ClosedRow[]>("paper_positions (closed)", closedRes, []);
+  const optLoad = loadResult<OptRow[]>("options_positions", optRes, []);
+  const failures = failuresOf(accountLoad, openLoad, closedLoad, optLoad);
+  if (failures.length > 0) return { data: null, failures };
+
+  const account = accountLoad.data ?? null;
+  const open = openLoad.data ?? [];
+  const closed = closedLoad.data ?? [];
 
   const alpacaActive = !!(alpaca?.configured && alpaca?.account);
   const agentsOnline = alpaca !== null && !alpaca.stale;
@@ -166,7 +183,7 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
   // Options positions live in their OWN table (2026-07-06: three live
   // CSPs were invisible on the Overview). Fold them into layers 3/5 with
   // Alpaca's mark-to-market P/L, matched by OCC symbol.
-  const optRows = (optRes.data ?? []) as OptRow[];
+  const optRows = optLoad.data ?? [];
   for (const o of optRows) {
     const layer = String(o.strategy ?? "").startsWith("wheel") ? 5 : 3;
     const occ = occSymbol(o);
@@ -208,5 +225,8 @@ export async function buildOverviewData(userId: string): Promise<OverviewData> {
   }
   const weekPnl = week.reduce((s, x) => s + x.v, 0);
 
-  return { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf, activity, goal: goalInfo };
+  return {
+    data: { portfolioValue, weekPnl, todayPnl, deployed, deployedPct, layersActive, week, layers, live: true, agentsOnline, buyingPower, stale, asOf, activity, goal: goalInfo },
+    failures: [],
+  };
 }

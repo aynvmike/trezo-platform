@@ -10,10 +10,15 @@
  */
 
 import * as crypto from "crypto";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import type { BrokerKey } from "@/lib/broker-providers";
 
 const KEY_ENV = "TREZO_TOKENS_KEY";
+
+// OAUTH-8: a token whose expiry is within this window of "now" is treated as
+// already expired, so a caller never receives a token that dies in flight.
+const EXPIRY_SKEW_MS = 60 * 1000;
 
 export type ConnectionRow = {
   id: string;
@@ -135,18 +140,25 @@ export async function disconnect(
 /**
  * Look up the active per-user token for a broker, returning plaintext
  * for upstream use (the agents service calls this via an internal API).
- * Returns null if the row is missing, expired, or revoked.
+ * Returns null if the row is missing, expired (status or expires_at within
+ * EXPIRY_SKEW_MS of now — OAUTH-8), or revoked.
+ *
+ * `client` — AUTH-01/OAUTH-1: machine-to-machine callers have no user
+ * session, so the default cookie client runs as anon and RLS hides every
+ * row. Those callers must pass the service-role client from
+ * "@/lib/supabase/admin". Session-backed callers can omit it.
  */
 export async function getActiveToken(
   user_id: string,
-  broker: BrokerKey
+  broker: BrokerKey,
+  client?: SupabaseClient
 ): Promise<{
   access_token: string;
   refresh_token: string | null;
   expires_at: string | null;
 } | null> {
-  const supabase = createClient();
-  const { data } = await supabase
+  const supabase = client ?? createClient();
+  const { data, error } = await supabase
     .from("broker_connections")
     .select(
       "access_token_enc, refresh_token_enc, expires_at, status"
@@ -154,7 +166,21 @@ export async function getActiveToken(
     .eq("user_id", user_id)
     .eq("broker", broker)
     .maybeSingle();
+  // REV-SEC-01 (review 2026-09-01): a FAILED read must not read as "no
+  // connection". Dropping `error` here turned every DB/RLS/network failure
+  // into a 404 upstream, which is exactly how AUTH-01 hid for so long.
+  // Throw so the caller can answer 5xx instead of "not connected".
+  if (error) {
+    throw new Error(`broker_connections read failed: ${error.message}`);
+  }
   if (!data || data.status !== "active") return null;
+  // OAUTH-8: expires_at <= now (+ skew) is not active, whatever `status` says.
+  if (data.expires_at) {
+    const expMs = Date.parse(data.expires_at as string);
+    if (Number.isFinite(expMs) && expMs <= Date.now() + EXPIRY_SKEW_MS) {
+      return null;
+    }
+  }
   try {
     const access_token = decryptToken(data.access_token_enc as string);
     const refresh_token = (data.refresh_token_enc as string | null)

@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth-guards";
 import { cacheGetOrSet } from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
@@ -16,6 +18,11 @@ type FinnhubSearch = { count: number; result: FinnhubMatch[] };
  * Returns Finnhub symbol matches. Cached 24h.
  */
 export async function GET(request: Request) {
+  // AUTH-06: this route was reachable with no session at all.
+  const supabase = createClient();
+  const guard = await requireUser(supabase);
+  if (!guard.ok) return guard.response;
+
   const { searchParams } = new URL(request.url);
   const q = (searchParams.get("q") ?? "").trim();
   if (q.length < 1) return NextResponse.json({ matches: [] });

@@ -30,13 +30,17 @@ class CryptoScannerAgent(Agent):
     _last_hb: float = 0.0
 
     async def tick(self) -> list[AgentMessage]:
-        from app.runtime.settings import get_bot_settings
-        # Honor the user's Bot Tuning TCS slider. Crypto stays slightly
-        # under the stock floor (per-coin stops are tighter) so if the
-        # user sets a stock floor of 500, crypto effectively runs at 500
-        # too — the user's slider drives everything.
-        _cfg = get_bot_settings()
-        tcs_floor = int(_cfg.tcs_threshold or self.MIN_TCS)
+        from app.runtime.settings import (
+            lane_enabled_any, min_tcs_floor_across_books,
+        )
+        # Honor the Bot Tuning TCS slider. Crypto stays slightly under
+        # the stock floor (per-coin stops are tighter) so if the user
+        # sets a stock floor of 50, crypto effectively runs at 50 too.
+        # BI-03: a bare get_bot_settings() is the PRIMARY book's opinion;
+        # this scanner feeds every book. Emit at the LOWEST enabled
+        # book's floor and run while ANY book has the lane on -- the
+        # fan-out prunes per book (book_gate.min_tcs_for).
+        tcs_floor = int(min_tcs_floor_across_books() or self.MIN_TCS)
         # Crypto floor via Settings (Mike 2026-07-23: "lower it to 35
         # and see what the agents do" -- his frame: crypto = stocks,
         # just more liquid; tighter per-coin stops justify the lower
@@ -51,11 +55,11 @@ class CryptoScannerAgent(Agent):
                 _gs_cf(), "trezo_crypto_tcs_floor", 35)))
         except Exception:  # noqa: BLE001
             pass
-        if not _cfg.crypto_enabled:
+        if not lane_enabled_any("crypto_enabled"):
             # Patched 2026-06-05: surface clearly so Mike can spot it
             # in the trace panel. If Bot Tuning has crypto_enabled=False
-            # (default for new users), this is why no crypto signals
-            # ever fire even though the scanner is alive and ticking.
+            # on EVERY book (default for new users), this is why no
+            # crypto signals ever fire even though the scanner is alive.
             return [AgentMessage(
                 agent=self.name, kind="info",
                 payload={
@@ -229,11 +233,9 @@ class CryptoScannerAgent(Agent):
                 for s in _signals:
                     st = (s.payload or {}).get("strategy") or "default"
                     _by_strategy[st] = _by_strategy.get(st, 0) + 1
-                _scanned = 0
-                try:
-                    _scanned = len(symbols)  # type: ignore[name-defined]
-                except Exception:
-                    _scanned = len(_signals)
+                # EQ-10/NEQ-02: `symbols` was never defined here, so the
+                # pulse always reported the signal count as "scanned".
+                _scanned = scanned
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="scanner_pulse",

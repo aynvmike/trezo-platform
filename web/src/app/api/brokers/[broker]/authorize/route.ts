@@ -55,9 +55,20 @@ export async function GET(
   }
 
   const state = crypto.randomBytes(24).toString("hex");
+  // OAUTH-4: `secure: true` unconditionally meant the browser dropped the
+  // state cookie when the dashboard is served over plain HTTP (Tailscale),
+  // so every callback failed with state_mismatch. Set `secure` from the
+  // actual request protocol (proxy header first, then the URL).
+  const forwardedProto = (request.headers.get("x-forwarded-proto") ?? "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const isHttps =
+    forwardedProto === "https" ||
+    (!forwardedProto && new URL(request.url).protocol === "https:");
   cookies().set(`trezo_oauth_state_${provider.key}`, state, {
     httpOnly: true,
-    secure: true,
+    secure: isHttps,
     sameSite: "lax",
     path: "/",
     maxAge: 600

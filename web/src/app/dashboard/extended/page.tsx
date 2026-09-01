@@ -4,6 +4,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
+import { LoadError, loadResult } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -65,9 +66,13 @@ export default async function ExtendedPage() {
       .limit(20)
   ]);
 
-  const openPositions = openRes.data ?? [];
-  const closedPositions = closedRes.data ?? [];
-  const scanMessages = scanRes.data ?? [];
+  // PAGES-03: keep "read failed" distinct from "nothing there".
+  const openLoad = loadResult("paper_positions", openRes, []);
+  const closedLoad = loadResult("paper_positions (closed)", closedRes, []);
+  const scanLoad = loadResult("agent_messages", scanRes, []);
+  const openPositions = openLoad.data ?? [];
+  const closedPositions = closedLoad.data ?? [];
+  const scanMessages = scanLoad.data ?? [];
 
   const windowOpen = inSwingWindow();
   const latestScan = scanMessages.find(
@@ -77,7 +82,7 @@ export default async function ExtendedPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <LayerHero id={4} openCount={openPositions.length} action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>} />
+      <LayerHero id={4} openCount={openLoad.failure ? undefined : openPositions.length} action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>} />
 
       {/* Scanner status */}
       <section
@@ -121,10 +126,12 @@ export default async function ExtendedPage() {
           Recent swing signals{" "}
           <span className="text-sm text-weave-500">({recentSignals.length})</span>
         </h2>
-        {recentSignals.length === 0 ? (
+        {scanLoad.failure ? (
+          <LoadError {...scanLoad.failure} />
+        ) : recentSignals.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No qualifying signals yet. A swing signal fires only when a
-            watchlist name forms one of the four setups and scores TCS 700+.
+            watchlist name forms one of the four setups and scores TCS 70+ on the 0–100 scale.
           </div>
         ) : (
           <div className="rounded-xl border border-weave-100 bg-white overflow-hidden overflow-x-auto">
@@ -184,7 +191,9 @@ export default async function ExtendedPage() {
           Open swing positions{" "}
           <span className="text-sm text-weave-500">({openPositions.length})</span>
         </h2>
-        {openPositions.length === 0 ? (
+        {openLoad.failure ? (
+          <LoadError {...openLoad.failure} />
+        ) : openPositions.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No open swing positions. Positions appear here after a signal is
             approved by Risk Manager — and each closes on its stop, its target,
@@ -234,7 +243,9 @@ export default async function ExtendedPage() {
           Recent swing trades{" "}
           <span className="text-sm text-weave-500">({closedPositions.length})</span>
         </h2>
-        {closedPositions.length === 0 ? (
+        {closedLoad.failure ? (
+          <LoadError {...closedLoad.failure} />
+        ) : closedPositions.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No closed swing trades yet.
           </div>

@@ -7,6 +7,7 @@ import {
   Layers as LayersIcon, Gauge,
 } from "lucide-react";
 import { saveTourSettings } from "./actions";
+import { BROKER_PROVIDERS } from "@/lib/broker-providers";
 
 /* Trezo tokens — gold = --accent (gold in BOTH light + dark); card = --surface,
    text = --foreground, etc. all read the active theme so it's readable either way. */
@@ -23,12 +24,21 @@ const ROSE = "rgb(244 63 94)";
 const SERIF = "var(--font-serif)";
 const MONO = "var(--font-mono)";
 
-const brokers = [
-  { id: "alpaca", name: "Alpaca", desc: "Commission-free stocks & crypto API" },
-  { id: "ibkr", name: "Interactive Brokers", desc: "Global multi-asset access" },
-  { id: "tradier", name: "Tradier", desc: "Options-friendly broker API" },
-  { id: "coinbase", name: "Coinbase", desc: "Crypto-only · spot trading" },
-];
+/* PAGES-04: derive the broker list from the provider registry instead of a
+   hand-typed list — "tradier" had no provider entry, so picking it led
+   nowhere. Only `status: "available"` cards are selectable; planned ones
+   are shown greyed so the user knows what is coming. Banking (Plaid) and
+   the live Alpaca venue are not brokers to route paper orders through. */
+const brokers = BROKER_PROVIDERS
+  .filter((p) => p.category !== "banking" && p.venue !== "live")
+  .map((p) => ({
+    id: p.key,
+    name: p.label,
+    available: p.status === "available",
+    desc: p.status === "available"
+      ? (p.category === "crypto" ? "Crypto · OAuth connect" : "Stocks & options · OAuth connect")
+      : "Coming soon — no public OAuth flow yet",
+  }));
 
 const allLayers = [
   { id: 1, name: "Crypto", desc: "BTC, ETH, alt momentum" },
@@ -42,10 +52,10 @@ const allLayers = [
 
 const stepMeta = [
   { title: "Welcome to Trezo", sub: "Seven layers, one woven basket", icon: <Sparkles size={14} /> },
-  { title: "Connect a broker", sub: "Choose where Trezo routes your orders", icon: <Plug size={14} /> },
-  { title: "Trading mode", sub: "Start safe — switch to live when ready", icon: <ShieldCheck size={14} /> },
-  { title: "Pick your layers", sub: "Activate or pause any layer later", icon: <LayersIcon size={14} /> },
-  { title: "Daily risk limit", sub: "Your safety cap — bots pause if breached", icon: <Gauge size={14} /> },
+  { title: "Connect a broker", sub: "Pick one — the connect itself happens on Settings → Connections", icon: <Plug size={14} /> },
+  { title: "Trading mode", sub: "Paper only — live execution is not built yet", icon: <ShieldCheck size={14} /> },
+  { title: "The seven layers", sub: "A tour — layers are switched on in Bot Tuning, not here", icon: <LayersIcon size={14} /> },
+  { title: "Daily risk limit", sub: "Your safety cap — the one setting this wizard saves", icon: <Gauge size={14} /> },
 ];
 
 function WovenBasketHero({ activeLayers }: { activeLayers: number[] }) {
@@ -133,7 +143,7 @@ function ModeHero({ mode }: { mode: "paper" | "live" }) {
           }}
         >
           <div className="mb-1 text-[10px]" style={{ color: ROSE, fontFamily: MONO }}>LIVE</div>
-          <div style={{ fontFamily: MONO, fontSize: "16px", color: FG }}>Real $</div>
+          <div style={{ fontFamily: MONO, fontSize: "16px", color: MUTEDFG }}>Not built</div>
         </div>
       </div>
     </div>
@@ -244,10 +254,10 @@ function AmbientLayers() {
 
 function WelcomeStep() {
   const items = [
-    { n: "1", text: "Connect a broker — Alpaca, IBKR, Tradier, or Coinbase" },
-    { n: "2", text: "Choose paper or live mode (paper is safe to test)" },
-    { n: "3", text: "Pick which wealth layers to run on day one" },
-    { n: "4", text: "Set a daily risk cap so bots pause if you bleed" },
+    { n: "1", text: "Pick a broker — Alpaca paper today; more as their OAuth opens up" },
+    { n: "2", text: "Paper mode — every trade is simulated; live is not built yet" },
+    { n: "3", text: "Meet the seven wealth layers (switch them on in Bot Tuning)" },
+    { n: "4", text: "Set a daily loss cap so the agents pause if you bleed" },
   ];
   return (
     <div>
@@ -259,7 +269,7 @@ function WelcomeStep() {
           </div>
         ))}
       </div>
-      <p className="mt-3 text-[11px]" style={{ color: MUTEDFG }}>Takes about a minute. Nothing goes live until you say so.</p>
+      <p className="mt-3 text-[11px]" style={{ color: MUTEDFG }}>Takes about a minute. Nothing here places a trade.</p>
     </div>
   );
 }
@@ -267,20 +277,21 @@ function WelcomeStep() {
 export function OnboardingWizard() {
   const router = useRouter();
   const [step, setStep] = useState(0);
+  // PAGES-04: only the loss cap is persisted (see actions.ts). The broker
+  // pick just decides where to land afterwards; mode and layers are
+  // informational and carry no state.
   const [broker, setBroker] = useState<string>("");
-  const [mode, setMode] = useState<"paper" | "live">("paper");
-  const [activeLayers, setActiveLayers] = useState<number[]>([1, 2, 3, 5, 7]);
   const [riskLimit, setRiskLimit] = useState(500);
   const [saving, setSaving] = useState(false);
 
   const totalSteps = stepMeta.length;
   const meta = stepMeta[step];
-  const canAdvance = step === 1 ? !!broker : step === 3 ? activeLayers.length > 0 : true;
+  const canAdvance = step === 1 ? !!broker : true;
 
   const finish = async () => {
     setSaving(true);
     try {
-      await saveTourSettings({ broker, mode, activeLayers, dailyRiskLimit: riskLimit });
+      await saveTourSettings({ dailyRiskLimit: riskLimit });
     } catch {
       /* best-effort */
     }
@@ -292,14 +303,13 @@ export function OnboardingWizard() {
   };
   const back = () => step > 0 && setStep(step - 1);
   const close = () => router.push("/dashboard");
-  const toggleLayer = (id: number) => setActiveLayers((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
 
   const renderHero = () => {
     switch (step) {
       case 0: return <WovenBasketHero activeLayers={[1, 2, 3, 4, 5, 6, 7]} />;
       case 1: return <BrokerHero selected={broker} />;
-      case 2: return <ModeHero mode={mode} />;
-      case 3: return <LayersHero active={activeLayers} />;
+      case 2: return <ModeHero mode="paper" />;
+      case 3: return <LayersHero active={[1, 2, 3, 4, 5, 6, 7]} />;
       case 4: return <RiskGaugeHero value={riskLimit} max={5000} />;
       default: return null;
     }
@@ -363,9 +373,16 @@ export function OnboardingWizard() {
                 {brokers.map((b) => (
                   <button
                     key={b.id}
-                    onClick={() => setBroker(b.id)}
-                    className="relative overflow-hidden rounded-lg border px-3 py-3 text-left transition-transform hover:-translate-y-0.5"
-                    style={{ background: broker === b.id ? GOLD_TINT : BG, borderColor: broker === b.id ? GOLD : BORDER }}
+                    onClick={() => b.available && setBroker(b.id)}
+                    disabled={!b.available}
+                    aria-disabled={!b.available}
+                    className="relative overflow-hidden rounded-lg border px-3 py-3 text-left transition-transform enabled:hover:-translate-y-0.5"
+                    style={{
+                      background: broker === b.id ? GOLD_TINT : BG,
+                      borderColor: broker === b.id ? GOLD : BORDER,
+                      opacity: b.available ? 1 : 0.45,
+                      cursor: b.available ? "pointer" : "not-allowed",
+                    }}
                   >
                     <div className="text-[12px]" style={{ color: FG, fontWeight: 500 }}>{b.name}</div>
                     <div className="mt-0.5 text-[10px]" style={{ color: MUTEDFG }}>{b.desc}</div>
@@ -380,48 +397,49 @@ export function OnboardingWizard() {
             )}
 
             {step === 2 && (
-              <div className="grid grid-cols-2 gap-3">
-                {([
-                  { id: "paper", label: "Paper Mode", sub: "Simulated trades — start here", reco: true, color: EMERALD },
-                  { id: "live", label: "Live Mode", sub: "Real orders, real capital", reco: false, color: ROSE },
-                ] as const).map((opt) => (
-                  <button
-                    key={opt.id}
-                    onClick={() => setMode(opt.id)}
-                    className="rounded-lg border px-4 py-3 text-left transition-transform hover:-translate-y-0.5"
-                    style={{ background: mode === opt.id ? GOLD_TINT : BG, borderColor: mode === opt.id ? opt.color : BORDER }}
-                  >
-                    <div className="mb-1 flex items-center justify-between">
-                      <span className="text-[13px]" style={{ color: FG, fontWeight: 500 }}>{opt.label}</span>
-                      {opt.reco ? (
-                        <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "rgba(16,185,129,0.12)", color: EMERALD, fontFamily: MONO }}>RECO</span>
-                      ) : null}
-                    </div>
-                    <p className="text-[11px]" style={{ color: MUTEDFG }}>{opt.sub}</p>
-                  </button>
-                ))}
+              /* PAGES-04: informational — there is no live executor to
+                 choose. TRADING_MODE is env-gated and inert. */
+              <div>
+                <div className="rounded-lg border px-4 py-3" style={{ background: GOLD_TINT, borderColor: EMERALD }}>
+                  <div className="mb-1 flex items-center justify-between">
+                    <span className="text-[13px]" style={{ color: FG, fontWeight: 500 }}>Paper Mode</span>
+                    <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "rgba(16,185,129,0.12)", color: EMERALD, fontFamily: MONO }}>ACTIVE</span>
+                  </div>
+                  <p className="text-[11px]" style={{ color: MUTEDFG }}>
+                    Every trade is simulated against a paper account. No real money moves.
+                  </p>
+                </div>
+                <p className="mt-2 text-[11px]" style={{ color: MUTEDFG }}>
+                  Live trading is not something you switch on here: the real-money
+                  executor does not exist yet and is gated behind the go-live
+                  checklist. Nothing in this wizard changes that.
+                </p>
               </div>
             )}
 
             {step === 3 && (
-              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                {allLayers.map((l) => {
-                  const isOn = activeLayers.includes(l.id);
-                  return (
-                    <button
+              /* PAGES-04: a tour, not a control. The wizard used to offer
+                 per-layer toggles that were never persisted; the real
+                 on/off switches are the strategy flags in Bot Tuning. */
+              <div>
+                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                  {allLayers.map((l) => (
+                    <div
                       key={l.id}
-                      onClick={() => toggleLayer(l.id)}
-                      className="flex items-center gap-2.5 rounded-md border px-2.5 py-2 text-left transition-transform hover:translate-x-0.5"
-                      style={{ background: isOn ? GOLD_TINT : BG, borderColor: isOn ? GOLD : BORDER }}
+                      className="flex items-center gap-2.5 rounded-md border px-2.5 py-2 text-left"
+                      style={{ background: BG, borderColor: BORDER }}
                     >
-                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-[10px]" style={{ background: isOn ? GOLD : MUTED, color: isOn ? BG : MUTEDFG, fontFamily: MONO, fontWeight: 500 }}>{l.id}</span>
+                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-[10px]" style={{ background: GOLD, color: BG, fontFamily: MONO, fontWeight: 500 }}>{l.id}</span>
                       <div className="min-w-0 flex-1">
                         <div className="text-[12px]" style={{ color: FG, fontWeight: 500 }}>{l.name}</div>
                         <div className="truncate text-[10px]" style={{ color: MUTEDFG }}>{l.desc}</div>
                       </div>
-                    </button>
-                  );
-                })}
+                    </div>
+                  ))}
+                </div>
+                <p className="mt-2 text-[11px]" style={{ color: MUTEDFG }}>
+                  Layers are enabled and paused in <span style={{ color: GOLD }}>Settings → Bot Tuning</span>, per book. This step just shows you the map.
+                </p>
               </div>
             )}
 
@@ -439,7 +457,7 @@ export function OnboardingWizard() {
                   </div>
                 </div>
                 <p className="mt-2 text-[11px]" style={{ color: MUTEDFG }}>
-                  Today&apos;s losses reach this cap → every layer pauses. Change any time in <span style={{ color: GOLD }}>Bot Tuning</span>.
+                  Today&apos;s losses reach this cap → the Risk Manager stops new entries. Saved to your profile; change any time in <span style={{ color: GOLD }}>Settings → Profile</span>.
                 </p>
               </div>
             )}

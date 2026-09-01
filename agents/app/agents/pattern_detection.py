@@ -54,6 +54,20 @@ def _supabase():
         return None
 
 
+def _urgency_for(tcs) -> str:
+    """Task #91 urgency bands on the 0-100 TCS scale.
+
+    EQ-9: these were 700/500 -- unreachable since the 2026-07-08 move to
+    0-100, so every pattern signal was tagged "low" and Risk Manager gave
+    all of them the slowest staleness deadline."""
+    t = int(tcs or 0)
+    if t >= 70:
+        return "urgent"
+    if t >= 50:
+        return "mixed"
+    return "low"
+
+
 class PatternDetectionAgent(Agent):
     name = "pattern_detection"
     tick_interval_seconds = 180  # Throttled 2026-06-05 (was 60) to cut API load
@@ -446,12 +460,7 @@ class PatternDetectionAgent(Agent):
                         # mid-band = mixed, else low. Pattern.is_fresh
                         # would refine this once we plumb a freshness
                         # signal through (TODO).
-                        if pick.tcs >= 700:
-                            payload["urgency"] = "urgent"
-                        elif pick.tcs >= 500:
-                            payload["urgency"] = "mixed"
-                        else:
-                            payload["urgency"] = "low"
+                        payload["urgency"] = _urgency_for(pick.tcs)
                         out.append(AgentMessage(
                             agent=self.name, kind="signal",
                             confidence=pick.tcs / 100.0, payload=payload,
@@ -534,7 +543,10 @@ class PatternDetectionAgent(Agent):
                     kind="scanner_pulse",
                     confidence=1.0,
                     payload={
-                        "scanned": len(symbols) if 'symbols' in dir() else 0,
+                        # EQ-10/NEQ-02: `symbols` never existed in this
+                        # scope, so the pulse always reported 0 scanned.
+                        "scanned": sum(int(s.get("tickers_scanned") or 0)
+                                       for s in scan_summary.values()),
                         "fired": len(_signals),
                         "top_tcs": _top_tcs,
                         "by_strategy": _by_strategy,

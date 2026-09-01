@@ -393,12 +393,22 @@ async def get_positions(token: Optional["UserToken"] = None) -> list[dict]:
     return data if data is not None else []
 
 
-async def get_option_positions(token: Optional["UserToken"] = None) -> list[dict]:
-    """Just the open OPTION positions on the Alpaca account. Returns the
-    raw position dicts (symbol field is the OCC code). Used by the Wheel
-    reconciler to settle stale modeled rows when the broker shows nothing
-    matching anymore."""
-    rows = await get_positions(token=token)
+async def get_option_positions_strict(
+        token: Optional["UserToken"] = None) -> Optional[list]:
+    """Open OPTION positions, or None when the read FAILED.
+
+    OG-9 / PM-4 / G2 / G1 (audit 2026-09-01): get_option_positions()
+    inherited get_positions()'s [] on failure, so one rate-limited read
+    told the Wheel reconciler and the options scanner "the broker holds
+    no contracts" and they settled/closed modeled rows the broker was
+    still holding -- the option-lane twin of the 2026-08-28 phantom-close
+    loop. Same fix, same shape as get_positions_strict: a failed read is
+    ANSWERLESS. Anything that can close, settle or re-open a row on this
+    answer must call this and take no action on None. Filters exactly as
+    get_option_positions does; the raw dicts' symbol is the OCC code."""
+    rows = await get_positions_strict(token=token)
+    if rows is None:
+        return None
     out: list[dict] = []
     for r in rows:
         ac = str(r.get("asset_class") or "").lower()
@@ -409,6 +419,17 @@ async def get_option_positions(token: Optional["UserToken"] = None) -> list[dict
         if is_opt:
             out.append(r)
     return out
+
+
+async def get_option_positions(token: Optional["UserToken"] = None) -> list[dict]:
+    """Just the open OPTION positions on the Alpaca account. Returns the
+    raw position dicts (symbol field is the OCC code).
+
+    DISPLAY-ONLY. [] here can also mean "the read failed"; destructive
+    callers (reconcilers, scanners that settle or close rows) must use
+    get_option_positions_strict() and honor its None (OG-9/PM-4)."""
+    rows = await get_option_positions_strict(token=token)
+    return rows if rows is not None else []
 
 
 async def get_clock(token: Optional["UserToken"] = None) -> Optional[dict]:
@@ -729,9 +750,72 @@ async def get_open_orders_for(symbol: str) -> Optional[list]:
     call failed. Added 2026-06-11 PM for the naked-position alert: a
     day-TIF bracket's exit legs DIE at the close, so a stock row held
     overnight at Alpaca can sit with no stop and no target (found live
-    with AAPL). Callers must treat None as 'could not check'."""
-    data = await _get(f"/v2/orders?status=open&symbols={symbol.upper()}")
-    return data if isinstance(data, list) else None
+    with AAPL). Callers must treat None as 'could not check'.
+
+    2026-09-01 (audit follow-up, the XLE/BAC re-arm churn): an OCO's stop
+    leg is a CHILD order that Alpaca only returns when the listing is
+    asked for `nested=true`, and even then it sits under the parent's
+    `legs`, not as a top-level row. Read without it, ensure_broker_stop
+    saw only the resting sell limit, judged it "a lone resting target",
+    cancelled the pair and re-armed it -- every ten minutes, all session,
+    leaving the position momentarily unprotected each time. So: ask for
+    the nested listing and FLATTEN every child leg into the returned list
+    so callers that scan for a resting stop actually see it. Legs carry
+    the same order shape (id/type/side/status/qty/prices)."""
+    data = await _get(f"/v2/orders?status=open&nested=true&symbols={symbol.upper()}")
+    if not isinstance(data, list):
+        return None
+    return _flatten_order_legs(data)
+
+
+# Child-leg statuses that mean "this leg is no longer working". A parent
+# can still be open while one of its legs has already been replaced
+# (ratchet_stop PATCHes the stop leg and Alpaca issues a NEW leg id) or
+# cancelled. Such a leg must not be read as resting protection, and it
+# must never be the leg ratchet_stop tries to amend.
+_DEAD_LEG_STATUSES = frozenset({
+    "canceled", "cancelled", "expired", "filled", "rejected", "replaced",
+})
+
+
+def _flatten_order_legs(orders: list) -> list:
+    """Top-level orders followed by every nested child leg, recursively.
+    A leg's own `legs` (if any) are flattened too; a leg is never
+    dropped because its status is `held` -- that IS the resting stop.
+
+    Review 2026-09-01 (R-NESTED-1/2): two guards so the flattened list
+    can never be misread by the callers that count or amend legs.
+    (1) De-duplicate by order id -- if the venue ever lists a leg both
+    at top level and under its parent's `legs`, ratchet_stop would
+    otherwise amend one id and ensure_stock_protection would cancel the
+    same id twice. (2) Skip child legs in a terminal status (see
+    _DEAD_LEG_STATUSES): a `replaced` stop leg under a still-open OCO
+    parent is not protection, and picking it as stop_legs[0] would make
+    every ratchet 'amend failed' while the live leg sat untouched.
+    Top-level rows are not status-filtered -- the venue's status=open
+    filter already did that -- and legs with no status are kept."""
+    out: list = []
+    seen: set = set()
+
+    def _walk(items: list, is_leg: bool) -> None:
+        for o in items:
+            if not isinstance(o, dict):
+                continue
+            if is_leg and (str(o.get("status") or "").lower()
+                           in _DEAD_LEG_STATUSES):
+                continue
+            oid = o.get("id")
+            if oid:
+                if oid in seen:
+                    continue
+                seen.add(oid)
+            out.append(o)
+            legs = o.get("legs")
+            if isinstance(legs, list) and legs:
+                _walk(legs, True)
+
+    _walk(orders, False)
+    return out
 
 
 async def replace_order(order_id: str, *, qty: Optional[float] = None,
@@ -1310,10 +1394,20 @@ async def liquidate_position(
 
     Crypto rows store the bare ticker ('BTC') but Alpaca's positions
     endpoint addresses crypto by pair without the slash ('BTCUSD'), so
-    pass asset_type='crypto' to translate; bare stock symbols are
-    passed through unchanged."""
+    pass asset_type='crypto' to translate; a symbol already spelled as a
+    known pair ('BTCUSD', 'BTC/USD') is treated as crypto regardless.
+    Bare stock symbols are passed through unchanged."""
     sym = symbol.upper().strip()
-    if asset_type == "crypto":
+    # SY-02: a row can arrive as a pair spelling with asset_type left at
+    # the 'stock' default (adoption writes the broker's naming). Route it
+    # as crypto anyway, or the cancel below asks the wrong question.
+    is_crypto = (
+        asset_type == "crypto"
+        or "/" in sym
+        or (sym.endswith("USD") and len(sym) > 4
+            and _crypto_base(sym) in ALPACA_CRYPTO_SYMBOLS)
+    )
+    if is_crypto:
         sym = _crypto_pair(sym).replace("/", "")
     # Fixed 2026-06-12 evening (the GM incident): DELETE /v2/positions
     # returns 403 "available: 0" when ALL shares are reserved by open
@@ -1323,12 +1417,24 @@ async def liquidate_position(
     # FIRST, then liquidate. Cancelling exit legs is always correct
     # here: every caller is a forced exit that replaces them.
     try:
-        orders = await _get(f"/v2/orders?status=open&symbols={sym}")
-        if isinstance(orders, list):
-            for o in orders:
-                oid = o.get("id")
-                if oid:
-                    await _delete(f"/v2/orders/{oid}")
+        if is_crypto:
+            # SY-02 (audit 2026-09-01): the symbols= filter below is the
+            # POSITIONS spelling (DOTUSD) while Alpaca files crypto orders
+            # under the slashed pair (DOT/USD). It matched nothing, so the
+            # resting stop-limit kept the units reserved and every forced
+            # crypto exit 403'd "available: 0" -- the stop fired and the
+            # coin rode. Use the base-matched helper (XRP == XRP/USD ==
+            # XRPUSD), the same lesson open_crypto_orders learned on 8/20.
+            # A failed listing is still best-effort here: the DELETE
+            # below surfaces the 403 honestly instead of us guessing.
+            await cancel_crypto_exits(sym)
+        else:
+            orders = await _get(f"/v2/orders?status=open&symbols={sym}")
+            if isinstance(orders, list):
+                for o in orders:
+                    oid = o.get("id")
+                    if oid:
+                        await _delete(f"/v2/orders/{oid}")
     except Exception:  # noqa: BLE001
         pass  # best effort; the liquidate below surfaces any real error
     return await _delete(f"/v2/positions/{sym}")

@@ -9,6 +9,7 @@ import {
 } from "@/components/dashboard/agents-view-redesign";
 import { AgentsSettings } from "./_agents-settings";
 import { describeAgentMessage, type FeedMessage } from "@/lib/agent-message";
+import { LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -61,10 +62,19 @@ export default async function AgentsPage() {
       .eq("scope", "shared").order("weight", { ascending: false }).order("updated_at", { ascending: false }).limit(12),
   ]);
 
-  const msgs = (msgsRes.data ?? []) as MsgRow[];
-  const open = (openRes.data ?? []) as OpenRow[];
-  const closed = (closedRes.data ?? []) as ClosedRow[];
-  const learned = (memRes.data ?? []) as Memory[];
+  // PAGES-03: keep "read failed" distinct from "nothing there". The
+  // board's status/win-rate/hold numbers are derived from the first
+  // three reads, so if any of them failed the board is not shown —
+  // every agent would otherwise read as "idle, 0 trades".
+  const msgsLoad = loadResult<MsgRow[]>("agent_messages", msgsRes, []);
+  const openLoad = loadResult<OpenRow[]>("paper_positions", openRes, []);
+  const closedLoad = loadResult<ClosedRow[]>("paper_positions (closed)", closedRes, []);
+  const memLoad = loadResult<Memory[]>("agent_memory", memRes, []);
+  const boardFailures = failuresOf(msgsLoad, openLoad, closedLoad);
+  const msgs = msgsLoad.data ?? [];
+  const open = openLoad.data ?? [];
+  const closed = closedLoad.data ?? [];
+  const learned = memLoad.data ?? [];
 
   const openByLayer: Record<number, number> = {};
   for (const p of open) {
@@ -112,9 +122,14 @@ export default async function AgentsPage() {
 
   return (
     <div className="mx-auto max-w-6xl px-4 sm:px-6 py-6 space-y-8">
-      <FadeIn>
-        <AgentsViewRedesign data={data} />
-      </FadeIn>
+      <LoadErrors failures={failuresOf(memLoad)} />
+      {boardFailures.length > 0 ? (
+        <LoadErrors failures={boardFailures} />
+      ) : (
+        <FadeIn>
+          <AgentsViewRedesign data={data} />
+        </FadeIn>
+      )}
 
       <section className="space-y-3">
         <div>

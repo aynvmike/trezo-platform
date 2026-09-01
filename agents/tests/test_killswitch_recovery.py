@@ -90,6 +90,21 @@ def test_persisted_day_halt_still_reads_as_halt():
     assert v.halted is True and v.mode == "halt"
 
 
+def test_recovering_book_still_hard_halts_on_a_daily_trip():
+    """KS-2: recovery must not disarm the anti-spiral brake. A book that
+    is -8% on the week AND -4% today is HALTED (day), not merely in
+    recovery — the weekly verdict used to return first and hide it."""
+    v = evaluate(_acct(week_realized_pnl_usd=-800.0,
+                       today_realized_pnl_usd=-400.0))
+    assert v.halted is True
+    assert v.scope == "day" and v.mode == "halt"
+
+
+def test_recovering_book_still_hard_halts_on_a_streak():
+    v = evaluate(_acct(week_realized_pnl_usd=-800.0, consecutive_losses=3))
+    assert v.halted is True and v.mode == "halt"
+
+
 # --- per-book independence: evaluate() sees ONE book's numbers -----------
 
 def test_books_are_judged_on_their_own_numbers():

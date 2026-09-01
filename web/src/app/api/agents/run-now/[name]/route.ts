@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwner } from "@/lib/auth-guards";
 
 export const dynamic = "force-dynamic";
 
@@ -66,7 +67,7 @@ function resolveName(raw: string): string {
 /**
  * POST /api/agents/run-now/:name
  *
- * Auth-gated proxy to the agents service. Force-ticks the named agent
+ * Owner-gated proxy to the agents service. Force-ticks the named agent
  * outside its normal schedule. A short health preflight separates
  * "agents service offline" from "scanner is slow" so the user gets a
  * useful error either way.
@@ -75,13 +76,10 @@ export async function POST(
   _request: Request,
   { params }: { params: { name: string } }
 ) {
+  // ADM-02: owner-only (TREZO_OWNER_USER_IDS allowlist; unset => 403).
   const supabase = createClient();
-  const {
-    data: { user }
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
-  }
+  const guard = await requireOwner(supabase);
+  if (!guard.ok) return guard.response;
   const rawName = String(params.name ?? "").trim();
   const name = resolveName(rawName);
   if (!ALLOWED.has(name)) {

@@ -50,7 +50,11 @@ EXTENDED_WATCHLIST: list[str] = [
     "NVDA", "MSFT", "AAPL", "PYPL", "DIS", "BAC", "F",
 ]
 
-EXTENDED_TCS_MIN = 70           # 0-100 scale; a signal must clear this to be emitted
+# 0-100 scale; a signal must clear this to be emitted. EQ-5: the detectors
+# below built their scores on the old 0-1000 scale until 2026-09-01, so
+# every hit cleared this bar by ~10x and carried confidence > 1. They are
+# now 0-100 (each component divided by 10), which makes this floor real.
+EXTENDED_TCS_MIN = 70
 MIN_CANDLES = 60                # ~60 daily bars needed for a 50-day EMA
 SWING_MAX_HOLD_DAYS = 7         # multi-day time stop (~5 trading days)
 
@@ -93,7 +97,7 @@ class ExtendedSignal:
     entry_price: float
     stop_pct: float
     target_pct: float
-    tcs: int
+    tcs: int              # 0-100 scale (EQ-5)
     rationale: str
 
 
@@ -124,15 +128,15 @@ def detect_ema50_pullback(symbol: str, candles: list[Candle]) -> Optional[Extend
     swing_low = min(float(c.low) for c in candles[-6:])
     stop_pct = max(0.05, min(0.10, (price - swing_low) / price + 0.01))
     target_pct = max(0.06, round(stop_pct * 1.8, 4))
-    tcs = 730
+    tcs = 73                                   # EQ-5: 0-100 scale
     if price <= e_now * 1.03:
-        tcs += 50                              # a tight bounce off the line
+        tcs += 5                               # a tight bounce off the line
     if len(ema50) >= 11 and e_now > ema50[-11]:
-        tcs += 30                              # EMA rising over a longer window
+        tcs += 3                               # EMA rising over a longer window
     return ExtendedSignal(
         symbol=symbol.upper(), setup="ema50_pullback", direction="bullish",
         entry_price=round(price, 4), stop_pct=round(stop_pct, 4),
-        target_pct=round(target_pct, 4), tcs=min(tcs, 880),
+        target_pct=round(target_pct, 4), tcs=min(tcs, 88),
         rationale=(f"{symbol.upper()} pulled back to its rising 50-day average "
                    f"(~{e_now:.2f}) and bounced — a continuation entry."),
     )
@@ -159,16 +163,16 @@ def detect_breakout_hold(symbol: str, candles: list[Candle]) -> Optional[Extende
         return None
     stop_pct = max(0.05, min(0.09, (price - resistance) / price + 0.04))
     target_pct = max(0.08, round(stop_pct * 1.8, 4))
-    tcs = 740
+    tcs = 74                                   # EQ-5: 0-100 scale
     avg_vol = _avg([float(c.volume) for c in candles[-21:-1]])
     if avg_vol > 0 and float(candles[-1].volume) >= avg_vol * 1.3:
-        tcs += 60                              # breakout on expanding volume
+        tcs += 6                               # breakout on expanding volume
     if price <= resistance * 1.04:
-        tcs += 30                              # entering close to the level
+        tcs += 3                               # entering close to the level
     return ExtendedSignal(
         symbol=symbol.upper(), setup="breakout_hold", direction="bullish",
         entry_price=round(price, 4), stop_pct=round(stop_pct, 4),
-        target_pct=round(target_pct, 4), tcs=min(tcs, 890),
+        target_pct=round(target_pct, 4), tcs=min(tcs, 89),
         rationale=(f"{symbol.upper()} broke its multi-week high (~{resistance:.2f}) "
                    f"and is holding above it — a breakout-continuation entry."),
     )
@@ -196,14 +200,14 @@ def detect_gap_continuation(symbol: str, candles: list[Candle]) -> Optional[Exte
     # and is at / near the gap bar's close.
     if not (price >= gap_open and price >= gap_close * 0.99):
         return None
-    tcs = 720
+    tcs = 72                                   # EQ-5: 0-100 scale
     avg_vol = _avg([float(c.volume) for c in candles[-21:-1]])
     if avg_vol > 0 and float(gap_bar.volume) >= avg_vol * 1.5:
-        tcs += 70                              # the gap printed on heavy volume
+        tcs += 7                               # the gap printed on heavy volume
     return ExtendedSignal(
         symbol=symbol.upper(), setup="gap_continuation", direction="bullish",
         entry_price=round(price, 4), stop_pct=0.07, target_pct=0.10,
-        tcs=min(tcs, 860),
+        tcs=min(tcs, 86),
         rationale=(f"{symbol.upper()} gapped up 4%+ recently and has held the gap "
                    f"(above ~{gap_open:.2f}) — an earnings-gap continuation."),
     )
@@ -228,13 +232,13 @@ def detect_stair_stepper(symbol: str, candles: list[Candle]) -> Optional[Extende
     run = (highs[-1] - lows[0]) / lows[0] if lows[0] > 0 else 0.0
     if not (0.08 <= run <= 0.60):
         return None
-    tcs = 710
+    tcs = 71                                   # EQ-5: 0-100 scale
     if run <= 0.35:
-        tcs += 40                              # a calmer ladder is a cleaner swing
+        tcs += 4                               # a calmer ladder is a cleaner swing
     return ExtendedSignal(
         symbol=symbol.upper(), setup="stair_stepper", direction="bullish",
         entry_price=round(price, 4), stop_pct=0.07, target_pct=0.10,
-        tcs=min(tcs, 820),
+        tcs=min(tcs, 82),
         rationale=(f"{symbol.upper()} is climbing in steady steps — higher highs "
                    f"and higher lows with shallow pullbacks."),
     )
@@ -260,7 +264,7 @@ def evaluate_extended(symbol: str, candles: list[Candle],
         if sig is None:
             continue
         if has_catalyst:
-            sig.tcs = min(sig.tcs + 40, 950)
+            sig.tcs = min(sig.tcs + 4, 95)     # EQ-5: 0-100 scale
             sig.rationale += " A recent news catalyst supports the move."
         if best is None or sig.tcs > best.tcs:
             best = sig

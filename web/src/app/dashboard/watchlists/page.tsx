@@ -71,7 +71,7 @@ export default async function WatchlistsIndex() {
           tickers: tickersById.get(l.id) ?? []
         }))}
         library={INCOME_ETF_LIBRARY}
-        heldTickers={heldYieldMax.map((p) => p.ticker)}
+        heldTickers={(heldYieldMax ?? []).map((p) => p.ticker)} // PAGES-03: null = read failed; chips just lose the "held" mark
         addHolding={addHolding}
       />
     </div>

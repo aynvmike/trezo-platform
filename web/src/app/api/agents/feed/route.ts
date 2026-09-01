@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth-guards";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +12,11 @@ const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
  * never tries to `.map()` over a non-array.
  */
 export async function GET(request: Request) {
+  // AUTH-06: this route was reachable with no session at all.
+  const supabase = createClient();
+  const guard = await requireUser(supabase);
+  if (!guard.ok) return guard.response;
+
   const { searchParams } = new URL(request.url);
   const limit = searchParams.get("limit") ?? "50";
   try {

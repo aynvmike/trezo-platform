@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
 import { WheelReconcileButton } from "@/components/dashboard/wheel-reconcile-button";
+import { LoadError, loadResult } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -95,8 +96,11 @@ export default async function OptionsPage() {
       .limit(40)
   ]);
 
-  const allBook = (bookRes.data ?? []) as BookRow[];
-  const ideas = ((ideaRes.data ?? []) as IdeaMessage[])
+  // PAGES-03: keep "read failed" distinct from "nothing there".
+  const bookLoad = loadResult<BookRow[]>("options_positions", bookRes, []);
+  const ideaLoad = loadResult<IdeaMessage[]>("agent_messages", ideaRes, []);
+  const allBook = bookLoad.data ?? [];
+  const ideas = (ideaLoad.data ?? [])
     .filter((m) => m.payload?.event === "options_idea")
     .slice(0, 12);
 
@@ -129,10 +133,13 @@ export default async function OptionsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <LayerHero id={3} openCount={openBook.length} />
+      <LayerHero id={3} openCount={bookLoad.failure ? undefined : openBook.length} />
 
       <WheelReconcileButton />
 
+      {bookLoad.failure ? (
+        <LoadError {...bookLoad.failure} />
+      ) : (
       <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <StatCard label="Currently open" value={String(openBook.length)} />
         <StatCard
@@ -147,6 +154,7 @@ export default async function OptionsPage() {
         />
         <StatCard label="Lifetime book" value={String(book.length)} />
       </section>
+      )}
       {hiddenPhantoms > 0 && (
         <p className="text-[11px] text-weave-500 leading-relaxed -mt-4">
           {hiddenPhantoms} stale reconcile row{hiddenPhantoms === 1 ? "" : "s"} hidden
@@ -166,7 +174,9 @@ export default async function OptionsPage() {
           Each card shows how the trade is built and the net Greeks it carries.
           Nothing here is traded automatically.
         </p>
-        {ideas.length === 0 ? (
+        {ideaLoad.failure ? (
+          <LoadError {...ideaLoad.failure} />
+        ) : ideas.length === 0 ? (
           <EmptyCard>
             No strategy ideas yet. The scanner surfaces a Long Call, Bull Call
             Spread, Cash-Secured Put, Bull Put Spread, or Iron Condor idea when
@@ -248,7 +258,9 @@ export default async function OptionsPage() {
           Options book{" "}
           <span className="text-sm text-weave-500">({book.length})</span>
         </h2>
-        {book.length === 0 ? (
+        {bookLoad.failure ? (
+          <LoadError {...bookLoad.failure} />
+        ) : book.length === 0 ? (
           <EmptyCard>
             No options positions yet. The Wheel (Layer 5) opens
             cash-secured puts here automatically once your paper

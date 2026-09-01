@@ -16,6 +16,13 @@ catches crashes and the outage class is bigger than that:
      a crash, a gate stuck closed, a config that vetoes everything.
 
 Net 2 is the one that matters most. It does not care WHY.
+
+Net 2 is PER LANE since the audit (NET2-GLOBAL / NET2-COUNT-BEFORE-KILL):
+a global count let one crypto approve silence a starving stock lane, and
+counting at approve time let an approve that died in trade_execution
+read as "the pipeline works". Two alarms per lane now: A (signals, no
+approvals) and B (approvals, no fills, every one killed -- and the alert
+names the top kill reason).
 """
 
 from __future__ import annotations
@@ -64,15 +71,37 @@ def _agent(open_market=True):
     return a
 
 
-def _feed(agent, signals=0, approves=0, vetoes=0, fails=0):
+def _feed(agent, signals=0, approves=0, vetoes=0, fails=0, executes=0,
+          kills=0, asset_type=None, kill_reason="insufficient buying power"):
+    """Drive the REAL on_message. `asset_type` is what the producers put
+    on the payload (risk_manager passes the signal's asset_type through;
+    trade_execution stamps "lane"); None = an unlabelled message, which
+    the sensor files under the "unknown" lane."""
+    base = {"asset_type": asset_type} if asset_type else {}
+    # An unlabelled message with NO ticker is the only thing that lands
+    # in "unknown"; a bare ticker is classified like trade_execution does.
+    tick = {"ticker": "KO"} if asset_type else {}
     for _ in range(signals):
-        _run(agent.on_message(_Msg("signal")))
+        _run(agent.on_message(_Msg("signal", dict(base))))
     for _ in range(approves):
-        _run(agent.on_message(_Msg("approve")))
+        _run(agent.on_message(_Msg("approve", dict(base), agent="risk_manager")))
     for _ in range(vetoes):
-        _run(agent.on_message(_Msg("veto")))
+        _run(agent.on_message(_Msg("veto", dict(base))))
     for _ in range(fails):
-        _run(agent.on_message(_Msg("error", {"event": "handler_failed"})))
+        _run(agent.on_message(_Msg("error", {"event": "handler_failed", **base})))
+    for _ in range(executes):
+        _run(agent.on_message(_Msg(
+            "execute", {"lane": asset_type or "", **tick},
+            agent="trade_execution")))
+    for _ in range(kills):
+        _run(agent.on_message(_Msg(
+            "error", {"event": "execute_error", "lane": asset_type or "",
+                      "error": kill_reason, **tick},
+            agent="trade_execution")))
+
+
+def _lane(agent, name="unknown"):
+    return agent._flow["lanes"].get(name) or wd._new_lane_counters()
 
 
 def _age_window(agent, minutes):
@@ -149,16 +178,20 @@ def test_the_window_resets_so_one_bad_window_cannot_poison_the_next():
     _age_window(a, 30)
     with _patched(wd, _us_market_open=lambda *_a, **_k: True):
         _run(a._check_flow())
-    assert a._flow["signals"] == 0 and a._flow["approves"] == 0
+    assert a._flow["lanes"] == {}, a._flow
 
 
 def test_the_counters_count_what_they_claim_to():
     a = _agent()
-    _feed(a, signals=3, approves=2, vetoes=1, fails=4)
-    assert a._flow["signals"] == 3
-    assert a._flow["approves"] == 2
-    assert a._flow["vetoes"] == 1
-    assert a._flow["handler_fails"] == 4
+    _feed(a, signals=3, approves=2, vetoes=1, fails=4, executes=5, kills=6)
+    c = _lane(a)                        # unlabelled -> "unknown" lane
+    assert c["signals"] == 3
+    assert c["approves"] == 2
+    assert c["vetoes"] == 1
+    assert c["handler_fails"] == 4
+    assert c["executes"] == 5
+    assert c["kills"] == 6
+    assert c["kill_reasons"] == {"insufficient buying power": 6}
 
 
 def test_counting_never_raises_on_a_junk_message():
@@ -172,6 +205,349 @@ def test_counting_never_raises_on_a_junk_message():
         def payload(self):
             raise RuntimeError("boom")
     _run(a.on_message(_Bad()))          # must not raise
+    # NET2-GLOBAL: the lane lookup is new surface; junk shapes there
+    # must be just as unbreakable.
+    _run(a.on_message(_Msg("signal", "not-a-dict")))
+    _run(a.on_message(_Msg("approve", {"asset_type": None})))
+    _run(a.on_message(_Msg("approve", {"asset_type": {"weird": 1}})))
+    _run(a.on_message(_Msg("execute", {"lane": 42})))
+    _run(a.on_message(_Msg("error", {"event": "execute_error",
+                                     "error": None, "lane": ""})))
+    _run(a.on_message(_Msg("error", {"event": None, "error": "x"},
+                           agent="trade_execution")))
+    _run(a.on_message(_Msg(None, None)))
+
+    class _NoAgent:
+        kind = "error"
+        payload = {"error": "boom"}
+    _run(a.on_message(_NoAgent()))      # no .agent attribute at all
+    _run(a._check_flow())               # and the judge survives the mess
+
+
+# --- net 2, PER LANE (NET2-GLOBAL / NET2-COUNT-BEFORE-KILL) ---------------
+
+def test_crypto_approves_do_not_silence_a_stock_lane_starvation():
+    """THE EQUITY STARVATION, replayed: crypto (24/7) keeps approving,
+    the stock lane produces signals and nothing else. The old global
+    counter saw approves > 0 and stayed quiet the whole time."""
+    a = _agent()
+    _feed(a, signals=40, vetoes=5, asset_type="us_equity")
+    _feed(a, signals=6, approves=6, executes=6, asset_type="crypto")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    events = {(m.payload["event"], m.payload["lane"]) for m in out}
+    assert ("approval_starvation", "stock") in events, events
+    assert not any(l == "crypto" for _e, l in events), events
+    p = [m.payload for m in out if m.payload["lane"] == "stock"][0]
+    assert p["signals"] == 40 and p["approves"] == 0
+    assert p["unaccounted"] == 35
+    assert "[stock]" in p["note"]
+
+
+def test_equity_spellings_all_land_in_the_stock_lane():
+    a = _agent()
+    for at in ("us_equity", "stock", "etf", "STOCK", "equity"):
+        _feed(a, signals=1, asset_type=at)
+    assert _lane(a, "stock")["signals"] == 5, a._flow["lanes"]
+    assert "us_equity" not in a._flow["lanes"]
+
+
+def test_unlabelled_scanner_signals_are_laned_the_way_the_executor_lanes_them():
+    """BOUND, not built: pattern_detection / stms / orb / extended and
+    crypto_scanner stamp NO asset_type (read their payloads). If the
+    sensor only read asset_type every real signal would sit in
+    'unknown' and the per-lane split would be decoration. So a bare
+    ticker is classified exactly as trade_execution classifies it
+    before routing: in COIN_MAP -> crypto, else stock."""
+    a = _agent()
+    # the exact shapes the scanners emit (see stms_scanner / crypto_scanner)
+    _run(a.on_message(_Msg("signal", {"ticker": "KO", "strategy": "stms",
+                                      "direction": "bullish", "tcs": 80})))
+    _run(a.on_message(_Msg("signal", {"ticker": "BTC", "strategy": "crypto_breakout",
+                                      "mode": "breakout"})))
+    _run(a.on_message(_Msg("signal", {"ticker": "ETH/USD"})))
+    _run(a.on_message(_Msg("signal", {"ticker": "xrp"})))
+    _run(a.on_message(_Msg("approve", {"ticker": "KO", "asset_type": None},
+                           agent="risk_manager")))
+    _run(a.on_message(_Msg("veto", {"ticker": "SOL"})))
+    _run(a.on_message(_Msg("info", {"event": "ops_heartbeat"})))
+    lanes = a._flow["lanes"]
+    assert _lane(a, "stock")["signals"] == 1 and _lane(a, "stock")["approves"] == 1
+    assert _lane(a, "crypto")["signals"] == 3 and _lane(a, "crypto")["vetoes"] == 1
+    assert _lane(a, "unknown")["signals"] == 0, lanes
+    # and the classifier really is the executor's set, not a hardcoded 4
+    assert "XLM" in wd._crypto_symbols() or len(wd._crypto_symbols()) == 4, (
+        "COIN_MAP import fell back silently -- check app.data.candles")
+    src = (Path(__file__).resolve().parents[1]
+           / "app" / "agents" / "trade_execution.py").read_text(encoding="utf-8")
+    assert "from app.data.candles import COIN_MAP" in src, (
+        "trade_execution no longer derives CRYPTO_SYMBOLS from COIN_MAP; "
+        "the watchdog's lane classifier must follow it")
+
+
+def test_approves_killed_at_execution_raise_alarm_b_naming_the_reason():
+    """NET2-COUNT-BEFORE-KILL: approvals were counted at approve time,
+    so a lane whose every approve died in trade_execution read as
+    healthy. Now: approved, zero fills, every one killed -> alarm, and
+    the alert says WHY they died."""
+    a = _agent()
+    _feed(a, signals=20, approves=5, kills=5, asset_type="us_equity",
+          kill_reason="insufficient buying power for 10 KO")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    b = [m for m in out if m.payload["event"] == "execution_starvation"]
+    assert b, [m.payload for m in out]
+    p = b[0].payload
+    assert p["lane"] == "stock"
+    assert p["approves"] == 5 and p["executes"] == 0 and p["kills"] == 5
+    assert p["top_kill_reason"] == "insufficient buying power for 10 KO"
+    assert "insufficient buying power for 10 KO" in p["note"]
+    assert "[stock]" in p["note"]
+    # approvals happened, so alarm A must NOT also fire for this lane
+    assert not any(m.payload["event"] == "approval_starvation" for m in out)
+    assert ("execution_starvation", "stock") in a._open_alerts
+
+
+def test_alarm_b_needs_the_approve_floor_and_every_one_dead():
+    """Two approves that died is not evidence; five approves with one
+    fill is a working (if bruised) pipeline."""
+    a = _agent()
+    _feed(a, signals=20, approves=2, kills=2, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow()) == []
+    a = _agent()
+    _feed(a, signals=20, approves=5, kills=4, executes=1, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow()) == []
+
+
+def test_the_legacy_eventless_execution_error_still_counts_as_a_kill():
+    """trade_execution's older error shape has no "event" key. Until
+    every producer stamps event="execute_error", that shape from
+    trade_execution is still a killed execution, not nothing."""
+    a = _agent()
+    _run(a.on_message(_Msg("error", {"ticker": "KO", "asset_type": "crypto",
+                                     "error": "Could not read the Alpaca account"},
+                           agent="trade_execution")))
+    assert _lane(a, "crypto")["kills"] == 1
+    # ...but an unrelated agent's error is NOT a kill
+    _run(a.on_message(_Msg("error", {"error": "watchdog import failed"},
+                           agent="ops_watchdog")))
+    assert _lane(a, "unknown")["kills"] == 0
+
+
+def test_a_healthy_lane_with_executes_stays_quiet():
+    a = _agent()
+    _feed(a, signals=40, approves=5, executes=5, vetoes=35, asset_type="us_equity")
+    _feed(a, signals=10, approves=3, executes=2, kills=1, asset_type="crypto")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow()) == []
+    assert not a._open_alerts
+
+
+def test_crypto_is_judged_even_when_the_us_market_is_closed():
+    a = _agent()
+    _feed(a, signals=40, asset_type="crypto")
+    _feed(a, signals=40, asset_type="us_equity")     # closed -> not judged
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: False):
+        out = _run(a._check_flow())
+    assert [m.payload["lane"] for m in out] == ["crypto"], [m.payload for m in out]
+
+
+def test_flow_alerts_are_deduped_per_lane_and_clear_when_the_lane_recovers():
+    a = _agent()
+    persisted = []
+
+    async def _p(**kw):
+        persisted.append(kw)
+    a._persist_alert = _p
+    for _ in range(2):                  # two bad windows, one alert
+        _feed(a, signals=40, asset_type="us_equity")
+        _age_window(a, 30)
+        with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+            out = _run(a._check_flow())
+        assert out and out[0].payload["lane"] == "stock"
+    assert [p["target"] for p in persisted] == ["stock"]
+    assert [p["kind"] for p in persisted] == ["approval_starvation"]
+    # the lane recovers -> the dedupe key clears so the NEXT starvation alerts
+    _feed(a, signals=40, approves=1, executes=1, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow()) == []
+    assert ("approval_starvation", "stock") not in a._open_alerts
+
+
+# --- review fixes NET2-REV-01/02/03 ------------------------------------------
+
+def _handler_crash(agent, n, *, failing="trade_execution", trigger="approve",
+                   ticker="KO", error="KeyError: 'user_id'"):
+    """The EXACT shape bootstrap._announce_handler_failure publishes
+    (kind=error, event=handler_failed, agent, trigger_kind, ticker)."""
+    for _ in range(n):
+        _run(agent.on_message(_Msg(
+            "error", {"event": "handler_failed", "agent": failing,
+                      "error": error, "trigger_agent": "risk_manager",
+                      "trigger_kind": trigger, "ticker": ticker,
+                      "occurrences": 1},
+            agent=failing)))
+
+
+def test_approvals_that_vanish_still_raise_alarm_b():
+    """NET2-REV-01: the audit shape (kills >= approves) was blind to an
+    approve with NO outcome -- trade_execution disabled, dropped, or
+    answering with a kind="info" skip ('no paper accounts', 'Supabase
+    unavailable'). Approvals in, zero fills out is the alarm."""
+    a = _agent()
+    _feed(a, signals=20, approves=5, asset_type="us_equity")   # no kills, no fills
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    b = [m.payload for m in out if m.payload["event"] == "execution_starvation"]
+    assert b, [m.payload for m in out]
+    assert b[0]["lane"] == "stock" and b[0]["approves"] == 5
+    assert b[0]["kills"] == 0 and b[0]["unaccounted"] == 5, b[0]
+    assert "no" in b[0]["note"].lower() and "outcome" in b[0]["note"]
+    assert ("execution_starvation", "stock") in a._open_alerts
+    # mixed: three died with a reason, two vanished -- the note says both
+    a = _agent()
+    _feed(a, signals=20, approves=5, kills=3, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    b = [m.payload for m in out if m.payload["event"] == "execution_starvation"]
+    assert b and b[0]["kills"] == 3 and b[0]["unaccounted"] == 2, b
+    assert "insufficient buying power" in b[0]["note"]
+    assert "2 produced NO outcome" in b[0]["note"], b[0]["note"]
+
+
+def test_an_executor_crash_on_an_approve_is_a_killed_approve():
+    """NET2-REV-01: the 8/27 shape one agent downstream. If
+    trade_execution.on_message raises on every approve, bootstrap
+    publishes handler_failed -- that IS the approve dying at execution,
+    and the alarm must name the exception."""
+    a = _agent()
+    _feed(a, signals=20, approves=4, asset_type="us_equity")
+    _handler_crash(a, 4)
+    c = _lane(a, "stock")
+    assert c["handler_fails"] == 4 and c["kills"] == 4, c
+    assert c["kill_reasons"] == {"KeyError: 'user_id'": 4}, c
+    # ...but risk_manager crashing on a SIGNAL is not a killed approve
+    _handler_crash(a, 2, failing="risk_manager", trigger="signal",
+                   error="UnboundLocalError: recovery_bump")
+    c = _lane(a, "stock")
+    assert c["handler_fails"] == 6 and c["kills"] == 4, c
+    # and trade_execution crashing on something other than an approve is not either
+    _handler_crash(a, 1, trigger="execute")
+    assert _lane(a, "stock")["kills"] == 4
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    b = [m.payload for m in out if m.payload["event"] == "execution_starvation"]
+    assert b and b[0]["top_kill_reason"] == "KeyError: 'user_id'", b
+    assert "KeyError: 'user_id'" in b[0]["note"]
+
+
+def test_a_thin_window_does_not_clear_an_open_starvation_alert():
+    """NET2-REV-02: only recovery (an approval / a fill) clears the
+    dedupe key. A thin window is inconclusive; clearing on it re-pinged
+    the webhook every other window while the lane stayed starved."""
+    a = _agent()
+    persisted = []
+
+    async def _p(**kw):
+        persisted.append(kw)
+    a._persist_alert = _p
+    _feed(a, signals=40, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow())
+    assert len(persisted) == 1
+    _feed(a, signals=3, asset_type="us_equity")             # thin, no approvals
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow()) == []
+    assert ("approval_starvation", "stock") in a._open_alerts, "thin window cleared it"
+    _feed(a, signals=40, asset_type="us_equity")            # still starved
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow())
+    assert len(persisted) == 1, "re-alerted without any recovery in between"
+    # same for alarm B: approvals with no fills, then a window with 1 approve
+    # and nothing else (below the floor), then starved again -> one persist
+    a = _agent()
+    persisted = []
+    a._persist_alert = _p
+    _feed(a, signals=20, approves=5, kills=5, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow())
+    _feed(a, signals=5, approves=1, kills=1, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow()) == []
+    assert ("execution_starvation", "stock") in a._open_alerts
+    _feed(a, signals=20, approves=5, kills=5, asset_type="us_equity")
+    _age_window(a, 30)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        assert _run(a._check_flow())
+    assert [p["kind"] for p in persisted] == ["execution_starvation"], persisted
+
+
+def test_the_webhook_gets_the_severity_that_was_persisted():
+    """NET2-REV-03: _raise_flow pinned notify() to "urgent" whatever it
+    persisted, so a fully-vetoed window (warn) pinged red. Patch the
+    REAL app.runtime.alerts.notify (restored) and read what arrives."""
+    alerts = load_module("app.runtime.alerts")
+    got = []
+
+    async def _notify(title, body="", **kw):
+        got.append((title, kw.get("severity"), kw.get("key")))
+        return False
+    a = _agent()
+    persisted = []
+
+    async def _p(**kw):
+        persisted.append(kw)
+    a._persist_alert = _p
+    _feed(a, signals=30, vetoes=30, asset_type="us_equity")     # accounted -> warn
+    _feed(a, signals=30, asset_type="crypto")                    # unaccounted -> urgent
+    _age_window(a, 30)
+    with _patched(alerts, notify=_notify), \
+            _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    assert len(out) == 2
+    sev = {k: s for _t, s, k in got}
+    assert sev == {"approval_starvation:stock": "warn",
+                   "approval_starvation:crypto": "urgent"}, got
+    assert {p["target"]: p["severity"] for p in persisted} == {
+        "stock": "warn", "crypto": "urgent"}
+
+
+# --- REG-05: event-driven agents are exempt from the silence check --------
+
+def test_event_driven_agents_skip_the_silence_check_outright():
+    """Read tick() as source: inside the EXPECTED_AGENTS loop the
+    tick_interval_seconds <= 0 exemption must come BEFORE last_tick_at is
+    consulted. It used to live only in the never-ticked branch, so one
+    forced tick made risk_manager read as 'stuck' four hours later.
+    (tick() itself cannot be driven here: it reaches for Supabase, the
+    route audit and the relay before it gets to Check 2.)"""
+    src = (Path(__file__).resolve().parents[1]
+           / "app" / "agents" / "ops_watchdog.py").read_text(encoding="utf-8")
+    loop = src[src.index("for name, tolerance_min in EXPECTED_AGENTS:"):]
+    loop = loop[:loop.index("# --- Heartbeat info message")]
+    guard = loop.index("interval_s <= 0")
+    first_last_tick = loop.index('getattr(_st, "last_tick_at"')   # the READ, not the comment
+    assert guard < first_last_tick, "REG-05: the exemption still sits after last_tick_at"
+    tail = loop[guard:guard + 200]
+    assert "continue" in tail, "the exemption must skip the agent, not just note it"
+    assert loop.count("interval_s <= 0") == 1, "the old in-branch exemption should be gone"
 
 
 # --- net 1: the router announces handler crashes -------------------------

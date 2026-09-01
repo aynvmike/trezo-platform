@@ -30,8 +30,11 @@ the rules doc remains deferred.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+
+_log = logging.getLogger(__name__)
 
 DAILY_DRAWDOWN_PCT = 0.03
 WEEKLY_DRAWDOWN_PCT = 0.06
@@ -102,8 +105,18 @@ def broker_reject_count(user_id: str | None = None) -> int:
             + len(_broker_reject_ts.get("", [])))
 
 
-def reset_broker_rejects() -> None:
-    _broker_reject_ts.clear()
+def reset_broker_rejects(user_id: str | None = None) -> None:
+    """Clear the rolling reject window.
+
+    KS-4: with a user_id this clears ONLY that book's bucket — a ghost
+    reconciled on the 75k must not wipe the primary's reject history
+    (every book is its own book). The '' unattributed bucket is left
+    alone because it counts toward every book. With None it clears
+    everything — the admin /clear-session-halt action only."""
+    if user_id is None:
+        _broker_reject_ts.clear()
+        return
+    _broker_reject_ts.pop(str(user_id), None)
 
 
 # --- Session-scoped slippage tracker (2026-07-02) ---------------------
@@ -264,23 +277,12 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
                           account.get("halt_reason") or "Trading halted",
                           mode="halt")
 
-    wse = _f(account.get("week_start_equity_usd"))
-    wpnl = _f(account.get("week_realized_pnl_usd"))
-    _tw = _f(account.get("_broker_equity"))
-    if _tw > 0 and wse > 0 and wse < 0.5 * _tw:
-        wse = _tw
-    if wse > 0 and wpnl <= -WEEKLY_DRAWDOWN_PCT * wse:
-        # RECOVERY, not a halt (Mike 2026-08-27). The book keeps trading:
-        # speculative lanes suspended, the rest at half size / +10 TCS /
-        # tighter stops. Recomputed from row sums every check, so
-        # clawing back above the line ends recovery on its own.
-        return KillSwitch(False, "week",
-                          f"Weekly loss limit: down ${abs(wpnl):,.0f} "
-                          f"({wpnl / wse * 100:.1f}%) this week — "
-                          f"recovery mode (speculative lanes suspended, "
-                          f"half size, +{RECOVERY_TCS_BUMP} TCS)",
-                          mode="recovery")
-
+    # KS-2: the HARD stops (daily %, streak, rejects, slippage) are
+    # evaluated BEFORE the weekly-recovery verdict. Recovery used to
+    # return first, so a book already in weekly recovery could lose
+    # another 3% today, or take three rejects, and never hard-halt —
+    # the anti-spiral brake was disarmed on exactly the book that
+    # needed it most. A fresh trip now halts a recovering book too.
     dse = _f(account.get("day_start_equity_usd"))
     dpnl = _f(account.get("today_realized_pnl_usd"))
     # STALENESS GUARD: a stored baseline far below true equity is left over
@@ -315,23 +317,48 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
                           f"- execution quality halt",
                           mode="halt")
 
+    wse = _f(account.get("week_start_equity_usd"))
+    wpnl = _f(account.get("week_realized_pnl_usd"))
+    _tw = _f(account.get("_broker_equity"))
+    if _tw > 0 and wse > 0 and wse < 0.5 * _tw:
+        wse = _tw
+    if wse > 0 and wpnl <= -WEEKLY_DRAWDOWN_PCT * wse:
+        # RECOVERY, not a halt (Mike 2026-08-27). The book keeps trading:
+        # speculative lanes suspended, the rest at half size / +10 TCS /
+        # tighter stops. Recomputed from row sums every check, so
+        # clawing back above the line ends recovery on its own.
+        return KillSwitch(False, "week",
+                          f"Weekly loss limit: down ${abs(wpnl):,.0f} "
+                          f"({wpnl / wse * 100:.1f}%) this week — "
+                          f"recovery mode (speculative lanes suspended, "
+                          f"half size, +{RECOVERY_TCS_BUMP} TCS)",
+                          mode="recovery")
+
     return KillSwitch(False, None, None)
 
 
-async def check_states(client) -> dict[str, KillSwitch]:
+async def check_states(client) -> dict[str, KillSwitch] | None:
     """Roll periods and evaluate every kill-switch PER BOOK.
 
     2026-08-27 (Mike): "the agents are not treating each book as their
-    own book and it is causing major issues." The old check_all summed
-    each book's own rows — the MEASUREMENT was always per book — but
-    returned a single verdict ("single-user assumption"), so one tripped
-    book vetoed every book's signals. On 2026-08-27 the primary's -8.0%
-    week froze two healthy books (25k at -1.6%, 75k at -2.7%) for 1,162
-    vetoes. This returns {user_id: KillSwitch} so the Risk Manager and
-    the execution fan-out can treat each book as its own book.
+    own book and it is causing major issues." The old single-verdict
+    wrapper summed each book's own rows — the MEASUREMENT was always per
+    book — but returned one answer ("single-user assumption"), so one
+    tripped book vetoed every book's signals. On 2026-08-27 the primary's
+    -8.0% week froze two healthy books (25k at -1.6%, 75k at -2.7%) for
+    1,162 vetoes. This returns {user_id: KillSwitch} so the Risk Manager
+    and the execution fan-out can treat each book as its own book.
+
+    Returns None — NOT {} — when there is no client or the paper_accounts
+    read fails (KS-11). An empty dict is a real answer ("no books"); None
+    is "could not evaluate". Callers must not fall through to trading on
+    None: the execution fan-out skips every book and says so in the log;
+    the risk gate logs and proceeds (the fan-out is the enforcement
+    point). Before this, a failed read returned {} and the fan-out read
+    "no halts anywhere" — a dead database looked like a healthy one.
     """
     if not client:
-        return {}
+        return None
 
     def _fetch():
         return client.table("paper_accounts").select("*").execute()
@@ -339,7 +366,7 @@ async def check_states(client) -> dict[str, KillSwitch]:
     try:
         res = await asyncio.to_thread(_fetch)
     except Exception:  # noqa: BLE001
-        return {}
+        return None
 
     states: dict[str, KillSwitch] = {}
     # 2026-08-18 (Mike: "the agents are not responding to each book's own
@@ -381,8 +408,8 @@ async def check_states(client) -> dict[str, KillSwitch]:
         # bracket stop never rolled them; manual closes booked $0 until the
         # 7/1 fix). The kill-switch now SUMS this week's closed rows itself,
         # so it is correct regardless of which close path wrote the row.
-        # 2026-07-07: cached 30s per user -- check_all runs per SIGNAL, and
-        # during a veto storm the uncached sums hammered the nano DB.
+        # 2026-07-07: cached 30s per user -- check_states runs per SIGNAL,
+        # and during a veto storm the uncached sums hammered the nano DB.
         try:
             import time as _t
             _ck = str(acct.get("user_id"))
@@ -507,27 +534,113 @@ async def check_states(client) -> dict[str, KillSwitch]:
     return states
 
 
-async def check_all(client) -> KillSwitch:
-    """Back-compat wrapper: the WORST single state across books.
+# KS-10/G11: the check_all() single-verdict wrapper that used to live here
+# is gone. It had zero call sites and its shape (worst state across books)
+# was the exact cross-book bleed check_states was written to end.
 
-    Prefer check_states() — this collapses per-book truth back into the
-    old single-verdict shape (a hard halt anywhere wins, else a recovery
-    anywhere, else clear) and exists only so older callers keep working.
+
+# --- KS-12: user-set daily DOLLAR limit, per book -----------------------
+
+async def daily_dollar_over(client) -> set[str] | None:
+    """user_ids whose today's realized loss is at or beyond the dollar
+    limit they set themselves (profiles.daily_loss_limit_usd).
+
+    KS-12: this is the per-book DOLLAR brake next to the percent one in
+    evaluate(). Moved here from the risk manager so the execution
+    fan-out can enforce it too (the risk gate alone was not enough —
+    a signal approved before the trip still filled after it). A limit
+    of 0 / unset means the user set no dollar brake. Returns None on any
+    read failure — a failed read must never read as "nobody is over".
     """
-    states = await check_states(client)
-    worst = KillSwitch(False, None, None)
-    for ks in states.values():
-        if ks.halted and ks.mode != "recovery":
-            return ks
-        if ks.mode == "recovery" and worst.mode is None:
-            worst = ks
-    return worst
+    if not client:
+        return None
+
+    def _sync():
+        accounts = (client.table("paper_accounts")
+                    .select("user_id, today_realized_pnl_usd").execute())
+        profiles = (client.table("profiles")
+                    .select("user_id, daily_loss_limit_usd").execute())
+        return accounts.data or [], profiles.data or []
+
+    try:
+        accounts, profiles = await asyncio.to_thread(_sync)
+    except Exception:  # noqa: BLE001
+        return None
+    limit_by_user: dict[str, float] = {}
+    for p in profiles:
+        try:
+            v = float(p.get("daily_loss_limit_usd") or 0)
+            if v > 0:
+                limit_by_user[p["user_id"]] = v
+        except (TypeError, ValueError):
+            pass
+
+    over: set[str] = set()
+    for a in accounts:
+        uid = a["user_id"]
+        limit = limit_by_user.get(uid, 0)
+        if limit <= 0:
+            continue
+        try:
+            today = float(a.get("today_realized_pnl_usd") or 0)
+        except (TypeError, ValueError):
+            continue
+        if today <= -limit:
+            over.add(uid)
+    return over
 
 
 # --- QW6: per-coin crypto daily loss limit -----------------------------
 
 NUM_CRYPTO_COINS = 3                 # XRP / ETH / SOL
 PER_COIN_DAILY_LOSS_PCT = 0.10       # of a coin's slice of the crypto budget
+
+
+def _utc_day_start_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
+
+
+def _coin_rows_query(client, sym: str, user_id: str | None):
+    """Today's closed crypto rows for one coin — filtered to ONE book
+    when a user_id is given (BI-04/PH-6). Before this the loss side of
+    the per-coin halt summed every book's XRP closes while the budget
+    side read one book: the primary's bad morning benched the 75k's
+    coin, and a book with no XRP losses at all could be measured over
+    its own limit. Loss and budget now come from the same book."""
+    q = (client.table("paper_positions")
+         .select("realized_pnl_usd, user_id")
+         .eq("ticker", sym)
+         .eq("asset_type", "crypto")
+         .neq("status", "open")
+         .gte("exit_at", _utc_day_start_iso()))
+    if user_id:
+        q = q.eq("user_id", str(user_id))
+    return q.execute()
+
+
+def _crypto_budget_for(acct: dict) -> float:
+    """The book's crypto allocation budget from ITS OWN equity, posture
+    and overrides. Raises on any failure — callers decide what a missing
+    budget means (module-level so tests can seam it)."""
+    equity = account_equity(acct)
+    from app.paper.allocation import build_allocation
+    from app.runtime.settings import get_bot_settings
+    cfg = get_bot_settings(str(acct.get("user_id") or ""))
+    alloc = build_allocation(equity, posture_setting=cfg.account_posture,
+                             overrides=cfg.allocation_overrides)
+    return float(alloc.budgets.get("crypto", 0.0))
+
+
+def _coin_verdict(sym: str, realized: float, crypto_budget: float) -> str | None:
+    """The ONE place the per-coin threshold is applied — shared by the
+    single-book and the by-book evaluators so they can never drift."""
+    if realized >= 0 or crypto_budget <= 0:
+        return None
+    limit = PER_COIN_DAILY_LOSS_PCT * (crypto_budget / NUM_CRYPTO_COINS)
+    if limit > 0 and -realized >= limit:
+        return (f"{sym} per-coin daily loss limit: down "
+                f"${-realized:,.0f} today (limit ${limit:,.0f})")
+    return None
 
 
 async def coin_loss_halt(client, ticker: str,
@@ -539,24 +652,20 @@ async def coin_loss_halt(client, ticker: str,
     allocation budget. This sits alongside the account-wide kill-switches
     so one bad coin can be stopped without halting the others. Returns a
     veto reason string, or None when the coin is clear.
+
+    With a user_id BOTH sides are that book's — its own losses on the
+    coin vs its own budget (BI-04/PH-6). Without one (a scanner signal
+    not yet fanned out) this keeps the old platform-wide loss sum
+    against the first account row; use coin_loss_halt_by_book() there
+    to get a verdict per book instead.
     """
     if not client:
         return None
     sym = (ticker or "").upper()
 
-    # Today's realized P&L on this coin (UTC day).
+    # Today's realized P&L on this coin (UTC day), on THIS book.
     try:
-        start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
-
-        def _q():
-            return (client.table("paper_positions")
-                    .select("realized_pnl_usd")
-                    .eq("ticker", sym)
-                    .eq("asset_type", "crypto")
-                    .neq("status", "open")
-                    .gte("exit_at", start)
-                    .execute())
-        res = await asyncio.to_thread(_q)
+        res = await asyncio.to_thread(_coin_rows_query, client, sym, user_id)
         realized = sum(_f(r.get("realized_pnl_usd")) for r in (res.data or []))
     except Exception:  # noqa: BLE001
         return None
@@ -567,9 +676,8 @@ async def coin_loss_halt(client, ticker: str,
     try:
         # 2026-08-18: this took the FIRST account row it found, so a
         # per-coin halt on one book was computed from another book's
-        # equity and allocation budget. With a user_id it now reads the
-        # book actually being judged; without one it keeps the old
-        # behaviour so nothing breaks while callers are updated.
+        # equity and allocation budget. With a user_id it reads the
+        # book actually being judged.
         def _acct(uid=user_id):
             q = client.table("paper_accounts").select("*")
             if uid:
@@ -579,20 +687,58 @@ async def coin_loss_halt(client, ticker: str,
         acct = (ares.data or [None])[0]
         if not acct:
             return None
-        equity = account_equity(acct)
-        from app.paper.allocation import build_allocation
-        from app.runtime.settings import get_bot_settings
-        cfg = get_bot_settings(user_id or str(acct.get("user_id") or ""))
-        alloc = build_allocation(equity, posture_setting=cfg.account_posture,
-                                 overrides=cfg.allocation_overrides)
-        crypto_budget = float(alloc.budgets.get("crypto", 0.0))
+        crypto_budget = _crypto_budget_for(acct)
     except Exception:  # noqa: BLE001
         return None
-    if crypto_budget <= 0:
-        return None
+    return _coin_verdict(sym, realized, crypto_budget)
 
-    limit = PER_COIN_DAILY_LOSS_PCT * (crypto_budget / NUM_CRYPTO_COINS)
-    if limit > 0 and -realized >= limit:
-        return (f"{sym} per-coin daily loss limit: down "
-                f"${-realized:,.0f} today (limit ${limit:,.0f})")
-    return None
+
+async def coin_loss_halt_by_book(client, ticker: str) -> dict[str, tuple[bool, str]]:
+    """The per-coin halt evaluated for EVERY paper_accounts book at once:
+    {user_id: (halted, reason)} — each book's own losses on the coin
+    today vs its own crypto budget, same threshold as coin_loss_halt().
+
+    BI-04/PH-6: for a scanner signal with no user_id the risk manager
+    used to sum every book's losses and veto the coin for all of them.
+    Now it benches only the books that are actually over (the approve
+    payload's "benched_books") and the fan-out skips those. A book whose
+    budget cannot be computed reads as clear — this is a per-coin
+    bench, the account kill-switches are the hard guard. On a failed
+    ledger read this returns {} (no verdicts, nothing benched) and logs
+    why, so the caller can see the difference between "all clear" and
+    "could not look".
+    """
+    if not client:
+        return {}
+    sym = (ticker or "").upper()
+    try:
+        ares = await asyncio.to_thread(
+            lambda: client.table("paper_accounts").select("*").execute())
+        accounts = list(ares.data or [])
+        res = await asyncio.to_thread(_coin_rows_query, client, sym, None)
+        rows = list(res.data or [])
+    except Exception as e:  # noqa: BLE001
+        _log.warning("coin_loss_halt_by_book(%s): ledger read failed (%s) "
+                     "- no per-book verdict, nothing benched", sym,
+                     type(e).__name__)
+        return {}
+
+    realized_by_book: dict[str, float] = {}
+    for r in rows:
+        _u = str(r.get("user_id") or "")
+        realized_by_book[_u] = realized_by_book.get(_u, 0.0) + _f(r.get("realized_pnl_usd"))
+
+    out: dict[str, tuple[bool, str]] = {}
+    for acct in accounts:
+        uid = str(acct.get("user_id") or "")
+        if not uid:
+            continue
+        realized = realized_by_book.get(uid, 0.0)
+        reason: str | None = None
+        if realized < 0:
+            try:
+                reason = _coin_verdict(sym, realized, _crypto_budget_for(acct))
+            except Exception:  # noqa: BLE001
+                reason = None
+        out[uid] = (bool(reason), reason or "")
+    return out

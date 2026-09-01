@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwner } from "@/lib/auth-guards";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,7 @@ type AgentsResp = {
  * POST /api/wheel/place-leg
  * Body: { leg: "csp" | "cc", underlying, target_strike, target_exp, contracts?, limit_price? }
  *
- * Auth-gated. Resolves the user_id from the Supabase session, then
+ * Owner-gated. Resolves the user_id from the Supabase session, then
  * proxies to the agents service. The agents service uses the user's
  * OAuth Alpaca connection when present.
  *
@@ -35,13 +36,11 @@ type AgentsResp = {
  * so the UI can show what happened.
  */
 export async function POST(request: Request) {
+  // ADM-04: owner-only (TREZO_OWNER_USER_IDS allowlist; unset => 403).
   const supabase = createClient();
-  const {
-    data: { user }
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
-  }
+  const guard = await requireOwner(supabase);
+  if (!guard.ok) return guard.response;
+  const user = guard.user;
 
   let body: {
     leg?: string;

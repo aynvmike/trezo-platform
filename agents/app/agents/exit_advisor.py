@@ -12,9 +12,15 @@ held-too-long pattern in real time:
   - If the position is approaching its stop within 1%, raise
     'stop_approaching'.
 
-The advisor NEVER closes a trade. It writes rows into
+By default the advisor only alerts. It writes rows into
 `exit_advisor_alerts` so the dashboard shows them inline and so the
-user has an audit trail of the bot's reasoning.
+user has an audit trail of the bot's reasoning. BUT when the book's
+Bot Tuning `auto_exit_advisor` is ON (Task #92), a peak_giveback alert
+ACTS: urgent -> close the position (broker-aware; Alpaca rows are
+liquidated at the broker first), warn -> trim half on internal paper
+rows. That close runs under bind_for_user(row.user_id) with the route
+verified (TE-18) so it lands on the row's own broker account, never
+the primary; a row whose book cannot be resolved is left as an alert.
 
 Alerts are deduplicated: we don't re-raise the same alert_kind for
 the same position while an unacknowledged one exists. Once Mike
@@ -284,48 +290,64 @@ class ExitAdvisorAgent(Agent):
                                 close_position_broker_aware,
                                 trim_position,
                             )
-                            if severity == "urgent":
-                                # Gap 2 fix (2026-06-11): broker-aware close.
-                                # For broker=alpaca rows, liquidate at Alpaca
-                                # FIRST (cancels brackets + sells), then update
-                                # Trezo. For internal paper, plain close.
-                                await close_position_broker_aware(
-                                    user_id, pid, price,
-                                    reason=f"auto_exit_advisor: peak_giveback {int(giveback*100)}% "
-                                           f"(tier {tier_label}, urgent)",
-                                )
-                            else:
-                                # warn -> trim half. Sells half the shares,
-                                # leaves the runner so winners can keep running.
-                                # Gap 2 follow-up (Task #7b, deferred): trim
-                                # on broker=alpaca rows is complex (cancel
-                                # bracket, sell half, re-submit bracket sized
-                                # to remainder). Until shipped, broker=alpaca
-                                # trim alerts stay alert-only so Mike can act
-                                # manually. Internal paper trims work as
-                                # before.
-                                _row_broker = ""
-                                try:
-                                    _row_res = await asyncio.to_thread(
-                                        lambda: client.table("paper_positions")
-                                        .select("broker")
-                                        .eq("id", pid)
-                                        .maybe_single()
-                                        .execute()
-                                    )
-                                    _row_broker = ((_row_res.data or {}).get("broker") or "").lower().strip()
-                                except Exception:
-                                    _row_broker = ""
-                                if _row_broker == "alpaca":
-                                    # Don't trim Alpaca rows yet - alert stays
-                                    # in place, no silent-half-close bug.
-                                    pass
-                                else:
-                                    await trim_position(
-                                        user_id, pid, fraction=0.5, price=price,
+                            # TE-18: close_position_broker_aware ->
+                            # liquidate_position submits to the CURRENTLY
+                            # BOUND account, and nothing here bound one --
+                            # so an urgent auto-close on a 25k/75k row hit
+                            # the primary. Bind the row's book and verify
+                            # the route first; an unresolvable book is
+                            # skipped with a logged reason (the alert
+                            # stays so Mike can act), never defaulted.
+                            from app.brokers.accounts import bind_for_user as _bind_acct
+                            from app.brokers.route_guard import check_route as _check_route
+                            from app.brokers.route_guard import record_mismatch as _rec_mm
+                            with _bind_acct(user_id):
+                                _ok, _note = _check_route(user_id)
+                                if not _ok:
+                                    _rec_mm(ticker, user_id, _note,
+                                            "exit_advisor.auto_close")
+                                elif severity == "urgent":
+                                    # Gap 2 fix (2026-06-11): broker-aware close.
+                                    # For broker=alpaca rows, liquidate at Alpaca
+                                    # FIRST (cancels brackets + sells), then update
+                                    # Trezo. For internal paper, plain close.
+                                    await close_position_broker_aware(
+                                        user_id, pid, price,
                                         reason=f"auto_exit_advisor: peak_giveback {int(giveback*100)}% "
-                                               f"(tier {tier_label}, half-trim)",
+                                               f"(tier {tier_label}, urgent)",
                                     )
+                                else:
+                                    # warn -> trim half. Sells half the shares,
+                                    # leaves the runner so winners can keep running.
+                                    # Gap 2 follow-up (Task #7b, deferred): trim
+                                    # on broker=alpaca rows is complex (cancel
+                                    # bracket, sell half, re-submit bracket sized
+                                    # to remainder). Until shipped, broker=alpaca
+                                    # trim alerts stay alert-only so Mike can act
+                                    # manually. Internal paper trims work as
+                                    # before.
+                                    _row_broker = ""
+                                    try:
+                                        _row_res = await asyncio.to_thread(
+                                            lambda: client.table("paper_positions")
+                                            .select("broker")
+                                            .eq("id", pid)
+                                            .maybe_single()
+                                            .execute()
+                                        )
+                                        _row_broker = ((_row_res.data or {}).get("broker") or "").lower().strip()
+                                    except Exception:
+                                        _row_broker = ""
+                                    if _row_broker == "alpaca":
+                                        # Don't trim Alpaca rows yet - alert stays
+                                        # in place, no silent-half-close bug.
+                                        pass
+                                    else:
+                                        await trim_position(
+                                            user_id, pid, fraction=0.5, price=price,
+                                            reason=f"auto_exit_advisor: peak_giveback {int(giveback*100)}% "
+                                                   f"(tier {tier_label}, half-trim)",
+                                        )
                     except Exception:  # noqa: BLE001
                         pass  # leave the alert so Mike can act manually
 

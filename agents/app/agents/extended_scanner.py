@@ -57,10 +57,12 @@ class ExtendedScannerAgent(Agent):
 
     async def tick(self) -> list[AgentMessage]:
         await self._maybe_seed_signalled()
-        from app.runtime.settings import get_bot_settings
-        if not get_bot_settings().extended_enabled:
+        from app.runtime.settings import lane_enabled_any
+        # BI-03: a bare get_bot_settings() is the PRIMARY book's opinion;
+        # this scanner feeds every book, and the fan-out prunes per book.
+        if not lane_enabled_any("extended_enabled"):
             return [AgentMessage(agent=self.name, kind="info",
-                                 payload={"note": "Extended Strategy disabled in Bot Tuning."})]
+                                 payload={"note": "Extended Strategy disabled in Bot Tuning (every book)."})]
 
         if fomc_blackout():
             return [AgentMessage(agent=self.name, kind="info",
@@ -107,6 +109,8 @@ class ExtendedScannerAgent(Agent):
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="signal",
+                    # EQ-5: sig.tcs is 0-100 (extended.py rescaled), so
+                    # this lands in the 0..1 range AgentMessage documents.
                     confidence=sig.tcs / 100.0,
                     payload={
                         "ticker": sig.symbol,
@@ -152,11 +156,9 @@ class ExtendedScannerAgent(Agent):
                 for s in _signals:
                     st = (s.payload or {}).get("strategy") or "default"
                     _by_strategy[st] = _by_strategy.get(st, 0) + 1
-                _scanned = 0
-                try:
-                    _scanned = len(symbols)  # type: ignore[name-defined]
-                except Exception:
-                    _scanned = len(_signals)
+                # EQ-10/NEQ-02: `symbols` was never defined here, so the
+                # pulse always reported the signal count as "scanned".
+                _scanned = scanned
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="scanner_pulse",

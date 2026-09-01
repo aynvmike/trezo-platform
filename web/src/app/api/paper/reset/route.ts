@@ -27,9 +27,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Not signed in." }, { status: 401 });
   }
 
-  let body: { target_equity_usd?: number };
+  let body: { target_equity_usd?: number; equity?: number };
   try {
-    body = (await request.json()) as { target_equity_usd?: number };
+    body = (await request.json()) as { target_equity_usd?: number; equity?: number };
   } catch {
     return NextResponse.json(
       { error: "Bad request body — expected JSON." },
@@ -37,7 +37,11 @@ export async function POST(request: Request) {
     );
   }
 
-  const target = Number(body.target_equity_usd);
+  // MIG-03 (found while fixing the audit row): the only caller,
+  // components/dashboard/account-size-sim.tsx, posts `{ equity }`, so
+  // `target_equity_usd` was always undefined and every reset 400'd.
+  // Accept both spellings.
+  const target = Number(body.target_equity_usd ?? body.equity);
   if (!Number.isFinite(target) || target < 100 || target > 10_000_000) {
     return NextResponse.json(
       {
@@ -100,12 +104,27 @@ export async function POST(request: Request) {
   }
 
   // 3. Audit the reset.
-  await supabase.from("paper_vault_transactions").insert({
-    user_id: user.id,
-    amount_usd: target,
-    kind: "reset",
-    note: `Paper account reset to $${target.toLocaleString()} for testing`
-  });
+  // MIG-03: the column is `description` (0008_paper_trading.sql), not
+  // `note`, and the insert error used to be discarded — so no reset was
+  // ever audited. Check it like the sibling writes above. The reset
+  // itself has already applied by this point; say so in the error.
+  const { error: auditErr } = await supabase
+    .from("paper_vault_transactions")
+    .insert({
+      user_id: user.id,
+      amount_usd: target,
+      kind: "reset",
+      description: `Paper account reset to $${target.toLocaleString()} for testing`
+    });
+  if (auditErr) {
+    console.error(`[paper/reset] audit insert failed: ${auditErr.message}`);
+    return NextResponse.json(
+      {
+        error: `Account was reset to $${target.toLocaleString()}, but the audit entry could not be written: ${auditErr.message}`
+      },
+      { status: 500 }
+    );
+  }
 
   return NextResponse.json({
     ok: true,

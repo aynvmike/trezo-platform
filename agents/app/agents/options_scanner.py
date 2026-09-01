@@ -170,6 +170,94 @@ async def _user_has_alpaca(user_id: str) -> bool:
         return False
 
 
+def _lane_enabled(env_name: str) -> bool:
+    """NEQ-09 (audit 2026-09-01): explicit switch for one direct-fire option
+    lane (TREZO_DAY_OPTIONS / TREZO_SPREADS / TREZO_LONG_OPTIONS).
+
+    Settings first -- pydantic is the only loader that sees agents/.env;
+    a bare os.getenv never does -- then the process env for a real shell
+    override. Default OFF. These lanes were dark for as long as the
+    primary id lived only in .env, and moving that read onto Settings
+    must not switch three order-placing lanes on by itself."""
+    import os as _os
+    attr = env_name.strip().lower()
+    v = None
+    try:
+        v = getattr(get_settings(), attr, None)
+    except Exception:  # noqa: BLE001
+        v = None
+    if v is None:
+        v = _os.getenv(env_name)
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _primary_book() -> str:
+    """NEQ-09: the primary BOOK id via app.runtime.settings (Settings first,
+    process env second). The lanes read TREZO_PRIMARY_USER_ID with
+    os.getenv, which never sees agents/.env, so they never resolved a
+    book at all."""
+    try:
+        from app.runtime.settings import primary_user_id
+        return str(primary_user_id() or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _book_token(user_id: str):
+    """(UserToken | None, routed) for one book: the per-user OAuth token
+    when the web app holds one, else None so the call rides the env keys
+    of the account currently bound for that book. This is the 2026-08-11
+    _wheel_auto_fire pattern, shared with the harvest path (TE-14)."""
+    from app.brokers.alpaca import UserToken
+    from app.integrations.web_tokens import get_user_broker_token
+    try:
+        bt = await get_user_broker_token(str(user_id or ""), "alpaca")
+    except Exception:  # noqa: BLE001
+        bt = None
+    if bt and bt.access_token:
+        return UserToken(access_token=bt.access_token,
+                         refresh_token=bt.refresh_token,
+                         expires_at=bt.expires_at), "user-oauth"
+    return None, "env-keys"
+
+
+async def _book_kill_states(client):
+    """KS-6: per-book kill-switch states for the direct-fire lanes. None
+    means UNREADABLE, and a lane must not fire on None -- the same
+    fail-closed contract the execution fan-out honours."""
+    try:
+        from app.paper.killswitch import check_states
+        return await check_states(client)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fire_block_reason(states, user_id: str, strategy: str):
+    """KS-6: why THIS book must not fire `strategy` now, or None.
+
+    The direct-fire lanes only ever asked paper_accounts.trading_halted
+    (_user_halted). A book in weekly recovery therefore kept buying
+    same-day and directional options -- the exact lanes recovery
+    suspends -- and a computed-but-unpersisted halt (row-sum daily %,
+    broker rejects, slippage) was invisible to them. Same verdict shape
+    as trade_execution's fan-out: hard halt -> skip; recovery -> skip the
+    suspended prefixes only; no states -> skip and say so."""
+    if states is None:
+        return "kill-switch unreadable -- not firing on an unknown state"
+    st = states.get(str(user_id or ""))
+    if st is None:
+        return None
+    if getattr(st, "halted", False) and getattr(st, "mode", None) != "recovery":
+        return f"book halted [{st.scope}]: {st.reason}"
+    if getattr(st, "mode", None) == "recovery":
+        from app.paper.killswitch import recovery_policy
+        if recovery_policy(strategy) == "suspend":
+            return f"weekly recovery suspends {strategy}: {st.reason}"
+    return None
+
+
 async def _multi_day_break() -> int:
     """Days the market stays CLOSED after today's session (2 = normal
     weekend, 3+ = holiday weekend, 0 = tomorrow trades). Mike 2026-07-15:
@@ -567,14 +655,35 @@ class OptionsScannerAgent(Agent):
         early or we leave. Strikes lean ITM/ATM so delta stays honest.
         PDT-aware: under $25k equity the 3-day-trades-per-5-sessions
         budget is shared with the stock scalps -- this lane never spends
-        the last slot. Kill switch TREZO_DAY_OPTIONS=0."""
-        import os as _oso
+        the last slot. Switch TREZO_DAY_OPTIONS (NEQ-09: Settings-first,
+        default OFF -- the lane fires only when it is explicitly true)."""
         out: list[AgentMessage] = []
-        if _oso.getenv("TREZO_DAY_OPTIONS", "1") != "1":
+        if not _lane_enabled("TREZO_DAY_OPTIONS"):
             return out
-        uid = _oso.getenv("TREZO_PRIMARY_USER_ID", "")
+        uid = _primary_book()
         if not uid:
             return out
+        return await self._run_bound(client, uid, "option_same_day",
+                                     self._run_same_day_for)
+
+    async def _run_bound(self, client, uid: str, where: str, fn):
+        """Run one direct-fire lane body with the book's broker account
+        BOUND (NEQ-09 / house rule: no broker call outside bind_for_user +
+        check_route). A book the registry cannot resolve is skipped with a
+        route_mismatch line -- never defaulted onto the primary."""
+        from app.brokers.accounts import bind_for_user
+        from app.brokers.route_guard import check_route, record_mismatch
+        with bind_for_user(uid):
+            ok, note = check_route(uid)
+            if not ok:
+                record_mismatch("ACCOUNT", uid, note, where)
+                return []
+            return await fn(client, uid)
+
+    async def _run_same_day_for(self, client, uid: str) -> list[AgentMessage]:
+        """Body of _run_same_day; entered only through _run_bound."""
+        import os as _oso
+        out: list[AgentMessage] = []
         today_s = date.today().isoformat()
         try:
             from datetime import datetime as _dtn
@@ -619,6 +728,16 @@ class OptionsScannerAgent(Agent):
             if f"pdtstop:{today_s}" in OptionsScannerAgent._day_fired:
                 return out
             if await _user_halted(client, uid):
+                return out
+            # KS-6: this book's own kill-switch verdict. option_day is a
+            # recovery-suspended lane; an unreadable state means no fire.
+            _blk_ks = _fire_block_reason(await _book_kill_states(client),
+                                         uid, "option_day")
+            if _blk_ks:
+                from app.agents.activity_log import record as _arec_ks
+                _arec_ks("option_day_skip", "ACCOUNT", strategy="option_day",
+                         reason=f"same-day lane not firing: {_blk_ks}",
+                         extra={"user_id": uid})
                 return out
             # Flexible capital (Mike 2026-07-14): same-day trades give the
             # money back the same session, so they breathe wider than the
@@ -847,17 +966,23 @@ class OptionsScannerAgent(Agent):
         time, one NEW spread per day, the credit must be real DOLLARS
         toward the daily goal (TREZO_SPREAD_MIN_CREDIT, default $20;
         10% pennies-vs-wing floor), and the market must be open. Kill
-        switch TREZO_SPREADS=0.
+        switch TREZO_SPREADS (NEQ-09: Settings-first, default OFF).
         Exits v1: spreads are built to be HELD -- expiry settles them and
         the wings cap the loss; the hourly re-score skips multi-leg rows
         so it never prices one leg as the whole position."""
-        import os as _oso
         out: list[AgentMessage] = []
-        if _oso.getenv("TREZO_SPREADS", "1") != "1":
+        if not _lane_enabled("TREZO_SPREADS"):
             return out
-        uid = _oso.getenv("TREZO_PRIMARY_USER_ID", "")
+        uid = _primary_book()
         if not uid:
             return out
+        return await self._run_bound(client, uid, "option_spreads",
+                                     self._run_spreads_for)
+
+    async def _run_spreads_for(self, client, uid: str) -> list[AgentMessage]:
+        """Body of _run_spreads; entered only through _run_bound."""
+        import os as _oso
+        out: list[AgentMessage] = []
         today_s = date.today().isoformat()
         if f"S:{today_s}" in OptionsScannerAgent._spread_fired:
             return out
@@ -920,6 +1045,18 @@ class OptionsScannerAgent(Agent):
                 if cnd:
                     play = build_iron_condor("SPY", cnd)
             if not play:
+                return out
+            # KS-6: this book's verdict for the chosen structure
+            # (credit spreads / condors tighten in recovery; a debit
+            # spread or butterfly is suspended). Unreadable -> no fire.
+            _blk_ks = _fire_block_reason(await _book_kill_states(client),
+                                         uid, str(play.strategy))
+            if _blk_ks:
+                from app.agents.activity_log import record as _arec_ks
+                _arec_ks("option_spread_skip", play.underlying,
+                         strategy=str(play.strategy),
+                         reason=f"spread lane not firing: {_blk_ks}",
+                         extra={"user_id": uid})
                 return out
 
             # Mike 2026-07-14: "the credit has to be worth the PROFIT,
@@ -1028,11 +1165,20 @@ class OptionsScannerAgent(Agent):
             one shot per underlying per day, one new entry per tick
           - exits live in the hourly re-score: +40% harvest, -50% cut,
             and always out by DTE <= 3 (no expiry roulette)
-        Kill switch: TREZO_LONG_OPTIONS=0."""
+        Switch TREZO_LONG_OPTIONS (NEQ-09: Settings-first, default OFF)."""
+        out: list[AgentMessage] = []
+        if not _lane_enabled("TREZO_LONG_OPTIONS"):
+            return out
+        uid = _primary_book()
+        if not uid:
+            return out
+        return await self._run_bound(client, uid, "option_directional",
+                                     self._run_directional_for)
+
+    async def _run_directional_for(self, client, uid: str) -> list[AgentMessage]:
+        """Body of _run_directional; entered only through _run_bound."""
         import os as _oso
         out: list[AgentMessage] = []
-        if _oso.getenv("TREZO_LONG_OPTIONS", "1") != "1":
-            return out
         try:
             from app.data.market_universe import SECTOR_BIAS
             gens = list(SECTOR_BIAS.get("generals") or [])
@@ -1050,9 +1196,20 @@ class OptionsScannerAgent(Agent):
             _eq = float(getattr(acct, "equity", 0) or 0)
             if int(getattr(acct, "options_approved_level", 0) or 0) < 2:
                 return out      # long options need approval level >= 2
-            uid = _oso.getenv("TREZO_PRIMARY_USER_ID", "")
-            if not uid or await _user_halted(client, uid):
+            if await _user_halted(client, uid):
                 return out
+            # KS-6: read once per lane pass; unreadable -> the lane does
+            # not fire. The per-strategy verdict (long_call / long_put
+            # are recovery-suspended) is taken per candidate below.
+            _ks_states = await _book_kill_states(client)
+            if _ks_states is None:
+                from app.agents.activity_log import record as _arec_ks
+                _arec_ks("option_long_skip", "ACCOUNT",
+                         reason=("directional lane not firing: "
+                                 "kill-switch unreadable"),
+                         extra={"user_id": uid})
+                return out
+            _blk_seen: set = set()
             _cap_usd = float(_oso.getenv("TREZO_LONG_OPT_USD", "120"))
             _max_open = int(_oso.getenv("TREZO_LONG_OPT_OPEN", "2"))
             _min_d3 = float(_oso.getenv("TREZO_LONG_OPT_MIN_D3", "2.5"))
@@ -1100,6 +1257,20 @@ class OptionsScannerAgent(Agent):
                         "TREZO_LONG_OPT_VOL_RATIO", "1.2")):
                     continue
                 opt_type = "call" if d3 > 0 else "put"
+                # KS-6: this book's verdict for THIS strategy, before the
+                # live pick and the one-shot guard so a skipped name is
+                # neither fetched nor burned for the day.
+                _blk_ks = _fire_block_reason(_ks_states, uid,
+                                             f"long_{opt_type}")
+                if _blk_ks:
+                    if _blk_ks not in _blk_seen:
+                        _blk_seen.add(_blk_ks)
+                        from app.agents.activity_log import record as _arec_ks
+                        _arec_ks("option_long_skip", sym,
+                                 strategy=f"long_{opt_type}",
+                                 reason=f"directional lane not firing: {_blk_ks}",
+                                 extra={"user_id": uid})
+                    continue
                 from datetime import timedelta as _tdl
                 target_exp = (date.today() + _tdl(days=30)).isoformat()
                 from app.brokers.alpaca_data import live_option_pick
@@ -1483,18 +1654,57 @@ class OptionsScannerAgent(Agent):
                                                   f"{_why}{_step_t}"),
                                                  _qty)
                                 if _fire:
-                                    OptionsScannerAgent._harvested.add(_hk)
-                                    from app.brokers.alpaca import submit_option_order as _soo
-                                    _o2, _e2 = await _soo(
-                                        _occ, int(_fire[3]), _fire[0],
-                                        time_in_force="day",
-                                        limit_price=_fire[1])
+                                    # TE-14 / NEQ-08 (audit 2026-09-01):
+                                    # this re-score selects EVERY book's
+                                    # open rows, and the harvest order
+                                    # went out with no token and no
+                                    # binding -- so a 25k/75k book's
+                                    # buy-back landed on the PRIMARY
+                                    # account. Bind the ROW's book, verify
+                                    # the route, honour the book's halt,
+                                    # and only then submit (OAuth token
+                                    # else the bound account's env keys).
+                                    # A skipped row is NOT marked
+                                    # harvested: it is retried next hour.
+                                    _uid_h = str(lr.get("user_id") or "")
+                                    from app.brokers.accounts import (
+                                        bind_for_user as _bind_h)
+                                    from app.brokers.route_guard import (
+                                        check_route as _rt_h,
+                                        record_mismatch as _mm_h)
+                                    with _bind_h(_uid_h):
+                                        _rok_h, _rnote_h = _rt_h(_uid_h)
+                                        if not _rok_h:
+                                            _mm_h(_u, _uid_h, _rnote_h,
+                                                  "option_harvest")
+                                            _fire = None
+                                        elif await _user_halted(client, _uid_h):
+                                            _arec("option_harvest_skip", _u,
+                                                  strategy=_strat_l,
+                                                  reason=("book halted -- no "
+                                                          "harvest order into a "
+                                                          "halted account; "
+                                                          "retried next hour"),
+                                                  extra={"user_id": _uid_h})
+                                            _fire = None
+                                        else:
+                                            _tok_h, _routed_h = await _book_token(_uid_h)
+                                            OptionsScannerAgent._harvested.add(_hk)
+                                            from app.brokers.alpaca import (
+                                                submit_option_order as _soo)
+                                            _o2, _e2 = await _soo(
+                                                _occ, int(_fire[3]), _fire[0],
+                                                time_in_force="day",
+                                                limit_price=_fire[1],
+                                                token=_tok_h)
+                                if _fire:
                                     _arec("option_harvest", _u,
                                           strategy=_strat_l,
-                                          reason=(_fire[2] + f" (limit {_fire[1]:.2f})"
+                                          reason=(_fire[2] + f" (limit {_fire[1]:.2f}, "
+                                                  f"book {_uid_h[:8]} via {_routed_h})"
                                                   if not _e2 else
                                                   f"harvest order failed: {str(_e2)[:90]}"),
-                                          extra={"user_id": str(lr.get("user_id"))})
+                                          extra={"user_id": _uid_h})
                                     # Step-down bookkeeping: shrink the open
                                     # row, book the sold slice at the limit
                                     # (conservative -- a sell fills at limit
@@ -1580,11 +1790,34 @@ class OptionsScannerAgent(Agent):
             pass
 
         for r in rows:
-            candles = await fetch_candles_for(r["underlying"], "stock")
+            try:
+                candles = await fetch_candles_for(r["underlying"], "stock")
+            except Exception:  # noqa: BLE001
+                candles = None
             spot = float(candles[-1].close) if candles else 0.0
             strike = float(r.get("strike") or 0)
             contracts = int(r.get("contracts") or 1)
             credit = float(r.get("net_premium_usd") or 0)
+
+            # NEQ-10 (audit 2026-09-01): no price, no settlement. When the
+            # settle-tick candle read failed (no candles / spot <= 0), a
+            # short put that expired IN the money fell through every
+            # spot-gated branch into the "full credit kept" else and was
+            # booked as a win. Defer the row to the next tick instead and
+            # say so; the row stays open and visible until a price exists.
+            if spot <= 0:
+                try:
+                    from app.agents.activity_log import record as _srec
+                    _srec("settle_deferred_no_price", r["underlying"],
+                          strategy=str(r.get("strategy") or ""),
+                          reason=("expired row NOT settled this tick: no "
+                                  "spot price for the underlying -- "
+                                  "deferred rather than booked at full "
+                                  "credit"),
+                          extra={"user_id": str(r.get("user_id") or "")})
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
 
             # Cash-secured put settlement
             if r["strategy"] in ("wheel_csp", "cash_secured_put") and strike > 0 and spot > 0:
@@ -1632,20 +1865,43 @@ class OptionsScannerAgent(Agent):
 
     async def _reconcile_with_broker(self, client) -> list[AgentMessage]:
         """For every user with a live Alpaca connection: any open modeled
-        row that has no matching contract at the broker is closed_manual."""
+        row that has no matching contract at the broker is closed_manual.
+
+        TE-15 (audit 2026-09-01): each book is bound to its own broker
+        account before its reads (see _reconcile_books) and the binding
+        is always cleared here -- Python 3.12's wait_for runs each tick
+        step in the SAME task, so a leaked ContextVar would follow the
+        next step onto the wrong account."""
+        from app.brokers.accounts import clear_account
+        try:
+            return await self._reconcile_books(client)
+        finally:
+            clear_account()
+
+    async def _reconcile_books(self, client) -> list[AgentMessage]:
+        """Body of _reconcile_with_broker; entered only through it."""
         from app.brokers.alpaca import (
-            UserToken, get_option_positions, alpaca_configured,
+            UserToken, get_option_positions_strict, alpaca_configured,
         )
+        from app.brokers.accounts import set_account_for_user as _bind_book
+        from app.brokers.route_guard import check_route as _rt_check
+        from app.brokers.route_guard import record_mismatch as _rt_mm
         from app.integrations.web_tokens import get_user_broker_token
 
         out: list[AgentMessage] = []
 
         # Open rows grouped per user.
         def _sync_open():
+            # net_premium_usd (audit 2026-09-01, found while wiring TE-15):
+            # the true-exit arithmetic below reads r["net_premium_usd"] as
+            # the credit, but this select never fetched it -- every
+            # reconciled short booked 0 - buyback (a loss the size of the
+            # buy-back) and every long booked raw proceeds. Fetch it.
             return (
                 client.table("options_positions")
                 .select("id, user_id, underlying, strategy, option_type, "
-                        "strike, expiration, contracts, notes")
+                        "strike, expiration, contracts, notes, "
+                        "net_premium_usd")
                 .eq("status", "open")
                 .execute()
             )
@@ -1657,12 +1913,25 @@ class OptionsScannerAgent(Agent):
         by_user: dict[str, list[dict]] = {}
         for r in rows:
             by_user.setdefault(str(r["user_id"]), []).append(r)
-        import os as _osr
-        _prim = _osr.getenv("TREZO_PRIMARY_USER_ID", "")
+        # NEQ-09: Settings-first primary id (os.getenv never saw .env, so
+        # the primary's adopt pass never ran when it held no open row).
+        _prim = _primary_book()
         if _prim and _prim not in by_user:
             by_user[_prim] = []
 
         for user_id, user_rows in by_user.items():
+            # TE-15: bind THIS book before any broker read below. Unbound,
+            # every env-key read here answered for the PRIMARY account, so
+            # a non-primary book's rows were judged against the wrong
+            # broker and its adopt pass copied the primary's contracts.
+            # set_account_for_user is the documented no-reindent binding;
+            # _reconcile_with_broker clears it in a finally. A book the
+            # registry cannot resolve is skipped -- never the primary.
+            _bind_book(str(user_id))
+            _rok, _rnote = _rt_check(str(user_id))
+            if not _rok:
+                _rt_mm("ACCOUNT", str(user_id), _rnote, "option_reconcile")
+                continue
             # Skip users with no live Alpaca connection (and no env-key
             # broker either — those stay in pure modeled mode).
             token = None
@@ -1677,13 +1946,27 @@ class OptionsScannerAgent(Agent):
                 continue
 
             try:
-                broker_options = await get_option_positions(token=token)
+                broker_options = await get_option_positions_strict(token=token)
             except Exception:  # noqa: BLE001
                 broker_options = None
             if broker_options is None:
-                # 2026-07-15 (the F-put disease): a FAILED fetch used to
-                # read as "no options at the broker" and closed every row.
-                # Absence of evidence is not evidence of absence -- skip.
+                # TE-15 (audit 2026-09-01): the 2026-07-15 comment that
+                # stood here claimed a failed fetch was skipped. It was
+                # not: get_option_positions() returned [] on failure, so
+                # this branch was unreachable and a 429/timeout read as
+                # "no options at the broker" (the F-put disease, alive).
+                # The strict read makes a failure ANSWERLESS (None) --
+                # absence of evidence is not evidence of absence -- and
+                # this skip is now real. Nothing is closed or adopted for
+                # this book this tick, and the log says so.
+                try:
+                    from app.agents.activity_log import record as _urec
+                    _urec("reconcile_skipped_unreadable", "ACCOUNT",
+                          reason=("broker option positions unreadable -- "
+                                  "no row closed or adopted this tick"),
+                          extra={"user_id": user_id})
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
             broker_occ = [str(p.get("symbol", "")) for p in broker_options]
 
@@ -1888,9 +2171,17 @@ class OptionsScannerAgent(Agent):
         leg,
         strategy: str,
         priced: str,
+        client=None,
     ):
         """Fire a Wheel CSP / CC order on Alpaca, mirroring the same
         primitives /wheel/place-leg uses for the manual button.
+
+        `client` (audit 2026-09-01, found while wiring TE-14): the
+        tracking insert below closed over a name `client` that was never
+        in scope here, so EVERY auto-fired leg raised NameError after the
+        order was accepted and surfaced as wheel_auto_tracking_failed --
+        the book row only existed once reconcile adopted it. Callers pass
+        their client; a fresh one is opened only when none is given.
 
         Returns an AgentMessage on SUCCESS (the order was accepted and a
         tracking row inserted) or None on FAILURE (caller falls back to
@@ -1912,6 +2203,9 @@ class OptionsScannerAgent(Agent):
         from app.integrations.web_tokens import get_user_broker_token
         from app.paper.engine import record_external_position
         import asyncio
+
+        if client is None:
+            client = _supabase()
 
         # Resolve token: per-user OAuth first, env-key fallback.
         # MULTI-ACCOUNT FIX (2026-08-11): bind THIS book before anything
@@ -2437,6 +2731,8 @@ class OptionsScannerAgent(Agent):
                 continue  # one new overlay write per day per user
             if not await _user_has_alpaca(user_id):
                 continue
+            # KS-6: THIS book's kill-switch verdict, read once per book.
+            _ks_states_u = await _book_kill_states(client)
             try:
                 from app.brokers.alpaca import get_positions, UserToken
                 from app.integrations.web_tokens import get_user_broker_token
@@ -2541,6 +2837,16 @@ class OptionsScannerAgent(Agent):
                 from app.runtime.settings import get_bot_settings
                 cfg = get_bot_settings(user_id)
                 halted = await _user_halted(client, user_id)
+                # KS-6 (see _run_wheel): computed halts / an unreadable
+                # kill-switch stand the overlay's auto-fire down too.
+                _blk_ks = _fire_block_reason(_ks_states_u, user_id,
+                                             "wheel_cc")
+                if _blk_ks and cfg.wheel_auto_execute and not halted:
+                    halted = True
+                    from app.agents.activity_log import record as _arec_ks
+                    _arec_ks("wheel_ks_skip", sym, strategy="wheel_cc",
+                             reason=f"cc overlay auto-fire stood down: {_blk_ks}",
+                             extra={"user_id": user_id})
                 if cfg.wheel_auto_execute and not halted:
                     fired = await self._wheel_auto_fire(
                         user_id=user_id, underlying=sym, leg=leg,
@@ -2548,6 +2854,7 @@ class OptionsScannerAgent(Agent):
                         priced=("Live-quoted"
                                 if getattr(leg, "live", False)
                                 else "Modeled"),
+                        client=client,
                     )
                     if fired is not None:
                         ev = (fired.payload or {}).get("event")
@@ -2610,6 +2917,10 @@ class OptionsScannerAgent(Agent):
                                     "yield_pct": 0.0})()
                     for s in WHEEL_WATCHLIST
                 ]
+            # KS-6: THIS book's kill-switch verdict, read once per book
+            # (the candidate loop below can run for minutes).
+            _ks_states_u = await _book_kill_states(client)
+            _ks_said: set = set()
             for cand in universe:
                 underlying = cand.ticker
                 candles = await fetch_candles_for(underlying, "stock")
@@ -2695,6 +3006,21 @@ class OptionsScannerAgent(Agent):
                     # Check kill-switch state first - never auto-fire
                     # into a halted account.
                     halted = await _user_halted(client, user_id)
+                    # KS-6: computed halts (row-sum daily %, rejects,
+                    # slippage) and an unreadable kill-switch stand the
+                    # auto-fire down too. wheel_csp / wheel_cc are
+                    # 'tighten' lanes, so recovery alone does not.
+                    _blk_ks = _fire_block_reason(_ks_states_u, user_id,
+                                                 strategy)
+                    if _blk_ks and cfg.wheel_auto_execute and not halted:
+                        halted = True
+                        if _blk_ks not in _ks_said:
+                            _ks_said.add(_blk_ks)
+                            from app.agents.activity_log import record as _arec_ks
+                            _arec_ks("wheel_ks_skip", leg.underlying,
+                                     strategy=strategy,
+                                     reason=f"wheel auto-fire stood down: {_blk_ks}",
+                                     extra={"user_id": user_id})
 
                     if cfg.wheel_auto_execute and not halted:
                         # 2026-06-16: skip names the broker recently rejected
@@ -2710,6 +3036,7 @@ class OptionsScannerAgent(Agent):
                             leg=leg,
                             strategy=strategy,
                             priced=priced,
+                            client=client,
                         )
                         if autofire is not None:
                             ev = (autofire.payload or {}).get("event")
@@ -2732,7 +3059,9 @@ class OptionsScannerAgent(Agent):
                     if cfg.wheel_auto_execute and halted:
                         suggestion_note += (
                             "Auto-execute is ON but the account is "
-                            "halted (kill-switch). Nothing auto-fired."
+                            "halted (kill-switch"
+                            + (f": {_blk_ks}" if _blk_ks else "")
+                            + "). Nothing auto-fired."
                         )
                     else:
                         suggestion_note += (

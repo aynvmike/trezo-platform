@@ -25,8 +25,18 @@ stated plainly, alarmed when it stops being true:
     not fire -- the stop exists and did nothing)
   * a book halted while its own counters say the condition has cleared
     (the latched kill-switch, 8/17)
-  * zero approvals across a market-hours window (the gate is shut)
-  * a book's ledger and its broker disagreeing about position COUNT
+
+Those three are what this agent implements (G6: the header used to
+promise two more -- "zero approvals across a market-hours window" and
+"ledger vs broker position COUNT" -- that were never written). The
+starvation question lives in ops_watchdog._check_flow(), per lane; the
+count question is answered by invariant 1, which lists the rows
+themselves rather than comparing two totals.
+
+Dust (DU-01): a broker row worth less than DUST_MIN_USD is NOT an
+unmanaged position -- it is the crumb a fractional close leaves behind
+-- and is skipped. A row whose market_value is MISSING or unparseable
+still flags: a failed read must never read as "nothing there".
 
 Findings go out through app.runtime.alerts, which is the channel this
 platform did not have. Detection was never the problem.
@@ -53,8 +63,10 @@ def _f(name: str, default: float) -> float:
 
 # A book with ANY unmanaged position is broken; above this it is urgent.
 URGENT_UNMANAGED_USD = _f("TREZO_HEALTH_URGENT_USD", 1000.0)
-# How long the entry gate may be shut during market hours before we say so.
-QUIET_GATE_HOURS = _f("TREZO_HEALTH_QUIET_GATE_H", 2.0)
+# DU-01: below this a broker row is dust (fractional-close residue),
+# not an unmanaged position. Only a PRESENT, PARSEABLE market_value can
+# qualify as dust; a missing one is never assumed small.
+DUST_MIN_USD = _f("TREZO_HEALTH_DUST_USD", 1.00)
 
 
 def _supabase():
@@ -169,12 +181,21 @@ class BookHealthAgent(Agent):
             key = _ledger_key(bp)
             if key in have:
                 continue
-            try:
-                mv = abs(float(bp.get("market_value") or 0))
-            except (TypeError, ValueError):
-                mv = 0.0
-            unmanaged.append(f"{key[0]} (${mv:,.0f})")
-            unmanaged_usd += mv
+            # DU-01: skip a row ONLY when market_value is present, parses
+            # and sits below the dust floor. Missing or unparseable is
+            # not "small" -- it is unknown, and unknown still flags.
+            mv_raw = bp.get("market_value")
+            mv = None
+            if mv_raw is not None and str(mv_raw).strip() != "":
+                try:
+                    mv = abs(float(mv_raw))
+                except (TypeError, ValueError):
+                    mv = None
+            if mv is not None and mv < DUST_MIN_USD:
+                continue
+            unmanaged.append(f"{key[0]} (${mv:,.0f})" if mv is not None
+                             else f"{key[0]} ($? -- no market value)")
+            unmanaged_usd += mv or 0.0
 
         fkey = f"unmanaged:{uid}"
         if unmanaged:
@@ -262,7 +283,9 @@ class BookHealthAgent(Agent):
 
         return findings
 
-    # ---- INVARIANT 4: the gate has been shut all session -------------
+    # Bus messages are not consumed here. The "gate shut all session"
+    # question (the old invariant 4) is answered per lane by
+    # ops_watchdog._check_flow() -- see G6 in the header.
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
         return []
 

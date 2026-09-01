@@ -64,7 +64,7 @@ class ORBSignal:
     sub_window: str
     stop_pct: float
     target_pct: float
-    tcs: int
+    tcs: int                # 0-100 scale (EQ-5)
 
 
 def evaluate_orb(symbol: str, candles_1m, daily_atr: float,
@@ -116,15 +116,19 @@ def evaluate_orb(symbol: str, candles_1m, daily_atr: float,
     stop_pct = stop_dist / breakout_price
     target_pct = stop_pct * 2.0
 
-    # ORB confidence: a confirmed breakout starts at 720; quality adds to it.
-    tcs = 720
+    # ORB confidence: a confirmed breakout starts at 72; quality adds to it.
+    # EQ-5: TCS is 0-100 platform-wide since 2026-07-08. This hand-built
+    # score stayed on the old 0-1000 scale (720/60/40/40, cap 900), so ORB
+    # signals sailed over every per-book floor and carried confidence > 1.
+    # Same components divided by 10; the shape of the score is unchanged.
+    tcs = 72
     if volume_ok:
-        tcs += 60
+        tcs += 6
     if sub_window == "best":
-        tcs += 40
+        tcs += 4
     if 0.20 <= atr_ratio <= 0.55:
-        tcs += 40
-    tcs = min(tcs, 900)
+        tcs += 4
+    tcs = min(tcs, 90)
 
     return ORBSignal(
         symbol=symbol.upper(), direction=direction,

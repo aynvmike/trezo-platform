@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import { requireUser } from "@/lib/auth-guards";
 
 export const dynamic = "force-dynamic";
 
@@ -12,6 +14,11 @@ export async function GET(
   request: Request,
   { params }: { params: { ticker: string } }
 ) {
+  // AUTH-06: this route was reachable with no session at all.
+  const supabase = createClient();
+  const guard = await requireUser(supabase);
+  if (!guard.ok) return guard.response;
+
   const { searchParams } = new URL(request.url);
   const qs = searchParams.toString();
   const url = `${AGENTS_BASE}/patterns/scan/${encodeURIComponent(params.ticker)}${qs ? "?" + qs : ""}`;

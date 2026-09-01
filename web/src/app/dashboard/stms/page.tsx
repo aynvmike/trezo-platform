@@ -4,6 +4,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
+import { LoadError, loadResult } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -58,9 +59,13 @@ export default async function StmsPage() {
       .limit(20)
   ]);
 
-  const openPositions = openRes.data ?? [];
-  const closedPositions = closedRes.data ?? [];
-  const scanMessages = scanRes.data ?? [];
+  // PAGES-03: keep "read failed" distinct from "nothing there".
+  const openLoad = loadResult("paper_positions", openRes, []);
+  const closedLoad = loadResult("paper_positions (closed)", closedRes, []);
+  const scanLoad = loadResult("agent_messages", scanRes, []);
+  const openPositions = openLoad.data ?? [];
+  const closedPositions = closedLoad.data ?? [];
+  const scanMessages = scanLoad.data ?? [];
 
   const windowOpen = inTradingWindow();
   const latestScan = scanMessages.find(
@@ -70,7 +75,7 @@ export default async function StmsPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
-      <LayerHero id={2} openCount={openPositions.length} action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>} />
+      <LayerHero id={2} openCount={openLoad.failure ? undefined : openPositions.length} action={<Link href="/dashboard/stocks" className="text-sm text-weave-600 hover:underline">Watchlist quotes →</Link>} />
 
       {/* Scanner status */}
       <section
@@ -109,11 +114,13 @@ export default async function StmsPage() {
         <h2 className="font-serif text-xl text-weave-800 mb-3">
           Recent STMS signals <span className="text-sm text-weave-500">({recentSignals.length})</span>
         </h2>
-        {recentSignals.length === 0 ? (
+        {scanLoad.failure ? (
+          <LoadError {...scanLoad.failure} />
+        ) : recentSignals.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No qualifying signals yet. A signal fires only when a watchlist
             ticker clears every filter — price, +10% move, 5× volume — AND scores
-            TCS 750+. That&apos;s a deliberately high bar.
+            TCS at or above the book&apos;s threshold (75 by default on the 0–100 scale). That&apos;s a deliberately high bar.
           </div>
         ) : (
           <div className="rounded-xl border border-weave-100 bg-white overflow-hidden overflow-x-auto">
@@ -163,7 +170,9 @@ export default async function StmsPage() {
         <h2 className="font-serif text-xl text-weave-800 mb-3">
           Open STMS positions <span className="text-sm text-weave-500">({openPositions.length})</span>
         </h2>
-        {openPositions.length === 0 ? (
+        {openLoad.failure ? (
+          <LoadError {...openLoad.failure} />
+        ) : openPositions.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No open STMS positions. Positions appear here after a signal is
             approved by Risk Manager — and all close automatically by 11 AM ET.
@@ -201,7 +210,9 @@ export default async function StmsPage() {
         <h2 className="font-serif text-xl text-weave-800 mb-3">
           Recent STMS trades <span className="text-sm text-weave-500">({closedPositions.length})</span>
         </h2>
-        {closedPositions.length === 0 ? (
+        {closedLoad.failure ? (
+          <LoadError {...closedLoad.failure} />
+        ) : closedPositions.length === 0 ? (
           <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
             No closed STMS trades yet.
           </div>

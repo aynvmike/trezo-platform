@@ -27,6 +27,7 @@ from app.brokers.accounts import (
     set_account_for_user as _pm_set_account,
     clear_account as _pm_clear_account,
     should_skip_unresolved as _pm_skip_unresolved,
+    bind_for_user as _pm_bind,      # TE-11: per-row binding for day options
 )
 
 # Profit-stepping LADDER (2026-07-02, multi-step per Mike: "it should be
@@ -50,6 +51,15 @@ _GAP_DAY = ""   # open-bell gap audit marker (Mike 2026-07-15)
 _PRE_BREAK_DAY = ""   # pre-holiday review marker (Mike 2026-07-16)
 
 
+def _utc_now():
+    """The UTC clock behind the time-gated passes below (day options,
+    gap check, pre-break review). One module-level seam so the guard
+    tests can open a gate without faking the stdlib."""
+    from datetime import datetime as _d
+    from datetime import timezone as _z
+    return _d.now(_z.utc)
+
+
 async def _pre_break_review() -> None:
     """PRE-HOLIDAY REVIEW (Mike 2026-07-16): before every multi-day
     market close, re-evaluate what is held. His rule, encoded: if the
@@ -60,12 +70,12 @@ async def _pre_break_review() -> None:
     (stop >= entry); green-but-unprotected ones get their stop raised
     to breakeven (+ broker resync); red ones close into the break.
     Crypto trades 24/7 and is exempt. Every decision logs a
-    `preholiday_review` line. Runs once, 2:00-3:45 PM ET on the eve."""
+    `preholiday_review` line. Runs once, 2:00-3:45 PM ET on the eve.
+    Runs at tick start, BEFORE the per-row binding: the broker resync
+    it triggers therefore binds the row's own book itself (TE-12)."""
     global _PRE_BREAK_DAY
     from datetime import date as _pb_d
-    from datetime import datetime as _pb_dt
-    from datetime import timezone as _pb_tz
-    now = _pb_dt.now(_pb_tz.utc)
+    now = _utc_now()
     h = now.hour + now.minute / 60.0
     if not (18.0 <= h <= 19.75):
         return
@@ -135,8 +145,11 @@ async def _pre_break_review() -> None:
                             from app.paper.leg_sync import (
                                 resync_alpaca_legs,
                             )
+                            # TE-12 / BI-07: THIS row's book, named
+                            # explicitly -- nothing is bound yet here.
                             await resync_alpaca_legs(
-                                r, why="pre-break: stop raised to breakeven")
+                                r, why="pre-break: stop raised to breakeven",
+                                user_id=uid)
                     except Exception:  # noqa: BLE001
                         pass
                     _rec("preholiday_review", tk,
@@ -170,12 +183,12 @@ async def _gap_check_open_bell() -> None:
     tighten the stop to ~2% under the open and push it to the broker
     (cap further bleed). Gap UP -> the trail ratchets the lock and the
     TP limit fills at the better price; we log the read either way so
-    the audit trail shows the gap was SEEN and handled."""
+    the audit trail shows the gap was SEEN and handled. Runs at tick
+    start, BEFORE the per-row binding: the broker resync it triggers
+    binds the row's own book itself (TE-12)."""
     global _GAP_DAY
     from datetime import date as _g_d
-    from datetime import datetime as _g_dt
-    from datetime import timezone as _g_tz
-    now = _g_dt.now(_g_tz.utc)
+    now = _utc_now()
     h = now.hour + now.minute / 60.0
     if not (13.5 <= h <= 14.2):
         return
@@ -229,9 +242,12 @@ async def _gap_check_open_bell() -> None:
                                 from app.paper.leg_sync import (
                                     resync_alpaca_legs,
                                 )
+                                # TE-12 / BI-07: THIS row's book, named
+                                # explicitly -- nothing is bound yet here.
                                 await resync_alpaca_legs(
                                     r, why=(f"gap-down {gap * 100:.1f}% at "
-                                            f"the open -- stop tightened"))
+                                            f"the open -- stop tightened"),
+                                    user_id=uid)
                         except Exception:  # noqa: BLE001
                             pass
                         _grec("gap_check", str(r["ticker"]),
@@ -258,6 +274,9 @@ async def _gap_check_open_bell() -> None:
 
 
 async def _manage_day_options() -> None:
+    """Same-day options leash (see the block comment above). Runs at
+    tick start, BEFORE the per-row binding, so every exit order is
+    bound to its own row's book right here (TE-11 / BI-06)."""
     global _day_opt_last
     import os as _os2
     import time as _t2
@@ -280,9 +299,7 @@ async def _manage_day_options() -> None:
         rows = (await _aio.to_thread(_q)).data or []
         if not rows:
             return
-        from datetime import datetime as _dt2
-        from datetime import timezone as _tz2
-        _now = _dt2.now(_tz2.utc)
+        _now = _utc_now()
         _h = _now.hour + _now.minute / 60.0
         _force = _h >= 19.75      # 3:45 PM EDT (safely early in EST too)
         _tp = 1.0 + float(_os2.getenv("TREZO_DAY_OPT_TP", "0.30"))
@@ -321,11 +338,38 @@ async def _manage_day_options() -> None:
                 why = "3:45 ET force-close -- same-day trades never sleep over"
             if not why:
                 continue
-            _day_opt_done.add(rid)
+            # TE-11 / BI-06: the exit goes to THIS row's book. This ran
+            # before the monitor's per-row binding, so the sell went to
+            # whichever account was bound last -- the primary at tick
+            # start -- and a 25k/75k contract was sold (or failed to
+            # sell) on the wrong account. Bind per row, verify the
+            # route, skip an unresolved book with a logged reason. rid
+            # joins _day_opt_done only after the broker ACCEPTED the
+            # order under that binding; anything else retries next pass.
+            _uid = str(r.get("user_id") or "")
+            _o, _e = None, None
+            if _pm_skip_unresolved(_uid):
+                try:
+                    from app.agents.activity_log import record as _rec2s
+                    _rec2s("option_day_exit_skipped", u, strategy="option_day",
+                           reason=(f"book {_uid[:8] or '?'} unresolved -- "
+                                   f"refusing to route the exit to the "
+                                   f"primary"),
+                           extra={"user_id": _uid})
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             from app.brokers.alpaca import submit_option_order
-            _o, _e = await submit_option_order(
-                occ, ct, "sell", time_in_force="day",
-                limit_price=round(max(0.01, float(prem)) * 0.95, 2))
+            from app.brokers.route_guard import (
+                check_route as _do_check, record_mismatch as _do_mm)
+            with _pm_bind(_uid):
+                _rok, _rnote = _do_check(_uid)
+                if not _rok:
+                    _do_mm(u, _uid, _rnote, "day_options")
+                    continue
+                _o, _e = await submit_option_order(
+                    occ, ct, "sell", time_in_force="day",
+                    limit_price=round(max(0.01, float(prem)) * 0.95, 2))
             try:
                 from app.agents.activity_log import record as _rec2
                 _rec2("option_day_exit", u, strategy="option_day",
@@ -334,11 +378,12 @@ async def _manage_day_options() -> None:
                                f"{why}")
                               if not _e else
                               f"same-day exit order failed: {str(_e)[:90]}"),
-                      extra={"user_id": str(r.get("user_id"))})
+                      extra={"user_id": _uid})
             except Exception:  # noqa: BLE001
                 pass
-            if _e:
-                _day_opt_done.discard(rid)   # retry on the next pass
+            if _o and not _e:
+                _day_opt_done.add(rid)   # accepted, on the right book
+            # a rejected / failed order is NOT marked done: retry next pass
     except Exception:  # noqa: BLE001
         pass
 
@@ -862,8 +907,11 @@ async def _maybe_trail_stock_profit(r: dict, price: float,
     try:
         if str(r.get("broker") or "") == "alpaca":
             from app.paper.leg_sync import resync_alpaca_legs
+            # TE-12: this runs inside the bound per-row loop, but the
+            # resync binds the row's book itself -- name it explicitly.
             await resync_alpaca_legs(
-                r, why=f"profit trail ratcheted the stop to {new_stop:.2f}")
+                r, why=f"profit trail ratcheted the stop to {new_stop:.2f}",
+                user_id=str(r.get("user_id") or ""))
     except Exception:  # noqa: BLE001
         pass
     return new_stop
@@ -1045,13 +1093,40 @@ async def _arm_broker_stop(r: dict) -> str | None:
 # sits past its stop. If the broker keeps REJECTING/CANCELING the close (e.g. a
 # day-TIF bracket conflict -- the GM 6/13 canceled-sell storm), an un-throttled
 # retry fires a market order every ~60s: order spam + repeated rejects that trip
-# the session kill-switch. This wrapper rate-limits attempts per symbol and
-# trips a circuit-breaker after repeated failures so the bot backs off + alerts
-# ONCE instead of hammering forever.
+# the session kill-switch. This wrapper rate-limits attempts per BOOK per
+# symbol and trips a circuit-breaker after repeated failures so the bot backs
+# off + alerts ONCE instead of hammering forever.
+#
+# BI-05 (audit 2026-09-01): keyed by symbol alone, one book's reject storm
+# on a shared ticker throttled and then circuit-broke every OTHER book's
+# exit on that ticker; and with no decay, a tripped circuit stayed open for
+# the life of the process. Keys are now "<user_id>:<symbol>" (same shape as
+# _throttle_key) and a tripped circuit re-arms after _LIQ_FAIL_RESET_S.
 _liq_attempt_at: dict[str, float] = {}
 _liq_fail_count: dict[str, int] = {}
-_LIQ_COOLDOWN_S = 120   # at most one close attempt per symbol per 2 min
+_liq_fail_at: dict[str, float] = {}     # BI-05: when the last failure landed
+_LIQ_COOLDOWN_S = 120   # at most one close attempt per book per symbol per 2 min
 _LIQ_MAX_FAILS = 3      # after 3 consecutive failures, back off (alert once)
+_LIQ_FAIL_RESET_S = 1800   # BI-05: a tripped circuit re-arms after 30 min
+
+
+def _liq_book(user_id) -> str:
+    """BI-05: the book a liquidation is keyed under -- the row's user_id
+    when the caller has it, else the book this task is BOUND to
+    (stocks_reconcile binds before it calls). REVIEW BI-05 (2026-09-01):
+    current_account() falls back to the PRIMARY when nothing is bound,
+    so an unbound, unattributed call keys under the primary's slot --
+    the same account its liquidate would hit -- and under '?' only when
+    no account is loaded at all. Every in-monitor caller passes the
+    row's user_id, so that fallback is reached only from outside."""
+    uid = str(user_id or "")
+    if not uid:
+        try:
+            from app.brokers.accounts import current_user_id
+            uid = str(current_user_id() or "")
+        except Exception:  # noqa: BLE001
+            uid = ""
+    return uid or "?"
 
 
 async def _alpaca_profit_step(r, price: float,
@@ -1260,38 +1335,54 @@ async def _rest_crypto_exits(r: dict, sym: str, qty: float,
     return "; ".join(notes) or "nothing to rest"
 
 
-async def _throttled_liquidate(symbol: str, asset_type: str = "stock"):
-    """Rate-limited + circuit-broken wrapper around liquidate_position.
-    Returns (result, status): 'ok' submitted; 'error:<msg>' broker ran but
-    failed; 'throttled' skipped (within cooldown); 'circuit_open' skipped (too
-    many consecutive fails). Never raises."""
+async def _throttled_liquidate(symbol: str, asset_type: str = "stock",
+                               user_id=None):
+    """Rate-limited + circuit-broken wrapper around liquidate_position,
+    keyed per BOOK per symbol (BI-05). Returns (result, status): 'ok'
+    submitted; 'error:<msg>' broker ran but failed; 'throttled' skipped
+    (within cooldown); 'circuit_open' skipped (too many consecutive
+    fails inside the last _LIQ_FAIL_RESET_S). Never raises. Does NOT
+    bind -- the caller must already be bound to the row's book; pass
+    that row's user_id so the throttle slot is the book's own."""
     import time as _t
     now_s = _t.time()
-    if _liq_fail_count.get(symbol, 0) >= _LIQ_MAX_FAILS:
-        return None, "circuit_open"
-    if now_s - _liq_attempt_at.get(symbol, 0.0) < _LIQ_COOLDOWN_S:
+    uid = _liq_book(user_id)
+    key = f"{uid}:{symbol}"
+    if _liq_fail_count.get(key, 0) >= _LIQ_MAX_FAILS:
+        # BI-05: time-based re-arm. Without it a circuit that tripped on
+        # a 9:31 reject storm stayed open until the next restart, with
+        # the position sitting past its stop and every tick reporting
+        # 'circuit_open'.
+        if now_s - _liq_fail_at.get(key, 0.0) < _LIQ_FAIL_RESET_S:
+            return None, "circuit_open"
+        _liq_fail_count[key] = 0
+        _liq_fail_at.pop(key, None)
+    if now_s - _liq_attempt_at.get(key, 0.0) < _LIQ_COOLDOWN_S:
         return None, "throttled"
-    _liq_attempt_at[symbol] = now_s
+    _liq_attempt_at[key] = now_s
     try:
         from app.brokers.alpaca import liquidate_position
         _res, _err = await liquidate_position(symbol, asset_type=asset_type)
     except Exception as e:  # noqa: BLE001
-        _liq_fail_count[symbol] = _liq_fail_count.get(symbol, 0) + 1
+        _liq_fail_count[key] = _liq_fail_count.get(key, 0) + 1
+        _liq_fail_at[key] = now_s
         return None, "error:" + str(e)[:120]
     if _err:
-        _liq_fail_count[symbol] = _liq_fail_count.get(symbol, 0) + 1
+        _liq_fail_count[key] = _liq_fail_count.get(key, 0) + 1
+        _liq_fail_at[key] = now_s
         try:
             from app.agents.activity_log import record as _arec
             _arec("exit_error", symbol, reason=str(_err)[:180],
-                  extra={"asset_type": asset_type})
+                  extra={"asset_type": asset_type, "user_id": uid})
         except Exception:  # noqa: BLE001
             pass
         return None, "error:" + str(_err)
-    _liq_fail_count[symbol] = 0
+    _liq_fail_count[key] = 0
+    _liq_fail_at.pop(key, None)
     try:
         from app.agents.activity_log import record as _arec
         _arec("exit_liquidate", symbol, reason="liquidation submitted",
-              extra={"asset_type": asset_type})
+              extra={"asset_type": asset_type, "user_id": uid})
     except Exception:  # noqa: BLE001
         pass
     return _res, "ok"
@@ -1497,8 +1588,13 @@ class PositionMonitorAgent(Agent):
                         price_c = await _price(tk, at)
                         if price_c is not None:
                             from app.paper.engine import record_external_close
+                            # PH-3: name the reason. Left to the default
+                            # this row was booked as 'alpaca_bracket' --
+                            # a bracket crypto cannot have at Alpaca --
+                            # while the bus message said alpaca_external.
                             fill = await record_external_close(
-                                r["user_id"], r["id"], price_c)
+                                r["user_id"], r["id"], price_c,
+                                reason="alpaca_external")
                             if fill.ok:
                                 alpaca_reconciled += 1
                                 affected_users.add(r["user_id"])
@@ -1716,7 +1812,8 @@ class PositionMonitorAgent(Agent):
                         alpaca_managed += 1
                         continue
                     _liq, _cstat = await _throttled_liquidate(
-                        tk, asset_type="crypto")
+                        tk, asset_type="crypto",
+                        user_id=r.get("user_id"))     # BI-05: this book's slot
                     if _cstat in ("throttled", "circuit_open"):
                         alpaca_managed += 1
                         continue
@@ -1802,7 +1899,8 @@ class PositionMonitorAgent(Agent):
                                 r, r["side"], price_a, stop_a,
                             )
                             if ts_reason:
-                                _liq, _liq_st = await _throttled_liquidate(tk)
+                                _liq, _liq_st = await _throttled_liquidate(
+                                    tk, user_id=r.get("user_id"))   # BI-05
                                 if _liq_st in ("throttled", "circuit_open"):
                                     continue
                                 liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
@@ -1897,7 +1995,8 @@ class PositionMonitorAgent(Agent):
                             await _maybe_ladder_stop(r, price_x, EXTENDED_PROFIT_LADDER)
                             _xstop = float(r["stop_price"]) if r.get("stop_price") else None
                             if _xstop is not None and price_x <= _xstop:
-                                _xliq, _x_st = await _throttled_liquidate(tk)
+                                _xliq, _x_st = await _throttled_liquidate(
+                                    tk, user_id=r.get("user_id"))   # BI-05
                                 if _x_st in ("throttled", "circuit_open"):
                                     continue
                                 _xerr = _x_st[6:] if _x_st.startswith("error:") else None
@@ -1914,7 +2013,8 @@ class PositionMonitorAgent(Agent):
                                 continue
 
                     if strat_a.startswith("extended") and held_days >= SWING_MAX_HOLD_DAYS:
-                        _liq, _liq_st = await _throttled_liquidate(tk)
+                        _liq, _liq_st = await _throttled_liquidate(
+                            tk, user_id=r.get("user_id"))           # BI-05
                         if _liq_st in ("throttled", "circuit_open"):
                             continue
                         liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
@@ -1963,7 +2063,8 @@ class PositionMonitorAgent(Agent):
                                         elif _tp is not None and _pn <= _tp:
                                             _hit = "target"
                                 if _hit is not None:
-                                    _ol, _ost = await _throttled_liquidate(tk)
+                                    _ol, _ost = await _throttled_liquidate(
+                                        tk, user_id=r.get("user_id"))   # BI-05
                                     if _ost == "ok":
                                         _enforced = True
                                         out.append(AgentMessage(

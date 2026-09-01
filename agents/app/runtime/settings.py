@@ -1,9 +1,12 @@
 """Bot tuning settings - read tunable parameters from `bot_settings`.
 
 Per-user capable (Phase 5b / #119): get_bot_settings(user_id) reads that
-user's row; get_bot_settings() with no argument keeps the global
-"most-recently-updated row" behaviour, so existing callers are
-unaffected. Cached per user_id for 30 seconds.
+user's row; get_bot_settings() with no argument resolves to the anchor
+(primary) row in single-row mode, else the bound account's row under
+multi-account. Cached per user_id for 30 seconds.
+
+Shared scanners must NOT gate on the bare read -- it is one book's
+opinion. Use lane_enabled_any() / min_tcs_floor_across_books() (BI-03).
 """
 
 from __future__ import annotations
@@ -305,3 +308,73 @@ def get_bot_settings(user_id: Optional[str] = None) -> BotSettings:
     except Exception:
         _cache[user_id] = (_DEFAULTS, now)
         return _DEFAULTS
+
+
+# ---- BI-03: lane gates that see EVERY book, not just the primary ----------
+# The scanners (stms/orb/extended/crypto/forex) asked a bare
+# get_bot_settings() "is this lane on?" and "what is the TCS floor?".
+# With TREZO_PRIMARY_USER_ID set that bare call resolves to the PRIMARY
+# book, so turning a lane off on the primary silenced the scanner for
+# every book, and the primary's slider became everyone's floor. The
+# scanners are shared producers; the per-book pruning (lane toggle,
+# floor, kill-switch) already happens in the fan-out via book_gate.
+# So the producer must be as permissive as the MOST permissive enabled
+# book, and let the fan-out prune per book. Both helpers fail OPEN to
+# today's single-book read -- with a log -- when multi-account is off
+# or the enumeration fails, so behaviour is unchanged until multi-account
+# is deliberately turned on.
+
+import logging as _logging
+
+_log = _logging.getLogger("trezo.settings")
+
+
+def _enabled_book_ids() -> list:
+    """Book keys of every enabled, valid broker account, or [] while
+    single-account. The seam the guard tests stub; may raise."""
+    from app.brokers.accounts import load_accounts, multi_account_active
+    if not multi_account_active():
+        return []
+    return [a.account_key for a in load_accounts() if a.account_key]
+
+
+def lane_enabled_any(field_name: str, default: bool = True) -> bool:
+    """True if ANY enabled book's bot_settings row has `field_name` on.
+
+    `default` is what a book counts as when its settings row has no such
+    field (forex has no bot_settings toggle yet; the caller passes its
+    env-derived default). Falls back to the single-book read when
+    multi-account is not active or the book enumeration fails."""
+    try:
+        books = _enabled_book_ids()
+    except Exception as e:  # noqa: BLE001
+        _log.warning("lane_enabled_any(%s): could not enumerate books (%s); "
+                     "falling back to the single-book read", field_name, e)
+        books = []
+    if not books:
+        v = getattr(get_bot_settings(), field_name, None)
+        return default if v is None else bool(v)
+    for uid in books:
+        v = getattr(get_bot_settings(uid), field_name, None)
+        if default if v is None else bool(v):
+            return True
+    return False
+
+
+def min_tcs_floor_across_books() -> int:
+    """The LOWEST tcs_threshold across enabled books -- the floor a shared
+    scanner must emit at so no book is starved by another's slider. The
+    fan-out re-applies each book's own floor (book_gate.min_tcs_for).
+    Falls back to the single-book read when multi-account is not active
+    or the book enumeration fails."""
+    try:
+        books = _enabled_book_ids()
+    except Exception as e:  # noqa: BLE001
+        _log.warning("min_tcs_floor_across_books: could not enumerate books "
+                     "(%s); falling back to the single-book read", e)
+        books = []
+    if not books:
+        return int(get_bot_settings().tcs_threshold or _DEFAULTS.tcs_threshold)
+    floors = [int(get_bot_settings(uid).tcs_threshold or _DEFAULTS.tcs_threshold)
+              for uid in books]
+    return min(floors)

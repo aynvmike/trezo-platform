@@ -1,5 +1,9 @@
 /**
  * Server-side helpers for paper trading data.
+ *
+ * PAGES-03: every list helper returns `null` when the read itself
+ * failed (logged server-side) and `[]` only when the table is genuinely
+ * empty. Callers must branch on null rather than treating it as empty.
  */
 
 import { createClient } from "@/lib/supabase/server";
@@ -42,39 +46,49 @@ export type VaultTx = {
   created_at: string;
 };
 
+/** `null` for both "no account row yet" and "read failed" — the latter is logged. */
 export async function getPaperAccount(userId: string): Promise<PaperAccount | null> {
   const supabase = createClient();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("paper_accounts")
     .select("*")
     .eq("user_id", userId)
     .maybeSingle();
+  if (error) console.error(`[load] paper_accounts: ${error.message}`);
   return (data as PaperAccount) ?? null;
 }
 
-export async function getOpenPositions(userId: string): Promise<PaperPosition[]> {
+export async function getOpenPositions(userId: string): Promise<PaperPosition[] | null> {
   const supabase = createClient();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("paper_positions")
     .select("*")
     .eq("user_id", userId)
     .eq("status", "open")
     .order("entry_at", { ascending: false });
+  if (error) {
+    console.error(`[load] paper_positions: ${error.message}`);
+    return null;
+  }
   return (data ?? []) as PaperPosition[];
 }
 
 export async function getClosedPositions(
   userId: string,
   limit = 25
-): Promise<PaperPosition[]> {
+): Promise<PaperPosition[] | null> {
   const supabase = createClient();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("paper_positions")
     .select("*")
     .eq("user_id", userId)
     .neq("status", "open")
     .order("exit_at", { ascending: false })
     .limit(limit);
+  if (error) {
+    console.error(`[load] paper_positions: ${error.message}`);
+    return null;
+  }
   const rows = (data ?? []) as PaperPosition[];
   // Hide reconciler "ghost" rows: an empty/errored broker read used to
   // phantom-close real positions as closed_manual with a null exit_price
@@ -93,13 +107,17 @@ export async function getClosedPositions(
 export async function getVaultTransactions(
   userId: string,
   limit = 25
-): Promise<VaultTx[]> {
+): Promise<VaultTx[] | null> {
   const supabase = createClient();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("paper_vault_transactions")
     .select("*")
     .eq("user_id", userId)
     .order("created_at", { ascending: false })
     .limit(limit);
+  if (error) {
+    console.error(`[load] paper_vault_transactions: ${error.message}`);
+    return null;
+  }
   return (data ?? []) as VaultTx[];
 }

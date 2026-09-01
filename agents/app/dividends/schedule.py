@@ -11,37 +11,58 @@ This module supplies the missing fact: the dates a symbol actually went
 ex-dividend, and for how much. With a real amount we stop estimating the
 distribution from a yield entirely and use what the fund actually paid.
 
-SOURCES, IN ORDER
-1. Finnhub /stock/dividend -- generous call budget, but the endpoint is
-   premium-gated on some plans and simply returns nothing when it is.
-2. Alpha Vantage DIVIDENDS -- full history including PAST ex-dates and a
-   numeric amount, which is exactly what is needed here, but the free
-   tier allows only ~25 calls a day.
+SOURCES, IN ORDER (AV-2/AV-3/AV-4, audit 2026-09-01)
+1. Alpaca corporate actions (app/data/corporate_actions.py) -- the
+   in-repo source the entry screen and the wheel universe already read:
+   ex_date and rate back to 2016, ETFs included, on the broker key we
+   already hold. This module was the last one still on the old chain.
+2. Finnhub /stock/dividend -- kept as a cheap middle fallback only when a
+   key is configured. The endpoint is NOT on this account's tier and
+   returns nothing; it is not relied upon.
+3. Alpha Vantage DIVIDENDS -- last resort. Full history and a numeric
+   amount, but the free tier allows only ~25 calls a day, and a
+   rate-limited response comes back HTTP 200 with a "Note"/"Information"
+   body and no "data" -- which the old code parsed as "no dividends" and
+   cached as the day's answer.
 
-Hence the cache: one network call per symbol per day, at most. A handful
-of income holdings therefore fits inside the smaller budget with room to
-spare.
+Hence the cache: one network call per symbol per day, at most -- but
+only for a read that SUCCEEDED. A read that failed at every source is
+retried after a short backoff instead of being remembered all day as
+"this symbol pays nothing" (AV-4).
 
 FAILURE POSTURE
 Every path fails OPEN and returns None/[]. A missing calendar must never
 stop a distribution from being modeled -- the manager falls back to the
 holding's declared frequency, which is what it did before this module
-existed. Nothing here raises.
+existed. Nothing here raises. Failures are logged, not silent.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
+import structlog
+
 from app.config import get_settings
+
+log = structlog.get_logger("trezo.dividends.schedule")
 
 FINNHUB_DIVIDEND_URL = "https://finnhub.io/api/v1/stock/dividend"
 ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 
 # (symbol, iso-day) -> list[ExDividend]. Ex-dates do not change intraday.
+# Populated ONLY by a successful read (AV-4).
 _CACHE: dict = {}
+
+# symbol -> unix time before which a failed read is not retried. Short on
+# purpose: long enough not to hammer a 25-call/day budget with a key
+# that is already rate-limited, short enough that the day's answer is
+# not a failure frozen in place.
+_FAIL_BACKOFF_SECONDS = 900
+_FAILED_UNTIL: dict = {}
 
 
 @dataclass(frozen=True)
@@ -118,19 +139,62 @@ def parse_alpha_vantage(symbol: str, data) -> list:
     return out
 
 
-async def ex_dividend_history(symbol: str) -> list:
-    """Known ex-dates for a symbol, newest first. Cached one day."""
-    sym = (symbol or "").upper().strip()
-    if not sym:
+def parse_corporate_actions(symbol: str, rows) -> list:
+    """Alpaca corporate-actions cash_dividend rows -> [ExDividend].
+
+    Uses the DECLARED `rate`, not the split-adjusted `adj_rate`: this
+    module answers "how much lands per share on that ex-date", which is
+    the declared figure, the same thing Alpha Vantage's `amount` is.
+    Pure; unit-testable.
+    """
+    out: list = []
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ex = str(r.get("ex_date") or "")
+        if not _parse_date(ex):
+            continue
+        out.append(ExDividend(symbol.upper(), ex[:10],
+                              _to_float(r.get("rate")),
+                              "alpaca:corporate_actions"))
+    return out
+
+
+def _alpha_vantage_ok(data) -> bool:
+    """Did Alpha Vantage actually ANSWER? A rate-limit or bad-key reply
+    is HTTP 200 with a Note/Information/Error Message body and no
+    "data" list -- that is a failed read, not an empty calendar."""
+    return isinstance(data, dict) and isinstance(data.get("data"), list)
+
+
+async def _alpaca_rows(sym: str) -> list:
+    """Corporate-actions rows for `sym`, [] when unavailable. Module-level
+    so a test can swap the source without planting anything in
+    sys.modules. corporate_actions already caches a genuine empty
+    calendar for a day and does NOT cache a failed fetch, so re-asking
+    it is cheap in the one case and correct in the other."""
+    try:
+        from app.data.corporate_actions import dividend_history
+        return await dividend_history(sym) or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("dividend_schedule.corporate_actions_failed",
+                    symbol=sym, error=str(e)[:160])
         return []
-    today = date.today().isoformat()
-    hit = _CACHE.get((sym, today))
-    if hit is not None:
-        return hit
+
+
+async def _fetch_history(sym: str) -> tuple:
+    """(rows, ok). `ok` is True only when SOME source answered; a chain
+    that produced nothing but silence is a failed read (AV-4)."""
+    # 1. Alpaca corporate actions -- the in-repo source of record (AV-2).
+    rows = parse_corporate_actions(sym, await _alpaca_rows(sym))
+    if rows:
+        return rows, True
 
     s = get_settings()
-    rows: list = []
 
+    # 2. Finnhub -- not on this tier; only tried when a key is present.
     if getattr(s, "finnhub_api_key", ""):
         # Finnhub needs an explicit window; ask for a wide one so past
         # ex-dates are included, which is what 'has it already gone ex'
@@ -141,16 +205,53 @@ async def ex_dividend_history(symbol: str) -> list:
             "token": s.finnhub_api_key,
         })
         rows = parse_finnhub(sym, data)
+        if rows:
+            return rows, True
 
-    if not rows and getattr(s, "alpha_vantage_api_key", ""):
+    # 3. Alpha Vantage -- last fallback, 25 calls/day (AV-3).
+    if getattr(s, "alpha_vantage_api_key", ""):
         data = await _get_json(ALPHA_VANTAGE_URL, {
             "function": "DIVIDENDS", "symbol": sym,
             "apikey": s.alpha_vantage_api_key,
         })
-        rows = parse_alpha_vantage(sym, data)
+        if _alpha_vantage_ok(data):
+            return parse_alpha_vantage(sym, data), True
+        reason = "no response"
+        if isinstance(data, dict):
+            reason = str(data.get("Note") or data.get("Information")
+                         or data.get("Error Message") or "no data")[:120]
+        log.warning("dividend_schedule.alpha_vantage_failed",
+                    symbol=sym, reason=reason)
 
+    return [], False
+
+
+async def ex_dividend_history(symbol: str) -> list:
+    """Known ex-dates for a symbol, newest first. A successful read is
+    cached for the day; a failed one is retried after a short backoff."""
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return []
+    today = date.today().isoformat()
+    hit = _CACHE.get((sym, today))
+    if hit is not None:
+        return hit
+    now = time.time()
+    if now < _FAILED_UNTIL.get(sym, 0.0):
+        return []                 # failed recently; fail open, do not re-spend
+
+    rows, ok = await _fetch_history(sym)
     rows.sort(key=lambda e: e.ex_date, reverse=True)
-    _CACHE[(sym, today)] = rows
+    if ok:
+        _CACHE[(sym, today)] = rows
+        _FAILED_UNTIL.pop(sym, None)
+    else:
+        # AV-4: a read that failed is NOT the day's answer. Remember the
+        # failure briefly so the next caller does not burn the budget
+        # again, then try afresh.
+        _FAILED_UNTIL[sym] = now + _FAIL_BACKOFF_SECONDS
+        log.warning("dividend_schedule.unresolved", symbol=sym,
+                    retry_in_s=_FAIL_BACKOFF_SECONDS)
     return rows
 
 
@@ -187,3 +288,4 @@ async def latest_unpaid_ex(symbol: str, last_paid: Optional[str],
 
 def clear_cache() -> None:
     _CACHE.clear()
+    _FAILED_UNTIL.clear()

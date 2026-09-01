@@ -3,7 +3,9 @@
 Ticks every 90 seconds during the 7-11 AM ET window. For each ticker in
 the STMS watchlist: evaluates STMS entry filters (price, daily move,
 relative volume), computes a Trade Confidence Score, and emits a `signal`
-tagged strategy='stms' when all filters pass and TCS >= 750.
+tagged strategy='stms' when all filters pass and TCS (0-100) clears the
+lowest enabled book's floor -- each book re-applies its own floor in the
+fan-out.
 """
 
 from __future__ import annotations
@@ -37,13 +39,18 @@ class STMSScannerAgent(Agent):
         self._day: str = ""
 
     async def tick(self) -> list[AgentMessage]:
-        from app.runtime.settings import get_bot_settings
-        # Honor the user's Bot Tuning TCS slider — lowering it to 500
-        # should make STMS fire at 500, not stay stuck on the hardcoded
-        # 750 default. The seed value is the fallback if no slider set.
-        _cfg = get_bot_settings()
-        tcs_floor = int(_cfg.tcs_threshold or TCS_THRESHOLD)
-        if not _cfg.stms_enabled:
+        from app.runtime.settings import (
+            lane_enabled_any, min_tcs_floor_across_books,
+        )
+        # Honor the Bot Tuning TCS slider -- lowering it to 50 should make
+        # STMS fire at 50, not stay stuck on the hardcoded default. The
+        # seed value is the fallback if no slider set.
+        # BI-03: a bare get_bot_settings() is the PRIMARY book's opinion;
+        # this scanner feeds every book. Emit at the LOWEST enabled
+        # book's floor and run while ANY book has the lane on -- the
+        # fan-out prunes per book.
+        tcs_floor = int(min_tcs_floor_across_books() or TCS_THRESHOLD)
+        if not lane_enabled_any("stms_enabled"):
             return [AgentMessage(
                 agent=self.name, kind="info",
                 payload={"note": "STMS strategy disabled in Bot Tuning settings."},
@@ -181,11 +188,9 @@ class STMSScannerAgent(Agent):
                 for s in _signals:
                     st = (s.payload or {}).get("strategy") or "default"
                     _by_strategy[st] = _by_strategy.get(st, 0) + 1
-                _scanned = 0
-                try:
-                    _scanned = len(symbols)  # type: ignore[name-defined]
-                except Exception:
-                    _scanned = len(_signals)
+                # EQ-10/NEQ-02: `symbols` was never defined here, so the
+                # pulse always reported the signal count as "scanned".
+                _scanned = scanned
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="scanner_pulse",

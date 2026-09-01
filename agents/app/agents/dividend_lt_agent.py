@@ -182,21 +182,37 @@ class DividendLTAgent(Agent):
         except Exception:  # noqa: BLE001
             positions = []
 
+        # `held` is EVERY open holding in the book, whatever strategy
+        # opened it: the fresh filter below must not propose a name the
+        # book already owns under another lane. `ladder` is only what
+        # THIS lane opened -- that is what counts against ladder_names.
         held = {}
+        ladder = {}
         for p in positions:
             t = str(p.get("ticker") or "").upper()
-            if t:
-                held[t] = held.get(t, 0.0) + float(p.get("quantity") or 0)
+            if not t:
+                continue
+            qty = float(p.get("quantity") or 0)
+            held[t] = held.get(t, 0.0) + qty
+            # TE-07 (audit 2026-09-01): this used to count ALL open
+            # positions as ladder names, so a book with a few ordinary
+            # stock positions read as a full ladder and the lane never
+            # added a single name. Only strategy='dividend_lt' is ladder.
+            if str(p.get("strategy") or "") == "dividend_lt":
+                ladder[t] = ladder.get(t, 0.0) + qty
 
-        ladder_held = [t for t in held if held[t] > 0]
+        ladder_held = [t for t in ladder if ladder[t] > 0]
         room = max(0, sizing.ladder_names - len(ladder_held))
 
         # --- graduation watch (§3). This fires regardless of whether the
         # lane has room to add: a name crossing 100 shares is the event
         # the spec most wants surfaced, because it is compounding
-        # unlocking option income by itself.
+        # unlocking option income by itself. Watched on LADDER names only
+        # (TE-07): an ordinary stock position crossing 100 shares is not a
+        # lane graduation, and screening every holding each tick was a
+        # lookup per position for an event that could not apply to it.
         from app.strategies.dividend_screen import screen as _screen
-        for ticker, qty in held.items():
+        for ticker, qty in ladder.items():
             key = f"{uid}:{ticker}"
             try:
                 verdict = await _screen(ticker)
@@ -258,7 +274,11 @@ class DividendLTAgent(Agent):
                 payload={
                     "user_id": uid,
                     "ticker": v.ticker,
-                    "direction": "long",
+                    # TE-07 (audit 2026-09-01): the platform vocabulary is
+                    # bullish/bearish. Trade Execution maps ONLY 'bullish'
+                    # to a long; the 'long' this used to emit would have
+                    # been routed as a SHORT of a dividend grower.
+                    "direction": "bullish",
                     "strategy": "dividend_lt",
                     "asset_type": "stock",
                     # The ladder has no stop: a dividend grower is held
@@ -266,6 +286,14 @@ class DividendLTAgent(Agent):
                     # (dividend cut, payout breach, recycling ratio), not
                     # a price stop. Signalled explicitly so Risk Manager
                     # does not infer a missing one.
+                    # TE-06 / NEQ-05 (audit 2026-09-01): deliberately NO
+                    # `tcs` on this signal. Risk Manager only forwards
+                    # signals that carry a tcs (TE-06), so the lane stays
+                    # dark -- but the `no_price_stop` contract is not yet
+                    # honoured downstream (NEQ-05): adding a tcs today
+                    # would put the default 5% price stop on every ladder
+                    # name. Turn the lane on only after NEQ-05 is fixed;
+                    # that is Mike's call, not this agent's.
                     "no_price_stop": True,
                     "max_notional": round(per_name_dollars, 2),
                     "dividend_lt": {

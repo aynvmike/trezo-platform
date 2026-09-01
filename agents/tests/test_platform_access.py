@@ -130,4 +130,6 @@ def test_non_approve_messages_are_ignored():
 
 
 if __name__ == "__main__":
-    run_tests(sys.modules[__name__])
+    # RV-2 (review 2026-09-01): run_tests walks namespace.items(); a module
+    # has no .items(), so the direct-run path in the docstring crashed.
+    sys.exit(run_tests(dict(vars(sys.modules[__name__]))))

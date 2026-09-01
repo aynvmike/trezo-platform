@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 
 import { Disclosure } from "@/components/ui/disclosure";
 import { PaymentInstructionsLedger } from "@/components/dashboard/payment-instructions-ledger";
+import { LoadError, LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -62,12 +63,17 @@ export default async function KindripPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/kindrip");
 
-  const { data: childRows } = await supabase
-    .from("kindrip_children")
-    .select("*")
-    .eq("user_id", user.id)
-    .order("created_at", { ascending: true });
-  const kids = (childRows ?? []) as KChild[];
+  // PAGES-03: keep "read failed" distinct from "nothing there".
+  const childLoad = loadResult<KChild[]>(
+    "kindrip_children",
+    await supabase
+      .from("kindrip_children")
+      .select("*")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: true }),
+    []
+  );
+  const kids = childLoad.data ?? [];
   const ids = kids.length
     ? kids.map((k) => k.id)
     : ["00000000-0000-0000-0000-000000000000"];
@@ -81,8 +87,11 @@ export default async function KindripPage() {
       .order("created_at", { ascending: false })
       .limit(120)
   ]);
-  const holdings = (holdingsRes.data ?? []) as KHolding[];
-  const txns = (txnRes.data ?? []) as KTxn[];
+  const holdingsLoad = loadResult<KHolding[]>("kindrip_holdings", holdingsRes, []);
+  const txnLoad = loadResult<KTxn[]>("kindrip_transactions", txnRes, []);
+  const holdings = holdingsLoad.data ?? [];
+  const txns = txnLoad.data ?? [];
+  const sideFailures = failuresOf(holdingsLoad, txnLoad);
 
   // QW5 — value child holdings at live ETF prices. Falls back to cost
   // basis per holding when a quote is unavailable (e.g. outside RTH).
@@ -94,7 +103,10 @@ export default async function KindripPage() {
 
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-5xl">
-      <LayerHero id={7} />
+      {/* PAGES-05: real count — one "position" per child holding row. */}
+      <LayerHero id={7} openCount={holdingsLoad.failure ? undefined : holdings.length} />
+
+      <LoadErrors failures={sideFailures} />
 
       <Disclosure title="The Future Index Account">
         <div className="space-y-2">
@@ -140,7 +152,9 @@ export default async function KindripPage() {
         </div>
       </Disclosure>
 
-      {kids.length === 0 ? (
+      {childLoad.failure ? (
+        <LoadError {...childLoad.failure} />
+      ) : kids.length === 0 ? (
         <div className="rounded-xl border border-dashed border-weave-200 bg-treasure-100/40 p-6 text-sm text-weave-500 text-center">
           No children added yet. Add your first below to start a KINDRIP account.
         </div>

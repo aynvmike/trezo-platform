@@ -127,8 +127,17 @@ export function buildTerseReasoning(payload: {
   return applyTerseRules(trimmed);
 }
 
+/**
+ * Trade Confidence Score -> 1..10 confidence for the terse card.
+ *
+ * EQ-5: the engine's TCS is 0-100 now (it used to be 0-1000). Dividing
+ * by 100 rendered every modern signal as confidence 1. Divide by 10 for
+ * the current scale; anything above 100 can only be a legacy 0-1000
+ * value (old agent_messages rows), so keep the /100 path for those.
+ */
 export function tcsToConfidence(tcs: number | null | undefined): number | null {
   if (tcs === null || tcs === undefined || !Number.isFinite(tcs)) return null;
-  const c = Math.round(Number(tcs) / 100);
+  const n = Number(tcs);
+  const c = Math.round(n > 100 ? n / 100 : n / 10);
   return Math.max(1, Math.min(10, c));
 }
