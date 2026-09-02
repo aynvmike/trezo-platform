@@ -294,6 +294,16 @@ class TradeExecutionAgent(Agent):
         _key = {"stock": "stocks", "option": "options",
                 "crypto": "crypto", "forex": "forex",
                 "income": "income"}.get(asset_type, "stocks")
+        # UNPINNED IS NOT UNFUNDED (2026-09-02). A lane ABSENT from the
+        # pins is sized by the posture split in build_allocation, so it
+        # carries no slot pin either -- it gets the book-wide cap. This
+        # used to return 0 for a missing key, which meant that clearing a
+        # book's stocks dollar pin (the way to let the widened posture
+        # split govern) silently gave the stock lane ZERO slots and every
+        # new stock name was refused. An explicit 0 still means "not
+        # funded on this book" -- that is a deliberate setting.
+        if _key not in pockets:
+            return book_cap
         total = sum(float(v or 0) for v in pockets.values())
         alloc = float(pockets.get(_key, 0) or 0)
         if total <= 0:
@@ -770,6 +780,47 @@ class TradeExecutionAgent(Agent):
                         _held = open_by_book.get(str(uid), {})
                         _cap = int(getattr(_cfg, "max_open_positions", 14)
                                    or 14)
+                        # THE STACKING GUARD, per book (Mike 2026-09-02).
+                        # Risk Manager used to refuse the whole signal when
+                        # ANY book held the name -- one book's ETH silenced
+                        # ETH for all three (the APPROVAL STARVATION
+                        # alerts). That refusal now lives here, where each
+                        # book's OPEN rows are read live for this very
+                        # signal: a book that holds the name is skipped,
+                        # the books that do not are executed. Accumulation
+                        # lanes (crypto HODL/DCA) may still add, exactly as
+                        # before -- Risk Manager has already applied their
+                        # cooldown and per-coin cap upstream.
+                        try:
+                            from app.strategies.crypto import (
+                                is_accumulation_strategy as _is_accum)
+                            _accum_ok = _is_accum(_sp_uid.get("strategy")
+                                                  or source_payload.get("strategy"))
+                        except Exception:  # noqa: BLE001
+                            _accum_ok = False
+                        if ticker.upper() in _held and not _accum_ok:
+                            try:
+                                from app.agents.activity_log import record as _arec
+                                _arec("book_already_holds", ticker,
+                                      strategy=str(_sp_uid.get("strategy") or ""),
+                                      reason=(f"this book already holds "
+                                              f"{ticker} - skipped to avoid "
+                                              f"stacking; other books are "
+                                              f"judged on their own rows"),
+                                      extra={"user_id": str(uid),
+                                             "market_type": _atype})
+                            except Exception:  # noqa: BLE001
+                                pass
+                            out.append(AgentMessage(
+                                agent=self.name, kind="info",
+                                confidence=1.0,
+                                payload={"user_id": uid, "ticker": ticker,
+                                         "side": side,
+                                         "event": "book_already_holds",
+                                         "note": (f"{ticker}: this book "
+                                                  f"already holds it - no "
+                                                  f"stacking")}))
+                            continue
                         _pcap = self._pocket_cap(_cfg, _atype, _cap)
                         _popen = self._pocket_open(_held, _atype)
                         if (ticker.upper() not in _held

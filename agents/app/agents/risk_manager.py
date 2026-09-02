@@ -219,15 +219,61 @@ class RiskManagerAgent(Agent):
             import asyncio
             def _fetch():
                 return client.table("paper_positions").select(
-                    "ticker"
+                    "ticker, user_id"
                 ).eq("status", "open").execute()
             res = await asyncio.to_thread(_fetch)
             for row in (res.data or []):
                 t = (row.get("ticker") or "").strip().upper()
                 if t:
-                    self._recent_approvals[t] = 0.0
+                    # PER BOOK (2026-09-02). This seed used to key by
+                    # ticker alone, so one book holding ETH seeded a
+                    # platform-wide block and the other two books could
+                    # never trade ETH again while it was held -- the
+                    # APPROVAL STARVATION alerts Mike forwarded twice
+                    # today (15-17 crypto signals, zero approvals).
+                    self._recent_approvals[
+                        self._ak(row.get("user_id"), t)] = 0.0
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- the stacking dedup is PER BOOK (Mike 2026-09-02) ----------------
+    # It exists for the 2026-06-10 WMT 52-share incident: a restart while a
+    # position was open re-approved the same name and stacked it. But it was
+    # keyed by TICKER across every book and seeded from every book's open
+    # positions with no filter, so one book holding a name silenced that
+    # name for all three -- a house-rule-2 violation that showed up as
+    # "APPROVAL STARVATION [crypto]: N signals, ZERO approvals" with every
+    # veto reading "Already approved X in this session". Keys are now
+    # "<book>:<TICKER>"; a book that does NOT hold the name is free to
+    # trade it, and the executor's fan-out (which reads each book's OPEN
+    # rows live) is the guard that actually prevents stacking per book.
+
+    @staticmethod
+    def _ak(user_id, ticker) -> str:
+        """The per-book dedup key. An empty book id keeps the old
+        platform-wide shape so a legacy entry is still prunable."""
+        return f"{str(user_id or '')}:{str(ticker or '').strip().upper()}"
+
+    def _books_holding(self, ticker: str) -> set:
+        """Which books have an approved-and-open row for this ticker.
+        A book id never contains ':' (it is a uuid), so the suffix match
+        cannot collide across tickers."""
+        suffix = f":{str(ticker or '').strip().upper()}"
+        return {k.split(":", 1)[0]
+                for k in self._recent_approvals if k.endswith(suffix)}
+
+    @staticmethod
+    def _registered_books() -> set:
+        """Every book the platform can actually route to. Empty on any
+        failure -- and an empty set DISENGAGES the unscoped veto rather
+        than blocking every signal, because a registry read that failed
+        must never read as 'no book is free'."""
+        try:
+            from app.brokers.accounts import load_accounts
+            return {str(a.user_id) for a in load_accounts()
+                    if getattr(a, "user_id", "")}
+        except Exception:  # noqa: BLE001
+            return set()
 
     async def _prune_approvals(self) -> None:
         """SELF-HEALING for the open-signal cap (Mike 2026-07-15: the
@@ -254,10 +300,18 @@ class RiskManagerAgent(Agent):
 
             def _fetch():
                 return (client.table("paper_positions")
-                        .select("ticker").eq("status", "open").execute())
+                        .select("ticker, user_id")
+                        .eq("status", "open").execute())
             res = await _pr_aio.to_thread(_fetch)
-            open_tk = {(r.get("ticker") or "").strip().upper()
-                       for r in (res.data or [])}
+            # Per book (2026-09-02): a slot is held only while THAT book
+            # still has the row. Legacy ticker-only keys ("" book) are
+            # matched on the bare ticker so they still prune out.
+            open_tk = set()
+            for r in (res.data or []):
+                _t = (r.get("ticker") or "").strip().upper()
+                if _t:
+                    open_tk.add(self._ak(r.get("user_id"), _t))
+                    open_tk.add(self._ak("", _t))
             ttl = float(_pr_os.getenv("TREZO_APPROVAL_TTL_H", "2")) * 3600.0
             before = len(self._recent_approvals)
             self._recent_approvals = {
@@ -282,8 +336,15 @@ class RiskManagerAgent(Agent):
     def forget_ticker(self, ticker: str) -> None:
         """Position Monitor calls this when a position closes, allowing
         a fresh approval on the same ticker. If the ticker was never in
-        the set, the discard is a silent no-op."""
-        self._recent_approvals.pop(ticker.upper(), None)
+        the set, the discard is a silent no-op.
+
+        2026-09-02: keys are per book now, and the close message this
+        follows does not always name one, so every book's entry for the
+        ticker is released. The next seed/prune re-adds any book that
+        still holds it, so a stale release cannot enable stacking."""
+        suffix = f":{str(ticker or '').strip().upper()}"
+        for k in [k for k in self._recent_approvals if k.endswith(suffix)]:
+            self._recent_approvals.pop(k, None)
 
     async def _account_equity(self, user_id) -> float:
         """Best-effort account equity (cash + vault) for per-coin cap
@@ -991,7 +1052,23 @@ class RiskManagerAgent(Agent):
         # already has a recent approval (and Position Monitor hasn't told
         # us the position closed yet), veto rather than re-buy -- EXCEPT
         # crypto HODL/DCA, which may add once the cooldown clears.
-        if _coin_u in self._recent_approvals:
+        # PER BOOK (2026-09-02, the APPROVAL STARVATION alerts): a pinned
+        # signal is judged against ITS OWN book; an unscoped scanner signal
+        # is refused here only when EVERY registered book already holds the
+        # name -- otherwise it goes to the fan-out, which skips the books
+        # that hold it and executes on the ones that do not. That fan-out
+        # check reads each book's OPEN rows live, so it is a stricter
+        # anti-stacking guard than this in-memory cache ever was.
+        _uid_sig = str(message.payload.get("user_id") or "")
+        _holding = self._books_holding(_coin_u)
+        if _uid_sig:
+            _dedup_blocked = _uid_sig in _holding
+            _dedup_who = "this book"
+        else:
+            _books_all = self._registered_books()
+            _dedup_blocked = bool(_books_all) and _books_all.issubset(_holding)
+            _dedup_who = f"all {len(_books_all)} books" if _books_all else ""
+        if _dedup_blocked:
             if _is_crypto and _accumulate_mode:
                 _cool = float(getattr(cfg, "crypto_accumulate_cooldown_hours", 18.0) or 18.0)
                 _hrs = _coin_state["hours_since_last"]
@@ -1008,8 +1085,8 @@ class RiskManagerAgent(Agent):
             else:
                 return [self._veto(
                     ticker, tcs,
-                    f"Already approved {ticker} in this session - skip to "
-                    f"avoid stacking. The open position must close (or be "
+                    f"Already held by {_dedup_who} - skip to avoid stacking "
+                    f"{ticker}. The open position must close (or be "
                     f"trimmed) before a fresh approval is allowed.",
                     strategy=strategy,
                     user_id=message.payload.get("user_id"),
@@ -1028,7 +1105,7 @@ class RiskManagerAgent(Agent):
         # against its own max_open_positions. Here the crossing is only
         # NOTED - with the rotation hint kept, since "which weakest
         # position frees a slot" is still useful on the dashboard.
-        if _coin_u not in self._recent_approvals and len(self._recent_approvals) >= max_open:
+        if not _holding and len(self._recent_approvals) >= max_open:
             try:
                 rotation_hint = await _find_rotation_candidate(
                     message.payload.get("user_id"), tcs,
@@ -1188,7 +1265,15 @@ class RiskManagerAgent(Agent):
                         strategy=strategy)]
 
         import time as _apt
-        self._recent_approvals[ticker.upper()] = _apt.time()
+        # PER BOOK (2026-09-02). A PINNED approval marks only its own book.
+        # An UNSCOPED scanner approval marks nothing here on purpose: which
+        # books actually open a position is decided at the fan-out, and the
+        # seed/prune passes re-read paper_positions, so the books that do
+        # open one get their key within the prune window while the books
+        # that were skipped stay free. Writing a platform-wide key here is
+        # exactly what starved the lanes.
+        if _uid_sig:
+            self._recent_approvals[self._ak(_uid_sig, ticker)] = _apt.time()
         # Patched 2026-06-05 (Task #47): propagate user_id into the
         # approve payload so persistence + trace panel can attribute
         # per-user instead of falling through to NULL.
