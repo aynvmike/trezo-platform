@@ -1439,6 +1439,119 @@ async def submit_oco_sell(
     })
 
 
+
+# ---- SHORT-side protection (2026-09-02) -----------------------------------
+# Mike: "I want the agents to maintain it; let them learn from recovery if
+# needed." A bearish scalp/extended entry is a real short with a bracket;
+# the long-only helpers above would never arm a buy-side stop for it, so a
+# short sat at the venue with only its profit-target buy limit resting.
+# These are the exact mirrors: the exit side of a short is BUY, its
+# take-profit limit sits BELOW the market and its protective stop ABOVE.
+
+def _is_buy_stop(order: dict) -> bool:
+    t = str(order.get("type") or order.get("order_type") or "").lower()
+    return "stop" in t and str(order.get("side") or "").lower() == "buy"
+
+
+def _is_buy_limit(order: dict) -> bool:
+    t = str(order.get("type") or order.get("order_type") or "").lower()
+    return t == "limit" and str(order.get("side") or "").lower() == "buy"
+
+
+async def submit_stop_buy(
+    symbol: str, qty, stop_price: float,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Plain buy stop -- protection-first fallback for a SHORT when the
+    OCO is refused (same shape as submit_stop_sell)."""
+    return await _post("/v2/orders", {
+        "symbol": symbol.upper(),
+        "qty": str(qty),
+        "side": "buy",
+        "type": "stop",
+        "stop_price": str(round(float(stop_price), 2)),
+        "time_in_force": _equity_sell_tif(float(qty)),
+    })
+
+
+async def submit_oco_buy(
+    symbol: str, qty, limit_price: float, stop_price: float,
+) -> tuple[Optional[dict], Optional[str]]:
+    """OCO exit pair for an existing SHORT: take-profit buy limit (below)
+    + buy stop (above), one cancels the other."""
+    return await _post("/v2/orders", {
+        "symbol": symbol.upper(),
+        "qty": str(qty),
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": _equity_sell_tif(float(qty)),
+        "order_class": "oco",
+        "take_profit": {"limit_price": str(round(float(limit_price), 2))},
+        "stop_loss": {"stop_price": str(round(float(stop_price), 2))},
+    })
+
+
+async def ensure_short_protection(
+    symbol: str, qty: float, stop: float, target: Optional[float] = None,
+) -> tuple[bool, str]:
+    """Make sure a SHORT equity position has a BUY STOP at the venue.
+
+    Mirror of ensure_stock_protection: "is one of the resting orders a
+    buy stop?" -- if a buy limit (the target) rests alone we cancel it
+    and place a proper buy OCO, because the shares it reserves are the
+    same shares the stop needs. Falls back to a plain buy stop when the
+    OCO is refused, and restores the lone target if BOTH are refused
+    (never leave the position with nothing resting). Never raises."""
+    sym = symbol.upper().strip()
+    if not (qty and qty > 0 and stop and stop > 0):
+        return False, "no quantity or stop to protect"
+
+    orders = await get_open_orders_for(sym)
+    if orders is None:
+        return False, "could not read open orders - left untouched"
+    if any(_is_buy_stop(o) for o in orders):
+        return False, "buy stop already resting at the broker"
+
+    resting_buys = [o for o in orders if _is_buy_limit(o)]
+    for o in resting_buys:
+        if o.get("id"):
+            await _delete(f"/v2/orders/{o.get('id')}")
+    lost_target = bool(resting_buys)
+
+    # QP-01: never ask for more than the venue holds (short qty is negative
+    # at the venue; the clamp strips the sign).
+    qty = await _clamp_to_venue_qty(sym, qty)
+
+    if target and target > 0:
+        _o, err = await submit_oco_buy(sym, qty, target, stop)
+        if not err:
+            return True, (f"short had no broker stop - placed buy OCO "
+                          f"{stop:g}/{target:g}"
+                          + (" (replaced a lone resting buy limit)"
+                             if lost_target else ""))
+    else:
+        err = None
+    _o2, err2 = await submit_stop_buy(sym, qty, stop)
+    if not err2:
+        return True, (f"short had no broker stop - placed buy stop at {stop:g}"
+                      + (" (target NOT restored - OCO refused)"
+                         if lost_target else ""))
+
+    restored = ""
+    for o in resting_buys:
+        try:
+            _q = float(o.get("qty") or 0)
+            _px = float(o.get("limit_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if _q > 0 and _px > 0:
+            _r, _rerr = await _post("/v2/orders", {
+                "symbol": sym, "qty": str(_q), "side": "buy", "type": "limit",
+                "limit_price": str(round(_px, 2)), "time_in_force": "gtc",
+            })
+            if not _rerr:
+                restored = " (buy limit restored)"
+    return False, (f"could not place buy protection: {err2 or err}{restored}")
+
 async def liquidate_position(
     symbol: str, asset_type: str = "stock",
 ) -> tuple[Optional[dict], Optional[str]]:

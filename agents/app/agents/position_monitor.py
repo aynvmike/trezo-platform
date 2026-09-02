@@ -1055,13 +1055,17 @@ async def _arm_broker_stop(r: dict) -> str | None:
     earns its keep. Off with TREZO_BROKER_STOP_SYNC=0. Never raises."""
     if os.getenv("TREZO_BROKER_STOP_SYNC", "1") == "0":
         return None
-    if str(r.get("broker") or "") != "alpaca" or r.get("side") != "long":
+    # 2026-09-02 (Mike: "let the agents maintain it"): shorts are armed
+    # too -- stock/Alpaca only; crypto is long-only by design.
+    if str(r.get("broker") or "") != "alpaca" or r.get("side") not in ("long", "short"):
         return None
     tk = str(r.get("ticker") or "")
     try:
         pol = _asset_policy(r.get("asset_type"))
         if not pol.holds_stop:
             return None
+        if r.get("side") == "short" and pol.stop_order_type == "stop_limit":
+            return None   # no crypto shorts exist; never arm one
         stop = float(r.get("stop_price") or 0)
         qty = float(r.get("quantity") or 0)
         if stop <= 0 or qty <= 0:
@@ -1094,6 +1098,11 @@ async def _arm_broker_stop(r: dict) -> str | None:
             from app.brokers.alpaca import ratchet_crypto_stop
             changed, note = await ratchet_crypto_stop(
                 tk, stop, qty=qty, offset_profile=_stop_offset_profile(r))
+        elif str(r.get("side")) == "short":
+            from app.brokers.alpaca import ensure_short_protection
+            changed, note = await ensure_short_protection(
+                tk, qty, stop,
+                float(r["target_price"]) if r.get("target_price") else None)
         else:
             from app.brokers.alpaca import ensure_stock_protection
             changed, note = await ensure_stock_protection(

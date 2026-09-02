@@ -30,7 +30,7 @@ SUITES = sorted(p.stem for p in HERE.glob("test_*.py"))
 # vf:gate-harness -- which is precisely the drift GATE-04 exists to catch,
 # so RAISE THIS NUMBER in the same commit that adds a suite). `>=` because
 # suites are added over time -- nothing should ever lower it.
-EXPECTED_MIN_SUITES = 51
+EXPECTED_MIN_SUITES = 52
 
 
 def main() -> int:
