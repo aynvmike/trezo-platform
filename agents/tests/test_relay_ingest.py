@@ -24,11 +24,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+from _bootstrap import (load_module, quiet_activity_log, run_tests,  # noqa: E402
+                        stub_config)
 
 stub_config()
 base = load_module("app.agents.base")
 ri = load_module("app.agents.relay_ingest")
+
+# 2026-09-02: ingest()/tick() announce every accept and refusal through
+# ri._record -> activity_log.record. The four tests below that drive them
+# hold quiet_activity_log() so those lines are captured, not written --
+# seven fixture rows (source "s", regime='bananas') were landing in the
+# live feed on every deploy-gate run. Where a test's name promises the
+# line was logged, the capture is asserted.
 
 NOW = datetime(2026, 8, 21, 19, 30, tzinfo=timezone.utc)
 
@@ -171,7 +179,9 @@ def test_each_kind_lands_in_its_own_scope_and_the_shared_pool():
     # validate() inside ingest() uses the real clock; pin as_of to now.
     for r in rows:
         r["payload"]["as_of"] = datetime.now(timezone.utc).isoformat()
-    msgs = [_run(a.ingest(r)) for r in rows]
+    with quiet_activity_log() as said:
+        msgs = [_run(a.ingest(r)) for r in rows]
+    assert [t for _, t, _ in said] == ["RELAY_BRIEF_INGESTED"] * 3, said
 
     scopes = {s for s, *_ in h.memory}
     assert scopes == {"relay:market", "relay:analytics", "relay:health", "shared"}, scopes
@@ -186,7 +196,10 @@ def test_rejection_is_marked_logged_and_announced():
     h = _Harness(); a = h.agent()
     row = {"id": "9", "kind": "market_context", "source": "market-report",
            "payload": _market(regime="bananas", as_of=datetime.now(timezone.utc).isoformat())}
-    msg = _run(a.ingest(row))
+    with quiet_activity_log() as said:
+        msg = _run(a.ingest(row))
+    assert [t for _, t, _ in said] == ["RELAY_BRIEF_REJECTED"], said
+    assert "bananas" in said[0][2].get("reason", ""), said
     assert h.marks and h.marks[0][1] == "rejected" and "regime" in h.marks[0][2]
     assert msg.kind == "info" and msg.payload.get("severity") == "warning"
     assert not h.memory, "a rejected brief still reached memory"
@@ -196,7 +209,8 @@ def test_memory_failure_is_visible_in_the_row_and_the_message():
     h = _Harness(); a = h.agent(fail_memory=True)
     row = {"id": "5", "kind": "health", "source": "trezo-midday-snapshot",
            "payload": _health(as_of=datetime.now(timezone.utc).isoformat())}
-    msg = _run(a.ingest(row))
+    with quiet_activity_log():
+        msg = _run(a.ingest(row))
     assert "FAILED" in h.marks[0][2]
     assert msg.payload.get("memory_ok") is False
     assert msg.payload.get("severity") == "warning"
@@ -228,7 +242,8 @@ def test_bad_rows_do_not_stop_the_batch():
     async def fetch():
         return [poison, good]
     a._fetch_new = fetch
-    msgs = _run(a.tick())
+    with quiet_activity_log():
+        msgs = _run(a.tick())
     kinds = [m.kind for m in msgs]
     assert "info" in kinds, f"the good row was lost behind the poison one: {kinds}"
     assert any(st == "rejected" for _, st, _ in h.marks)

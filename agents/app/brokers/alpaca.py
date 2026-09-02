@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -153,19 +154,115 @@ class UserToken:
     expires_at: Optional[str] = None
 
 
+# ---- read-failure visibility (2026-09-02) ---------------------------------
+# WHY: _get() collapsed every failure -- HTTP 4xx/5xx (429 included), an
+# httpx ReadTimeout or ConnectError, a non-JSON 200 -- into one bare None
+# with no log and no retained status. Every strict reader inherits that
+# None, so the five "could not read open orders - left untouched" returns
+# below and options_scanner's reconcile_skipped_unreadable had nothing to
+# report about WHY. On 2026-09-02 eight isolated failures (not rate
+# limiting: x-ratelimit-remaining sat at 199/200 on all three keys) were
+# invisible beyond "left untouched". Strict semantics do NOT change -- a
+# failed read is still None and never [] -- this only remembers the reason
+# PER BOOK and writes one activity row per (book, endpoint) per minute.
+_LAST_READ_ERROR: dict[str, str] = {}
+_READ_ERROR_LOGGED_AT: dict[tuple[str, str], float] = {}
+_READ_ERROR_LOG_EVERY_S = 60.0
+
+
+def _read_book() -> str:
+    """The key a read failure is filed under: the bound env-slot account
+    id ('primary' / 'acct2' / 'acct3'); unbound, the same 'live' /
+    'primary' split _base_url() and _headers() already make."""
+    a = _account_ctx()
+    if a is not None:
+        return str(getattr(a, "account_id", "") or "primary")
+    return "live" if _live_active() else "primary"
+
+
+def _symbol_from_path(path: str) -> str:
+    """The ticker a GET was about, for the activity row; 'ACCOUNT' when the
+    request was account-wide (/v2/account, /v2/positions, all orders)."""
+    try:
+        from urllib.parse import unquote
+        m = re.search(r"[?&]symbols?=([^&]+)", path)
+        if m:
+            return unquote(m.group(1)).split(",")[0].upper()[:24]
+        m = re.match(r"^/v2/positions/([^/?]+)", path)
+        if m:
+            return unquote(m.group(1)).upper()[:24]
+    except Exception:  # noqa: BLE001
+        pass
+    return "ACCOUNT"
+
+
+def _note_read_error(path: str, detail: str, *, log: bool = True) -> None:
+    """Remember why the latest GET for the BOUND book failed, and (log=True)
+    write ONE broker_read_failed activity row per (book, endpoint) per
+    _READ_ERROR_LOG_EVERY_S. Never raises: logging must never break a read,
+    which is why `record` is imported inside the try."""
+    try:
+        book = _read_book()
+        endpoint = str(path).split("?", 1)[0]
+        detail = str(detail)
+        _LAST_READ_ERROR[book] = f"GET {endpoint}: {detail}"
+        if not log:
+            return
+        now = time.time()
+        key = (book, endpoint)
+        if now - _READ_ERROR_LOGGED_AT.get(key, 0.0) < _READ_ERROR_LOG_EVERY_S:
+            return
+        _READ_ERROR_LOGGED_AT[key] = now
+        from app.agents.activity_log import record
+        from app.brokers.accounts import current_user_id
+        record("broker_read_failed", _symbol_from_path(path),
+               reason=f"{detail} on GET {endpoint}"[:290],
+               extra={"user_id": current_user_id() or "", "account": book})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def last_read_error() -> str:
+    """Why the most recent GET for the BOUND book failed ('' if none has).
+    Read it straight after a strict reader returns None -- that is the
+    moment it is guaranteed to describe THAT failure."""
+    try:
+        return _LAST_READ_ERROR.get(_read_book(), "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def _get(path: str, token: Optional["UserToken"] = None):
     """GET an Alpaca endpoint. Returns parsed JSON, or None on any failure.
     When `token` is set, the user's OAuth bearer is used; otherwise the
-    env-driven API key falls back."""
+    env-driven API key falls back.
+
+    2026-09-02: every failure still returns None (the strict readers depend
+    on exactly that) but the REASON is kept per book -- see _note_read_error
+    / last_read_error(). raise_for_status() used to turn a 429 or a 5xx
+    into the same anonymous exception as a timeout, so the status is now
+    checked explicitly and the note carries "HTTP <status>: <body>"; the
+    except branch names the exception class, which also names
+    JSONDecodeError for a 200 whose body is not JSON. Success paths are
+    untouched: a real [] is still []."""
     if token is None and not alpaca_configured():
+        _note_read_error(path, "Alpaca not configured for this book", log=False)
         return None
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(_base_url() + path, headers=_headers_for(token))
-            resp.raise_for_status()
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status >= 400:
+                try:
+                    text = str(resp.text or "")
+                except Exception:  # noqa: BLE001
+                    text = ""
+                _note_read_error(path, f"HTTP {status}: {text[:80]}")
+                return None
             return resp.json()
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _note_read_error(path, f"{type(e).__name__}: {str(e)[:80]}")
         return None
 
 
@@ -257,6 +354,30 @@ async def get_account(token: Optional["UserToken"] = None) -> Optional[AlpacaAcc
             return float(data.get(key) or 0)
         except (TypeError, ValueError):
             return 0.0
+
+    # 2026-09-02 (house rule 3 -- a failed read must never read as empty):
+    # a 2xx body with no parseable cash/equity is a failed read wearing a
+    # success status (an auth or gateway page served as JSON, a partial
+    # body, a shape change). _f() turned that into cash=0.0, and
+    # reconcile_account_balances_all_users would have stamped 0.00 into
+    # THIS book's ledger as broker truth. Refuse it: None makes the
+    # reconcile skip and log "broker read failed", and nothing sizes off
+    # a zeroed account. A genuine "0" still parses and still reads as 0.
+    def _parseable(key: str) -> bool:
+        v = data.get(key)
+        if v is None or v == "":
+            return False
+        try:
+            float(v)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    if not (_parseable("cash") and _parseable("equity")):
+        _note_read_error("/v2/account",
+                         "2xx payload without parseable cash/equity "
+                         f"(keys: {', '.join(sorted(map(str, data.keys())))[:60]})")
+        return None
 
     return AlpacaAccount(
         equity=_f("equity"),
@@ -381,7 +502,22 @@ async def get_positions_strict(
     empty one. Callers that can act destructively must use this and
     treat None as "do not act"."""
     data = await _get("/v2/positions", token=token)
-    return data if isinstance(data, list) else None
+    return _list_or_none("/v2/positions", data)
+
+
+def _list_or_none(path: str, data) -> Optional[list]:
+    """A strict list read: the list (possibly empty) or None.
+
+    Review 2026-09-02: a 2xx body that is not a list is a FAILED read too.
+    Note it (no activity row -- the transport already logged any HTTP
+    failure; this is a shape surprise) so the caller's last_read_error()
+    explains THIS None instead of repeating a stale reason."""
+    if isinstance(data, list):
+        return data
+    if data is not None:
+        _note_read_error(path, f"unexpected payload shape: {type(data).__name__}",
+                         log=False)
+    return None
 
 
 async def get_positions(token: Optional["UserToken"] = None) -> list[dict]:
@@ -731,8 +867,8 @@ async def submit_option_order(
 async def get_open_symbols() -> Optional[set]:
     """The set of symbols with an open Alpaca position. Returns None if the
     call failed - so callers can tell 'no positions' from 'could not check'."""
-    data = await _get("/v2/positions")
-    if not isinstance(data, list):
+    data = _list_or_none("/v2/positions", await _get("/v2/positions"))
+    if data is None:
         return None
     return {str(p.get("symbol", "")).upper() for p in data if p.get("symbol")}
 
@@ -742,7 +878,7 @@ async def get_all_open_orders() -> Optional[list]:
     the call failed. Crypto callers match client-side by base instead of
     trusting a venue-side symbol filter -- see open_crypto_orders."""
     data = await _get("/v2/orders?status=open&limit=500")
-    return data if isinstance(data, list) else None
+    return _list_or_none("/v2/orders?status=open&limit=500", data)
 
 
 async def get_open_orders_for(symbol: str) -> Optional[list]:
@@ -762,8 +898,9 @@ async def get_open_orders_for(symbol: str) -> Optional[list]:
     the nested listing and FLATTEN every child leg into the returned list
     so callers that scan for a resting stop actually see it. Legs carry
     the same order shape (id/type/side/status/qty/prices)."""
-    data = await _get(f"/v2/orders?status=open&nested=true&symbols={symbol.upper()}")
-    if not isinstance(data, list):
+    _path = f"/v2/orders?status=open&nested=true&symbols={symbol.upper()}"
+    data = _list_or_none(_path, await _get(_path))
+    if data is None:
         return None
     return _flatten_order_legs(data)
 
@@ -865,7 +1002,9 @@ async def ratchet_stop(symbol: str, new_stop: float, *,
     sym = symbol.upper().strip()
     orders = await get_open_orders_for(sym)
     if orders is None:
-        return False, "could not read open orders - left untouched"
+        # 2026-09-02: say WHY -- the reason _get() just retained for this book.
+        return False, ("could not read open orders "
+                       f"({last_read_error() or 'reason not captured'}) - left untouched")
 
     stop_legs = [o for o in orders if _is_stop_leg(o)]
     if stop_legs:
@@ -946,7 +1085,9 @@ async def ensure_stock_protection(
 
     orders = await get_open_orders_for(sym)
     if orders is None:
-        return False, "could not read open orders - left untouched"
+        # 2026-09-02: say WHY -- the reason _get() just retained for this book.
+        return False, ("could not read open orders "
+                       f"({last_read_error() or 'reason not captured'}) - left untouched")
     if any(_is_stop_leg(o) for o in orders):
         return False, "stop already resting at the broker"
 
@@ -1074,7 +1215,9 @@ async def ensure_crypto_take_profit(
 
     orders = await open_crypto_orders(sym)
     if orders is None:
-        return False, "could not read open orders - left untouched"
+        # 2026-09-02: say WHY -- the reason _get() just retained for this book.
+        return False, ("could not read open orders "
+                       f"({last_read_error() or 'reason not captured'}) - left untouched")
 
     resting = [o for o in orders if _is_sell_limit(o)]
     body = {
@@ -1153,7 +1296,9 @@ async def ratchet_crypto_stop(
 
     orders = await open_crypto_orders(sym)
     if orders is None:
-        return False, "could not read open orders - left untouched"
+        # 2026-09-02: say WHY -- the reason _get() just retained for this book.
+        return False, ("could not read open orders "
+                       f"({last_read_error() or 'reason not captured'}) - left untouched")
 
     limit_px = stop_limit_price(new_stop, "long", offset_profile)
     legs = [o for o in orders if _is_crypto_stop_leg(o)]
@@ -1507,7 +1652,9 @@ async def ensure_short_protection(
 
     orders = await get_open_orders_for(sym)
     if orders is None:
-        return False, "could not read open orders - left untouched"
+        # 2026-09-02: say WHY -- the reason _get() just retained for this book.
+        return False, ("could not read open orders "
+                       f"({last_read_error() or 'reason not captured'}) - left untouched")
     if any(_is_buy_stop(o) for o in orders):
         return False, "buy stop already resting at the broker"
 

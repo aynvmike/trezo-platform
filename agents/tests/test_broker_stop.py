@@ -23,7 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+from _bootstrap import (load_module, quiet_activity_log, run_tests,  # noqa: E402
+                        stub_config)
 
 # alpaca.py reads settings at import. Stub them so these run in a bare
 # checkout with no .env and no credentials -- a guard test nobody can
@@ -34,14 +35,35 @@ alp = load_module("app.brokers.alpaca")
 ap = load_module("app.runtime.asset_policy")
 
 
+_REAL_GET = alp._get   # 2026-09-02: see _run
+
+
 def _run(coro):
     # Close the loop each time: leaking one per call makes CPython spew
     # a GC traceback AFTER the results print, which reads like a failure
     # in a suite that passed.
+    #
+    # 2026-09-02: the arm/ratchet paths also read the position through
+    # alpaca._get(). This suite never stubbed that read, so every test
+    # made a REAL GET /v2/positions/<sym> to Alpaca with the stub keys and
+    # took the 401 as None -- and since alpaca.py's read-failure
+    # visibility (same day) that 401 writes a broker_read_failed row,
+    # which run_all's leak net fails the suite for (from the server's
+    # gate it would have put "unauthorized" in the live feed). Hold the
+    # wire shut for the call -- a failed read is exactly what every test
+    # already got -- unless a test installed its own _get, and capture
+    # any activity row instead of writing it.
+    async def _no_wire(*_a, **_k):
+        return None
     loop = asyncio.new_event_loop()
+    real_get = alp._get
     try:
-        return loop.run_until_complete(coro)
+        if real_get is _REAL_GET:
+            alp._get = _no_wire
+        with quiet_activity_log():
+            return loop.run_until_complete(coro)
     finally:
+        alp._get = real_get
         loop.close()
 
 

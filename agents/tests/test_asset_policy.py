@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _bootstrap import load_module, run_tests  # noqa: E402
+from _bootstrap import load_module, quiet_activity_log, run_tests  # noqa: E402
 
 ap = load_module("app.runtime.asset_policy")
 
@@ -59,11 +59,15 @@ def test_sentinels_are_not_mistaken_for_asset_classes():
     """`auto` reads like an asset type in a comparison but means "detect
     it". It must stay UNREGISTERED -- if someone ever gives it a policy,
     positions would be managed under a class that does not exist."""
-    for s in ap.SENTINELS:
-        assert not ap.is_registered(s), (
-            f"{s!r} is a sentinel, not an asset class -- it must not have "
-            f"a policy")
-        assert ap.policy_for(s) is ap.UNKNOWN_POLICY
+    # 2026-09-02: policy_for() on an unregistered class writes an
+    # asset_policy_missing receipt. Captured, not written -- 'AUTO' was
+    # landing in the live feed on every deploy-gate run (run_all's net).
+    with quiet_activity_log():
+        for s in ap.SENTINELS:
+            assert not ap.is_registered(s), (
+                f"{s!r} is a sentinel, not an asset class -- it must not have "
+                f"a policy")
+            assert ap.policy_for(s) is ap.UNKNOWN_POLICY
 
 
 def test_the_classes_we_promised_are_all_there():
@@ -72,8 +76,13 @@ def test_the_classes_we_promised_are_all_there():
 
 
 def test_unknown_asset_type_fails_closed():
-    pol = ap.policy_for("dogecoin_futures_on_the_moon")
+    with quiet_activity_log() as said:
+        pol = ap.policy_for("dogecoin_futures_on_the_moon")
     assert pol is ap.UNKNOWN_POLICY
+    # 2026-09-02: the miss must be SAID -- the receipt is how a forgotten
+    # policy gets noticed -- and captured here, never written from a test.
+    assert [(e, t) for e, t, _ in said] == [
+        ("asset_policy_missing", "DOGECOIN_FUTURES_ON_THE_MOON")], said
     assert pol.client_side_exits is True, "we must still watch it"
     assert pol.supports_partial_step is False, "we must not invent behaviour"
     assert pol.adoptable is False

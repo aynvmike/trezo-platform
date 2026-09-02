@@ -12,12 +12,34 @@ pre-commit hook, in CI, on a laptop with no .env and no broker keys.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 AGENTS_DIR = Path(__file__).resolve().parents[1]
+
+# 2026-09-02 (leak net, see run_all.py): activity_log.record appends to
+# <repo>/logs/activity-<date>.jsonl unless TREZO_ACTIVITY_LOG_DIR points
+# elsewhere, and ops_relay.push_log_tail mirrors that file into the live
+# feed. run_all pins the dir to a fresh temp dir before anything imports;
+# this covers the OTHER ways a suite runs (pytest on one file, `python -m
+# tests.test_x`), so a suite that forgot to stub record writes to scratch
+# on a laptop too, never to the checkout's live log. An operator who set
+# the variable on purpose keeps it (a plain guard, not setdefault, so no
+# stray temp dir is created when it is already set).
+if "TREZO_ACTIVITY_LOG_DIR" not in os.environ:
+    import atexit
+    import shutil
+    _scratch_activity_dir = tempfile.mkdtemp(prefix="trezo-tests-activity-")
+    os.environ["TREZO_ACTIVITY_LOG_DIR"] = _scratch_activity_dir
+    # Removed when the process ends: a stand-alone run must not litter the
+    # temp dir any more than it may write the live log. run_all cleans the
+    # one it makes itself.
+    atexit.register(shutil.rmtree, _scratch_activity_dir, ignore_errors=True)
 
 
 def _stub_package(name: str, path: Path) -> types.ModuleType:
@@ -110,3 +132,60 @@ def run_tests(namespace: dict) -> int:
             print(f"  ERROR {name}: {type(e).__name__}: {e}")
     print(f"\n{'FAILED' if fails else 'all green'} ({fails} failures)")
     return 1 if fails else 0
+
+
+@contextlib.contextmanager
+def quiet_activity_log(*bound):
+    """Capture app.agents.activity_log.record for ONE block instead of
+    letting it append to the activity file; the real function goes back
+    in `finally`.
+
+    2026-09-02: five suites drove real code paths -- trade_execution's
+    fail-closed branch, route_guard.record_mismatch, asset_policy's
+    unknown-class receipt, relay_ingest's ingested/rejected lines --
+    whose late `from app.agents.activity_log import record` resolved
+    against the REAL module, so every deploy-gate run appended a 12-line
+    burst of fixtures (AGNC execute_error, a book that does not exist,
+    regime='bananas') to logs/activity-<date>.jsonl, the file ops_relay
+    mirrors into the live feed. run_all.py now fails any suite that grows
+    that file; this is the one-line fix for a suite it names.
+
+    Yields the captured calls as (event, ticker, kwargs), the ticker
+    normalised exactly as record() writes it (upper-cased), so a test can
+    assert the row it EXPECTS was said -- a silent refusal is its own
+    bug:
+
+        with quiet_activity_log() as said:
+            ...
+        assert ("route_mismatch", "-") in [(e, t) for e, t, _ in said]
+
+    Every call site in app/ imports record late, inside the function, so
+    swapping the module attribute reaches all of them. A consumer that
+    bound the name at import time (`from ... import record` at module
+    level -- none exist today) is not reached that way; pass it as
+    (module, "attr") in `bound` and it is swapped and restored too."""
+    alog = load_module("app.agents.activity_log")
+    said: list = []
+    import inspect as _inspect
+    _real_sig = _inspect.signature(getattr(alog, "record"))
+
+    def _capture(*a, **kw):
+        # Mirror the REAL signature (review 2026-09-02): a call that the real
+        # record(event, ticker, *, tcs, strategy, reason, iv_rank, extra)
+        # would reject with TypeError is rejected here too -- otherwise a
+        # bad call site passes in tests and silently drops its row in prod
+        # (every caller swallows the TypeError).
+        bound_args = dict(_real_sig.bind(*a, **kw).arguments)
+        event = bound_args.pop("event")
+        ticker = bound_args.pop("ticker")
+        said.append((str(event), str(ticker or "").upper(), bound_args))
+
+    targets = [(alog, "record")] + [(m, a) for m, a in bound]
+    saved = [(m, a, getattr(m, a)) for m, a in targets]
+    try:
+        for m, a, _ in saved:
+            setattr(m, a, _capture)
+        yield said
+    finally:
+        for m, a, real in saved:
+            setattr(m, a, real)

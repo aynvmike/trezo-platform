@@ -1980,8 +1980,14 @@ class OptionsScannerAgent(Agent):
                 # this book this tick, and the log says so.
                 try:
                     from app.agents.activity_log import record as _urec
+                    # 2026-09-02: name the cause. alpaca._get() now keeps
+                    # WHY the read failed for the bound book (HTTP status,
+                    # timeout, non-JSON body); without it this row said
+                    # "unreadable" and nothing else, eight times today.
+                    from app.brokers.alpaca import last_read_error as _lre
                     _urec("reconcile_skipped_unreadable", "ACCOUNT",
-                          reason=("broker option positions unreadable -- "
+                          reason=("broker option positions unreadable "
+                                  f"({_lre() or 'reason not captured'}) -- "
                                   "no row closed or adopted this tick"),
                           extra={"user_id": user_id})
                 except Exception:  # noqa: BLE001

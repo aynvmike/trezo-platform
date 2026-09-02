@@ -35,7 +35,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+from _bootstrap import (load_module, quiet_activity_log, run_tests,  # noqa: E402
+                        stub_config)
 
 stub_config()  # app.brokers.accounts reads settings at import
 book_scope = load_module("app.runtime.book_scope")
@@ -201,8 +202,18 @@ def test_a_failed_broker_read_is_none_not_empty():
 
 
 def test_an_unresolved_book_is_refused_not_defaulted():
-    with _fake_world():
+    # 2026-09-02: the refusal is said out loud through
+    # route_guard.record_mismatch -> activity_log.record. Captured rather
+    # than written -- this one row ('book-that-does-not-exist') reached
+    # the live feed on every deploy-gate run -- and asserted, because a
+    # refusal nobody can see is the silent failure this file exists for.
+    with _fake_world(), quiet_activity_log() as said:
         assert _run(book_scope.held_symbols("book-that-does-not-exist")) is None
+    rows = [(e, t, (kw.get("extra") or {}).get("user_id"), kw.get("reason", ""))
+            for e, t, kw in said]
+    assert len(rows) == 1 and rows[0][:3] == (
+        "route_mismatch", "-", "book-that-does-not-exist"), rows
+    assert "unresolved book" in rows[0][3], rows
 
 
 def test_binding_yields_the_right_book_and_restores_after():
