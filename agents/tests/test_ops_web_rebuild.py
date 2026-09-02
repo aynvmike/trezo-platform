@@ -126,6 +126,9 @@ class _FakeClient:
     def table(self, name): return _FakeTable(self.store, name)
 
 
+_alog = _bootstrap.load_module("app.agents.activity_log")
+
+
 def _run_loop(coro):
     loop = _aio.new_event_loop()
     try:
@@ -154,7 +157,7 @@ def test_a_web_rebuild_is_handed_to_a_detached_task_and_still_lands_done():
             assert store["ops_tasks"][0]["status"] == "done", store
             assert "Compiled successfully" in store["ops_tasks"][0]["result"]
             assert relay._TICK_BUSY is False          # released by the task
-    with _patched(relay, HANDLERS=dict(relay.HANDLERS)):
+    with _patched(relay, HANDLERS=dict(relay.HANDLERS)), _patched(_alog, record=lambda *a, **k: None):
         _run_loop(scenario())
     assert seen == ["built"]
 
@@ -172,7 +175,7 @@ def test_a_detached_failure_is_recorded_not_lost():
         row = store["ops_tasks"][0]
         assert row["status"] == "failed" and "npm exploded" in row["result"], row
         assert relay._TICK_BUSY is False
-    with _patched(relay, HANDLERS=dict(relay.HANDLERS)):
+    with _patched(relay, HANDLERS=dict(relay.HANDLERS)), _patched(_alog, record=lambda *a, **k: None):
         _run_loop(scenario())
 
 
@@ -198,5 +201,5 @@ def test_inline_kinds_still_release_the_latch_when_they_finish():
         assert out == {"kind": "report_status", "status": "done"}, out
         assert store["ops_tasks"][0]["status"] == "done"
         assert relay._TICK_BUSY is False
-    with _patched(relay, HANDLERS=dict(relay.HANDLERS)):
+    with _patched(relay, HANDLERS=dict(relay.HANDLERS)), _patched(_alog, record=lambda *a, **k: None):
         _run_loop(scenario())
