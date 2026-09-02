@@ -5,12 +5,21 @@
  * any signed-in user could hit /api/admin/* and the global-op routes
  * (toggle/trigger agents, reconcile, place-leg, ...). These helpers give
  * every route handler one line to require a session (requireUser) or the
- * owner allowlist (requireOwner).
+ * owner check (requireOwner).
  *
- * Owner = the session user's id appears in TREZO_OWNER_USER_IDS
- * (comma-separated Supabase auth user ids, server env). If that env var is
- * unset or empty, requireOwner FAILS CLOSED (403) and logs once — unset is
- * never "everyone is owner".
+ * WHO IS AN OWNER (2026-09-02):
+ *   1. If TREZO_OWNER_USER_IDS (comma-separated Supabase auth user ids) is
+ *      set in the server env, it is the allowlist and nothing else counts.
+ *   2. Otherwise ownership is DERIVED FROM THE DATABASE: the session user
+ *      owns at least one active row in trading_accounts (owner_id = their
+ *      auth uid, is_active = true). That table is where migration 0045
+ *      registered the person→accounts→books model, and RLS lets a person
+ *      read only their own rows, so the lookup runs on the caller's own
+ *      session client. A signed-up user with no books gets 403.
+ *   The DB rule exists so the operator does not have to edit server env by
+ *   hand to keep their own admin buttons working; the env allowlist remains
+ *   the stricter override for a multi-owner deployment. Neither branch ever
+ *   treats "unset" as "everyone is owner": no env AND no books → 403.
  *
  * Usage:
  *   const supabase = createClient();
@@ -36,22 +45,45 @@ export function ownerUserIds(): string[] {
     .filter(Boolean);
 }
 
-let warnedUnsetOnce = false;
+let loggedModeOnce = false;
 
 /** True only when the id is explicitly allowlisted. Unset list => false. */
 export function isOwnerUserId(userId: string | null | undefined): boolean {
   if (!userId) return false;
   const ids = ownerUserIds();
-  if (ids.length === 0) {
-    if (!warnedUnsetOnce) {
-      warnedUnsetOnce = true;
+  if (ids.length === 0) return false;
+  return ids.includes(userId);
+}
+
+/**
+ * DB-derived ownership: does this session user own >= 1 active trading
+ * account? Runs on the caller's RLS-scoped client, so it can only ever see
+ * the caller's own rows. A failed read is NOT ownership (fail closed).
+ */
+export async function ownsAnActiveBook(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from("trading_accounts")
+      .select("account_key")
+      .eq("owner_id", userId)
+      .eq("is_active", true)
+      .limit(1);
+    if (error) {
       console.error(
-        `[auth-guards] ${OWNER_IDS_ENV} is not set — every owner-only route (admin/*, agent toggle/trigger, reconcile, place-leg, ...) will return 403 until it is. Set it to the owner's Supabase auth user id.`
+        `[auth-guards] trading_accounts read failed while resolving ownership: ${error.message}`
       );
+      return false;
     }
+    return Array.isArray(data) && data.length > 0;
+  } catch (e) {
+    console.error(
+      `[auth-guards] trading_accounts read threw while resolving ownership: ${String(e)}`
+    );
     return false;
   }
-  return ids.includes(userId);
 }
 
 /** 401 unless there is a valid Supabase session on the request. */
@@ -72,11 +104,33 @@ export async function requireUser(supabase: SupabaseClient): Promise<GuardResult
   return { ok: true, user };
 }
 
-/** 401 without a session; 403 unless the session user is an allowlisted owner. */
+/**
+ * 401 without a session; 403 unless the session user is an owner — by the
+ * env allowlist when set, otherwise by owning an active trading account.
+ */
 export async function requireOwner(supabase: SupabaseClient): Promise<GuardResult> {
   const r = await requireUser(supabase);
   if (!r.ok) return r;
-  if (!isOwnerUserId(r.user.id)) {
+
+  const allowlist = ownerUserIds();
+  let owner: boolean;
+  if (allowlist.length > 0) {
+    owner = allowlist.includes(r.user.id);
+    if (!loggedModeOnce) {
+      loggedModeOnce = true;
+      console.log(`[auth-guards] owner mode: ${OWNER_IDS_ENV} allowlist (${allowlist.length} id(s))`);
+    }
+  } else {
+    owner = await ownsAnActiveBook(supabase, r.user.id);
+    if (!loggedModeOnce) {
+      loggedModeOnce = true;
+      console.log(
+        `[auth-guards] owner mode: derived from trading_accounts (set ${OWNER_IDS_ENV} to override with an explicit allowlist)`
+      );
+    }
+  }
+
+  if (!owner) {
     return {
       ok: false,
       user: null,
