@@ -16,8 +16,14 @@ constant, and check what actually leaves the agent on the bus.
          instruction was stamped 'Trezo Parent'.
   TE-06  the lane's activation switch: the signal carries `tcs` if and
          only if Settings.trezo_dividend_lt_tcs is > 0 (TREZO_DIVIDEND_LT_TCS
-         in agents/.env). At 0 the lane stays dark exactly as before;
-         no_price_stop and max_notional ride on every signal either way.
+         in agents/.env). At 0 / unset the lane stays dark exactly as
+         before; no_price_stop and max_notional ride on every signal
+         either way.
+  vf:no-price-stop-exec (skeptic 2026-09-01): every ladder signal is
+         pinned to ITS book (book_scoped True). Trade Execution treats a
+         bare user_id as provenance and fans the approval out to every
+         book, so without the pin one book's per-name cap would buy the
+         name on all three.
 
 Plain zero-arg test_ functions, no pytest, no fixtures, no network, no
 .env -- this file must run under tests/run_all.py.
@@ -211,11 +217,48 @@ def test_the_switch_is_a_real_settings_field_read_by_name():
     TREZO_DIVIDEND_LT_TCS in agents/.env actually reaches it."""
     cfg = (Path(__file__).resolve().parents[1] / "app/config.py").read_text(
         encoding="utf-8", errors="replace")
-    assert "trezo_dividend_lt_tcs: int = 0" in cfg, (
-        "Settings has no trezo_dividend_lt_tcs field -- the switch is dead")
+    # vf:config-web: Optional, default None (= unset -> _lane_tcs reads 0),
+    # so a blank TREZO_DIVIDEND_LT_TCS= pasted from the template cannot
+    # stop the engine booting.
+    assert "trezo_dividend_lt_tcs: int | None = None" in cfg, (
+        "Settings has no Optional trezo_dividend_lt_tcs field -- the switch is dead or a boot trap")
     src = Path(agent_mod.__file__).read_text(encoding="utf-8", errors="replace")
     assert 'getattr(get_settings(), "trezo_dividend_lt_tcs", 0)' in src
     assert "TREZO_DIVIDEND_LT_TCS" in src, "the switch is not documented"
+
+
+def test_the_documented_example_switch_value_clears_the_default_tcs_floor():
+    """vf:no-price-stop-exec: the module docstring used to suggest
+    TREZO_DIVIDEND_LT_TCS=60, below the default tcs_threshold of 70 --
+    a switch that turns the lane on and then has Risk Manager veto every
+    signal. The example must clear the default floor and say so."""
+    import re as _re
+    src = Path(agent_mod.__file__).read_text(encoding="utf-8", errors="replace")
+    m = _re.search(r"TREZO_DIVIDEND_LT_TCS=([0-9]+)", src)
+    assert m, "the docstring no longer shows an example TREZO_DIVIDEND_LT_TCS value"
+    assert int(m.group(1)) > 70, f"example {m.group(1)} does not exceed the default tcs_threshold 70"
+    assert "tcs_threshold" in src, "the docstring must say the value has to exceed the book's tcs_threshold"
+
+
+# --- vf:no-price-stop-exec: the ladder signal is pinned to its book ----------
+
+def test_ladder_signal_is_book_scoped():
+    """Drives the real _tick_book: every ladder signal that leaves the
+    agent carries book_scoped True next to its user_id, switch on or off.
+    trade_execution.on_message treats user_id WITHOUT book_scoped as
+    provenance and fans the approval out to every book at this book's
+    per-name cap; risk_manager passes book_scoped through to the approval
+    (TE-02). Absent or False here and the pin is gone for all of them."""
+    verdicts = {"PG": _verdict("PG", "Staples"), "JNJ": _verdict("JNJ", "Health")}
+    for cfg in (_Cfg(trezo_dividend_lt_tcs=None), _Cfg(trezo_dividend_lt_tcs=75)):
+        with _patched(agent_mod, get_settings=lambda cfg=cfg: cfg):
+            out = _tick([], ["PG", "JNJ"], verdicts)
+        sigs = _signals(out)
+        assert len(sigs) == 2, [m.payload for m in out]
+        for m in sigs:
+            assert m.payload.get("book_scoped") is True, m.payload
+            assert m.payload["user_id"] == "book-1", m.payload
+            assert m.payload["no_price_stop"] is True, m.payload
 
 
 # --- TE-07: ladder count ----------------------------------------------------

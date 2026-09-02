@@ -15,7 +15,10 @@ Rules pinned:
   - BI-04: a scanner crypto signal (no user_id) benches only the books
     whose per-coin halt is tripped, carries them as "benched_books" on
     the approval, and is vetoed only when EVERY book is benched. A
-    user-scoped signal is judged for its own book alone.
+    PINNED signal (user_id + book_scoped) is judged for its own book
+    alone; a bare user_id (pattern_detection's provenance stamp on a
+    COIN_MAP symbol) walks every book like a scanner signal
+    (vf:single-book-gates).
   - KS-11: check_states() -> None is "could not evaluate": no veto, no
     exception, and the moment is logged (the fan-out fails closed).
   - KS-12: the user-set daily $ brake is judged per book via
@@ -33,10 +36,16 @@ Rules pinned:
     at the LOWEST enabled book's floor via the REAL
     settings.min_tcs_floor_across_books; a user-scoped signal keeps its
     own book's floor; a failed enumeration falls open to the bare read.
-  - User-scoped kill-switch (review 2026-09-01): a signal with a
-    user_id is judged for THAT book alone -- halted -> veto naming the
-    book, its daily $ limit -> veto, recovery -> its lane policy and the
-    RECOVERY_TCS_BUMP on its bar; a halted neighbour changes nothing.
+  - Pinned kill-switch (review 2026-09-01; vf:single-book-gates): a
+    signal with user_id AND book_scoped=True is judged for THAT book
+    alone -- halted -> veto naming the book, its daily $ limit -> veto,
+    recovery -> its lane policy and the RECOVERY_TCS_BUMP on its bar; a
+    halted neighbour changes nothing. A BARE user_id is provenance (the
+    pattern_detection stamp): trade_execution fans that approval out to
+    every book, so the risk gate judges it by the all-books rule -- a
+    halted / $-limited / recovering origin book must NOT veto or bump
+    the sibling books' copies (the 2026-08-27 failure class). The same
+    contract binds the per-coin bench (BI-04 above).
   - NEQ-05 / G3: no_price_stop=True gets NO stop geometry (no default
     fill, no harmonizer, nothing forwarded) and the flag rides the
     approval with the lane's max_notional.
@@ -319,8 +328,10 @@ def test_a_failed_by_book_read_benches_nobody_here():
 
 
 def test_user_scoped_crypto_signal_is_judged_for_its_own_book_only():
+    """Pinned (user_id + book_scoped): the own-book read runs, the
+    by-book walk does not."""
     with _desk(states=THREE_OPEN, coin_veto=None) as (agent, calls):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True))))
     assert v.kind == "approve" and v.payload["user_id"] == "B"
     assert calls.coin_loss_halt == [("XRP", "B")], calls.coin_loss_halt
     assert calls.by_book == [], "a pinned signal never walks the other books"
@@ -329,9 +340,38 @@ def test_user_scoped_crypto_signal_is_judged_for_its_own_book_only():
 def test_user_scoped_crypto_signal_over_its_own_limit_is_vetoed_for_that_book():
     why = "XRP per-coin daily loss limit: down $40 today (limit $30)"
     with _desk(states=THREE_OPEN, coin_veto=why) as (agent, _):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True))))
     assert v.kind == "veto" and v.payload["reason"] == why
     assert v.payload["user_id"] == "B", "the veto must be attributed to the book it judged"
+
+
+def test_provenance_crypto_signal_walks_every_books_bench_not_just_the_origin():
+    """vf:single-book-gates: pattern_detection stamps a bare origin-book
+    user_id on a COIN_MAP watchlist signal and the fan-out sends it to
+    every book. Origin A benched, B and C open -> approve carrying
+    benched_books == ["A"] from the by-book walk; the own-book read
+    (which would have vetoed everyone) never runs."""
+    verdicts = {"A": (True, "XRP per-coin daily loss limit: down $40 today (limit $30)"),
+                "B": (False, ""), "C": (False, "")}
+    with _desk(states=THREE_OPEN, verdicts=verdicts) as (agent, calls):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A"))))
+    assert v.kind == "approve", v.payload
+    assert v.payload.get("benched_books") == ["A"], v.payload
+    assert calls.by_book == ["XRP"], "a provenance stamp must walk every book"
+    assert calls.coin_loss_halt == [], "the own-book read is for pinned signals only"
+
+
+def test_provenance_crypto_signal_with_a_benched_sibling_carries_that_book():
+    """The other half of the same defect: origin A open, sibling B
+    benched. The own-book read would have carried NO benched_books and
+    the fan-out (which trusts that list) would have let B trade."""
+    verdicts = {"A": (False, ""),
+                "B": (True, "XRP per-coin daily loss limit: down $35 today (limit $30)"),
+                "C": (False, "")}
+    with _desk(states=THREE_OPEN, verdicts=verdicts) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A"))))
+    assert v.kind == "approve", v.payload
+    assert v.payload.get("benched_books") == ["B"], v.payload
 
 
 # --- KS-11: None from check_states is 'cannot evaluate' -------------------
@@ -572,15 +612,17 @@ def test_a_failed_book_enumeration_falls_open_to_the_bare_read():
     assert v.kind == "veto" and "below threshold 70" in v.payload["reason"], v.payload
 
 
-# --- user-scoped signals: the kill-switch judges THAT book alone -----------
+# --- PINNED signals: the kill-switch judges THAT book alone ----------------
 # (review 2026-09-01, rv:killswitch-contracts). The all-books rule asks
-# "can ANY book act?" -- right for a shared scanner signal, wrong for a
-# signal raised FOR one book: B's own signal while B is halted and A is
-# open used to be approved.
+# "can ANY book act?" -- right for a signal every book will see, wrong
+# for a signal raised FOR one book: B's own signal while B is halted and
+# A is open used to be approved. "Pinned" means user_id AND book_scoped
+# =True, exactly what trade_execution.on_message pins to one book
+# (vf:single-book-gates) -- these six say so explicitly.
 
 def test_user_scoped_signal_on_a_halted_book_is_vetoed_naming_that_book():
     with _desk(states={"A": _open(), "B": _halt()}, coin_veto=None) as (agent, _):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True))))
     assert v.kind == "veto", v.payload
     assert v.payload["reason"].startswith("Kill-switch [book B]"), v.payload["reason"]
     assert "Daily loss limit" in v.payload["reason"]
@@ -589,13 +631,13 @@ def test_user_scoped_signal_on_a_halted_book_is_vetoed_naming_that_book():
 
 def test_user_scoped_signal_on_an_open_book_ignores_a_halted_neighbour():
     with _desk(states={"A": _halt(), "B": _open()}, coin_veto=None) as (agent, _):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True))))
     assert v.kind == "approve" and v.payload["user_id"] == "B", v.payload
 
 
 def test_user_scoped_signal_at_its_own_daily_dollar_limit_is_vetoed():
     with _desk(states=TWO_OPEN, daily_over={"B"}, coin_veto=None) as (agent, calls):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True))))
     assert v.kind == "veto" and "daily $ loss limit" in v.payload["reason"], v.payload
     assert v.payload["reason"].startswith("Kill-switch [book B]")
     assert calls.daily_dollar_over == 1
@@ -603,7 +645,7 @@ def test_user_scoped_signal_at_its_own_daily_dollar_limit_is_vetoed():
 
 def test_user_scoped_signal_is_not_braked_by_a_neighbours_dollar_limit():
     with _desk(states=TWO_OPEN, daily_over={"A"}, coin_veto=None) as (agent, _):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True))))
     assert v.kind == "approve", v.payload
 
 
@@ -613,19 +655,19 @@ def test_user_scoped_signal_on_a_recovering_book_faces_the_recovery_bump():
     the all-books rule only bumped when EVERY book was recovering."""
     states = {"A": _open(), "B": _recovering()}
     with _desk(states=states, coin_veto=None) as (agent, _):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B", tcs=40))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True, tcs=40))))
     assert v.kind == "veto", v.payload
     assert f"below threshold {35 + ks.RECOVERY_TCS_BUMP}" in v.payload["reason"], v.payload
     assert "weekly recovery" in v.payload["reason"] and "book B" in v.payload["reason"]
     with _desk(states=states, coin_veto=None) as (agent, _):
-        v = _verdict(_run(agent.on_message(_signal(user_id="B", tcs=50))))
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", book_scoped=True, tcs=50))))
     assert v.kind == "approve", v.payload
 
 
 def test_user_scoped_signal_on_a_recovering_book_suspends_speculative_lanes():
     with _desk(states={"A": _open(), "B": _recovering()}, coin_veto=None) as (agent, _):
         v = _verdict(_run(agent.on_message(
-            _signal(user_id="B", strategy="crypto_scalp", tcs=90))))
+            _signal(user_id="B", book_scoped=True, strategy="crypto_scalp", tcs=90))))
     assert v.kind == "veto" and "recovery suspends crypto_scalp" in v.payload["reason"], v.payload
 
 
@@ -634,6 +676,75 @@ def test_a_scanner_signal_still_uses_the_all_books_rule():
     with _desk(states={"A": _halt(), "B": _open()}, verdicts={}) as (agent, _):
         v = _verdict(_run(agent.on_message(_signal())))
     assert v.kind == "approve", v.payload
+
+
+# --- vf:single-book-gates: a BARE user_id is provenance, not a pin ---------
+# pattern_detection stamps payload["user_id"] = <origin book> on every
+# watchlist signal and never sets book_scoped; trade_execution.on_message
+# treats exactly that shape as PROVENANCE (origin_book, fan out to every
+# book) and pins only user_id AND book_scoped. Between 2026-09-01's
+# rv:killswitch-contracts change and this fix the risk gate read the bare
+# user_id as a pin, so the primary hard-halted / over its $ limit vetoed
+# the 25k/75k copies too -- the 2026-08-27 failure class, back for the
+# stock pattern lane. These controls drive the REAL on_message with the
+# producer's exact payload shape.
+
+def test_provenance_user_id_on_a_halted_origin_book_is_not_a_veto():
+    """A: halted origin book, B: open. Bare user_id="A" -> the all-books
+    rule -> approve; the fan-out skips A itself. The provenance stamp
+    still rides the approval so execution can record origin_book."""
+    with _desk(states={"A": _halt(), "B": _open()}, verdicts={}) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A"))))
+    assert v.kind == "approve", v.payload
+    assert v.payload.get("user_id") == "A" and "book_scoped" not in v.payload, v.payload
+
+
+def test_provenance_user_id_on_an_origin_book_over_its_dollar_limit_is_not_a_veto():
+    with _desk(states=TWO_OPEN, daily_over={"A"}, verdicts={}) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A"))))
+    assert v.kind == "approve", v.payload
+
+
+def test_provenance_user_id_on_a_recovering_origin_book_does_not_bump_the_bar():
+    """The pinned rule adds RECOVERY_TCS_BUMP for a recovering book; a
+    provenance-only origin book in recovery must not raise the bar for
+    the copies the open books will take (crypto floor 35, tcs 40), nor
+    suspend a speculative lane for them."""
+    with _desk(states={"A": _recovering(), "B": _open()}, verdicts={}) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A", tcs=40))))
+    assert v.kind == "approve", v.payload
+    with _desk(states={"A": _recovering(), "B": _open()}, verdicts={}) as (agent, _):
+        v = _verdict(_run(agent.on_message(
+            _signal(user_id="A", strategy="crypto_scalp", tcs=90))))
+    assert v.kind == "approve", v.payload
+
+
+def test_provenance_stock_signal_from_a_halted_primary_still_reaches_the_siblings():
+    """The exact 2026-08-27 shape on the stock pattern lane: a
+    pattern_detection signal stamped with the primary's id while the
+    primary is hard-halted and a sibling is open -> approve."""
+    with _desk(states={"A": _halt(), "B": _open()}, pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(_stock(user_id="A"))))
+    assert v.kind == "approve", v.payload
+    assert v.payload.get("user_id") == "A", v.payload
+
+
+def test_provenance_user_id_is_no_free_pass_when_every_book_is_halted():
+    """Provenance falls through to the all-books rule, not past it."""
+    with _desk(states={"A": _halt(), "B": _halt()}, verdicts={}) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A"))))
+    assert v.kind == "veto", v.payload
+    assert v.payload["reason"].startswith("Kill-switch [all books]"), v.payload["reason"]
+
+
+def test_pinned_signal_on_a_halted_book_a_is_vetoed_naming_a():
+    """The pin still binds: user_id="A" WITH book_scoped while A is
+    halted and B is open -> veto naming A, attributed to A."""
+    with _desk(states={"A": _halt(), "B": _open()}, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="A", book_scoped=True))))
+    assert v.kind == "veto", v.payload
+    assert v.payload["reason"].startswith("Kill-switch [book A]"), v.payload["reason"]
+    assert v.payload["user_id"] == "A", v.payload
 
 
 # --- NEQ-05 / G3: no_price_stop gets NO stop geometry -----------------------

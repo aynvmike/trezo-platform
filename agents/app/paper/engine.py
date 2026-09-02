@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.config import get_settings
+from app.paper.no_price_stop import is_no_price_stop as _is_no_price_stop
+from app.paper.no_price_stop import payload_is_no_price_stop as _payload_nps
 
 
 # ---- Configurable parameters ----------------------------------------------
@@ -701,15 +703,50 @@ async def record_external_position(
     # --- weighted-average merge -------------------------------------
     try:
         def _find_open():
+            # vf:no-price-stop-monitor: source_payload (and strategy) ride
+            # along so the boundary check below can read the flag off
+            # the EXISTING row; without them every open row read as
+            # unflagged and the check was built but never bound.
             return (client.table("paper_positions")
                     .select("id, quantity, entry_price, stop_price, "
-                            "target_price, peak_price")
+                            "target_price, peak_price, source_payload, "
+                            "strategy")
                     .eq("user_id", user_id).eq("ticker", ticker.upper())
                     .eq("side", side).eq("status", "open")
                     .order("entry_at", desc=False).limit(1).execute())
         _ex = (await asyncio.to_thread(_find_open)).data or []
     except Exception:  # noqa: BLE001
         _ex = []
+    # vf:no-price-stop-monitor (audit 2026-09-01): the merge keyed on
+    # user/ticker/side/status only and patched quantity/entry/stop/target
+    # onto the EXISTING row, so an ordinary add of the same ticker into a
+    # book holding a flagged no_price_stop ladder row was folded into
+    # that row -- which kept the flag and so IGNORED the add's stop (the
+    # added shares sat unprotected under a flag they never carried) --
+    # and a ladder add into an ordinary row was folded into the unflagged
+    # row and price-managed after all (the lane's contract silently
+    # lost). The flag is a property of the shares' contract, not of the
+    # ticker: when the two sides disagree, this is a DIFFERENT position
+    # and gets its own row. Same predicate the monitor uses.
+    if _ex and (_is_no_price_stop(_ex[0])
+                != _payload_nps(source_payload or {})):
+        try:
+            from app.agents.activity_log import record as _brec
+            _brec("position_merge_refused", ticker.upper(),
+                  strategy=strategy,
+                  reason=("add not merged: the open row and the add "
+                          "disagree on no_price_stop (existing "
+                          f"{'flagged' if _is_no_price_stop(_ex[0]) else 'ordinary'}, "
+                          f"add {'flagged' if _payload_nps(source_payload or {}) else 'ordinary'}) "
+                          "- a screen-managed hold and a price-stopped "
+                          "position are two positions, so this opens "
+                          "its own row"),
+                  extra={"user_id": str(user_id),
+                         "existing_position_id": str(_ex[0].get("id")),
+                         "existing_strategy": str(_ex[0].get("strategy") or "")})
+        except Exception:  # noqa: BLE001
+            pass
+        _ex = []          # fall through to a fresh insert
     if _ex:
         _row = _ex[0]
         try:

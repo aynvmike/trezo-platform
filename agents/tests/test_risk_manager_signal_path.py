@@ -91,6 +91,35 @@ def test_the_kill_switch_gate_still_exists_above_the_bar():
                         f"stay above the confidence bar (line {bar})")
 
 
+def test_the_own_book_kill_switch_branch_requires_book_scoped():
+    """vf:single-book-gates (2026-09-01): the own-book kill-switch branch
+    must key on user_id AND book_scoped -- trade_execution.on_message's
+    pin contract. A bare `elif _sig_uid:` reads pattern_detection's
+    provenance stamp as a pin, so one halted origin book vetoes every
+    sibling's copy (the 2026-08-27 failure class). Static on purpose:
+    the executed counterpart is test_risk_manager_bookkeyed's
+    test_provenance_* controls."""
+    node = _on_message_node()
+    # The branch is the If whose body binds `_who` (the "book <id>" label
+    # every own-book veto carries) and whose test names _sig_uid. The
+    # reason strings are f-strings, so anchor on the binding, not text.
+    own = [n for n in ast.walk(node)
+           if isinstance(n, ast.If)
+           and any(isinstance(m, ast.Name) and m.id == "_who"
+                   and isinstance(m.ctx, ast.Store) for m in ast.walk(n))
+           and any(isinstance(m, ast.Name) and m.id == "_sig_uid"
+                   for m in ast.walk(n.test))]
+    assert own, "the own-book kill-switch branch (Kill-switch [book ...]) vanished"
+    guard = own[-1].test
+    assert isinstance(guard, ast.BoolOp) and isinstance(guard.op, ast.And), (
+        f"line {guard.lineno}: the own-book branch keys on _sig_uid alone -- "
+        f"a provenance-only user_id will be judged as a pin")
+    assert any(isinstance(m, ast.Constant) and m.value == "book_scoped"
+               for m in ast.walk(guard)), (
+        f"line {guard.lineno}: the own-book branch must test "
+        f"payload.get('book_scoped') alongside _sig_uid")
+
+
 def test_compiling_the_module_finds_no_unbound_locals():
     """A cheap belt-and-braces: python -O compiles the file, so a syntax
     regression in this hot path fails the deploy rather than the market."""

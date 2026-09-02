@@ -15,7 +15,10 @@ Rules:
   - Kill-switches: a scanner signal is vetoed only when NO book can take
     it (per-book halts, the user-set daily $ brake and the per-coin bench
     are judged book by book here and enforced again at the fan-out); a
-    USER-SCOPED signal (payload.user_id) is judged for ITS book alone
+    PINNED signal (payload.user_id AND book_scoped=True) is judged for
+    ITS book alone. A bare user_id is PROVENANCE -- which book's scan
+    raised it -- and the fan-out sends that approval to every book, so
+    it takes the all-books rule as well (vf:single-book-gates)
   - Otherwise approve, forwarding strategy + stop/target geometry, with
     stops tightened by the current Adaptive Scope posture. A signal that
     says no_price_stop=True gets NO stop geometry filled in (NEQ-05)
@@ -802,23 +805,39 @@ class RiskManagerAgent(Agent):
             # here (the fan-out fails closed for every book on the same
             # None and is the enforcement point), but never silent.
             _note_kill_switch_unknown(ticker)
-        elif _sig_uid:
-            # USER-SCOPED signal (review 2026-09-01, rv:killswitch-
-            # contracts): judge ONLY this signal's own book. The all-books
-            # branch below asks "can ANY book act?", which is the right
-            # question for a shared scanner signal and the wrong one for
-            # a signal raised FOR one book -- a dividend-ladder buy for
+        elif _sig_uid and message.payload.get("book_scoped"):
+            # PINNED signal (review 2026-09-01, rv:killswitch-contracts):
+            # judge ONLY this signal's own book. The all-books branch
+            # below asks "can ANY book act?", which is the right question
+            # for a signal every book will see and the wrong one for a
+            # signal raised FOR one book -- a dividend-ladder buy for
             # book B while B is hard-halted and A is open used to be
             # approved (and, book_scoped, executed on B). The execution
             # single-book path re-applies the same gate; this is the
             # first line of defence, not the only one.
+            # vf:single-book-gates (2026-09-01): the test is user_id AND
+            # book_scoped -- the SAME contract as trade_execution.
+            # on_message. A bare user_id is PROVENANCE: pattern_detection
+            # stamps its origin book on every watchlist signal and the
+            # fan-out sends that approval to EVERY book (origin_book set,
+            # user_id popped). Judging such a signal here by its origin
+            # book alone re-froze the siblings -- the primary halted or
+            # over its $ limit vetoed the 25k/75k books' copies too (the
+            # 2026-08-27 failure class), and a primary in weekly recovery
+            # raised every book's bar. A provenance-only user_id falls
+            # through to the all-books rule below; its cfg / TCS-floor
+            # read above keeps the origin book's row, as before.
             _st_own = _states.get(str(_sig_uid))
             try:
                 _daily_over_own = await daily_dollar_over(_ks_client)
             except Exception:  # noqa: BLE001
                 _daily_over_own = None
             if _daily_over_own is None:
-                _daily_over_own = set()   # unknown: fail-open-but-logged
+                # unknown: fail-open here (same as the all-books branch);
+                # nothing in this branch logs -- _read_book_brakes records
+                # daily_dollar_limit_unknown at execution (vf:single-book-
+                # gates :820).
+                _daily_over_own = set()
             _who = f"book {str(_sig_uid)[:8]}"
             if _st_own is not None and _st_own.halted and _st_own.mode != "recovery":
                 return [self._veto(
@@ -1128,9 +1147,9 @@ class RiskManagerAgent(Agent):
         else:
             # Per-coin daily loss limit (QW6) - crypto only. Benches a
             # single coin without halting the rest of the book.
-            # BI-04: PER BOOK. A user-scoped signal is judged for its own
-            # book (coin_loss_halt now filters by user_id). A scanner
-            # signal (no user_id) used to be judged on every book's losses
+            # BI-04: PER BOOK. A PINNED signal (user_id + book_scoped) is
+            # judged for its own book (coin_loss_halt filters by user_id).
+            # A shared signal used to be judged on every book's losses
             # summed against one book's budget and vetoed for ALL of them
             # -- the primary's bad morning benched the 75k's coin. Now each
             # book gets its own verdict: veto only when EVERY book is
@@ -1138,7 +1157,18 @@ class RiskManagerAgent(Agent):
             # and let the fan-out skip just those.
             from app.paper.killswitch import (
                 coin_loss_halt, coin_loss_halt_by_book)
-            _coin_uid = message.payload.get("user_id")
+            # vf:single-book-gates (2026-09-01): "own book" means PINNED
+            # -- user_id AND book_scoped -- the same contract as the
+            # kill-switch branch above and trade_execution.on_message.
+            # pattern_detection emits crypto signals (COIN_MAP watchlist
+            # symbols) stamped with a bare origin-book user_id that the
+            # fan-out sends to EVERY book. Reading that stamp as a pin
+            # vetoed every book's copy when the origin book's coin was
+            # benched, and carried NO benched_books when it was not, so
+            # the fan-out (which trusts benched_books) let a benched
+            # sibling trade the coin. A provenance stamp walks every book.
+            _coin_uid = (message.payload.get("user_id")
+                         if message.payload.get("book_scoped") else None)
             if _coin_uid:
                 coin_veto = await coin_loss_halt(
                     _supabase(), ticker, _coin_uid)

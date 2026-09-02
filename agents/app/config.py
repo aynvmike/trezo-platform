@@ -5,7 +5,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # vf:config-web (skeptic, 2026-09-01): env_ignore_empty makes a blank
+    # `KEY=` in agents/.env (or the shell) mean "unset -> code default",
+    # which is what every "blank = not set" note in .env.example has
+    # always promised. Without it pydantic hands a typed field an empty
+    # string, Settings() raises ValidationError, and because
+    # get_settings() runs at import the whole engine -- monitor included,
+    # all three books -- fails to boot on ONE blank line. The live
+    # agents/.env carries no blank values (checked 2026-09-01, key names
+    # only), so nothing changes for it; the trap would have fired the
+    # first time a template line was pasted to "keep it dark".
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore",
+                                      env_ignore_empty=True)
 
     # Crypto confidence floor (Mike 2026-07-23: "lower it to 35 and
     # see what the agents do"). Applied by the crypto scanner AND the
@@ -259,22 +270,27 @@ class Settings(BaseSettings):
     # until they were declared here, `extra="ignore"` (line 8) silently
     # dropped every agents/.env override and the value came from the
     # process env (which never sees .env) -- i.e. always the default.
-    # Defaults copied EXACTLY from reevaluator._TUNABLES and the two
-    # inline reads; typed float because the reader coerces with float()
-    # and the old os.getenv path parsed floats, so "2.5" days must not
-    # become a startup validation error. tcs_rescore is a bool flag.
-    trezo_reeval_cooldown_sec: float = 900
-    trezo_reeval_stale_days: float = 3
-    trezo_reeval_rotate_days: float = 7
-    trezo_reeval_tighten_giveback: float = 0.30
-    trezo_reeval_tighten_band: float = 0.02
-    trezo_reeval_target_far_pct: float = 0.08
-    trezo_reeval_target_reach_band: float = 0.02
-    trezo_reeval_min_bank_profit: float = 0.005
-    trezo_reeval_avgdown_trigger: float = 0.08
-    trezo_reeval_tcs_collapse_frac: float = 0.5
-    trezo_reeval_shadow_far_pct: float = 0.03
-    trezo_reeval_tcs_rescore: bool = True
+    # vf:config-web (skeptic, 2026-09-01): Optional, default None. None
+    # means "the operator said nothing" and both readers (_settings_num /
+    # _settings_flag) fall through to the code default in
+    # reevaluator._TUNABLES and the two inline reads (900, 3, 7, 0.30,
+    # 0.02, 0.08, 0.02, 0.005, 0.08, 0.5, 0.03, rescore True) -- so the
+    # effective knob values are unchanged and each default lives in ONE
+    # place, next to the code that uses it. Typed float because the
+    # reader coerces with float() and "2.5" days must not become a
+    # startup validation error. tcs_rescore is a bool flag.
+    trezo_reeval_cooldown_sec: float | None = None
+    trezo_reeval_stale_days: float | None = None
+    trezo_reeval_rotate_days: float | None = None
+    trezo_reeval_tighten_giveback: float | None = None
+    trezo_reeval_tighten_band: float | None = None
+    trezo_reeval_target_far_pct: float | None = None
+    trezo_reeval_target_reach_band: float | None = None
+    trezo_reeval_min_bank_profit: float | None = None
+    trezo_reeval_avgdown_trigger: float | None = None
+    trezo_reeval_tcs_collapse_frac: float | None = None
+    trezo_reeval_shadow_far_pct: float | None = None
+    trezo_reeval_tcs_rescore: bool | None = None
 
     # ---- Direct-fire option lanes (NEQ-09, audit 2026-09-01) ------------
     # options_scanner._lane_enabled reads these Settings fields FIRST
@@ -283,7 +299,10 @@ class Settings(BaseSettings):
     # to read -- no field here meant getattr returned None and a value in
     # agents/.env was dropped by extra="ignore". Default OFF keeps today's
     # behaviour: the three order-placing lanes stay dark until Mike flips
-    # a switch in agents/.env.
+    # a switch in agents/.env. vf:config-web: these three stay an explicit
+    # `bool = False` (not Optional) -- an order-placing lane's default must
+    # READ as off, and test_options_scanner_bookbound pins exactly that;
+    # a blank TREZO_SPREADS= is boot-safe through env_ignore_empty above.
     trezo_day_options: bool = False
     trezo_spreads: bool = False
     trezo_long_options: bool = False
@@ -295,8 +314,11 @@ class Settings(BaseSettings):
     # A positive value (0-100 scale) is the tcs the lane stamps on its
     # ladder signals, which lets them through the Risk Manager -- turn it
     # on only after NEQ-05 (no_price_stop honoured downstream) is fixed;
-    # that is Mike's call.
-    trezo_dividend_lt_tcs: int = 0
+    # that is Mike's call. Default None (vf:config-web) = "not set":
+    # dividend_lt_agent._lane_tcs reads None as 0, i.e. dark. A value
+    # must EXCEED the book's tcs_threshold (bot_settings, default 70) or
+    # Risk Manager vetoes every ladder signal the switch lets through.
+    trezo_dividend_lt_tcs: int | None = None
 
     # ---- Multi-account (2026-08-09, Mike) -------------------------------
     # Trezo's state layer (positions, pockets, kill-switch, equity) already

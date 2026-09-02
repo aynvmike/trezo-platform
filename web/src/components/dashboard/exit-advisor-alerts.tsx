@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
 import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
+import { LoadError, loadResult } from "./load-error";
 import { TrimDialog } from "./trim-dialog";
 import { OptionsTrimButton } from "./options-trim-button";
 
@@ -60,7 +61,9 @@ const OPTIONS_KINDS = new Set([
  * Each card has a "Dismiss" form that sets acknowledged_at, which is
  * what stops the advisor from re-raising the same alert.
  *
- * Renders nothing when there are no open alerts.
+ * Renders nothing when there are no open alerts. When the books (or the
+ * alerts) could not be READ it renders the LoadError card instead -- a
+ * failed read must never look like "no alerts" (vf:config-web :79).
  */
 export async function ExitAdvisorAlerts() {
   const supabase = createClient();
@@ -77,7 +80,11 @@ export async function ExitAdvisorAlerts() {
   // rv:web-pages sweep: exit_advisor_alerts is keyed by BOOK (0047); an
   // urgent alert on the 75k book must reach the person who owns it.
   const books = await getOwnerBookKeys(supabase, user.id);
-  const { data: rows } = await supabase
+  // vf:config-web :79: a failed trading_accounts read used to fall through
+  // to the NO_BOOK_SENTINEL and this banner rendered EMPTY -- an urgent
+  // alert silently hidden behind a read error. Say "could not load" instead.
+  if (books.failure) return <LoadError {...books.failure} />;
+  const alertsRes = await supabase
     .from("exit_advisor_alerts")
     .select(
       "id, ticker, alert_kind, severity, message, current_price, peak_price, giveback_pct, unrealized_pnl_usd, raised_at, position_id"
@@ -88,8 +95,12 @@ export async function ExitAdvisorAlerts() {
     .order("severity", { ascending: false })
     .order("raised_at", { ascending: false })
     .limit(10);
+  // Same rule for the alerts read itself: `rows ?? []` made a failed
+  // exit_advisor_alerts query indistinguishable from a quiet book.
+  const load = loadResult<Alert[]>("exit_advisor_alerts", alertsRes, []);
+  if (load.failure) return <LoadError {...load.failure} />;
 
-  const alerts = (rows ?? []) as Alert[];
+  const alerts = load.data;
   if (alerts.length === 0) return null;
 
   return (

@@ -2121,6 +2121,63 @@ class OptionsScannerAgent(Agent):
             # card showed nothing). Any broker option with no open row
             # becomes a tracked row -- UI, harvest, settle and realized
             # accounting all see it again.
+            #
+            # vf:truth-sweep (audit 2026-09-01): row_occs above is built
+            # only from options_positions, but the engine's own option
+            # legs live in the LT-05 ledger -- paper_positions rows with
+            # asset_type='option' and ticker = OCC code. A contract that
+            # adoption had already placed there got an options_positions
+            # row from THIS pass on the next 30-min tick, so the "one
+            # contract, two managers" churn the same-sweep reorder ended
+            # kept coming back here. Read this book's open ledger legs
+            # under the binding set at the top of the loop and add them
+            # to the dedupe set, keyed exactly the way row_occs is keyed
+            # (a canonical OCC string). A failed read is ANSWERLESS, not
+            # empty: adopting on a guess is the split-brain being closed,
+            # so the adopt pass is skipped for this book with a log line.
+            # The close/hold pass above has already run and is untouched.
+            def _ledger_open(uid=user_id):
+                return (
+                    client.table("paper_positions")
+                    .select("ticker")
+                    .eq("user_id", uid).eq("status", "open")
+                    .eq("asset_type", "option")
+                    .execute()
+                )
+            try:
+                _lres = await asyncio.to_thread(_ledger_open)
+                _lrows = getattr(_lres, "data", None)
+                if _lrows is None:
+                    raise RuntimeError("ledger read returned no data")
+            except Exception as _le:  # noqa: BLE001
+                try:
+                    from app.agents.activity_log import record as _lrec
+                    _lrec("reconcile_adopt_skipped_unreadable", "ACCOUNT",
+                          reason=("paper_positions option ledger unreadable "
+                                  "-- no contract adopted this tick "
+                                  f"(adopting on a guess is the split-brain "
+                                  f"this dedupe closes): {str(_le)[:120]}"),
+                          extra={"user_id": user_id})
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            for _lr in _lrows:
+                try:
+                    _lt = str(_lr.get("ticker") or "").upper().strip()
+                    if len(_lt) < 16:
+                        continue
+                    _lund, _lymd, _lcp, _lk = (_lt[:-15], _lt[-15:-9],
+                                               _lt[-9], _lt[-8:])
+                    if not (_lund.isalpha() and _lymd.isdigit()
+                            and _lcp in ("C", "P") and _lk.isdigit()):
+                        continue
+                    # Same key row_occs uses: UND + YYMMDD + C/P + 8-digit
+                    # strike*1000 -- re-emitted so a stray pad or case in
+                    # the ledger ticker still collides with the broker OCC.
+                    row_occs.add(f"{_lund}{_lymd}{_lcp}{int(_lk):08d}")
+                except Exception:  # noqa: BLE001
+                    continue
+
             adopted = 0
             for p in broker_options:
                 try:

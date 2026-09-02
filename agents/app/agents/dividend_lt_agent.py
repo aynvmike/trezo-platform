@@ -35,7 +35,12 @@ against the owner's stated intent.
 ACTIVATION SWITCH (TE-06, audit 2026-09-01). Risk Manager forwards only
 signals that carry a `tcs`, and vetoes one without it at TCS 0. This lane
 emits `tcs` ONLY when Settings.trezo_dividend_lt_tcs is > 0 -- i.e. when
-TREZO_DIVIDEND_LT_TCS is set in agents/.env (e.g. TREZO_DIVIDEND_LT_TCS=60).
+TREZO_DIVIDEND_LT_TCS is set in agents/.env (e.g. TREZO_DIVIDEND_LT_TCS=75).
+The value must EXCEED the book's tcs_threshold (bot_settings, default 70,
+plus any recovery/cycle bump): Risk Manager judges the stamped tcs against
+that floor, so a switch set below it (vf:no-price-stop-exec: this example
+used to say 60) lets the lane emit and then vetoes every ladder signal --
+on, yet still dark.
 At the default 0 the signal carries no `tcs` and the lane stays dark, on
 purpose: every ladder signal is `no_price_stop: True`, and that contract
 has to be honoured live by the executor (no default price stop planted)

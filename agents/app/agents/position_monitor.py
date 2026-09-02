@@ -70,35 +70,12 @@ def _utc_now():
     return _d.now(_z.utc)
 
 
-def _is_no_price_stop(row: dict) -> bool:
-    """NEQ-05 / G3: is this row a screen-managed hold with NO price stop?
-
-    True when the row's source_payload carries `no_price_stop` truthy --
-    the dividend ladder's contract (dividend_lt_agent sets it on every
-    signal; the executor writes the payload onto the row). Such a row is
-    held through drawdowns by design: the monitor must not close it on
-    price, ratchet a stop onto it, arm one at the broker, or count it
-    naked. Manual close_requested, external-fill detection and plain
-    bookkeeping are NOT gated by this.
-
-    Reads only the row (jsonb comes back as a dict; a string is parsed
-    defensively). Anything unreadable is NOT flagged: an unflagged row
-    keeps today's price management, which is the conservative side for
-    every lane except the ladder -- and the ladder's rows are written by
-    one executor path with the flag set explicitly. Never raises."""
-    try:
-        sp = row.get("source_payload")
-        if isinstance(sp, str):
-            import json as _json
-            sp = _json.loads(sp)
-        if not isinstance(sp, dict):
-            return False
-        v = sp.get("no_price_stop")
-        if isinstance(v, str):
-            return v.strip().lower() in ("1", "true", "yes", "on")
-        return bool(v)
-    except Exception:  # noqa: BLE001
-        return False
+# NEQ-05 / G3: the predicate itself lives in app.paper.no_price_stop
+# (dependency-free) so the paper engine and book_health bind the SAME
+# reading of the flag as this module -- see that module's docstring
+# (vf:no-price-stop-monitor). Re-exported under its old name: book_health
+# and the guard suites import `_is_no_price_stop` from here.
+from app.paper.no_price_stop import is_no_price_stop as _is_no_price_stop  # noqa: E402
 
 
 async def _pre_break_review() -> None:
@@ -1597,770 +1574,787 @@ class PositionMonitorAgent(Agent):
                     price_cache[key] = p
             return price_cache.get(key)
 
-        for r in rows:
-            # Bind THIS row's book before any broker action. Exits are
-            # routed per position, and an exit for one book executed on
-            # another would close the wrong position AND leave the right
-            # one open. Set inline rather than `with`: the body is ~500
-            # lines and re-indenting live exit code is the riskier edit.
-            if _pm_skip_unresolved(str(r.get("user_id") or "")):
-                continue          # unknown book: never act on the primary
-            _pm_set_account(str(r.get("user_id") or ""))
-            # Route guard (8/11): an exit on the wrong account would close
-            # a stranger's position AND leave the real one open. Verify the
-            # binding actually took before any broker action on this row.
-            try:
-                from app.brokers.route_guard import (
-                    check_route as _pm_check, record_mismatch as _pm_mm)
-                _rok, _rnote = _pm_check(str(r.get("user_id") or ""))
-                if not _rok:
-                    _pm_mm(str(r.get("ticker") or "?"),
-                           str(r.get("user_id") or ""), _rnote, "monitor")
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-            tk = r["ticker"]
-            at = r["asset_type"]
-            # NEQ-05 / G3: decided ONCE per row, consulted at every price-
-            # management site below. True = a screen-managed hold (the
-            # dividend ladder): no stop/target close, no trail or ladder
-            # ratchet, no broker stop, no naked check, no reeval. Manual
-            # close_requested and external-fill detection still run.
-            _nps = _is_no_price_stop(r)
-            # Broker truth for THIS book -- not for whichever account
-            # happened to be bound first. Cached per book for the tick.
-            if r.get("broker") == "alpaca":
-                alpaca_held = await book_scope.held_symbols(
-                    str(r.get("user_id") or ""), where="monitor")
-            else:
-                alpaca_held = None
+        # Bind per row, clear once the loop is done -- on EVERY path.
+        # REVIEW position_monitor.py:28/:1545 (2026-09-01) cleared it after
+        # the loop and claimed a raised tick could not leak the binding
+        # because 'asyncio.wait_for copies the context'. On this box's
+        # Python 3.12 that is false (wait_for no longer wraps the
+        # coroutine in a Task); the guarantee only held because
+        # APScheduler's AsyncIOExecutor happens to create a task per job
+        # run, and the manual run path (main.py, `await state.impl.tick()`
+        # inside the request handler) kept the last row's book bound for
+        # the rest of that request when a row raised. try/finally makes
+        # the clear independent of who calls tick() and how
+        # (vf:no-price-stop-monitor; body re-indented, unchanged).
+        try:
+            for r in rows:
+                # Bind THIS row's book before any broker action. Exits are
+                # routed per position, and an exit for one book executed on
+                # another would close the wrong position AND leave the right
+                # one open. Set inline rather than `with`: the body is ~500
+                # lines and re-indenting live exit code is the riskier edit.
+                if _pm_skip_unresolved(str(r.get("user_id") or "")):
+                    continue          # unknown book: never act on the primary
+                _pm_set_account(str(r.get("user_id") or ""))
+                # Route guard (8/11): an exit on the wrong account would close
+                # a stranger's position AND leave the real one open. Verify the
+                # binding actually took before any broker action on this row.
+                try:
+                    from app.brokers.route_guard import (
+                        check_route as _pm_check, record_mismatch as _pm_mm)
+                    _rok, _rnote = _pm_check(str(r.get("user_id") or ""))
+                    if not _rok:
+                        _pm_mm(str(r.get("ticker") or "?"),
+                               str(r.get("user_id") or ""), _rnote, "monitor")
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                tk = r["ticker"]
+                at = r["asset_type"]
+                # NEQ-05 / G3: decided ONCE per row, consulted at every price-
+                # management site below. True = a screen-managed hold (the
+                # dividend ladder): no stop/target close, no trail or ladder
+                # ratchet, no broker stop, no naked check, no reeval. Manual
+                # close_requested and external-fill detection still run.
+                _nps = _is_no_price_stop(r)
+                # Broker truth for THIS book -- not for whichever account
+                # happened to be bound first. Cached per book for the tick.
+                if r.get("broker") == "alpaca":
+                    alpaca_held = await book_scope.held_symbols(
+                        str(r.get("user_id") or ""), where="monitor")
+                else:
+                    alpaca_held = None
 
-            # --- Alpaca-routed positions (Phase 8b / 8g) -------------------
-            if r.get("broker") == "alpaca":
-                # --- Crypto exits (Task #10 fix, 2026-06-11) ---------------
-                # Alpaca crypto has NO native bracket order, so stops and
-                # targets are enforced client-side right here -- exactly
-                # what Trade Execution's docstring promises. Membership
-                # checks need pair variants because Alpaca reports crypto
-                # as 'BTCUSD'/'BTC/USD' while Trezo rows store 'BTC';
-                # without that, every crypto row phantom-closes on tick 1
-                # while Alpaca keeps holding the coins.
-                if at == "crypto":
-                    from app.brokers.alpaca import (
-                        crypto_symbol_variants,
-                        liquidate_position,
-                    )
-                    if (alpaca_held is not None
-                            and not (crypto_symbol_variants(tk)
-                                     & alpaca_held)):
-                        # Genuinely gone at the broker -> reconcile books.
+                # --- Alpaca-routed positions (Phase 8b / 8g) -------------------
+                if r.get("broker") == "alpaca":
+                    # --- Crypto exits (Task #10 fix, 2026-06-11) ---------------
+                    # Alpaca crypto has NO native bracket order, so stops and
+                    # targets are enforced client-side right here -- exactly
+                    # what Trade Execution's docstring promises. Membership
+                    # checks need pair variants because Alpaca reports crypto
+                    # as 'BTCUSD'/'BTC/USD' while Trezo rows store 'BTC';
+                    # without that, every crypto row phantom-closes on tick 1
+                    # while Alpaca keeps holding the coins.
+                    if at == "crypto":
+                        from app.brokers.alpaca import (
+                            crypto_symbol_variants,
+                            liquidate_position,
+                        )
+                        if (alpaca_held is not None
+                                and not (crypto_symbol_variants(tk)
+                                         & alpaca_held)):
+                            # Genuinely gone at the broker -> reconcile books.
+                            price_c = await _price(tk, at)
+                            if price_c is not None:
+                                from app.paper.engine import record_external_close
+                                # PH-3: name the reason. Left to the default
+                                # this row was booked as 'alpaca_bracket' --
+                                # a bracket crypto cannot have at Alpaca --
+                                # while the bus message said alpaca_external.
+                                fill = await record_external_close(
+                                    r["user_id"], r["id"], price_c,
+                                    reason="alpaca_external")
+                                if fill.ok:
+                                    alpaca_reconciled += 1
+                                    affected_users.add(r["user_id"])
+                                    out.append(AgentMessage(
+                                        agent=self.name, kind="close",
+                                        confidence=1.0,
+                                        payload={
+                                            "user_id": r["user_id"],
+                                            "ticker": tk,
+                                            "side": r["side"],
+                                            "reason": "alpaca_external",
+                                            "exit_price": fill.fill_price,
+                                            "realized_pnl_usd": fill.realized_pnl_usd,
+                                            "position_id": r["id"],
+                                            "broker": "alpaca",
+                                        }))
+                            continue
                         price_c = await _price(tk, at)
-                        if price_c is not None:
-                            from app.paper.engine import record_external_close
-                            # PH-3: name the reason. Left to the default
-                            # this row was booked as 'alpaca_bracket' --
-                            # a bracket crypto cannot have at Alpaca --
-                            # while the bus message said alpaca_external.
-                            fill = await record_external_close(
-                                r["user_id"], r["id"], price_c,
-                                reason="alpaca_external")
-                            if fill.ok:
-                                alpaca_reconciled += 1
-                                affected_users.add(r["user_id"])
-                                out.append(AgentMessage(
-                                    agent=self.name, kind="close",
-                                    confidence=1.0,
-                                    payload={
-                                        "user_id": r["user_id"],
-                                        "ticker": tk,
-                                        "side": r["side"],
-                                        "reason": "alpaca_external",
-                                        "exit_price": fill.fill_price,
-                                        "realized_pnl_usd": fill.realized_pnl_usd,
-                                        "position_id": r["id"],
-                                        "broker": "alpaca",
-                                    }))
-                        continue
-                    price_c = await _price(tk, at)
-                    if price_c is None:
-                        alpaca_managed += 1
-                        continue
-                    stop_c = (float(r["stop_price"])
-                              if r.get("stop_price") else None)
-                    target_c = (float(r["target_price"])
-                                if r.get("target_price") else None)
-                    # Crypto trail-to-lock for Alpaca-routed rows (Part 2/2b):
-                    # HODL ratchets a trailing stop up (no target, keeps
-                    # holding); SWING keeps its target but step-ladders the
-                    # stop up to lock return-on-capital on the way there.
-                    _strat_a = (r.get("strategy") or "").lower()
-                    # 2026-08-17: this was an if/elif chain, and a chain is
-                    # how crypto DCA ended up with ladder rungs but no trail
-                    # between them -- the continuous trail was hand-wired to
-                    # SWING and later SCALP, and DCA was simply never added.
-                    # DCA's first rung is +3% against a ~6% target, so every
-                    # gain under +3% round-tripped by construction. That is
-                    # the XRP giveback. Each strategy now DECLARES what it
-                    # wants (asset_policy.TRAIL_POLICIES) and this reads it,
-                    # so a new strategy cannot be silently left out.
-                    _tp = _trail_policy(_strat_a)
-                    if _nps:
-                        # NEQ-05: no trail, no ladder, no breakeven arm on
-                        # a screen-managed hold -- every branch below
-                        # writes a price stop onto the row and the venue.
-                        pass
-                    elif r["side"] == "long" and "hodl" in _strat_a:
-                        # A HODL is meant to ride: its own +40%/20% trail and
-                        # the catastrophe stop, deliberately no giveback trail.
-                        _t = await _maybe_trail_hodl(r, price_c)
-                        if _t is not None:
-                            stop_c = _t
-                    elif r["side"] == "long" and "swing" in _strat_a:
-                        from app.strategies.crypto import SWING_PROFIT_LADDER
-                        _tl = await _maybe_ladder_stop(r, price_c, SWING_PROFIT_LADDER)
-                        if _tl is not None:
-                            stop_c = _tl
-                        # Mike 2026-07-16 (the ETH 33%-giveback alert):
-                        # between ladder rungs the giveback could eat most
-                        # of a run. The CONTINUOUS profit-lock trail from
-                        # the stock side now ratchets crypto stops too --
-                        # locks (1 - 30%) of the peak gain, never lowers,
-                        # so a pullback still books ~70% of the best gain.
-                        _tt = await _maybe_trail_stock_profit(r, price_c)
-                        if _tt is not None and (stop_c is None or _tt > stop_c):
-                            stop_c = _tt
-                    elif r["side"] == "long" and "dca" in _strat_a:
-                        from app.strategies.crypto import DCA_PROFIT_LADDER
-                        _td = await _maybe_ladder_stop(r, price_c, DCA_PROFIT_LADDER)
-                        if _td is not None:
-                            stop_c = _td
-                        # The missing half of the DCA rules (8/17 audit).
-                        if _tp.continuous_trail:
-                            _tdt = await _maybe_trail_stock_profit(
+                        if price_c is None:
+                            alpaca_managed += 1
+                            continue
+                        stop_c = (float(r["stop_price"])
+                                  if r.get("stop_price") else None)
+                        target_c = (float(r["target_price"])
+                                    if r.get("target_price") else None)
+                        # Crypto trail-to-lock for Alpaca-routed rows (Part 2/2b):
+                        # HODL ratchets a trailing stop up (no target, keeps
+                        # holding); SWING keeps its target but step-ladders the
+                        # stop up to lock return-on-capital on the way there.
+                        _strat_a = (r.get("strategy") or "").lower()
+                        # 2026-08-17: this was an if/elif chain, and a chain is
+                        # how crypto DCA ended up with ladder rungs but no trail
+                        # between them -- the continuous trail was hand-wired to
+                        # SWING and later SCALP, and DCA was simply never added.
+                        # DCA's first rung is +3% against a ~6% target, so every
+                        # gain under +3% round-tripped by construction. That is
+                        # the XRP giveback. Each strategy now DECLARES what it
+                        # wants (asset_policy.TRAIL_POLICIES) and this reads it,
+                        # so a new strategy cannot be silently left out.
+                        _tp = _trail_policy(_strat_a)
+                        if _nps:
+                            # NEQ-05: no trail, no ladder, no breakeven arm on
+                            # a screen-managed hold -- every branch below
+                            # writes a price stop onto the row and the venue.
+                            pass
+                        elif r["side"] == "long" and "hodl" in _strat_a:
+                            # A HODL is meant to ride: its own +40%/20% trail and
+                            # the catastrophe stop, deliberately no giveback trail.
+                            _t = await _maybe_trail_hodl(r, price_c)
+                            if _t is not None:
+                                stop_c = _t
+                        elif r["side"] == "long" and "swing" in _strat_a:
+                            from app.strategies.crypto import SWING_PROFIT_LADDER
+                            _tl = await _maybe_ladder_stop(r, price_c, SWING_PROFIT_LADDER)
+                            if _tl is not None:
+                                stop_c = _tl
+                            # Mike 2026-07-16 (the ETH 33%-giveback alert):
+                            # between ladder rungs the giveback could eat most
+                            # of a run. The CONTINUOUS profit-lock trail from
+                            # the stock side now ratchets crypto stops too --
+                            # locks (1 - 30%) of the peak gain, never lowers,
+                            # so a pullback still books ~70% of the best gain.
+                            _tt = await _maybe_trail_stock_profit(r, price_c)
+                            if _tt is not None and (stop_c is None or _tt > stop_c):
+                                stop_c = _tt
+                        elif r["side"] == "long" and "dca" in _strat_a:
+                            from app.strategies.crypto import DCA_PROFIT_LADDER
+                            _td = await _maybe_ladder_stop(r, price_c, DCA_PROFIT_LADDER)
+                            if _td is not None:
+                                stop_c = _td
+                            # The missing half of the DCA rules (8/17 audit).
+                            if _tp.continuous_trail:
+                                _tdt = await _maybe_trail_stock_profit(
+                                    r, price_c, min_gain=_tp.trail_arm_gain)
+                                if _tdt is not None and (stop_c is None or _tdt > stop_c):
+                                    stop_c = _tdt
+                        elif r["side"] == "long" and "scalp" in _strat_a:
+                            # EXIT REPAIR, 2026-08-05. Scalps had NO trail at all --
+                            # only the net-edge auto-exit below, which closed them
+                            # the instant a gain covered round-trip cost. Mike's
+                            # stated intent for that level was the opposite: "it was
+                            # supposed to protect it from a loss not to take a win
+                            # at that rate under 1 percent."
+                            #
+                            # So the level now ARMS BREAKEVEN and the position is
+                            # given the same 30%-giveback profit trail swings
+                            # already use. Order of precedence is Mike's: trail
+                            # first, net-edge last and only as protection.
+                            try:
+                                from app.strategies.crypto import (
+                                    clears_fee_edge as _cfe0)
+                                from app.paper.engine import (
+                                    CRYPTO_COMMISSION_BPS as _F0, SLIPPAGE_BPS as _S0)
+                                _e0 = float(r.get("entry_price") or 0)
+                                if _e0 > 0:
+                                    _g0 = (price_c - _e0) / _e0
+                                    if _cfe0(_g0, _F0, _S0) and (
+                                            stop_c is None or _e0 > stop_c):
+                                        stop_c = _e0     # breakeven: cannot lose now
+                            except Exception:  # noqa: BLE001
+                                pass
+                            _ts = await _maybe_trail_stock_profit(
+                                r, price_c, min_gain=SCALP_TRAIL_MIN_GAIN)
+                            if _ts is not None and (stop_c is None or _ts > stop_c):
+                                stop_c = _ts
+                        elif r["side"] == "long" and _tp.continuous_trail:
+                            # Anything not named above -- a new crypto strategy,
+                            # a hand-tagged row, a reconciled import -- still
+                            # gets the shared profit trail instead of nothing.
+                            _tg = await _maybe_trail_stock_profit(
                                 r, price_c, min_gain=_tp.trail_arm_gain)
-                            if _tdt is not None and (stop_c is None or _tdt > stop_c):
-                                stop_c = _tdt
-                    elif r["side"] == "long" and "scalp" in _strat_a:
-                        # EXIT REPAIR, 2026-08-05. Scalps had NO trail at all --
-                        # only the net-edge auto-exit below, which closed them
-                        # the instant a gain covered round-trip cost. Mike's
-                        # stated intent for that level was the opposite: "it was
-                        # supposed to protect it from a loss not to take a win
-                        # at that rate under 1 percent."
-                        #
-                        # So the level now ARMS BREAKEVEN and the position is
-                        # given the same 30%-giveback profit trail swings
-                        # already use. Order of precedence is Mike's: trail
-                        # first, net-edge last and only as protection.
-                        try:
-                            from app.strategies.crypto import (
-                                clears_fee_edge as _cfe0)
-                            from app.paper.engine import (
-                                CRYPTO_COMMISSION_BPS as _F0, SLIPPAGE_BPS as _S0)
-                            _e0 = float(r.get("entry_price") or 0)
-                            if _e0 > 0:
-                                _g0 = (price_c - _e0) / _e0
-                                if _cfe0(_g0, _F0, _S0) and (
-                                        stop_c is None or _e0 > stop_c):
-                                    stop_c = _e0     # breakeven: cannot lose now
-                        except Exception:  # noqa: BLE001
-                            pass
-                        _ts = await _maybe_trail_stock_profit(
-                            r, price_c, min_gain=SCALP_TRAIL_MIN_GAIN)
-                        if _ts is not None and (stop_c is None or _ts > stop_c):
-                            stop_c = _ts
-                    elif r["side"] == "long" and _tp.continuous_trail:
-                        # Anything not named above -- a new crypto strategy,
-                        # a hand-tagged row, a reconciled import -- still
-                        # gets the shared profit trail instead of nothing.
-                        _tg = await _maybe_trail_stock_profit(
-                            r, price_c, min_gain=_tp.trail_arm_gain)
-                        if _tg is not None and (stop_c is None or _tg > stop_c):
-                            stop_c = _tg
-                    reason_c: str | None = None
-                    if r.get("close_requested"):
-                        reason_c = "manual"
-                    elif _nps:
-                        pass   # NEQ-05: no stop/target close on this row
-                    elif r["side"] == "long":
-                        if stop_c is not None and price_c <= stop_c:
-                            reason_c = "stop"
-                        elif target_c is not None and price_c >= target_c:
-                            reason_c = "target"
-                    else:
-                        if stop_c is not None and price_c >= stop_c:
-                            reason_c = "stop"
-                        elif target_c is not None and price_c <= target_c:
-                            reason_c = "target"
-                    # Scalp net-edge auto-exit (Mike 2026-06-15): fast/quick plays take
-                    # profit once they clear round-trip cost + the 0.01% net floor.
-                    # SCALP only; HODL/SWING/DCA keep their ladders.
-                    # RETIRED 2026-08-05. This closed a scalp the moment its
-                    # gain covered round-trip cost -- 0.63% against a 1.8%
-                    # stop, a geometry of 1:0.35 AGAINST, needing a 74% win
-                    # rate to break even while the lane ran at 34%. The cost
-                    # work (Harris) showed it sat BELOW its own cost bar in
-                    # the friendliest market and closed at a loss outright in
-                    # a thin one. Breakeven-arming plus the trail replaces it
-                    # above. Set TREZO_SCALP_NET_EDGE_EXIT=1 to restore the
-                    # old behaviour instantly if this proves wrong.
-                    if (reason_c is None and "scalp" in _strat_a
-                            and os.getenv("TREZO_SCALP_NET_EDGE_EXIT", "0") == "1"):
-                        try:
-                            from app.strategies.crypto import clears_fee_edge as _cfe2
-                            from app.paper.engine import (
-                                CRYPTO_COMMISSION_BPS as _FEE2, SLIPPAGE_BPS as _SLIP2,
-                            )
-                            _ec = float(r.get("entry_price") or 0)
-                            if _ec > 0:
-                                _g = ((price_c - _ec) / _ec if r["side"] == "long"
-                                    else (_ec - price_c) / _ec)
-                                if _cfe2(_g, _FEE2, _SLIP2):
-                                    reason_c = "scalp_net_edge"
-                        except Exception:
-                            pass
-                    # Step-profit ladder for CRYPTO (2026-08-17). Broker-
-                    # routed crypto reached none of this: the only step
-                    # call sat further down behind `at == "stock"`, so a
-                    # coin could run the whole way to its target and bank
-                    # nothing on the way. Same ladder, same env knobs, same
-                    # daily-goal nudge -- sized by the asset policy, which
-                    # knows coins are fractional and the venue never shuts.
-                    if (reason_c is None and r["side"] == "long"
-                            and not _nps          # NEQ-05: no profit ladder
-                            and os.getenv("TREZO_PROFIT_STEP_CRYPTO", "1") != "0"
-                            and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
-                        try:
-                            _ec = float(r.get("entry_price") or 0)
-                            _tc = float(r.get("target_price") or 0)
-                            _qc = float(r.get("quantity") or 0)
-                            _polc = _asset_policy(at)
-                            if (_ec > 0 and _tc > _ec and price_c > _ec
-                                    and _polc.can_step(_qc)):
-                                _runc = (price_c - _ec) / (_tc - _ec)
-                                _at0c, _fracc = _step_profile(_ec * _qc)
-                                _okc, _nc = await _step_check(
-                                    str(r.get("id")), r.get("user_id"),
-                                    _runc, at0_override=_at0c)
-                                if _okc:
-                                    _stepped_c, _notec = await _alpaca_profit_step(
-                                        r, price_c, frac=_fracc)
-                                    _notec = f"step {_nc + 1}: {_notec}"
-                                    if _stepped_c:
-                                        _step_mark(str(r.get("id")))
-                                        affected_users.add(r["user_id"])
-                                        out.append(AgentMessage(
-                                            agent=self.name, kind="info",
-                                            payload={
-                                                "user_id": r["user_id"],
-                                                "ticker": tk,
-                                                "note": f"Profit step: {_notec}",
-                                                "position_id": r["id"],
-                                                "broker": "alpaca",
-                                            }))
-                                    try:
-                                        from app.agents.activity_log import record as _arecc
-                                        _arecc("profit_step" if _stepped_c
-                                               else "profit_step_abort", tk,
-                                               strategy=(r.get("strategy") or ""),
-                                               reason=_notec,
-                                               extra={"user_id": str(r.get("user_id")),
-                                                      "broker": "alpaca"})
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                    if _stepped_c:
-                                        continue
-                        except Exception:  # noqa: BLE001
-                            pass
+                            if _tg is not None and (stop_c is None or _tg > stop_c):
+                                stop_c = _tg
+                        reason_c: str | None = None
+                        if r.get("close_requested"):
+                            reason_c = "manual"
+                        elif _nps:
+                            pass   # NEQ-05: no stop/target close on this row
+                        elif r["side"] == "long":
+                            if stop_c is not None and price_c <= stop_c:
+                                reason_c = "stop"
+                            elif target_c is not None and price_c >= target_c:
+                                reason_c = "target"
+                        else:
+                            if stop_c is not None and price_c >= stop_c:
+                                reason_c = "stop"
+                            elif target_c is not None and price_c <= target_c:
+                                reason_c = "target"
+                        # Scalp net-edge auto-exit (Mike 2026-06-15): fast/quick plays take
+                        # profit once they clear round-trip cost + the 0.01% net floor.
+                        # SCALP only; HODL/SWING/DCA keep their ladders.
+                        # RETIRED 2026-08-05. This closed a scalp the moment its
+                        # gain covered round-trip cost -- 0.63% against a 1.8%
+                        # stop, a geometry of 1:0.35 AGAINST, needing a 74% win
+                        # rate to break even while the lane ran at 34%. The cost
+                        # work (Harris) showed it sat BELOW its own cost bar in
+                        # the friendliest market and closed at a loss outright in
+                        # a thin one. Breakeven-arming plus the trail replaces it
+                        # above. Set TREZO_SCALP_NET_EDGE_EXIT=1 to restore the
+                        # old behaviour instantly if this proves wrong.
+                        if (reason_c is None and "scalp" in _strat_a
+                                and os.getenv("TREZO_SCALP_NET_EDGE_EXIT", "0") == "1"):
+                            try:
+                                from app.strategies.crypto import clears_fee_edge as _cfe2
+                                from app.paper.engine import (
+                                    CRYPTO_COMMISSION_BPS as _FEE2, SLIPPAGE_BPS as _SLIP2,
+                                )
+                                _ec = float(r.get("entry_price") or 0)
+                                if _ec > 0:
+                                    _g = ((price_c - _ec) / _ec if r["side"] == "long"
+                                        else (_ec - price_c) / _ec)
+                                    if _cfe2(_g, _FEE2, _SLIP2):
+                                        reason_c = "scalp_net_edge"
+                            except Exception:
+                                pass
+                        # Step-profit ladder for CRYPTO (2026-08-17). Broker-
+                        # routed crypto reached none of this: the only step
+                        # call sat further down behind `at == "stock"`, so a
+                        # coin could run the whole way to its target and bank
+                        # nothing on the way. Same ladder, same env knobs, same
+                        # daily-goal nudge -- sized by the asset policy, which
+                        # knows coins are fractional and the venue never shuts.
+                        if (reason_c is None and r["side"] == "long"
+                                and not _nps          # NEQ-05: no profit ladder
+                                and os.getenv("TREZO_PROFIT_STEP_CRYPTO", "1") != "0"
+                                and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
+                            try:
+                                _ec = float(r.get("entry_price") or 0)
+                                _tc = float(r.get("target_price") or 0)
+                                _qc = float(r.get("quantity") or 0)
+                                _polc = _asset_policy(at)
+                                if (_ec > 0 and _tc > _ec and price_c > _ec
+                                        and _polc.can_step(_qc)):
+                                    _runc = (price_c - _ec) / (_tc - _ec)
+                                    _at0c, _fracc = _step_profile(_ec * _qc)
+                                    _okc, _nc = await _step_check(
+                                        str(r.get("id")), r.get("user_id"),
+                                        _runc, at0_override=_at0c)
+                                    if _okc:
+                                        _stepped_c, _notec = await _alpaca_profit_step(
+                                            r, price_c, frac=_fracc)
+                                        _notec = f"step {_nc + 1}: {_notec}"
+                                        if _stepped_c:
+                                            _step_mark(str(r.get("id")))
+                                            affected_users.add(r["user_id"])
+                                            out.append(AgentMessage(
+                                                agent=self.name, kind="info",
+                                                payload={
+                                                    "user_id": r["user_id"],
+                                                    "ticker": tk,
+                                                    "note": f"Profit step: {_notec}",
+                                                    "position_id": r["id"],
+                                                    "broker": "alpaca",
+                                                }))
+                                        try:
+                                            from app.agents.activity_log import record as _arecc
+                                            _arecc("profit_step" if _stepped_c
+                                                   else "profit_step_abort", tk,
+                                                   strategy=(r.get("strategy") or ""),
+                                                   reason=_notec,
+                                                   extra={"user_id": str(r.get("user_id")),
+                                                          "broker": "alpaca"})
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                                        if _stepped_c:
+                                            continue
+                            except Exception:  # noqa: BLE001
+                                pass
 
-                    if reason_c is None:
-                        # Holding. Make sure the venue is holding this
-                        # row's protection, so it still works if this
-                        # process is not here next tick.
-                        #
-                        # 2026-08-19: the stop arming lives HERE as well
-                        # as in the stock branch. Mirroring a crypto stop
-                        # used to happen only from the ratchet sites, so
-                        # a coin whose stop had not moved never reached
-                        # the venue -- protection for the positions
-                        # already doing well, and nothing for the rest.
-                        #
-                        # NEQ-05: not for a no_price_stop row -- arming
-                        # here is exactly the price stop it must not have.
-                        if not _nps:
-                            await _arm_broker_stop(r)
-                            await _push_crypto_tp(r, target_c)
-                        alpaca_managed += 1
-                        continue
-                    _liq, _cstat = await _throttled_liquidate(
-                        tk, asset_type="crypto",
-                        user_id=r.get("user_id"))     # BI-05: this book's slot
-                    if _cstat in ("throttled", "circuit_open"):
-                        alpaca_managed += 1
-                        continue
-                    liq_err = _cstat[6:] if _cstat.startswith("error:") else None
-                    if liq_err:
-                        # Leave the row open and retry next tick. NEVER
-                        # close the Trezo row while Alpaca may still be
-                        # holding the coins (Gap 2 lesson).
-                        out.append(AgentMessage(
-                            agent=self.name, kind="error",
-                            payload={
-                                "user_id": r["user_id"], "ticker": tk,
-                                "error": (
-                                    f"crypto {reason_c} exit: Alpaca "
-                                    f"liquidate failed: {liq_err}"),
-                                "position_id": r["id"],
-                                "broker": "alpaca",
-                            }))
-                        continue
-                    fill = await close_position(
-                        r["user_id"], r["id"], price_c, reason=reason_c)
-                    if fill.ok:
-                        affected_users.add(r["user_id"])
-                        out.append(AgentMessage(
-                            agent=self.name, kind="close", confidence=1.0,
-                            payload={
-                                "user_id": r["user_id"], "ticker": tk,
-                                "side": r["side"], "reason": reason_c,
-                                "exit_price": fill.fill_price,
-                                "realized_pnl_usd": fill.realized_pnl_usd,
-                                "position_id": r["id"],
-                                "broker": "alpaca",
-                            }))
-                    continue
-                if alpaca_held is not None and tk.upper() not in alpaca_held:
-                    # Fresh-row grace (2026-06-12: at the open, WMT/GM/
-                    # CSCO/SOFI were "closed" 6-60s after submission --
-                    # the order had not FILLED yet, so the positions API
-                    # did not list the symbol and this branch phantom-
-                    # closed the row; the fill then landed and the shares
-                    # sat orphaned until the 30-min reconcile re-imported
-                    # them WITHOUT their strategy tags). A just-submitted
-                    # order needs time to appear: skip reconcile-close
-                    # for rows younger than 5 minutes.
-                    if _minutes_since(r.get("entry_at")) < 5.0:
-                        alpaca_managed += 1
-                        continue
-                    # Alpaca's bracket order closed it - reconcile our books.
-                    price = await _price(tk, at)
-                    if price is not None:
-                        from app.paper.engine import record_external_close
-                        fill = await record_external_close(r["user_id"], r["id"], price)
+                        if reason_c is None:
+                            # Holding. Make sure the venue is holding this
+                            # row's protection, so it still works if this
+                            # process is not here next tick.
+                            #
+                            # 2026-08-19: the stop arming lives HERE as well
+                            # as in the stock branch. Mirroring a crypto stop
+                            # used to happen only from the ratchet sites, so
+                            # a coin whose stop had not moved never reached
+                            # the venue -- protection for the positions
+                            # already doing well, and nothing for the rest.
+                            #
+                            # NEQ-05: not for a no_price_stop row -- arming
+                            # here is exactly the price stop it must not have.
+                            if not _nps:
+                                await _arm_broker_stop(r)
+                                await _push_crypto_tp(r, target_c)
+                            alpaca_managed += 1
+                            continue
+                        _liq, _cstat = await _throttled_liquidate(
+                            tk, asset_type="crypto",
+                            user_id=r.get("user_id"))     # BI-05: this book's slot
+                        if _cstat in ("throttled", "circuit_open"):
+                            alpaca_managed += 1
+                            continue
+                        liq_err = _cstat[6:] if _cstat.startswith("error:") else None
+                        if liq_err:
+                            # Leave the row open and retry next tick. NEVER
+                            # close the Trezo row while Alpaca may still be
+                            # holding the coins (Gap 2 lesson).
+                            out.append(AgentMessage(
+                                agent=self.name, kind="error",
+                                payload={
+                                    "user_id": r["user_id"], "ticker": tk,
+                                    "error": (
+                                        f"crypto {reason_c} exit: Alpaca "
+                                        f"liquidate failed: {liq_err}"),
+                                    "position_id": r["id"],
+                                    "broker": "alpaca",
+                                }))
+                            continue
+                        fill = await close_position(
+                            r["user_id"], r["id"], price_c, reason=reason_c)
                         if fill.ok:
-                            alpaca_reconciled += 1
                             affected_users.add(r["user_id"])
                             out.append(AgentMessage(
                                 agent=self.name, kind="close", confidence=1.0,
                                 payload={
                                     "user_id": r["user_id"], "ticker": tk,
-                                    "side": r["side"], "reason": "alpaca_bracket",
+                                    "side": r["side"], "reason": reason_c,
                                     "exit_price": fill.fill_price,
                                     "realized_pnl_usd": fill.realized_pnl_usd,
-                                    "position_id": r["id"], "broker": "alpaca",
+                                    "position_id": r["id"],
+                                    "broker": "alpaca",
                                 }))
-                else:
-                    # Swing time stop (Phase 10c): an Extended position
-                    # held past its multi-day window is closed at market
-                    # on Alpaca; the next tick reconciles the Trezo row
-                    # once Alpaca drops the symbol from its open set.
-                    strat_a = (r.get("strategy") or "").lower()
-                    held_days = _minutes_since(r.get("entry_at")) / 1440.0
-
-                    # Gap 1 fix (2026-06-11, Task #8): intraday time stops
-                    # MUST apply to Alpaca-routed rows too. Previously these
-                    # rules only ran in the internal-paper branch, so
-                    # Alpaca-routed STMS/ORB positions could ride past
-                    # their max-hold and 3:45 force-exit windows.
-                    if strat_a.startswith("stms") or strat_a.startswith("orb"):
-                        price_a = await _price(tk, at)
-                        stop_a = float(r["stop_price"]) if r.get("stop_price") else None
-                        if price_a is not None:
-                            ts_reason, ts_detail = _decide_time_stop(
-                                r, r["side"], price_a, stop_a,
-                            )
-                            if ts_reason:
-                                _liq, _liq_st = await _throttled_liquidate(
-                                    tk, user_id=r.get("user_id"))   # BI-05
-                                if _liq_st in ("throttled", "circuit_open"):
-                                    continue
-                                liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
+                        continue
+                    if alpaca_held is not None and tk.upper() not in alpaca_held:
+                        # Fresh-row grace (2026-06-12: at the open, WMT/GM/
+                        # CSCO/SOFI were "closed" 6-60s after submission --
+                        # the order had not FILLED yet, so the positions API
+                        # did not list the symbol and this branch phantom-
+                        # closed the row; the fill then landed and the shares
+                        # sat orphaned until the 30-min reconcile re-imported
+                        # them WITHOUT their strategy tags). A just-submitted
+                        # order needs time to appear: skip reconcile-close
+                        # for rows younger than 5 minutes.
+                        if _minutes_since(r.get("entry_at")) < 5.0:
+                            alpaca_managed += 1
+                            continue
+                        # Alpaca's bracket order closed it - reconcile our books.
+                        price = await _price(tk, at)
+                        if price is not None:
+                            from app.paper.engine import record_external_close
+                            fill = await record_external_close(r["user_id"], r["id"], price)
+                            if fill.ok:
+                                alpaca_reconciled += 1
+                                affected_users.add(r["user_id"])
                                 out.append(AgentMessage(
-                                    agent=self.name, kind="info",
-                                    payload={
-                                        "user_id": r["user_id"],
-                                        "ticker": tk,
-                                        "note": (
-                                            f"Intraday time stop ({ts_detail}) - "
-                                            f"Alpaca position closed at market"
-                                            + (f" (error: {liq_err})" if liq_err else "")
-                                        ),
-                                        "position_id": r["id"],
-                                        "broker": "alpaca",
-                                        "reason": ts_detail,
-                                    }))
-                                # Skip the rest for this row; next tick
-                                # reconciles the Trezo row once Alpaca
-                                # drops it from open positions.
-                                continue
-
-                    # Profit stepping for Alpaca-held stock longs (Mike
-                    # 2026-07-02: partial selling controls drawdown). The
-                    # broker-side twin of the modeled stepping: cancel legs
-                    # -> sell slice -> OCO re-protect, verified at each step.
-                    # 2026-08-17: was `at == "stock"` -- true by accident of
-                    # history, not by decision, and the reason crypto never
-                    # banked a slice. The registry answers now, so options,
-                    # futures, bonds and a 401k sleeve each get the behaviour
-                    # someone actually chose for them.
-                    _pol2 = _asset_policy(at)
-                    if (os.getenv("TREZO_PROFIT_STEP_ALPACA", "1") != "0"
-                            and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"
-                            and _pol2.supports_partial_step
-                            and not _nps          # NEQ-05: no profit ladder
-                            and r["side"] == "long"):
-                        try:
-                            _e2 = float(r.get("entry_price") or 0)
-                            _t2 = float(r.get("target_price") or 0)
-                            _q2 = float(r.get("quantity") or 0)
-                            if _e2 > 0 and _t2 > _e2 and _pol2.can_step(_q2):
-                                price_ps = await _price(tk, at)
-                                _run2 = ((price_ps - _e2) / (_t2 - _e2)
-                                         if price_ps is not None else -1.0)
-                                _at02, _frac2 = _step_profile(_e2 * _q2)
-                                _ok2, _n2 = (await _step_check(
-                                    str(r.get("id")), r.get("user_id"), _run2,
-                                    at0_override=_at02)
-                                    if price_ps is not None and price_ps > _e2
-                                    else (False, 0))
-                                if _ok2:
-                                    stepped, note = await _alpaca_profit_step(
-                                        r, price_ps, frac=_frac2)
-                                    note = f"step {_n2 + 1}: {note}"
-                                    if stepped:
-                                        _step_mark(str(r.get("id")))
-                                        affected_users.add(r["user_id"])
-                                        out.append(AgentMessage(
-                                            agent=self.name, kind="info",
-                                            payload={
-                                                "user_id": r["user_id"],
-                                                "ticker": tk,
-                                                "note": f"Profit step: {note}",
-                                                "position_id": r["id"],
-                                                "broker": "alpaca",
-                                            }))
-                                    try:
-                                        from app.agents.activity_log import record as _arec
-                                        _arec("profit_step" if stepped else "profit_step_abort",
-                                              tk, strategy=(r.get("strategy") or ""),
-                                              reason=note,
-                                              extra={"user_id": str(r.get("user_id")),
-                                                     "broker": "alpaca"})
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                    if stepped:
-                                        continue
-                        except Exception:  # noqa: BLE001
-                            pass
-
-                    # Extended trailing step-ladder (crypto Part 2b ext,
-                    # 2026-06-13): lock return-on-capital as a stock swing
-                    # runs. Ratchet the stop up by the ladder; if price has
-                    # fallen back to the locked stop, close at market (cancel
-                    # legs first) -- the same client-side liquidation pattern
-                    # the time stops use, so it works on Alpaca-routed rows
-                    # whose real stop lives in the broker bracket.
-                    if strat_a.startswith("extended"):
-                        price_x = await _price(tk, at)
-                        if price_x is not None:
-                            from app.strategies.crypto import EXTENDED_PROFIT_LADDER
-                            await _maybe_ladder_stop(r, price_x, EXTENDED_PROFIT_LADDER)
-                            _xstop = float(r["stop_price"]) if r.get("stop_price") else None
-                            if _xstop is not None and price_x <= _xstop:
-                                _xliq, _x_st = await _throttled_liquidate(
-                                    tk, user_id=r.get("user_id"))   # BI-05
-                                if _x_st in ("throttled", "circuit_open"):
-                                    continue
-                                _xerr = _x_st[6:] if _x_st.startswith("error:") else None
-                                out.append(AgentMessage(
-                                    agent=self.name, kind="info",
+                                    agent=self.name, kind="close", confidence=1.0,
                                     payload={
                                         "user_id": r["user_id"], "ticker": tk,
-                                        "note": ("Extended trailing-lock stop hit - "
-                                                 "Alpaca position closed at market"
-                                                 + (f" (error: {_xerr})" if _xerr else "")),
+                                        "side": r["side"], "reason": "alpaca_bracket",
+                                        "exit_price": fill.fill_price,
+                                        "realized_pnl_usd": fill.realized_pnl_usd,
                                         "position_id": r["id"], "broker": "alpaca",
-                                        "reason": "trail_lock",
                                     }))
-                                continue
-
-                    if strat_a.startswith("extended") and held_days >= SWING_MAX_HOLD_DAYS:
-                        _liq, _liq_st = await _throttled_liquidate(
-                            tk, user_id=r.get("user_id"))           # BI-05
-                        if _liq_st in ("throttled", "circuit_open"):
-                            continue
-                        liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
-                        out.append(AgentMessage(
-                            agent=self.name, kind="info",
-                            payload={"user_id": r["user_id"], "ticker": tk,
-                                     "note": ("Extended swing time stop - Alpaca "
-                                              "position closed at market"
-                                              + (f" (error: {liq_err})" if liq_err else "")),
-                                     "position_id": r["id"], "broker": "alpaca"}))
                     else:
-                        alpaca_managed += 1
-                        # Naked-position alert (2026-06-11 PM). A day-TIF
-                        # bracket's exit legs expire at the close, so a
-                        # stock row that survives into the next session
-                        # has NO stop and NO target at the broker (live
-                        # case: AAPL). Alert-only -- auto-selling here
-                        # could double-sell against legs that DO exist.
-                        #
-                        # NEQ-05: a no_price_stop row is SUPPOSED to rest
-                        # at the broker with no exit legs. Arming a stop
-                        # (ensure_stock_protection) and the naked check's
-                        # orphan stop/target enforcement are both price
-                        # management this row does not get.
-                        if at == "stock" and not _nps:
-                            _armed = await _arm_broker_stop(r)
-                            if _armed:
-                                out.append(AgentMessage(
-                                    agent=self.name, kind="info",
-                                    payload={"user_id": r["user_id"],
-                                             "ticker": tk,
-                                             "position_id": r["id"],
-                                             "broker": "alpaca",
-                                             "event": "broker_stop_armed",
-                                             "note": f"{tk}: {_armed}"}))
-                            note = await _naked_position_check(tk, r)
-                            if note is not None:
-                                _enforced = False
-                                _pn = await _price(tk, at)
-                                _sp = float(r["stop_price"]) if r.get("stop_price") else None
-                                _tp = float(r["target_price"]) if r.get("target_price") else None
-                                _hit = None
-                                if _pn is not None:
-                                    if r["side"] == "long":
-                                        if _sp is not None and _pn <= _sp:
-                                            _hit = "stop"
-                                        elif _tp is not None and _pn >= _tp:
-                                            _hit = "target"
-                                    else:
-                                        if _sp is not None and _pn >= _sp:
-                                            _hit = "stop"
-                                        elif _tp is not None and _pn <= _tp:
-                                            _hit = "target"
-                                if _hit is not None:
-                                    _ol, _ost = await _throttled_liquidate(
+                        # Swing time stop (Phase 10c): an Extended position
+                        # held past its multi-day window is closed at market
+                        # on Alpaca; the next tick reconciles the Trezo row
+                        # once Alpaca drops the symbol from its open set.
+                        strat_a = (r.get("strategy") or "").lower()
+                        held_days = _minutes_since(r.get("entry_at")) / 1440.0
+
+                        # Gap 1 fix (2026-06-11, Task #8): intraday time stops
+                        # MUST apply to Alpaca-routed rows too. Previously these
+                        # rules only ran in the internal-paper branch, so
+                        # Alpaca-routed STMS/ORB positions could ride past
+                        # their max-hold and 3:45 force-exit windows.
+                        if strat_a.startswith("stms") or strat_a.startswith("orb"):
+                            price_a = await _price(tk, at)
+                            stop_a = float(r["stop_price"]) if r.get("stop_price") else None
+                            if price_a is not None:
+                                ts_reason, ts_detail = _decide_time_stop(
+                                    r, r["side"], price_a, stop_a,
+                                )
+                                if ts_reason:
+                                    _liq, _liq_st = await _throttled_liquidate(
                                         tk, user_id=r.get("user_id"))   # BI-05
-                                    if _ost == "ok":
-                                        _enforced = True
-                                        out.append(AgentMessage(
-                                            agent=self.name, kind="info",
-                                            payload={"user_id": r["user_id"], "ticker": tk,
-                                                "note": (f"Orphan/naked {_hit} hit - enforced "
-                                                         f"exit at market (was unmanaged)."),
-                                                "position_id": r["id"], "broker": "alpaca",
-                                                "reason": f"orphan_{_hit}"}))
-                                if not _enforced:
+                                    if _liq_st in ("throttled", "circuit_open"):
+                                        continue
+                                    liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
                                     out.append(AgentMessage(
-                                        agent=self.name, kind="error",
-                                        payload=note))
-                continue
+                                        agent=self.name, kind="info",
+                                        payload={
+                                            "user_id": r["user_id"],
+                                            "ticker": tk,
+                                            "note": (
+                                                f"Intraday time stop ({ts_detail}) - "
+                                                f"Alpaca position closed at market"
+                                                + (f" (error: {liq_err})" if liq_err else "")
+                                            ),
+                                            "position_id": r["id"],
+                                            "broker": "alpaca",
+                                            "reason": ts_detail,
+                                        }))
+                                    # Skip the rest for this row; next tick
+                                    # reconciles the Trezo row once Alpaca
+                                    # drops it from open positions.
+                                    continue
 
-            # --- Internal paper positions ----------------------------------
-            price = await _price(tk, at)
-            if price is None:
-                continue
+                        # Profit stepping for Alpaca-held stock longs (Mike
+                        # 2026-07-02: partial selling controls drawdown). The
+                        # broker-side twin of the modeled stepping: cancel legs
+                        # -> sell slice -> OCO re-protect, verified at each step.
+                        # 2026-08-17: was `at == "stock"` -- true by accident of
+                        # history, not by decision, and the reason crypto never
+                        # banked a slice. The registry answers now, so options,
+                        # futures, bonds and a 401k sleeve each get the behaviour
+                        # someone actually chose for them.
+                        _pol2 = _asset_policy(at)
+                        if (os.getenv("TREZO_PROFIT_STEP_ALPACA", "1") != "0"
+                                and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"
+                                and _pol2.supports_partial_step
+                                and not _nps          # NEQ-05: no profit ladder
+                                and r["side"] == "long"):
+                            try:
+                                _e2 = float(r.get("entry_price") or 0)
+                                _t2 = float(r.get("target_price") or 0)
+                                _q2 = float(r.get("quantity") or 0)
+                                if _e2 > 0 and _t2 > _e2 and _pol2.can_step(_q2):
+                                    price_ps = await _price(tk, at)
+                                    _run2 = ((price_ps - _e2) / (_t2 - _e2)
+                                             if price_ps is not None else -1.0)
+                                    _at02, _frac2 = _step_profile(_e2 * _q2)
+                                    _ok2, _n2 = (await _step_check(
+                                        str(r.get("id")), r.get("user_id"), _run2,
+                                        at0_override=_at02)
+                                        if price_ps is not None and price_ps > _e2
+                                        else (False, 0))
+                                    if _ok2:
+                                        stepped, note = await _alpaca_profit_step(
+                                            r, price_ps, frac=_frac2)
+                                        note = f"step {_n2 + 1}: {note}"
+                                        if stepped:
+                                            _step_mark(str(r.get("id")))
+                                            affected_users.add(r["user_id"])
+                                            out.append(AgentMessage(
+                                                agent=self.name, kind="info",
+                                                payload={
+                                                    "user_id": r["user_id"],
+                                                    "ticker": tk,
+                                                    "note": f"Profit step: {note}",
+                                                    "position_id": r["id"],
+                                                    "broker": "alpaca",
+                                                }))
+                                        try:
+                                            from app.agents.activity_log import record as _arec
+                                            _arec("profit_step" if stepped else "profit_step_abort",
+                                                  tk, strategy=(r.get("strategy") or ""),
+                                                  reason=note,
+                                                  extra={"user_id": str(r.get("user_id")),
+                                                         "broker": "alpaca"})
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                                        if stepped:
+                                            continue
+                            except Exception:  # noqa: BLE001
+                                pass
 
-            side   = r["side"]
-            stop   = float(r["stop_price"]) if r.get("stop_price") else None
-            target = float(r["target_price"]) if r.get("target_price") else None
-            # Restored 2026-06-11 PM: the morning _decide_time_stop refactor
-            # lifted the old `strat = ...` assignment out of this loop but a
-            # reference survived at the swing-stop check below -> NameError
-            # on EVERY tick that reached an internal row. Position Monitor
-            # crash-looped from 10:33 AM ET (found via GET /agents
-            # last_error="name 'strat' is not defined").
-            strat  = (r.get("strategy") or "").lower()
+                        # Extended trailing step-ladder (crypto Part 2b ext,
+                        # 2026-06-13): lock return-on-capital as a stock swing
+                        # runs. Ratchet the stop up by the ladder; if price has
+                        # fallen back to the locked stop, close at market (cancel
+                        # legs first) -- the same client-side liquidation pattern
+                        # the time stops use, so it works on Alpaca-routed rows
+                        # whose real stop lives in the broker bracket.
+                        #
+                        # vf:no-price-stop-monitor: gated by the FLAG, not only
+                        # by the strategy name -- a no_price_stop row is never
+                        # laddered or trail-locked, whatever it is called
+                        # (the merge used to be able to hand this branch a
+                        # flagged row under an ordinary strategy label).
+                        if strat_a.startswith("extended") and not _nps:
+                            price_x = await _price(tk, at)
+                            if price_x is not None:
+                                from app.strategies.crypto import EXTENDED_PROFIT_LADDER
+                                await _maybe_ladder_stop(r, price_x, EXTENDED_PROFIT_LADDER)
+                                _xstop = float(r["stop_price"]) if r.get("stop_price") else None
+                                if _xstop is not None and price_x <= _xstop:
+                                    _xliq, _x_st = await _throttled_liquidate(
+                                        tk, user_id=r.get("user_id"))   # BI-05
+                                    if _x_st in ("throttled", "circuit_open"):
+                                        continue
+                                    _xerr = _x_st[6:] if _x_st.startswith("error:") else None
+                                    out.append(AgentMessage(
+                                        agent=self.name, kind="info",
+                                        payload={
+                                            "user_id": r["user_id"], "ticker": tk,
+                                            "note": ("Extended trailing-lock stop hit - "
+                                                     "Alpaca position closed at market"
+                                                     + (f" (error: {_xerr})" if _xerr else "")),
+                                            "position_id": r["id"], "broker": "alpaca",
+                                            "reason": "trail_lock",
+                                        }))
+                                    continue
 
-            # Crypto trail-to-lock (crypto Part 2 / 2b, 2026-06-13):
-            #  - HODL: ratchet a trailing stop UP after a big run; no target,
-            #    so it keeps holding -- only the trailed stop or a manual
-            #    close exits.
-            #  - SWING: a defined trade, so it keeps its fixed target but
-            #    step-ladders the stop up to lock return-on-capital in stages,
-            #    so a reversal before the target still banks most of the gain.
-            if at == "crypto" and side == "long" and not _nps:   # NEQ-05
-                if "hodl" in strat:
-                    _trail = await _maybe_trail_hodl(r, price)
-                    if _trail is not None:
-                        stop = _trail
-                elif "swing" in strat:
-                    from app.strategies.crypto import SWING_PROFIT_LADDER
-                    _lad = await _maybe_ladder_stop(r, price, SWING_PROFIT_LADDER)
-                    if _lad is not None:
-                        stop = _lad
-                elif "dca" in strat:
-                    from app.strategies.crypto import DCA_PROFIT_LADDER
-                    _ld = await _maybe_ladder_stop(r, price, DCA_PROFIT_LADDER)
-                    if _ld is not None:
-                        stop = _ld
+                        # vf:no-price-stop-monitor: same for the swing time stop --
+                        # a market liquidation of a screen-managed hold is an
+                        # exit the lane did not ask for.
+                        if (strat_a.startswith("extended") and not _nps
+                                and held_days >= SWING_MAX_HOLD_DAYS):
+                            _liq, _liq_st = await _throttled_liquidate(
+                                tk, user_id=r.get("user_id"))           # BI-05
+                            if _liq_st in ("throttled", "circuit_open"):
+                                continue
+                            liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
+                            out.append(AgentMessage(
+                                agent=self.name, kind="info",
+                                payload={"user_id": r["user_id"], "ticker": tk,
+                                         "note": ("Extended swing time stop - Alpaca "
+                                                  "position closed at market"
+                                                  + (f" (error: {liq_err})" if liq_err else "")),
+                                         "position_id": r["id"], "broker": "alpaca"}))
+                        else:
+                            alpaca_managed += 1
+                            # Naked-position alert (2026-06-11 PM). A day-TIF
+                            # bracket's exit legs expire at the close, so a
+                            # stock row that survives into the next session
+                            # has NO stop and NO target at the broker (live
+                            # case: AAPL). Alert-only -- auto-selling here
+                            # could double-sell against legs that DO exist.
+                            #
+                            # NEQ-05: a no_price_stop row is SUPPOSED to rest
+                            # at the broker with no exit legs. Arming a stop
+                            # (ensure_stock_protection) and the naked check's
+                            # orphan stop/target enforcement are both price
+                            # management this row does not get.
+                            if at == "stock" and not _nps:
+                                _armed = await _arm_broker_stop(r)
+                                if _armed:
+                                    out.append(AgentMessage(
+                                        agent=self.name, kind="info",
+                                        payload={"user_id": r["user_id"],
+                                                 "ticker": tk,
+                                                 "position_id": r["id"],
+                                                 "broker": "alpaca",
+                                                 "event": "broker_stop_armed",
+                                                 "note": f"{tk}: {_armed}"}))
+                                note = await _naked_position_check(tk, r)
+                                if note is not None:
+                                    _enforced = False
+                                    _pn = await _price(tk, at)
+                                    _sp = float(r["stop_price"]) if r.get("stop_price") else None
+                                    _tp = float(r["target_price"]) if r.get("target_price") else None
+                                    _hit = None
+                                    if _pn is not None:
+                                        if r["side"] == "long":
+                                            if _sp is not None and _pn <= _sp:
+                                                _hit = "stop"
+                                            elif _tp is not None and _pn >= _tp:
+                                                _hit = "target"
+                                        else:
+                                            if _sp is not None and _pn >= _sp:
+                                                _hit = "stop"
+                                            elif _tp is not None and _pn <= _tp:
+                                                _hit = "target"
+                                    if _hit is not None:
+                                        _ol, _ost = await _throttled_liquidate(
+                                            tk, user_id=r.get("user_id"))   # BI-05
+                                        if _ost == "ok":
+                                            _enforced = True
+                                            out.append(AgentMessage(
+                                                agent=self.name, kind="info",
+                                                payload={"user_id": r["user_id"], "ticker": tk,
+                                                    "note": (f"Orphan/naked {_hit} hit - enforced "
+                                                             f"exit at market (was unmanaged)."),
+                                                    "position_id": r["id"], "broker": "alpaca",
+                                                    "reason": f"orphan_{_hit}"}))
+                                    if not _enforced:
+                                        out.append(AgentMessage(
+                                            agent=self.name, kind="error",
+                                            payload=note))
+                    continue
 
-            if (at == "stock" and side in ("long", "short") and STOCK_TRAIL_ENABLED
-                    and not _nps):                               # NEQ-05
-                _strail = await _maybe_trail_stock_profit(r, price)
-                if _strail is not None:
-                    stop = _strail
+                # --- Internal paper positions ----------------------------------
+                price = await _price(tk, at)
+                if price is None:
+                    continue
 
-            # Continuous re-evaluation (Mike 6/29). Re-judges this position
-            # with the shared capability library and actively manages it
-            # (tighten stop / lower target / rotate / advise add).
-            # 2026-08-22: this comment used to say "Master-flagged OFF, so
-            # this is a no-op until enabled -- live behavior is unchanged
-            # today." That has been FALSE since the flag was flipped:
-            # TREZO_REEVAL_ENABLED=true in production, so this path is LIVE
-            # and 395 lines of reevaluator.py are actively managing open
-            # positions. Anyone reading the old note would have believed
-            # otherwise while debugging a moved stop.
-            # NEQ-05: the reevaluator tightens stops, lowers targets and
-            # closes on a TCS collapse -- all price management. It does
-            # not see a no_price_stop row at all (belt to its own
-            # strategy-prefix exemption's braces).
-            reeval_close: str | None = None
-            if reeval_is_enabled() and not _nps:
-                try:
-                    _rv = await reevaluate_position(
-                        r, price, side, at, strat, stop, target,
-                        emit=out, agent_name="reevaluator",
-                    )
-                    if _rv:
-                        if _rv.get("stop") is not None:
-                            stop = _rv["stop"]
-                        if _rv.get("target") is not None:
-                            target = _rv["target"]
-                        reeval_close = _rv.get("close")
-                except Exception as _re:  # noqa: BLE001
-                    out.append(AgentMessage(agent=self.name, kind="info",
-                               payload={"note": f"reeval error: {str(_re)[:120]}"}))
+                side   = r["side"]
+                stop   = float(r["stop_price"]) if r.get("stop_price") else None
+                target = float(r["target_price"]) if r.get("target_price") else None
+                # Restored 2026-06-11 PM: the morning _decide_time_stop refactor
+                # lifted the old `strat = ...` assignment out of this loop but a
+                # reference survived at the swing-stop check below -> NameError
+                # on EVERY tick that reached an internal row. Position Monitor
+                # crash-looped from 10:33 AM ET (found via GET /agents
+                # last_error="name 'strat' is not defined").
+                strat  = (r.get("strategy") or "").lower()
 
-            close_reason: str | None = None
-            close_detail = ""
-            # QW1: an explicit user close request takes priority.
-            if r.get("close_requested"):
-                close_reason, close_detail = "manual", "manual_close"
-            elif reeval_close:
-                close_reason, close_detail = "reeval", reeval_close
-            # NEQ-05: no stop/target close on a screen-managed hold; the
-            # manual branch above still applies to it.
-            if close_reason is None and not _nps:
-                if side == "long":
-                    if stop is not None and price <= stop:
-                        close_reason = "stop"
-                        try:
-                            _e = float(r.get("entry_price") or 0)
-                            if at == "stock" and _e and stop > _e:
-                                close_detail = "profit_lock"
-                        except (TypeError, ValueError):
-                            pass
-                    elif target is not None and price >= target:
-                        close_reason = "target"
-                else:  # short
-                    if stop is not None and price >= stop:
-                        close_reason = "stop"
-                        try:
-                            _e = float(r.get("entry_price") or 0)
-                            if at == "stock" and _e and stop < _e:
-                                close_detail = "profit_lock"
-                        except (TypeError, ValueError):
-                            pass
-                    elif target is not None and price <= target:
-                        close_reason = "target"
+                # Crypto trail-to-lock (crypto Part 2 / 2b, 2026-06-13):
+                #  - HODL: ratchet a trailing stop UP after a big run; no target,
+                #    so it keeps holding -- only the trailed stop or a manual
+                #    close exits.
+                #  - SWING: a defined trade, so it keeps its fixed target but
+                #    step-ladders the stop up to lock return-on-capital in stages,
+                #    so a reversal before the target still banks most of the gain.
+                if at == "crypto" and side == "long" and not _nps:   # NEQ-05
+                    if "hodl" in strat:
+                        _trail = await _maybe_trail_hodl(r, price)
+                        if _trail is not None:
+                            stop = _trail
+                    elif "swing" in strat:
+                        from app.strategies.crypto import SWING_PROFIT_LADDER
+                        _lad = await _maybe_ladder_stop(r, price, SWING_PROFIT_LADDER)
+                        if _lad is not None:
+                            stop = _lad
+                    elif "dca" in strat:
+                        from app.strategies.crypto import DCA_PROFIT_LADDER
+                        _ld = await _maybe_ladder_stop(r, price, DCA_PROFIT_LADDER)
+                        if _ld is not None:
+                            stop = _ld
 
-            # Day-trade management (Phase 8e) for intraday strategies.
-            # Logic lives in _decide_time_stop() so both this branch and
-            # the Alpaca branch (Gap 1 fix, Task #8) share the same rules.
-            if not close_reason:
-                ts_reason, ts_detail = _decide_time_stop(r, side, price, stop)
-                if ts_reason:
-                    close_reason, close_detail = ts_reason, ts_detail
+                if (at == "stock" and side in ("long", "short") and STOCK_TRAIL_ENABLED
+                        and not _nps):                               # NEQ-05
+                    _strail = await _maybe_trail_stock_profit(r, price)
+                    if _strail is not None:
+                        stop = _strail
 
-            # Multi-day time stop for swing strategies (Phase 10c).
-            # Extended positions are held across sessions, then closed
-            # once they pass their swing window (~5 trading days).
-            if not close_reason and strat.startswith("extended"):
-                if _minutes_since(r.get("entry_at")) / 1440.0 >= SWING_MAX_HOLD_DAYS:
-                    close_reason, close_detail = "time", "swing_time_stop"
+                # Continuous re-evaluation (Mike 6/29). Re-judges this position
+                # with the shared capability library and actively manages it
+                # (tighten stop / lower target / rotate / advise add).
+                # 2026-08-22: this comment used to say "Master-flagged OFF, so
+                # this is a no-op until enabled -- live behavior is unchanged
+                # today." That has been FALSE since the flag was flipped:
+                # TREZO_REEVAL_ENABLED=true in production, so this path is LIVE
+                # and 395 lines of reevaluator.py are actively managing open
+                # positions. Anyone reading the old note would have believed
+                # otherwise while debugging a moved stop.
+                # NEQ-05: the reevaluator tightens stops, lowers targets and
+                # closes on a TCS collapse -- all price management. It does
+                # not see a no_price_stop row at all (belt to its own
+                # strategy-prefix exemption's braces).
+                reeval_close: str | None = None
+                if reeval_is_enabled() and not _nps:
+                    try:
+                        _rv = await reevaluate_position(
+                            r, price, side, at, strat, stop, target,
+                            emit=out, agent_name="reevaluator",
+                        )
+                        if _rv:
+                            if _rv.get("stop") is not None:
+                                stop = _rv["stop"]
+                            if _rv.get("target") is not None:
+                                target = _rv["target"]
+                            reeval_close = _rv.get("close")
+                    except Exception as _re:  # noqa: BLE001
+                        out.append(AgentMessage(agent=self.name, kind="info",
+                                   payload={"note": f"reeval error: {str(_re)[:120]}"}))
 
-            # Profit stepping (Mike 2026-07-02): bank HALF once the move
-            # has covered most of the trip to target; the rest rides the
-            # trail. Modeled rows only in v1 -- Alpaca partials must
-            # renegotiate bracket legs first (queued, cancel-legs lesson
-            # 6/12). Tunables: TREZO_PROFIT_STEP_ENABLED / _AT / _FRACTION.
-            if (close_reason is None and side == "long"
-                    and r.get("broker") != "alpaca"
-                    and not _nps                  # NEQ-05: no profit ladder
-                    and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
-                try:
-                    _e = float(r.get("entry_price") or 0)
-                    _q = float(r.get("quantity") or 0)
-                    _big_enough = _asset_policy(at).can_step(_q)
-                    if (_e > 0 and _q > 0 and _big_enough
-                            and target is not None and float(target) > _e):
-                        _run = (price - _e) / (float(target) - _e)
-                        _at0, _frac = _step_profile(_e * _q)
-                        _ok_step, _n_prev = await _step_check(
-                            str(r.get("id")), r.get("user_id"), _run,
-                            at0_override=_at0)
-                        if _ok_step:
-                            from app.paper.engine import close_partial_position
-                            _pf = await close_partial_position(
-                                r["user_id"], r["id"], _frac, price,
-                                reason="profit_step")
-                            if _pf.ok:
-                                _step_mark(str(r.get("id")))
-                                affected_users.add(r["user_id"])
-                                try:
-                                    from app.agents.activity_log import record as _arec
-                                    _arec("profit_step", tk, strategy=strat,
-                                          reason=(f"step {_n_prev + 1}: banked "
-                                                  f"{_frac * 100:.0f}% of remaining at "
-                                                  f"{_run * 100:.0f}% of the run to "
-                                                  f"target (${_pf.realized_pnl_usd:+.2f}); "
-                                                  f"rest rides on"),
-                                          extra={"user_id": str(r.get("user_id"))})
-                                except Exception:  # noqa: BLE001
-                                    pass
-                except Exception:  # noqa: BLE001
-                    pass
+                close_reason: str | None = None
+                close_detail = ""
+                # QW1: an explicit user close request takes priority.
+                if r.get("close_requested"):
+                    close_reason, close_detail = "manual", "manual_close"
+                elif reeval_close:
+                    close_reason, close_detail = "reeval", reeval_close
+                # NEQ-05: no stop/target close on a screen-managed hold; the
+                # manual branch above still applies to it.
+                if close_reason is None and not _nps:
+                    if side == "long":
+                        if stop is not None and price <= stop:
+                            close_reason = "stop"
+                            try:
+                                _e = float(r.get("entry_price") or 0)
+                                if at == "stock" and _e and stop > _e:
+                                    close_detail = "profit_lock"
+                            except (TypeError, ValueError):
+                                pass
+                        elif target is not None and price >= target:
+                            close_reason = "target"
+                    else:  # short
+                        if stop is not None and price >= stop:
+                            close_reason = "stop"
+                            try:
+                                _e = float(r.get("entry_price") or 0)
+                                if at == "stock" and _e and stop < _e:
+                                    close_detail = "profit_lock"
+                            except (TypeError, ValueError):
+                                pass
+                        elif target is not None and price <= target:
+                            close_reason = "target"
 
-            if close_reason:
-                fill = await close_position(r["user_id"], r["id"], price, reason=close_reason)
-                if fill.ok:
-                    affected_users.add(r["user_id"])
-                    out.append(AgentMessage(
-                        agent=self.name,
-                        kind="close",
-                        confidence=1.0,
-                        payload={
-                            "user_id": r["user_id"],
-                            "ticker": tk,
-                            "side": side,
-                            "reason": close_detail or close_reason,
-                            "exit_price": fill.fill_price,
-                            "realized_pnl_usd": fill.realized_pnl_usd,
-                            "position_id": r["id"],
-                        },
-                    ))
+                # Day-trade management (Phase 8e) for intraday strategies.
+                # Logic lives in _decide_time_stop() so both this branch and
+                # the Alpaca branch (Gap 1 fix, Task #8) share the same rules.
+                if not close_reason:
+                    ts_reason, ts_detail = _decide_time_stop(r, side, price, stop)
+                    if ts_reason:
+                        close_reason, close_detail = ts_reason, ts_detail
 
-        # REVIEW position_monitor.py:28/:1545 (2026-09-01): the inline
-        # per-row binding left the LAST row's book set after the loop.
-        # Clear it here, as set_account_for_user's contract asks. Not a
-        # try/finally around the loop: an exception leaves tick() at once
-        # and the scheduler runs each tick in its own task (asyncio.wait_for
-        # copies the context), so a binding cannot outlive a raised tick;
-        # re-indenting 700 lines of live exit code buys nothing for that.
-        _pm_clear_account()
+                # Multi-day time stop for swing strategies (Phase 10c).
+                # Extended positions are held across sessions, then closed
+                # once they pass their swing window (~5 trading days).
+                if not close_reason and strat.startswith("extended"):
+                    if _minutes_since(r.get("entry_at")) / 1440.0 >= SWING_MAX_HOLD_DAYS:
+                        close_reason, close_detail = "time", "swing_time_stop"
+
+                # Profit stepping (Mike 2026-07-02): bank HALF once the move
+                # has covered most of the trip to target; the rest rides the
+                # trail. Modeled rows only in v1 -- Alpaca partials must
+                # renegotiate bracket legs first (queued, cancel-legs lesson
+                # 6/12). Tunables: TREZO_PROFIT_STEP_ENABLED / _AT / _FRACTION.
+                if (close_reason is None and side == "long"
+                        and r.get("broker") != "alpaca"
+                        and not _nps                  # NEQ-05: no profit ladder
+                        and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
+                    try:
+                        _e = float(r.get("entry_price") or 0)
+                        _q = float(r.get("quantity") or 0)
+                        _big_enough = _asset_policy(at).can_step(_q)
+                        if (_e > 0 and _q > 0 and _big_enough
+                                and target is not None and float(target) > _e):
+                            _run = (price - _e) / (float(target) - _e)
+                            _at0, _frac = _step_profile(_e * _q)
+                            _ok_step, _n_prev = await _step_check(
+                                str(r.get("id")), r.get("user_id"), _run,
+                                at0_override=_at0)
+                            if _ok_step:
+                                from app.paper.engine import close_partial_position
+                                _pf = await close_partial_position(
+                                    r["user_id"], r["id"], _frac, price,
+                                    reason="profit_step")
+                                if _pf.ok:
+                                    _step_mark(str(r.get("id")))
+                                    affected_users.add(r["user_id"])
+                                    try:
+                                        from app.agents.activity_log import record as _arec
+                                        _arec("profit_step", tk, strategy=strat,
+                                              reason=(f"step {_n_prev + 1}: banked "
+                                                      f"{_frac * 100:.0f}% of remaining at "
+                                                      f"{_run * 100:.0f}% of the run to "
+                                                      f"target (${_pf.realized_pnl_usd:+.2f}); "
+                                                      f"rest rides on"),
+                                              extra={"user_id": str(r.get("user_id"))})
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                if close_reason:
+                    fill = await close_position(r["user_id"], r["id"], price, reason=close_reason)
+                    if fill.ok:
+                        affected_users.add(r["user_id"])
+                        out.append(AgentMessage(
+                            agent=self.name,
+                            kind="close",
+                            confidence=1.0,
+                            payload={
+                                "user_id": r["user_id"],
+                                "ticker": tk,
+                                "side": side,
+                                "reason": close_detail or close_reason,
+                                "exit_price": fill.fill_price,
+                                "realized_pnl_usd": fill.realized_pnl_usd,
+                                "position_id": r["id"],
+                            },
+                        ))
+        finally:
+            _pm_clear_account()
+
 
         # After closures, evaluate Daily Profit Lock for each affected user.
         for user_id in affected_users:

@@ -19,8 +19,10 @@
  * House rules honoured here:
  *   - a failed trading_accounts read is a FAILURE (LoadResult), never an
  *     empty book list -- use `withBooks()` so dependent reads inherit it;
- *   - an unresolvable book is skipped, never defaulted to the primary
- *     (`resolveBookKey` returns null rather than guessing).
+ *   - an unresolvable book is skipped, never GUESSED (`resolveBookKey`
+ *     returns null rather than picking one of several books). Note the
+ *     owner's own uid IS a book key for Mike (0045 registers the primary
+ *     with account_key = owner_id), so it resolves by rule, not by guess.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -69,7 +71,15 @@ export function withBooks<T>(books: BookKeysLoad, res: LoadResult<T>): LoadResul
  * Which ONE book an action targets. `requested` (e.g. a body `account_key`)
  * must be one of the caller's books; without it, the caller's own uid when
  * it is a book, else the only book they own. Anything else is null -- the
- * caller must say which book, we never pick the primary for them.
+ * caller must say which book; we never GUESS among several.
+ *
+ * vf:config-web :77 -- be precise about what that means for the one real
+ * owner: migration 0045 registers the PRIMARY book with
+ * account_key = owner_id, so Mike's auth uid IS the primary's key and
+ * `keys.includes(userId)` legitimately selects the primary whenever
+ * `requested` is omitted (same target the routes had before books existed).
+ * Callers that must never land on the primary by omission have to pass
+ * `requested` explicitly; this function does not refuse the uid rule.
  */
 export function resolveBookKey(
   keys: string[],

@@ -25,10 +25,12 @@ SUITES = sorted(p.stem for p in HERE.glob("test_*.py"))
 # suites" for whatever N the glob happened to find. A tests/ directory
 # that vanished from a bad checkout, a rename that broke the test_*.py
 # glob, or a pull that dropped the new suites would deploy green. Pin the
-# floor at the suite count present when this was set (46 on 2026-09-01);
-# `>=` because suites are added over time -- each addition may raise this
-# number, nothing should ever lower it.
-EXPECTED_MIN_SUITES = 46
+# floor at the suite count present when this was set (49 on 2026-09-01;
+# it sat at 46 while three suites were added in the same wave --
+# vf:gate-harness -- which is precisely the drift GATE-04 exists to catch,
+# so RAISE THIS NUMBER in the same commit that adds a suite). `>=` because
+# suites are added over time -- nothing should ever lower it.
+EXPECTED_MIN_SUITES = 50
 
 
 def main() -> int:

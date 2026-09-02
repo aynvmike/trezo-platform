@@ -480,6 +480,87 @@ def test_reconcile_adopts_a_broker_contract_into_the_bound_book():
     assert body["user_id"] == "U3" and body["underlying"] == "F", body
 
 
+# --- vf:truth-sweep: the adopt pass dedupes against the LT-05 ledger ------
+
+def _ledger_client(open_rows, ledger, binding):
+    """A client that answers options_positions like _positions and
+    paper_positions (the LT-05 option ledger) from `ledger` -- a list of
+    rows, or an Exception to raise as a failed read. Records which book
+    was bound when the ledger was read and what the query filtered on."""
+    base = _positions(open_rows=open_rows)
+    reads: list[dict] = []
+
+    def _h(q):
+        if q.table_name != "paper_positions":
+            return base(q)
+        reads.append({"bound": binding.now,
+                      "eq": [c[1] for c in q.op("eq")]})
+        if isinstance(ledger, Exception):
+            raise ledger
+        return list(ledger)
+    return _Client(_h), reads
+
+
+def test_reconcile_does_not_adopt_a_contract_the_paper_ledger_already_holds():
+    """Broker holds three contracts for U3: AGNC (an options_positions
+    row), F (already adopted into paper_positions as an OCC ticker, no
+    options_positions row) and T (tracked nowhere). Only T may be
+    inserted -- F getting a second row is the split-brain churn."""
+    exp = _EXP_FUTURE
+    f_occ = _occ("F", exp, "P", 12.5)
+    stack, _client, binding, reads, activity = _reconcile_seams(
+        [_short_row("U3")],
+        strict=[{"symbol": _occ("AGNC", exp, "P", 9.5), "qty": "-1",
+                 "avg_entry_price": "0.4"},
+                {"symbol": f_occ, "qty": "-1", "avg_entry_price": "0.3"},
+                {"symbol": _occ("T", exp, "C", 20.0), "qty": "1",
+                 "avg_entry_price": "0.5"}])
+    client, ledger_reads = _ledger_client(
+        [_short_row("U3")], [{"ticker": f_occ.lower()}], binding)
+    with stack:
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    ins = [q for q in client.writes("options_positions") if q.op("insert")]
+    assert len(ins) == 1, ins
+    body = ins[0].op("insert")[0][1][0]
+    assert body["user_id"] == "U3" and body["underlying"] == "T", body
+    # The ledger was read for THIS book, under its binding, open option
+    # legs only -- every book is its own book.
+    assert len(ledger_reads) == 1 and ledger_reads[0]["bound"] == "U3", ledger_reads
+    assert {("user_id", "U3"), ("status", "open"), ("asset_type", "option")} \
+        <= set(ledger_reads[0]["eq"]), ledger_reads
+    assert not any(a["event"] == "reconcile_adopt_skipped_unreadable"
+                   for a in activity), activity
+
+
+def test_reconcile_skips_adopt_but_still_closes_when_the_ledger_is_unreadable():
+    """A failed paper_positions read is answerless, not empty: nothing is
+    adopted for that book (T stays un-inserted), the log says why, and
+    the close pass that already ran is unaffected -- the AGNC row with no
+    broker match and a real buy-back fill is still closed at its true
+    exit."""
+    exp = _EXP_FUTURE
+    stack, _client, binding, reads, activity = _reconcile_seams(
+        [_short_row("U3")],
+        strict=[{"symbol": _occ("T", exp, "C", 20.0), "qty": "1",
+                 "avg_entry_price": "0.5"}],
+        fills=[{"status": "filled", "filled_avg_price": "0.20", "side": "buy"}])
+    client, ledger_reads = _ledger_client(
+        [_short_row("U3")], RuntimeError("429 from the ledger"), binding)
+    with stack:
+        out = _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    writes = client.writes("options_positions")
+    assert [q for q in writes if q.op("insert")] == [], "adopted on a failed read"
+    ups = [q for q in writes if q.op("update")]
+    assert len(ups) == 1, ups
+    body = ups[0].op("update")[0][1][0]
+    assert body["status"] == "closed_manual" and body["realized_pnl_usd"] == 20.0, body
+    assert any(a["event"] == "reconcile_adopt_skipped_unreadable"
+               and a["user_id"] == "U3" for a in activity), activity
+    assert ledger_reads and ledger_reads[0]["bound"] == "U3", ledger_reads
+    assert not any(m.payload.get("adopted") for m in out), out
+    assert binding.now is None, "reconcile must clear its binding"
+
+
 # --- NEQ-10: settle defers when there is no price ------------------------
 
 def _expired_csp(uid="U1"):

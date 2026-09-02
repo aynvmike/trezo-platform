@@ -28,6 +28,14 @@ NEQ-05 / G3    A row whose source_payload carries no_price_stop (the
                _is_no_price_stop(row), at every site; the flag must be
                SELECTed or the whole exemption is built and unbound.
 REVIEW :28/:1545  The inline per-row binding is cleared after the loop.
+vf:no-price-stop-monitor  The Extended profit ladder / trail_lock and the
+               swing time stop on the Alpaca-stock branch ride by the
+               FLAG too, not only by the strategy name; the per-row
+               binding is cleared in a finally, so a row that raises
+               cannot leave its book bound (on Python 3.12 wait_for does
+               not copy the context); the predicate is the shared
+               app.paper.no_price_stop one, the same object the engine's
+               merge boundary reads.
 
 Every test here drives the REAL function out of the real module (loaded
 through _bootstrap, no engine boot) and stubs only the external seams
@@ -1001,7 +1009,14 @@ def test_the_flag_is_selected_and_consulted_where_it_is_read():
                    "if reeval_is_enabled() and not _nps:",
                    "if close_reason is None and not _nps:",
                    'if at == "stock" and not _nps:',
-                   "elif _nps:"):
+                   "elif _nps:",
+                   # vf:no-price-stop-monitor: Extended ladder / trail_lock
+                   # and the swing time stop ride by the flag
+                   'if strat_a.startswith("extended") and not _nps:',
+                   'if (strat_a.startswith("extended") and not _nps',
+                   # ...and the predicate is the shared one
+                   "from app.paper.no_price_stop import is_no_price_stop "
+                   "as _is_no_price_stop"):
         assert anchor in src, f"position_monitor lost: {anchor}"
     bh_src = (root / "app/agents/book_health.py").read_text(
         encoding="utf-8", errors="replace")
@@ -1022,6 +1037,143 @@ def test_the_tick_clears_its_inline_binding_when_the_loop_is_done():
         _run(agent.tick())
         left = accounts._active.get()
     assert left is None, f"the last row's book stayed bound: {left}"
+
+
+def test_the_monitor_and_the_engine_bind_the_same_predicate():
+    """vf:no-price-stop-monitor: the merge boundary in the engine and every
+    gate in the monitor must read the flag the SAME way -- one function
+    object out of app.paper.no_price_stop, re-exported here under the
+    name book_health imports."""
+    nps_mod = load_module("app.paper.no_price_stop")
+    assert pm._is_no_price_stop is nps_mod.is_no_price_stop
+    assert engine._is_no_price_stop is nps_mod.is_no_price_stop
+
+
+def _extended_row(uid, tk, **over):
+    """An Alpaca-held 'extended_swing' long: entry 50, stop 45, peak 56,
+    opened a day ago (inside SWING_MAX_HOLD_DAYS)."""
+    from datetime import timedelta
+    day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    base = dict(broker="alpaca", strategy="extended_swing", stop_price=45.0,
+                peak_price=56.0, entry_at=day_ago)
+    base.update(over)
+    return _row_for(uid, tk, **base)
+
+
+def test_a_flagged_extended_row_is_neither_laddered_nor_trail_locked():
+    """vf:no-price-stop-monitor. Twin Alpaca stock rows labelled
+    'extended_swing' in one book, entry 50, stop 45, peak 56, price 52.
+    The ordinary one: the Extended ladder ratchets the stop to 53 (the
+    +10% rung locks +6%), pushes it to the broker, and since 52 <= 53
+    the trail_lock liquidation fires. The flagged twin: no stop write,
+    no broker push, no liquidation, no message -- whatever it is called."""
+    rows = [_extended_row("book-a", "KO"),
+            _extended_row("book-a", "PG", source_payload=dict(_FLAG))]
+    client = _Client({"paper_positions": rows})
+    pushed, liquidated = [], []
+
+    async def _held(user_id, *, where="", max_age_s=None):
+        return {"KO", "PG"}
+
+    async def _push(r, new_stop):
+        pushed.append((r["ticker"], new_stop))
+
+    async def _liq(symbol, asset_type="stock"):
+        liquidated.append(symbol)
+        return {"id": "liq"}, None
+
+    async def _ensure(sym, qty, stop, target=None):
+        return False, "not armed"
+
+    async def _open(sym):
+        return [{"id": "leg"}]           # exit legs resting: not naked
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _clean_liq(), _clean_naked(), \
+            _real_tick(client, 52.0, _push_stop_to_broker=_push), \
+            _patched(book_scope, held_symbols=_held), \
+            _patched(alp, liquidate_position=_liq, ensure_stock_protection=_ensure,
+                     get_open_orders_for=_open), \
+            _patched(ops_watchdog, _us_market_open=lambda: True):
+        out = _run(agent.tick())
+    stop_writes = [p for t, p in client.updates
+                   if t == "paper_positions" and "stop_price" in p]
+    assert stop_writes == [{"stop_price": 53.0}], f"ladder writes: {stop_writes}"
+    assert rows[0]["stop_price"] == 53.0, "the ordinary row was not laddered"
+    assert rows[1]["stop_price"] == 45.0, "the flagged row's stop was ratcheted"
+    assert pushed == [("KO", 53.0)], f"stop pushed for the wrong rows: {pushed}"
+    assert liquidated == ["KO"], f"trail_lock liquidated the wrong rows: {liquidated}"
+    ko = [m.payload.get("reason") for m in out if m.payload.get("ticker") == "KO"]
+    assert ko == ["trail_lock"], ko
+    pg = [m for m in out if m.payload.get("ticker") == "PG"]
+    assert pg == [], f"a flagged row produced messages: {[m.payload for m in pg]}"
+
+
+def test_a_flagged_extended_row_is_not_time_stopped_either():
+    """Same twins held 31 days (past SWING_MAX_HOLD_DAYS) at entry price,
+    so the ladder has nothing to lock: the ordinary one is closed at
+    market by the swing time stop; the flagged one rides."""
+    rows = [_extended_row("book-a", "KO", entry_at="2026-08-01T00:00:00+00:00",
+                          peak_price=None),
+            _extended_row("book-a", "PG", entry_at="2026-08-01T00:00:00+00:00",
+                          peak_price=None, source_payload=dict(_FLAG))]
+    client = _Client({"paper_positions": rows})
+    liquidated = []
+
+    async def _held(user_id, *, where="", max_age_s=None):
+        return {"KO", "PG"}
+
+    async def _liq(symbol, asset_type="stock"):
+        liquidated.append(symbol)
+        return {"id": "liq"}, None
+
+    async def _ensure(sym, qty, stop, target=None):
+        return False, "not armed"
+
+    async def _open(sym):
+        return [{"id": "leg"}]
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _clean_liq(), _clean_naked(), _real_tick(client, 50.0), \
+            _patched(book_scope, held_symbols=_held), \
+            _patched(alp, liquidate_position=_liq, ensure_stock_protection=_ensure,
+                     get_open_orders_for=_open), \
+            _patched(ops_watchdog, _us_market_open=lambda: True):
+        out = _run(agent.tick())
+    assert liquidated == ["KO"], f"time stop liquidated the wrong rows: {liquidated}"
+    ko = [m.payload.get("note", "") for m in out if m.payload.get("ticker") == "KO"]
+    assert any("swing time stop" in n for n in ko), ko
+    assert not [m for m in out if m.payload.get("ticker") == "PG"], out
+    assert client.updates == [], f"a stop was written at entry price: {client.updates}"
+
+
+def test_the_tick_clears_its_inline_binding_when_a_row_raises():
+    """vf:no-price-stop-monitor: the old WHY-comment said a raised tick
+    could not leak the binding because asyncio.wait_for copies the
+    context -- false on Python 3.12, and the manual run path awaits
+    tick() straight from the request handler. The clear is in a finally
+    now: a row that blows up mid-way leaves no book bound behind it."""
+    rows = [_row_for("book-b", "KO", broker="alpaca")]
+    client = _Client({"paper_positions": rows})
+    seen = {}
+
+    async def _boom(user_id, *, where="", max_age_s=None):
+        seen["bound_during_row"] = accounts._active.get()
+        raise RuntimeError("broker read blew up mid-row")
+
+    agent = pm.PositionMonitorAgent()
+    with _registry(_two_books()), _real_tick(client, 55.0), \
+            _patched(book_scope, held_symbols=_boom):
+        try:
+            _run(agent.tick())
+            raised = False
+        except RuntimeError:
+            raised = True
+        left = accounts._active.get()
+    assert raised, "the seam never raised, so this proves nothing"
+    assert seen.get("bound_during_row") is not None, \
+        "the row's book was not bound when the row ran; the test is not reaching the loop"
+    assert left is None, f"a raised row left its book bound: {left}"
 
 
 if __name__ == "__main__":
