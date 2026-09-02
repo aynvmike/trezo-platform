@@ -81,6 +81,7 @@ pm = load_module("app.agents.position_monitor")
 # are patched on their own modules.
 ops_watchdog = load_module("app.agents.ops_watchdog")
 options_scanner = load_module("app.agents.options_scanner")
+qa = load_module("app.paper.trade_qa")
 
 
 def _run(coro):
@@ -110,6 +111,35 @@ def _patched(mod, **attrs):
 def _norec(*_a, **_k):
     """activity_log.record stand-in: nothing written to disk."""
     return None
+
+
+@contextlib.contextmanager
+def _qa_shield(books):
+    """Pin the QA working-order SHIELD for ONE test, then clear it.
+
+    BLOCKER 3 (review 2026-09-02) wired app/paper/trade_qa's shield into
+    this agent's two close-on-absence paths, so every test that drives
+    them now has to say what the broker's order book looks like:
+
+        {"book-a": set()}        swept, nothing working  -> False, close
+        {"book-a": {"DOT"}}      an entry is in flight   -> True,  skip
+        {}                       never swept / restarted -> None,  skip
+
+    Written straight into qa._SHIELD rather than through a stubbed
+    has_working_order on purpose: these tests are here to prove the REAL
+    predicate is reached from the REAL tick, and a stub of the predicate
+    would pass whether the call site existed or not.
+    """
+    qa.reset_state()
+    try:
+        for book, syms in books.items():
+            qa._SHIELD[str(book)] = {
+                "ts": time.time(),
+                "entries": {s: {"ids": ["ord-x"], "oldest": None}
+                            for s in syms}}
+        yield
+    finally:
+        qa.reset_state()
 
 
 # --- two books, the way accounts.py would load them ---------------------
@@ -696,7 +726,8 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
     pm.PositionMonitorAgent._recon_tick_counter = 0
     pm.PositionMonitorAgent._did_initial_reconcile = True
     try:
-        with _registry([]), \
+        # Shield swept, nothing working -> False -> the close proceeds.
+        with _registry([]), _qa_shield({"book-a": set()}), \
                 _patched(pm, _supabase=lambda: client, _latest_price=_price,
                          _manage_day_options=_noop, _gap_check_open_bell=_noop,
                          _pre_break_review=_noop, check_and_lock_profit=_nolock), \
@@ -916,7 +947,9 @@ def test_external_fill_detection_still_applies_to_a_flagged_row():
                                  fill_price=exit_price, realized_pnl_usd=1.0)
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _real_tick(client, 10.0), \
+    # Shield swept, nothing working -> False -> the close proceeds.
+    with _registry([]), _qa_shield({"book-a": set()}), \
+            _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(engine, record_external_close=_rec_close):
         out = _run(agent.tick())
@@ -1174,6 +1207,174 @@ def test_the_tick_clears_its_inline_binding_when_a_row_raises():
     assert seen.get("bound_during_row") is not None, \
         "the row's book was not bound when the row ran; the test is not reaching the loop"
     assert left is None, f"a raised row left its book bound: {left}"
+
+
+# =======================================================================
+# BLOCKER 3 (review 2026-09-02): the QA working-order SHIELD, on the two
+# close-on-absence paths THIS agent owns.
+#
+# The shield shipped wired into stocks_reconcile and options_scanner --
+# and both of those run on the 30-minute reconcile. These two run on the
+# 60-second tick, close via record_external_close at a MODELLED price,
+# and are the paths the acceptance case would have hit first: NOBL's own
+# order was working for 78 minutes, so the stock/option branch's only
+# guard -- a 5-minute fresh-row grace -- is walked straight through, and
+# the crypto branch has no grace at all.
+#
+# Every test below drives the REAL tick and writes the REAL shield cache.
+# Nothing stubs has_working_order: a stubbed predicate passes whether or
+# not the call site exists, which is precisely house rule 4's failure.
+# =======================================================================
+
+
+def _alpaca_stock_row(uid="book-a", tk="PG", **over):
+    """An open Alpaca-routed row old enough that the 5-minute fresh-row
+    grace cannot be what stops the close."""
+    r = {"id": f"pos-{tk}", "user_id": uid, "ticker": tk,
+         "asset_type": "stock", "side": "long", "quantity": 10,
+         "entry_price": 50.0, "stop_price": 40.0, "target_price": 80.0,
+         "strategy": "momentum", "entry_at": "2026-08-01T00:00:00+00:00",
+         "broker": "alpaca", "close_requested": False}
+    r.update(over)
+    return r
+
+
+def _no_close_tick(rows, held, shield):
+    """Run one real tick and report every close it tried to make."""
+    client = _Client({"paper_positions": rows})
+    seen = {}
+
+    async def _held(user_id, *, where="", max_age_s=None):
+        return set(held)
+
+    async def _rec_close(user_id, position_id, exit_price,
+                         reason="alpaca_bracket"):
+        seen.update(pid=position_id, reason=reason)
+        return engine.FillResult(ok=True, position_id=position_id,
+                                 fill_price=exit_price, realized_pnl_usd=1.0)
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _qa_shield(shield), _real_tick(client, 10.0), \
+            _patched(book_scope, held_symbols=_held), \
+            _patched(engine, record_external_close=_rec_close):
+        out = _run(agent.tick())
+    return seen, [m for m in out if m.kind == "close"], client
+
+
+def test_the_monitor_does_not_close_a_stock_row_while_its_order_is_working():
+    """position_monitor's stock/option absence path, shield True."""
+    seen, closes, client = _no_close_tick(
+        [_alpaca_stock_row()], held={"KO"}, shield={"book-a": {"PG"}})
+    assert seen == {}, f"closed a row with an order in flight: {seen}"
+    assert closes == [], closes
+    assert client.updates == [], client.updates
+
+
+def test_the_monitor_does_not_close_a_stock_row_when_it_cannot_check():
+    """Shield None. 'Could not check' is not a green light (house rule 3);
+    read as False it is exactly the phantom this component exists to
+    stop. The book is simply absent from the cache -- never swept, or the
+    process restarted."""
+    seen, closes, client = _no_close_tick(
+        [_alpaca_stock_row()], held={"KO"}, shield={})
+    assert seen == {}, f"closed a row it could not check: {seen}"
+    assert closes == [], closes
+    assert client.updates == [], client.updates
+
+
+def test_the_monitor_still_closes_when_the_shield_says_nothing_is_working():
+    """The control. A shield that never answers False would be a shield
+    that switched row-closing off platform-wide, which is the failure
+    mode on the other side of this guard."""
+    seen, closes, _c = _no_close_tick(
+        [_alpaca_stock_row()], held={"KO"}, shield={"book-a": set()})
+    assert seen.get("pid") == "pos-PG", seen
+    assert len(closes) == 1, closes
+
+
+def test_the_monitor_option_lane_shield_is_keyed_on_the_occ():
+    """`tk` is the OCC on an option row, and the shield is keyed on the
+    OCC. Handed the underlying instead, it would protect nothing on the
+    very lane that produced the acceptance case."""
+    occ = "NOBL260918P00055000"
+    row = _alpaca_stock_row(tk=occ, asset_type="option", side="short",
+                            quantity=1, entry_price=0.05, stop_price=0.315)
+    seen, closes, _c = _no_close_tick([row], held={"SPY"},
+                                      shield={"book-a": {occ}})
+    assert seen == {}, f"closed a contract with an order in flight: {seen}"
+    assert closes == [], closes
+    # ...and the UNDERLYING is not what protects it.
+    seen2, closes2, _c2 = _no_close_tick([row], held={"SPY"},
+                                         shield={"book-a": {"NOBL"}})
+    assert seen2.get("pid") == f"pos-{occ}", (
+        "a shield keyed on the underlying must not answer for the "
+        f"contract: {seen2}")
+    assert len(closes2) == 1, closes2
+
+
+def test_the_monitor_does_not_close_a_crypto_row_while_its_order_is_working():
+    """The crypto lane has NO fresh-row grace at all, so it is the fastest
+    path to a phantom close on the platform."""
+    row = _alpaca_stock_row(tk="DOT", asset_type="crypto", quantity=100.0,
+                            entry_price=1.0, stop_price=0.8,
+                            target_price=1.5, strategy="crypto_swing")
+    seen, closes, client = _no_close_tick(
+        [row], held={"AMZN"}, shield={"book-a": {"DOT"}})
+    assert seen == {}, f"closed a coin with an order in flight: {seen}"
+    assert closes == [], closes
+    assert client.updates == [], client.updates
+
+
+def test_the_monitor_does_not_close_a_crypto_row_when_it_cannot_check():
+    row = _alpaca_stock_row(tk="DOT", asset_type="crypto", quantity=100.0,
+                            entry_price=1.0, stop_price=0.8,
+                            target_price=1.5, strategy="crypto_swing")
+    seen, closes, client = _no_close_tick([row], held={"AMZN"}, shield={})
+    assert seen == {}, f"closed a coin it could not check: {seen}"
+    assert closes == [], closes
+    assert client.updates == [], client.updates
+
+
+def test_the_monitors_shield_is_per_book_like_every_other_gate():
+    """House rule 2. book-b's working order must not shield book-a's row,
+    and book-a being unswept must not be answered by book-b's sweep."""
+    seen, closes, _c = _no_close_tick(
+        [_alpaca_stock_row(uid="book-a")], held={"KO"},
+        shield={"book-b": {"PG"}})
+    assert seen == {}, (
+        "book-a was never swept, so the answer is None -> skip, NOT "
+        f"book-b's answer: {seen}")
+    assert closes == [], closes
+
+
+def test_the_monitor_shield_helper_falls_through_when_there_is_no_inspector():
+    """A broken inspector must not freeze row-closing platform-wide. An
+    EXCEPTION out of the shield falls back to existing behaviour and says
+    so in a qa_shield_error row -- unlike None, which skips."""
+    said = []
+
+    def _rec(event, ticker, **kw):
+        said.append(event)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("inspector is gone")
+    with _qa_shield({"book-a": {"PG"}}), \
+            _patched(qa, has_working_order=_boom), \
+            _patched(alog, record=_rec):
+        blocked = pm._qa_shield_blocks_close("book-a", "PG")
+    assert blocked is False, "an exception must not freeze the close path"
+    assert "qa_shield_error" in said, said
+
+
+def test_the_monitors_two_close_paths_are_actually_bound_to_the_shield():
+    """House rule 4, asserted structurally as well as behaviourally: the
+    helper must be CALLED at both sites, not merely defined."""
+    src = (Path(__file__).resolve().parents[1]
+           / "app/agents/position_monitor.py").read_text(encoding="utf-8")
+    assert src.count('_qa_shield_blocks_close(r.get("user_id"), tk, r.get("side"))') == 2, (
+        "both close-on-absence paths must consult the shield")
+    assert "if _shield is not False:" in src, (
+        "None must skip the close exactly as True does")
 
 
 if __name__ == "__main__":

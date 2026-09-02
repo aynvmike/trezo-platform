@@ -56,6 +56,7 @@ killswitch = load_module("app.paper.killswitch")
 sr = load_module("app.paper.stocks_reconcile")
 adoption = load_module("app.paper.adoption")
 pm = load_module("app.agents.position_monitor")
+trade_qa = load_module("app.paper.trade_qa")
 
 import supabase  # noqa: E402  -- real package; only create_client is swapped
 
@@ -476,6 +477,7 @@ def test_a_ghost_close_resets_only_that_books_reject_window():
     os.environ["TREZO_ACTIVITY_LOG"] = "0"      # no jsonl side-files
     try:
         with _patched(supabase, create_client=lambda *_a, **_k: client), \
+             _patched(trade_qa, has_working_order=lambda uid, sym, side=None: False), \
              _patched(accounts, set_account_for_user=lambda uid: True,
                       should_skip_unresolved=lambda uid: False), \
              _patched(book_scope, verify=lambda uid: (True, "ok"),
@@ -605,7 +607,16 @@ def _stock_seams(client, positions, **alp_extra):
     async def _no_orders(sym, token=None):
         return []
 
+    # 2026-09-02, the QA shield: stocks_reconcile now asks trade_qa whether
+    # an ENTRY order for this symbol is still working before it treats
+    # "not at the broker" as a close, and it skips the close on True AND on
+    # None. False is "checked, nothing in flight" -- the condition under
+    # which every close below is the correct outcome, and the one production
+    # is in whenever the 5-minute shield refresh has run. The shield's own
+    # behaviour is asserted separately, in the two tests below this file's
+    # ghost-close cases.
     with _no_activity_files(), \
+         _patched(trade_qa, has_working_order=lambda uid, sym, side=None: False), \
          _patched(supabase, create_client=lambda *_a, **_k: client), \
          _patched(accounts, set_account_for_user=lambda uid: True,
                   should_skip_unresolved=lambda uid: False), \
@@ -633,6 +644,38 @@ def test_a_failed_stock_read_skips_the_book_and_closes_nothing():
     assert out["closed"] == 0 and out["users_touched"] == 0, out
     assert out["skipped"] == [{"user_id": "acct2-book",
                                "reason": "broker read failed"}], out
+
+
+def test_a_working_buy_order_stops_the_ghost_close():
+    """THE SHIELD, bound at stocks_reconcile. trust_close only proves the
+    positions read was non-empty; it never asks whether an order for this
+    symbol is still in flight. A buy that has not filled yet looks exactly
+    like a position that is gone."""
+    async def _strict(token=None):
+        return [{"symbol": "AMZN", "asset_class": "us_equity", "qty": "1",
+                 "avg_entry_price": "100"}]
+
+    client = FakeClient(_stock_tables())
+    with _stock_seams(client, _strict), \
+            _patched(trade_qa, has_working_order=lambda uid, sym, side=None: True):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert out["closed"] == 0, out
+    assert client.writes == [], client.writes
+
+
+def test_an_unanswerable_shield_also_stops_the_ghost_close():
+    """None means COULD NOT CHECK. Read as False it is a green light, and
+    that is the reasoning that closed DOT seven times (house rule 3)."""
+    async def _strict(token=None):
+        return [{"symbol": "AMZN", "asset_class": "us_equity", "qty": "1",
+                 "avg_entry_price": "100"}]
+
+    client = FakeClient(_stock_tables())
+    with _stock_seams(client, _strict), \
+            _patched(trade_qa, has_working_order=lambda uid, sym, side=None: None):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert out["closed"] == 0, out
+    assert client.writes == [], client.writes
 
 
 def test_the_stock_pass_never_calls_the_collapsing_read():

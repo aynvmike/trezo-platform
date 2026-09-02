@@ -29,7 +29,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+from _bootstrap import (  # noqa: E402
+    load_module, quiet_activity_log, run_tests, stub_config,
+)
 
 stub_config()
 bh = load_module("app.agents.book_health")
@@ -110,8 +112,12 @@ def _check(broker_rows, open_rows=(), *, uid="book-1", price=None):
         async def _p(ticker, asset_type):
             return price
         agent._price = _p
+    # 2026-09-02: _check_book now runs the trade QA pass as invariant 0,
+    # and that pass writes activity rows (it is the proof it was reached).
+    # This suite drives the REAL method, so the rows must be captured or
+    # run_all's leak net fails the suite -- correctly.
     with _patched(bh.book_scope, positions=_positions), \
-            _patched(bh, notify=_notify):
+            _patched(bh, notify=_notify), quiet_activity_log():
         findings = _run(agent._check_book(_Client(list(open_rows)), uid, "Book"))
     return findings, sent
 
@@ -201,7 +207,9 @@ def test_a_failed_broker_read_says_nothing_rather_than_all_clear():
     agent = bh.BookHealthAgent()
     agent._open_findings = {"unmanaged:book-1": "unmanaged"}   # instance, see _check
     with _patched(bh.book_scope, positions=_none), _patched(bh, notify=_notify):
-        findings = _run(agent._check_book(_Client([]), "book-1", "Book"))
+        with quiet_activity_log():
+            findings = _run(agent._check_book(_Client([]), "book-1",
+                                              "Book"))
     assert findings == []
     assert sent == [], "a failed read announced a recovery"
     assert agent._open_findings == {"unmanaged:book-1": "unmanaged"}

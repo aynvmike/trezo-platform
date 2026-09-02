@@ -2029,6 +2029,56 @@ class OptionsScannerAgent(Agent):
                         for occ in broker_occ)
                     if matched:
                         continue
+                # QA SHIELD (2026-09-02, app/paper/trade_qa.py). Before
+                # treating "not at the broker" as a close, ask whether an
+                # ENTRY order for THIS CONTRACT is still working. Order
+                # edefd889 sat working for 78 minutes; any close decided
+                # from a position snapshot inside that window is a phantom
+                # manufactured from absence, and this lane is where that
+                # happens. The shield is keyed on the OCC, not the
+                # underlying -- an underlying would match nothing here.
+                #   True -> skip (an order is in flight)
+                #   None -> ALSO skip. "Could not check" is not a green
+                #           light (house rule 3).
+                #   False -> existing behaviour, unchanged.
+                # An EXCEPTION means there is no shield at all; a broken
+                # inspector must not freeze row-closing platform-wide, so
+                # that falls through to existing behaviour and says so.
+                _shield = False
+                try:
+                    from app.paper.trade_qa import has_working_order
+                    _occ_sh = (f"{str(r['underlying']).upper()}"
+                               f"{str(r['expiration'])[2:4]}"
+                               f"{str(r['expiration'])[5:7]}"
+                               f"{str(r['expiration'])[8:10]}"
+                               f"{'C' if str(r['option_type']).lower().startswith('c') else 'P'}"
+                               f"{int(round(float(r['strike']) * 1000)):08d}")
+                    _shield = has_working_order(str(user_id), _occ_sh, r.get("side"))
+                except Exception as _e_sh:  # noqa: BLE001
+                    _shield = False
+                    try:
+                        from app.agents.activity_log import record as _arec_sh
+                        _arec_sh("qa_shield_error", str(r.get("underlying") or "-"),
+                                 reason=(f"QA shield unavailable "
+                                         f"({type(_e_sh).__name__}); falling back "
+                                         f"to existing close behaviour"),
+                                 extra={"user_id": str(user_id)})
+                    except Exception:  # noqa: BLE001
+                        pass
+                if _shield is not False:
+                    try:
+                        from app.agents.activity_log import record as _arec_sh2
+                        _arec_sh2("qa_shield", str(_occ_sh),
+                                  reason=("not closed: an entry order for this "
+                                          "contract is still working at the broker"
+                                          if _shield else
+                                          "not closed: could not check whether an "
+                                          "order is working -- refusing to guess"),
+                                  extra={"user_id": str(user_id)})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+
                 # No match at the broker -> close it as Reconciled.
                 # 2026-07-14 (Mike saw a wall of $0 rows): recover the TRUE
                 # exit instead of booking zero. Find the closing fill at

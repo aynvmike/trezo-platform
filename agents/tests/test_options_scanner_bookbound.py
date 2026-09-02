@@ -45,6 +45,7 @@ from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
 
 stub_config()
 scanner = load_module("app.agents.options_scanner")
+trade_qa = load_module("app.paper.trade_qa")
 alp = load_module("app.brokers.alpaca")
 accounts = load_module("app.brokers.accounts")
 route_guard = load_module("app.brokers.route_guard")
@@ -402,6 +403,13 @@ def _reconcile_seams(open_rows, *, strict, fills=None):
     stack.enter_context(_patched(route_guard, check_route=_route))
     stack.enter_context(_patched(wt, get_user_broker_token=_token))
     stack.enter_context(_patched(act, record=rec))
+    # 2026-09-02, the QA shield: the option lane now asks trade_qa whether an
+    # ENTRY order for THIS CONTRACT is still working before it closes a row
+    # as Reconciled, and skips on True AND on None. False is "checked,
+    # nothing in flight" -- the state production is in after any shield
+    # refresh, and the one under which the closes below are correct. The
+    # shield's own behaviour has its own two tests.
+    stack.enter_context(_patched(trade_qa, has_working_order=lambda uid, sym, side=None: False))
     return stack, client, binding, reads, activity
 
 
@@ -437,6 +445,42 @@ def test_reconcile_skips_an_unresolvable_book_entirely():
     assert reads == [], "an unresolved book must never reach the broker"
     assert client.writes("options_positions") == []
     assert any(a["event"] == "route_mismatch" for a in activity), activity
+
+
+def test_a_working_order_stops_the_option_lane_closing_the_row():
+    """THE SHIELD, bound at options_scanner. Order edefd889 was working for
+    78 minutes; a close decided from a position snapshot inside that window
+    is the phantom this lane keeps producing."""
+    stack, client, binding, reads, activity = _reconcile_seams(
+        [_short_row("U2")], strict=[], fills=[])
+    with stack, _patched(trade_qa, has_working_order=lambda uid, sym, side=None: True):
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    assert client.writes("options_positions") == [], "closed while an order worked"
+    assert any(a["event"] == "qa_shield" for a in activity), activity
+
+
+def test_the_option_lane_shield_is_asked_for_the_occ_not_the_underlying():
+    """Handed an underlying where an OCC belongs, the shield would match
+    nothing and protect nothing on the very lane that produced NOBL."""
+    asked: list = []
+
+    def _seen(uid, sym, side=None):
+        asked.append(sym)
+        return False
+    stack, client, binding, reads, activity = _reconcile_seams(
+        [_short_row("U2")], strict=[], fills=[])
+    with stack, _patched(trade_qa, has_working_order=_seen):
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    assert asked, "the shield was never consulted"
+    assert all(len(a) >= 15 and a[-8:].isdigit() for a in asked), asked
+
+
+def test_an_unanswerable_shield_also_stops_the_option_lane_close():
+    stack, client, binding, reads, activity = _reconcile_seams(
+        [_short_row("U2")], strict=[], fills=[])
+    with stack, _patched(trade_qa, has_working_order=lambda uid, sym, side=None: None):
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    assert client.writes("options_positions") == [], "closed on 'could not check'"
 
 
 def test_reconcile_holds_a_row_when_the_broker_is_flat_and_no_fill_exists():

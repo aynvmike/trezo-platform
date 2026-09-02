@@ -1132,6 +1132,66 @@ def _minutes_since(iso_ts) -> float:
         return 0.0
 
 
+def _qa_shield_blocks_close(user_id, symbol, row_side=None) -> bool:
+    """Is an ENTRY order for this instrument still working at the broker?
+
+    True  -> DO NOT close this row from a position snapshot.
+    False -> nothing is in flight; existing behaviour, unchanged.
+
+    Review 2026-09-02 (BLOCKER 3, house rule 4). The QA shield
+    (app/paper/trade_qa.py) shipped wired into two close-on-absence paths
+    -- stocks_reconcile and options_scanner -- and this agent has the
+    other two. Both of THESE run on the 60-second tick rather than the
+    30-minute reconcile, so they are the paths NOBL would have fallen
+    through first: its own order was working for 78 minutes, and the
+    stock/option branch's only guard is a 5-minute fresh-row grace while
+    the crypto branch has no grace at all. Until the shield is consulted
+    here too, the hole is narrowed, not closed.
+
+    `symbol` must be the spelling the INSTRUMENT is identified by -- for
+    an option row that is the OCC, which is exactly what `ticker` holds on
+    a paper_positions option row, so `tk` is correct at both call sites.
+
+    Semantics are the other two sites', to the character:
+      * None (COULD NOT CHECK) skips the close exactly as True does --
+        "could not check" is not a green light (house rule 3);
+      * an EXCEPTION means there is no inspector at all, which must NOT
+        freeze row-closing platform-wide, so it falls through to existing
+        behaviour and says so in a qa_shield_error row.
+    """
+    _shield = False
+    _sym = str(symbol or "-")
+    _uid = str(user_id or "")
+    try:
+        from app.paper.trade_qa import has_working_order
+        _shield = has_working_order(_uid, _sym, row_side)
+    except Exception as _e_sh:  # noqa: BLE001
+        _shield = False
+        try:
+            from app.agents.activity_log import record as _arec_sh
+            _arec_sh("qa_shield_error", _sym,
+                     reason=(f"QA shield unavailable "
+                             f"({type(_e_sh).__name__}); falling back "
+                             f"to existing close behaviour"),
+                     extra={"user_id": _uid})
+        except Exception:  # noqa: BLE001
+            pass
+    if _shield is not False:
+        try:
+            from app.agents.activity_log import record as _arec_sh2
+            _arec_sh2("qa_shield", _sym,
+                      reason=("not closed: an entry order for this "
+                              "symbol is still working at the broker"
+                              if _shield else
+                              "not closed: could not check whether an "
+                              "order is working -- refusing to guess"),
+                      extra={"user_id": _uid})
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    return False
+
+
 _naked_checked_at: dict[str, float] = {}
 _naked_alerted_at: dict[str, float] = {}
 _NAKED_CHECK_EVERY_S = 600    # poll Alpaca orders at most every 10 min/symbol
@@ -1809,6 +1869,15 @@ class PositionMonitorAgent(Agent):
                         if (alpaca_held is not None
                                 and not (crypto_symbol_variants(tk)
                                          & alpaca_held)):
+                            # QA SHIELD (2026-09-02, BLOCKER 3). This lane
+                            # closes at a MODELLED price on the 60-second
+                            # tick and, unlike the stock branch below, it
+                            # has NO fresh-row grace at all -- a crypto buy
+                            # that has not filled yet is indistinguishable
+                            # here from a coin that is gone. True or None
+                            # both skip; see _qa_shield_blocks_close.
+                            if _qa_shield_blocks_close(r.get("user_id"), tk, r.get("side")):
+                                continue
                             # Genuinely gone at the broker -> reconcile books.
                             price_c = await _price(tk, at)
                             if price_c is not None:
@@ -2228,6 +2297,15 @@ class PositionMonitorAgent(Agent):
                         # for rows younger than 5 minutes.
                         if _minutes_since(r.get("entry_at")) < 5.0:
                             alpaca_managed += 1
+                            continue
+                        # QA SHIELD (2026-09-02, BLOCKER 3). The grace above
+                        # is five minutes; NOBL's own order was working for
+                        # seventy-eight, so the acceptance case walks
+                        # straight through it. `tk` is the OCC on an option
+                        # row, which is the spelling the shield is keyed on.
+                        # True or None both skip; see
+                        # _qa_shield_blocks_close.
+                        if _qa_shield_blocks_close(r.get("user_id"), tk, r.get("side")):
                             continue
                         # Alpaca's bracket order closed it - reconcile our books.
                         price = await _price(tk, at)

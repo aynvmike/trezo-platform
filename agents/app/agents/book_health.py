@@ -166,6 +166,42 @@ class BookHealthAgent(Agent):
     async def _check_book(self, client, uid: str, label: str) -> list[dict]:
         findings: list[dict] = []
 
+        # ---- INVARIANT 0: does each TRADE's paperwork settle? ---------
+        # Runs FIRST and independently of everything below. The three
+        # invariants that follow compare POSITION SNAPSHOTS; invariant 0
+        # asks the question no snapshot can answer -- "what became of the
+        # orders we sent?" -- against the broker's own order log and fill
+        # activities. That is the question nobody owned on 2026-09-02,
+        # when a NOBL put filled 78 minutes after submit and never
+        # reached the ledger at all.
+        #
+        # Deliberately BEFORE the positions read below: _check_book
+        # returns early when that read comes back None, and the QA pass
+        # must not inherit another check's failure -- it does its own
+        # strict reads and its own skip (house rule 3).
+        #
+        # The SHIELD refreshes every tick (one orders read per book); the
+        # full sweep rides every Nth tick, because three broker reads and
+        # a ledger inspection are not "cheap" the way these three checks
+        # are. Any failure here is contained: a broken inspector must not
+        # take the book-health monitor down with it.
+        try:
+            from app.paper import trade_qa
+            if trade_qa.shield_due(uid):
+                await trade_qa.refresh_shield_for_book(uid)
+            if trade_qa.due(uid):
+                rep = await trade_qa.qa_sweep_for_book(client, uid)
+                findings.extend(rep.get("findings") or [])
+        except Exception as e:  # noqa: BLE001
+            try:
+                from app.agents.activity_log import record
+                record("qa_sweep_error", "-",
+                       reason=f"trade QA pass failed: {type(e).__name__}: "
+                              f"{str(e)[:200]}",
+                       extra={"user_id": uid})
+            except Exception:  # noqa: BLE001
+                pass
+
         broker = await book_scope.positions(uid, where="book_health")
         if broker is None:
             # Could not check. Say nothing -- a broker blip is not a

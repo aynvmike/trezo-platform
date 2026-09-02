@@ -266,6 +266,45 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                 # as a close (open-bell phantom-close race, 2026-06-15).
                 if not trust_close:
                     continue
+                # QA SHIELD (2026-09-02, app/paper/trade_qa.py). trust_close
+                # only proves the positions read was NON-EMPTY -- it never
+                # asks whether an order for THIS symbol is still in flight.
+                # A buy that has not filled yet looks exactly like a
+                # position that is gone, and closing on that is the phantom
+                # this platform keeps regenerating.
+                #   True -> skip. None -> ALSO skip ("could not check" is
+                #   not a green light, house rule 3). False -> unchanged.
+                # An EXCEPTION means the inspector is not there at all;
+                # that falls through to existing behaviour rather than
+                # freezing every close on the book.
+                _shield = False
+                try:
+                    from app.paper.trade_qa import has_working_order
+                    _shield = has_working_order(str(user_id), sym, r.get("side"))
+                except Exception as _e_sh:  # noqa: BLE001
+                    _shield = False
+                    try:
+                        from app.agents.activity_log import record as _arec_sh
+                        _arec_sh("qa_shield_error", sym,
+                                 reason=(f"QA shield unavailable "
+                                         f"({type(_e_sh).__name__}); falling back "
+                                         f"to existing close behaviour"),
+                                 extra={"user_id": str(user_id)})
+                    except Exception:  # noqa: BLE001
+                        pass
+                if _shield is not False:
+                    try:
+                        from app.agents.activity_log import record as _arec_sh2
+                        _arec_sh2("qa_shield", sym,
+                                  reason=("not closed: an entry order for this "
+                                          "symbol is still working at the broker"
+                                          if _shield else
+                                          "not closed: could not check whether an "
+                                          "order is working -- refusing to guess"),
+                                  extra={"user_id": str(user_id)})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
                 # Trezo has it open; Alpaca does not. Close as manual --
                 # and recover the REAL exit fill so realized P/L is true
                 # ($0-realized rows corrupted the learning loop and kept

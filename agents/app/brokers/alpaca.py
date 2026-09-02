@@ -232,7 +232,43 @@ def last_read_error() -> str:
         return ""
 
 
-async def _get(path: str, token: Optional["UserToken"] = None):
+class _NotFound:
+    """The venue answered: this object does not exist. Distinct from None,
+    which every reader in this module uses for "the read failed"."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "<alpaca.NOT_FOUND>"
+
+
+NOT_FOUND = _NotFound()
+
+
+def _q(value) -> str:
+    """Percent-encode ONE query-string VALUE.
+
+    Review 2026-09-02 (BLOCKER 2). The QA readers below were the first
+    callers in this module to put a TIMESTAMP in a query string, and they
+    concatenated `datetime.isoformat()` -- '2026-08-30T22:25:06+00:00' --
+    straight in. '+' is a legal sub-delimiter in a query, so httpx leaves
+    it alone, and a form-decoder on the far side reads it as a SPACE:
+    '2026-08-30T22:25:06 00:00'. If the venue 4xx's that, _get returns
+    None, get_orders_all_strict returns None, and the QA shield never
+    populates -- which makes has_working_order answer None forever, which
+    makes BOTH wired reconcilers refuse every close, permanently, with a
+    30-minute stale alert as the only signal.
+
+    So every value that is not a bare literal goes through here. safe=""
+    on purpose: ':' survives unencoded in practice but there is no reason
+    to bet a shield on which sub-delimiters a server tolerates.
+    """
+    from urllib.parse import quote
+    return quote(str(value if value is not None else ""), safe="")
+
+
+async def _get(path: str, token: Optional["UserToken"] = None,
+               *, quiet_404: bool = False):
     """GET an Alpaca endpoint. Returns parsed JSON, or None on any failure.
     When `token` is set, the user's OAuth bearer is used; otherwise the
     env-driven API key falls back.
@@ -254,6 +290,15 @@ async def _get(path: str, token: Optional["UserToken"] = None):
             resp = await client.get(_base_url() + path, headers=_headers_for(token))
             status = int(getattr(resp, "status_code", 0) or 0)
             if status >= 400:
+                # quiet_404 (2026-09-02, QA inspector): "no such order" is
+                # an ANSWER, not a failed read. Routing it through
+                # _note_read_error would poison last_read_error() for
+                # every other reporter on this book and emit an
+                # unthrottled broker_read_failed row per probed order id
+                # (the path key is unique per id, so the throttle never
+                # bites). Only get_order_strict asks for this.
+                if status == 404 and quiet_404:
+                    return NOT_FOUND
                 try:
                     text = str(resp.text or "")
                 except Exception:  # noqa: BLE001
@@ -578,6 +623,231 @@ async def get_order(order_id: str) -> Optional[dict]:
     """Fetch a single order by id. None if not found / unconfigured."""
     data = await _get(f"/v2/orders/{order_id}")
     return data if isinstance(data, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# The paperwork readers (2026-09-02, trade QA inspector)
+#
+# WHY THESE EXIST. On 2026-09-02 order edefd889 (SELL 1 NOBL 55P on the 75k
+# book) was submitted at 17:07:11Z and filled at 18:25:20Z -- seventy-eight
+# minutes later. The executor writes the ledger row from the SUBMIT result,
+# so an order that is not filled when it looks produces no row, and nothing
+# in the platform owned the question "what became of the orders I sent?".
+# The broker had the answer the whole time and nothing read it.
+#
+# Every reconciler before this one compared POSITION SNAPSHOTS and guessed.
+# These three readers are what makes a reconciliation bookkeeping instead:
+# an order id, and a fill record with qty, price and time.
+#
+# ALL THREE ARE STRICT (house rule 3). None means ANSWERLESS -- and that
+# includes a window that could not be read to EXHAUSTION. A silently short
+# page is a failed read wearing a successful read's clothes: judged against
+# it, a real fill looks like an absent one, which is precisely the reasoning
+# that closed DOT seven times.
+# ---------------------------------------------------------------------------
+
+# Statuses in which an order is still live at the venue.
+NON_TERMINAL_ORDER_STATUSES = frozenset({
+    "new", "pending_new", "accepted", "accepted_for_bidding",
+    "partially_filled", "held", "pending_cancel", "pending_replace",
+    "stopped", "suspended", "calculated",
+})
+
+# ...of which THESE mean "an entry may still arrive". `held` is a resting
+# bracket leg -- protection, not an entry in flight -- and the rest are
+# in-flight amendments to something already placed.
+ENTRY_WORKING_STATUSES = frozenset({
+    "new", "pending_new", "accepted", "accepted_for_bidding",
+    "partially_filled", "pending_replace", "calculated",
+})
+
+# Order types that are exits by construction. A resting stop is not an
+# order whose entry fill is still coming.
+PROTECTIVE_ORDER_TYPES = frozenset({"stop", "stop_limit", "trailing_stop"})
+
+
+async def get_open_orders_all_strict(limit: int = 500, *, max_pages: int = 4,
+                                     token: Optional["UserToken"] = None
+                                     ) -> Optional[list]:
+    """Every order still OPEN at the venue, flattened. None on a failed or
+    unexhausted read.
+
+    Review 2026-09-02 (ADVISORY A). The QA shield was reading
+    get_orders_all_strict over 72 hours with status=all -- 1 to 8 pages per
+    book per five minutes, and past roughly 4000 orders in the window the
+    read can never be exhausted, so it returns None FOREVER. A permanently
+    None shield answers "could not check" to every caller, and every wired
+    reconciler then refuses every close, with a 30-minute stale alert as
+    the only signal. The shield only ever asks "is an entry WORKING?", and
+    that is what status=open answers: one page essentially always, and no
+    truncation cliff to fall off.
+
+    Paged all the same (house rule 3): a full page is not proof there is
+    nothing behind it, and an unexhausted read is answerless here as
+    everywhere else.
+    """
+    return await _orders_window_strict(
+        "open", None, limit, max_pages=max_pages, token=token)
+
+
+async def get_orders_all_strict(after_iso: str, limit: int = 500,
+                                *, max_pages: int = 8,
+                                token: Optional["UserToken"] = None
+                                ) -> Optional[list]:
+    """Every order of ANY status submitted at/after `after_iso`.
+
+    Returns the FLATTENED list (parents followed by their child legs), or
+    None when the read failed OR when the window could not be exhausted
+    inside `max_pages`. A truncated evidence set is an ANSWERLESS read.
+
+    `nested=true` does NOT flatten anything -- it makes Alpaca return each
+    bracket's child legs UNDER the parent's `legs` key instead of omitting
+    them entirely. _flatten_order_legs is what turns that into a list a
+    caller can scan, and it is the only reason resting-stop detection costs
+    no extra call. (A design note claiming nested=true flattens had it
+    backwards; get_open_orders_for's 2026-09-01 docstring above is the
+    correct account of this endpoint.)
+
+    Alpaca's /v2/orders has no page token, so paging walks BACKWARDS: each
+    page after the first ends at the oldest submitted_at already seen.
+    """
+    return await _orders_window_strict(
+        "all", after_iso, limit, max_pages=max_pages, token=token)
+
+
+async def _orders_window_strict(status: str, after_iso: Optional[str],
+                                limit: int, *, max_pages: int,
+                                token: Optional["UserToken"] = None
+                                ) -> Optional[list]:
+    """The paging body shared by the two strict order readers above.
+
+    ONE implementation on purpose: the exhaustion rule, the no-progress
+    guard and the flattening are the parts house rule 3 rests on, and a
+    second copy is a second place for them to drift apart.
+    """
+    lim = max(1, min(int(limit or 500), 500))
+    out: list = []
+    seen: set = set()
+    until: Optional[str] = None
+    base = (f"/v2/orders?status={_q(status)}"
+            + (f"&after={_q(after_iso)}" if after_iso else "")
+            + f"&limit={lim}&direction=desc&nested=true")
+    for _ in range(max(1, int(max_pages))):
+        path = base + (f"&until={_q(until)}" if until else "")
+        page = _list_or_none(base, await _get(path, token=token))
+        if page is None:
+            return None
+        fresh = 0
+        oldest = None
+        for o in page:
+            if not isinstance(o, dict):
+                continue
+            ts = str(o.get("submitted_at") or o.get("created_at") or "")
+            if ts and (oldest is None or ts < oldest):
+                oldest = ts
+            oid = o.get("id")
+            if oid and oid in seen:
+                continue
+            if oid:
+                seen.add(oid)
+            out.append(o)
+            fresh += 1
+        if len(page) < lim:
+            return _flatten_order_legs(out)
+        if not oldest or oldest == until or fresh == 0:
+            # No progress: paging cannot terminate. Refuse the window.
+            _note_read_error(base, "orders paging made no progress", log=False)
+            return None
+        until = oldest
+    _note_read_error(base, f"orders window not exhausted in {max_pages} pages",
+                     log=False)
+    return None
+
+
+async def get_fill_activities_strict(
+        after_iso: str, page_size: int = 100, *,
+        activity_types: str = "FILL,OPEXP,OPASN,OPEXC",
+        max_pages: int = 20,
+        token: Optional["UserToken"] = None) -> Optional[list]:
+    """Every fill-shaped account activity at/after `after_iso`.
+
+    None on a failed read OR an unexhausted window (see the module note).
+
+    Beyond FILL: an option that EXPIRES worthless and one that is ASSIGNED
+    emit no fill at all. Without OPEXP/OPASN the wheel lane's normal,
+    profitable ending -- a short put decaying to nothing -- looks to an
+    inspector exactly like a position that vanished for no reason, and
+    every worthless CSP would raise a quarantine that could never clear.
+    """
+    ps = max(1, min(int(page_size or 100), 100))
+    out: list = []
+    seen: set = set()
+    token_param = ""
+    base = (f"/v2/account/activities?activity_types={activity_types}"
+            f"&after={_q(after_iso)}&page_size={ps}")
+    for _ in range(max(1, int(max_pages))):
+        page = _list_or_none(base, await _get(base + token_param, token=token))
+        if page is None:
+            return None
+        last_id = None
+        fresh = 0
+        for a in page:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("id")
+            last_id = aid or last_id
+            if aid and aid in seen:
+                continue
+            if aid:
+                seen.add(aid)
+            out.append(a)
+            fresh += 1
+        if len(page) < ps:
+            return out
+        if not last_id or fresh == 0:
+            _note_read_error(base, "activities paging made no progress",
+                             log=False)
+            return None
+        token_param = f"&page_token={_q(last_id)}"
+    _note_read_error(base,
+                     f"activities window not exhausted in {max_pages} pages",
+                     log=False)
+    return None
+
+
+async def get_order_strict(order_id: str,
+                           token: Optional["UserToken"] = None
+                           ) -> tuple[Optional[dict], Optional[str]]:
+    """One order by id: (order, None) | (None, None) | (None, reason).
+
+    get_order() above returns a bare None for BOTH "the venue says there is
+    no such order" and "the read failed" -- the exact ambiguity house rule 3
+    forbids, and the reason a caller cannot tell a cancelled order from an
+    unreachable API. This one separates them:
+
+        (order, None)   the order, as the venue has it
+        (None, None)    HTTP 404 -- an ANSWER: no such order
+        (None, reason)  ANSWERLESS: timeout, 429, 5xx, bad shape
+
+    The 404 is deliberately NOT routed through _note_read_error: probing
+    ids is normal here, and noting each one would overwrite
+    last_read_error() for every other reporter on this book and emit an
+    unthrottled broker_read_failed row per id (the throttle keys on the
+    path, which is unique per order).
+
+    get_order() is left exactly as it was -- its callers are unchanged.
+    """
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None, "empty order id"
+    data = await _get(f"/v2/orders/{oid}", token=token, quiet_404=True)
+    if data is NOT_FOUND:
+        return None, None
+    if isinstance(data, dict):
+        return data, None
+    if data is None:
+        return None, (last_read_error() or "read failed")
+    return None, f"unexpected payload shape: {type(data).__name__}"
 
 
 # ---------------------------------------------------------------------------
