@@ -211,6 +211,7 @@ async def open_position(
         stop_price=stop_price,
         target_price=target_price,
         risk_pct=risk_pct,
+        user_id=user_id,        # this book's R:R floor, not the global row
         asset_type=asset_type,
         buying_power=(min(_spend, max_notional) if max_notional is not None else _spend),
     )

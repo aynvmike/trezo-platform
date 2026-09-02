@@ -135,7 +135,9 @@ def plan_position(
         pass
     try:
         from app.runtime.settings import get_bot_settings as _gbs2
-        _bs = _gbs2(user_id)   # RR-3: THIS book's cap, not the ambient row
+        # RR-3: THIS book's cap, not the ambient row (same leak the 8/18
+        # fix closed for risk_pct, two lines further down the same page).
+        _bs = _gbs2(user_id)
         _user_cap = getattr(_bs, "max_position_pct", None)
         if _user_cap is not None and 0.01 <= float(_user_cap) <= 1.0:
             cap_pct = float(_user_cap)
@@ -178,12 +180,15 @@ def plan_position(
     if target_price and target_price > 0:
         reward = abs(target_price - entry_price)
         reward_risk = round(reward / stop_distance, 2)
-        # Per-user floor from Bot Tuning. Falls back to the seed (1.5)
-        # if the settings module isn't reachable.
-        # RR-3 / RM-6: read THIS book's floor by name. The bare read judged
-        # every executing book against whatever row the ambient binding
-        # resolved to -- 134 rejections 'Reward:risk 0.4 below your 0.5
-        # floor' while the fan-out had already bound a different book.
+        # RR-3 / RM-6: THIS BOOK's floor by name -- the same row the Risk
+        # Manager's harmonizer read when it shaped this trade. The bare
+        # read judged every executing book against whatever row the
+        # ambient binding resolved to: 134 rejections "Reward:risk 0.4
+        # below your 0.5 floor" (6-for-6 on 8/31, again at Monday's
+        # open) while the harmonizer had landed geometry EXACTLY AT the
+        # book's floor. Measured per book, enforced ambient -- the
+        # platform's oldest disease, in the money path. Falls back to
+        # the seed (1.5) if settings are unreachable.
         try:
             from app.runtime.settings import get_bot_settings as _gbs
             floor = float(_gbs(user_id).min_reward_risk or MIN_REWARD_RISK)
@@ -191,7 +196,11 @@ def plan_position(
             floor = MIN_REWARD_RISK
         # Clamp to a sane band so a typo can't disable the floor entirely.
         floor = max(0.3, min(3.0, floor))
-        if reward_risk < floor:
+        # Tolerance of one 2-dp rounding step: the harmonizer TARGETS the
+        # floor exactly (stop = target/floor), and cent-rounding of the
+        # stop/target PRICES can shave the realized ratio to 0.39 against
+        # a 0.40 floor. Enforcement must not reject its own target.
+        if reward_risk < floor - 0.011:
             return SizingPlan(ok=False, account_equity=equity, account_tier=tier,
                               stop_distance=round(stop_distance, 4), reward_risk=reward_risk,
                               reject_reason=f"Reward:risk {reward_risk} below your {floor} floor — raise the profit target, tighten the stop, or lower the R:R floor in Bot Tuning.")
