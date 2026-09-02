@@ -32,18 +32,32 @@ MARKET_TYPES = ("crypto", "stocks", "options", "income", "forex")
 # Per-posture split of equity across market types (fractions, sum to 1.0).
 # Forex added 2026-07-02 (modeled engine, Kraken data): a small dedicated
 # pocket carved from stocks+crypto so FX trades never eat the other lanes.
+# Mike 2026-09-02: "widen the stock pool for all the books, not just the
+# 75k" -- stocks growth .42->.50, balanced .32->.45, income .18->.28,
+# velocity .22->.30; the other four lanes of each posture rescaled
+# proportionally (rounded to 2 dp, rounding residual absorbed in income) so
+# every row still sums to exactly 1.00.
+#
+# READ THIS BEFORE EDITING THESE NUMBERS: a per-book dollar pin in
+# bot_settings.allocation_overrides[<lane>] REPLACES the fraction outright
+# (see build_allocation), and on 2026-09-02 all three live books carried a
+# stocks pin ($1,065 / $7,000 / $26,000) -- so this split only governs a
+# book whose stocks pin is blank. Changing it without lifting the pin is
+# BUILT BUT NOT BOUND.
 POSTURE_SPLIT: dict[str, dict[str, float]] = {
-    "growth":   {"crypto": 0.32, "stocks": 0.42, "options": 0.10, "income": 0.10, "forex": 0.06},
-    "balanced": {"crypto": 0.18, "stocks": 0.32, "options": 0.20, "income": 0.25, "forex": 0.05},
-    "income":   {"crypto": 0.09, "stocks": 0.18, "options": 0.20, "income": 0.48, "forex": 0.05},
+    "growth":   {"crypto": 0.28, "stocks": 0.50, "options": 0.09, "income": 0.08, "forex": 0.05},
+    "balanced": {"crypto": 0.15, "stocks": 0.45, "options": 0.16, "income": 0.20, "forex": 0.04},
+    "income":   {"crypto": 0.08, "stocks": 0.28, "options": 0.18, "income": 0.42, "forex": 0.04},
     # VELOCITY (Mike 2026-07-24): "prioritize the trades that can be
     # settled in a day, the 24-hour market, and things that are liquid
     # so we can reach a daily profit goal." Capital cycles instead of
-    # parking: 24/7 lanes (crypto+forex = 48%) and fast option cycles
-    # (same-day lane + weekly wheel) weighted first; multi-day stock
-    # swings get the smallest share they've ever had. Opt-in only via
-    # the account_posture setting -- auto never picks it.
-    "velocity": {"crypto": 0.40, "stocks": 0.22, "options": 0.22, "income": 0.08, "forex": 0.08},
+    # parking: 24/7 lanes (crypto+forex = 43% since 2026-09-02) and fast
+    # option cycles (same-day lane + weekly wheel) weighted first;
+    # multi-day stock swings get the smallest share of any posture.
+    # Opt-in only via the account_posture setting -- auto never picks it
+    # (and as of 2026-09-02 the DB check constraint from migration 0015
+    # and the web enum do not accept it -- unreachable until both change).
+    "velocity": {"crypto": 0.36, "stocks": 0.30, "options": 0.20, "income": 0.07, "forex": 0.07},
 }
 
 # How each posture leans on realized gains.
