@@ -506,6 +506,7 @@ from app.agents.reevaluator import reeval_is_enabled, reevaluate_position
 from .base import Agent, AgentMessage
 from app.runtime.asset_policy import policy_for as _asset_policy
 from app.runtime.asset_policy import trail_policy_for as _trail_policy
+from app.runtime.asset_policy import crypto_stale_exit_for as _crypto_stale_exit
 
 # Day-trade management thresholds (Phase 8e).
 MAX_HOLD_MINUTES = 90
@@ -592,6 +593,141 @@ def _decide_time_stop(
     return None, ""
 
 
+# --- 24/7 defence of a LOSING coin (Mike 2026-09-02, the DOT bleed) ---------
+# The crypto lane already runs around the clock on every book: the scanner
+# has no calendar gate, the Risk Manager skips the equity filter for coins,
+# execution never reads the market clock, and this monitor's crypto branch
+# checks stop/target every 60s. What it did NOT have was anything that acts
+# on a coin that is simply LOSING between a far stop and its target: the
+# ladder and both trails only raise a winner's stop, the intraday time
+# stops are stock-only by Mike's 2026-08-05 decision, and the reevaluator
+# was never reached by a broker-routed crypto row. DOT on the 75k sat nine
+# days and -13% that way. The three switches below and the pure function
+# under them are the fix. Switches are read per call (never at import) with
+# os.getenv, like every other TREZO_* knob in this file, so a flip needs no
+# code change -- but note the server must EXPORT them; agents/.env is read
+# by pydantic Settings only.
+
+def _crypto_time_exit_enabled() -> bool:
+    """The losing-TIME limit for coins (asset_policy.CRYPTO_STALE_EXITS,
+    swing 4d / scalp 1d / dca 7d). OFF BY DEFAULT: Mike's 2026-08-05 note in
+    _decide_time_stop excluded crypto from every time-based exit, and that
+    note stands until he says today's 24/7 decision supersedes it. Set
+    TREZO_CRYPTO_TIME_EXIT=1 to turn it on. The clock is the ROW's
+    entry_at -- for an adopted row that is its adoption time (the engine's
+    record_external_position inserts no entry_at), NOT the broker's
+    original fill; a coin re-adopted after every phantom close restarts
+    this clock each time."""
+    return os.getenv("TREZO_CRYPTO_TIME_EXIT", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _crypto_mae_adopted_enabled() -> bool:
+    """May the MAE ceiling sell an ADOPTED coin? OFF BY DEFAULT. An adopted
+    row's entry_price is the broker's inherited average, so a coin adopted
+    already 8% under water would be sold on the very next tick -- and
+    adoption.py's contract says adopting a position must never, by itself,
+    be a trading decision. Until TREZO_CRYPTO_MAE_ADOPTED=1 the monitor only
+    SAYS so: one adopted_underwater row per position per hour."""
+    return os.getenv("TREZO_CRYPTO_MAE_ADOPTED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _crypto_reeval_enabled() -> bool:
+    """May the reevaluator see a broker-routed coin? OFF BY DEFAULT.
+    reevaluator.py has no crypto-safe overrides yet: on a losing coin it
+    would close at >=1d when the fresh TCS is under HALF the book's STOCK
+    bar, tighten the stop to price*0.98 at 3d (a 2% band under most coins'
+    own stop_pct), and close outright at 7d. Set TREZO_CRYPTO_REEVAL=1 to
+    turn it on. The crypto call passes target=None so lower_target can
+    never touch a coin, and only ratchets a returned stop UP."""
+    return os.getenv("TREZO_CRYPTO_REEVAL", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _is_adopted_row(r: dict) -> bool:
+    """Was this row written by adoption (broker truth) rather than by a
+    lane's signal? strategy 'adopted_*' or source_payload.adopted. A row
+    re-adopted under an inherited strategy tag ('crypto_swing') carries
+    the flag in its payload. Never raises."""
+    try:
+        if str(r.get("strategy") or "").strip().lower().startswith("adopted"):
+            return True
+        sp = r.get("source_payload")
+        if isinstance(sp, str):
+            import json as _json
+            sp = _json.loads(sp)
+        return bool(isinstance(sp, dict) and sp.get("adopted"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _decide_crypto_stale_exit(r: dict, price: float) -> tuple[str | None, str]:
+    """Pure function: should this LOSING long coin be closed by its
+    strategy's MAE ceiling or losing-time limit? Returns
+    (close_reason, detail): ('stop', 'crypto_mae_exit: ...'),
+    ('time', 'crypto_time_exit: ...'), or (None, detail) -- where a
+    non-empty detail with no reason means "seen, not acted on": an
+    adopted row under the ceiling while TREZO_CRYPTO_MAE_ADOPTED is off.
+
+    Precedence: MAE ceiling before the time limit. Winners (gain >= 0)
+    return (None, '') before any policy is read; HODL is exempt by policy
+    (None, None); a missing/unparseable entry_at reads as 0 days (no
+    time exit -- fail safe); a missing or zero entry_price or price is
+    (None, '') -- the row loop has no per-row try/except, so this MUST
+    NOT raise or every row after it on every book goes unmanaged.
+    stms/orb/scalp intraday prefixes are untouched: _decide_time_stop's
+    2026-08-05 exemption is preserved verbatim, this is a separate rule."""
+    try:
+        if str(r.get("asset_type") or "").strip().lower() != "crypto":
+            return None, ""
+        if str(r.get("side") or "").strip().lower() != "long":
+            return None, ""
+        entry = float(r.get("entry_price") or 0)
+        px = float(price or 0)
+    except (TypeError, ValueError):
+        return None, ""
+    if entry <= 0 or px <= 0:
+        return None, ""
+    gain = (px - entry) / entry
+    if gain >= 0:
+        return None, ""      # winners belong to the ladder / trails
+    strat = str(r.get("strategy") or "").strip().lower()
+    pol = _crypto_stale_exit(strat)
+    adopted = _is_adopted_row(r)
+    try:
+        stop_s = f"{float(r.get('stop_price')):.6g}" if r.get("stop_price") else "none"
+    except (TypeError, ValueError):
+        stop_s = "?"
+    pending = ""
+    if pol.max_adverse_pct is not None and gain <= -pol.max_adverse_pct:
+        body = (f"down {abs(gain) * 100:.1f}% vs {pol.mode} ceiling "
+                f"{pol.max_adverse_pct * 100:.0f}% (row stop {stop_s})")
+        if adopted and not _crypto_mae_adopted_enabled():
+            pending = ("adopted_underwater: " + body + " -- adopted row, entry "
+                       "is the broker's inherited average; not sold without "
+                       "TREZO_CRYPTO_MAE_ADOPTED=1")
+        else:
+            return "stop", ("crypto_mae_exit: " + body
+                            + (" [adopted row, TREZO_CRYPTO_MAE_ADOPTED=1]"
+                               if adopted else ""))
+    if _crypto_time_exit_enabled() and pol.max_hold_days_losing is not None:
+        days = _minutes_since(r.get("entry_at")) / 1440.0
+        if days >= pol.max_hold_days_losing:
+            return "time", (f"crypto_time_exit: losing {abs(gain) * 100:.1f}% "
+                            f"after {days:.1f}d >= {pol.max_hold_days_losing:g}d "
+                            f"for {pol.mode} (clock: row entry_at"
+                            f"{' = adoption time' if adopted else ''})")
+    return None, pending
+
+
+# Visibility throttles for the block above, per BOOK / per row -- never a
+# shared slot, so one book's row cannot silence another's line.
+_crypto_reeval_off_at: dict[str, float] = {}     # user_id -> last said
+_adopted_underwater_at: dict[str, float] = {}    # user_id:position_id -> last said
+_CRYPTO_SAY_EVERY_S = 3600.0
+
+
 def _supabase():
     settings = get_settings()
     if not settings.supabase_url or not settings.supabase_service_role_key:
@@ -641,13 +777,7 @@ async def _maybe_trail_hodl(r: dict, price: float) -> float | None:
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
-    if _breached:
-        record("ladder_lock_breached", tk,
-               entry=r.get("entry_price"), peak=_anchor, price=price,
-               locked_stop=new_stop,
-               reason="gave back through the rung - local stop-check sells")
-    else:
-        await _push_stop_to_broker(r, new_stop)
+    await _push_stop_to_broker(r, new_stop)
     return new_stop
 
 
@@ -825,10 +955,15 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
         from app.strategies.crypto import round_trip_cost_pct
         _floor_pct = round_trip_cost_pct(_FB, _SB)
         if (new_stop / _entry - 1.0) <= _floor_pct:
+            # 2026-09-02: record() takes no bare kwargs; the old call would
+            # have raised TypeError out of the tick the first time a rung
+            # ever landed under the fee floor.
             record("ladder_lock_below_fee_floor", tk,
-                   entry=_entry, proposed_stop=new_stop,
-                   fee_floor_pct=round(_floor_pct * 100, 4),
-                   reason="rung locks at or under round-trip cost - refused")
+                   strategy=str(r.get("strategy") or ""),
+                   reason="rung locks at or under round-trip cost - refused",
+                   extra={"entry": _entry, "proposed_stop": new_stop,
+                          "fee_floor_pct": round(_floor_pct * 100, 4),
+                          "user_id": str(r.get("user_id") or "")})
             return None
 
     try:
@@ -858,6 +993,28 @@ async def _maybe_ladder_stop(r: dict, price: float, ladder) -> float | None:
     except Exception:  # noqa: BLE001
         return None
     r["stop_price"] = new_stop
+    # 2026-09-02: the `if _breached: record(...)` below lived in
+    # _maybe_trail_hodl by mistake, where none of _breached / tk / _anchor
+    # / record exist -- a NameError on the first HODL ratchet, live since
+    # 8/19 -- while THIS function computed _breached and never read it.
+    # Moved here, where every name is defined, with record()'s real
+    # signature (extra=..., not bare kwargs it does not accept).
+    #
+    # The broker push is NOT skipped on a breach, on purpose: the
+    # 2026-08-19 intent above says "skip the broker push", but the deploy
+    # gate (test_monitor_bookbound, the extended KO/PG twin) pins today's
+    # behaviour -- push, then the local stop-check liquidates on this same
+    # pass. The venue rejects a stop through the market (a wasted call,
+    # said as broker_stop_unmoved), not a wrong order. Changing that is a
+    # two-file change (this line + that pin); see the 2026-09-02 crypto
+    # track notes.
+    if _breached:
+        record("ladder_lock_breached", tk,
+               strategy=str(r.get("strategy") or ""),
+               reason="gave back through the rung - local stop-check sells this pass",
+               extra={"entry": r.get("entry_price"), "peak": _anchor,
+                      "price": price, "locked_stop": new_stop,
+                      "user_id": str(r.get("user_id") or "")})
     await _push_stop_to_broker(r, new_stop)
     return new_stop
 
@@ -1777,6 +1934,7 @@ class PositionMonitorAgent(Agent):
                             if _tg is not None and (stop_c is None or _tg > stop_c):
                                 stop_c = _tg
                         reason_c: str | None = None
+                        _cexit_event, _cexit_detail = "", ""
                         if r.get("close_requested"):
                             reason_c = "manual"
                         elif _nps:
@@ -1791,6 +1949,118 @@ class PositionMonitorAgent(Agent):
                                 reason_c = "stop"
                             elif target_c is not None and price_c <= target_c:
                                 reason_c = "target"
+                        # --- A LOSING coin is defended 24/7 (Mike 2026-09-02,
+                        # the DOT bleed). Everything above only ever RAISES a
+                        # winner's stop; nothing acted on a coin sitting red
+                        # between a far stop and its target, and the
+                        # reevaluator never saw a broker-routed coin (the
+                        # Alpaca block `continue`s before its call). Runs
+                        # only when no ordinary exit fired this tick, so a
+                        # row already closing on its stop is never re-scored,
+                        # tightened or logged first. Precedence: manual >
+                        # stop > target > reeval close (TCS collapse / 7d
+                        # rotate) > MAE ceiling > losing-time limit. Winners
+                        # never enter (reevaluator L288 and the gain>=0 guard
+                        # in _decide_crypto_stale_exit); HODL is exempt from
+                        # all three by name AND by policy; a no_price_stop
+                        # row is untouched. Same per-row binding, same book:
+                        # the reevaluator judges the collapse against THIS
+                        # row's book bar (_collapse_bar(user_id)); every
+                        # throttle here is keyed by book or by row.
+                        reeval_close_c = None
+                        if (reason_c is None and not _nps and r["side"] == "long"
+                                and "hodl" not in _strat_a):
+                            _uid_c = str(r.get("user_id") or "")
+                            _now_c = _utc_now().timestamp()
+                            if _crypto_reeval_enabled() and reeval_is_enabled():
+                                try:
+                                    # target=None ON PURPOSE (2026-09-02):
+                                    # lower_target would persist target =
+                                    # entry+0.5% on a coin, under the 0.62%
+                                    # crypto round trip. With cur_target None
+                                    # the reevaluator skips step 3 entirely.
+                                    _rvc = await reevaluate_position(
+                                        r, price_c, r["side"], at, _strat_a,
+                                        stop_c, None,
+                                        emit=out, agent_name="reevaluator")
+                                except Exception as _rce:  # noqa: BLE001
+                                    out.append(AgentMessage(
+                                        agent=self.name, kind="info",
+                                        payload={"note": f"reeval error: {str(_rce)[:120]}",
+                                                 "user_id": _uid_c, "ticker": tk}))
+                                    _rvc = None
+                                if _rvc:
+                                    try:
+                                        if _rvc.get("stop") is not None and (
+                                                stop_c is None or float(_rvc["stop"]) > stop_c):
+                                            stop_c = float(_rvc["stop"])   # ratchet UP only
+                                        if _rvc.get("target") is not None:
+                                            target_c = float(_rvc["target"])
+                                    except (TypeError, ValueError):
+                                        pass
+                                    reeval_close_c = _rvc.get("close")
+                                    try:
+                                        from app.agents.activity_log import record as _arec
+                                        _arec("crypto_reeval", tk,
+                                              strategy=str(r.get("strategy") or ""),
+                                              reason=(f"close {reeval_close_c}" if reeval_close_c
+                                                      else f"stop->{stop_c}" if _rvc.get("stop") is not None
+                                                      else f"target->{target_c}")
+                                              + f" (book {_uid_c[:8]})",
+                                              extra={"user_id": _uid_c, "broker": "alpaca",
+                                                     "position_id": str(r.get("id"))})
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                            elif (_now_c - _crypto_reeval_off_at.get(_uid_c, 0.0)
+                                    >= _CRYPTO_SAY_EVERY_S):
+                                # Said hourly per book so an OFF flag on the
+                                # server is visible, not silent: no reeval
+                                # line could ever have existed for a coin
+                                # before today, so absence proves nothing.
+                                _crypto_reeval_off_at[_uid_c] = _now_c
+                                try:
+                                    from app.agents.activity_log import record as _arec
+                                    _arec("crypto_reeval_off", tk,
+                                          strategy=str(r.get("strategy") or ""),
+                                          reason=("losing coin not re-scored: "
+                                                  + ("TREZO_CRYPTO_REEVAL is off"
+                                                     if not _crypto_reeval_enabled()
+                                                     else "TREZO_REEVAL_ENABLED is off")
+                                                  + " -- MAE ceiling / time limit still apply"),
+                                          extra={"user_id": _uid_c, "broker": "alpaca"})
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            if reeval_close_c:
+                                reason_c = "reeval"
+                                _cexit_event, _cexit_detail = (
+                                    "crypto_reeval_exit", str(reeval_close_c))
+                            else:
+                                try:
+                                    _cr, _cd = _decide_crypto_stale_exit(r, price_c)
+                                except Exception:  # noqa: BLE001
+                                    _cr, _cd = None, ""
+                                if _cr:
+                                    reason_c = _cr
+                                    _cexit_event = ("crypto_time_exit"
+                                                    if _cd.startswith("crypto_time")
+                                                    else "crypto_mae_exit")
+                                    _cexit_detail = _cd
+                                elif _cd:
+                                    # Adopted row under the ceiling, no yes from
+                                    # Mike yet: say it, hourly per row.
+                                    _ak = f"{_uid_c}:{r.get('id')}"
+                                    if (_now_c - _adopted_underwater_at.get(_ak, 0.0)
+                                            >= _CRYPTO_SAY_EVERY_S):
+                                        _adopted_underwater_at[_ak] = _now_c
+                                        try:
+                                            from app.agents.activity_log import record as _arec
+                                            _arec("adopted_underwater", tk,
+                                                  strategy=str(r.get("strategy") or ""),
+                                                  reason=_cd,
+                                                  extra={"user_id": _uid_c, "broker": "alpaca",
+                                                         "position_id": str(r.get("id"))})
+                                        except Exception:  # noqa: BLE001
+                                            pass
                         # Scalp net-edge auto-exit (Mike 2026-06-15): fast/quick plays take
                         # profit once they clear round-trip cost + the 0.01% net floor.
                         # SCALP only; HODL/SWING/DCA keep their ladders.
@@ -1917,6 +2187,23 @@ class PositionMonitorAgent(Agent):
                             r["user_id"], r["id"], price_c, reason=reason_c)
                         if fill.ok:
                             affected_users.add(r["user_id"])
+                            if _cexit_event:
+                                # Said AFTER the fill, not at the decision: a
+                                # throttled or rejected liquidate must not
+                                # log an exit that did not happen (the
+                                # exit_error row covers the reject).
+                                try:
+                                    from app.agents.activity_log import record as _arec
+                                    _arec(_cexit_event, tk,
+                                          strategy=str(r.get("strategy") or ""),
+                                          reason=_cexit_detail,
+                                          extra={"user_id": str(r.get("user_id") or ""),
+                                                 "broker": "alpaca",
+                                                 "position_id": str(r.get("id")),
+                                                 "exit_price": fill.fill_price,
+                                                 "realized_pnl_usd": fill.realized_pnl_usd})
+                                except Exception:  # noqa: BLE001
+                                    pass
                             out.append(AgentMessage(
                                 agent=self.name, kind="close", confidence=1.0,
                                 payload={
@@ -1926,6 +2213,7 @@ class PositionMonitorAgent(Agent):
                                     "realized_pnl_usd": fill.realized_pnl_usd,
                                     "position_id": r["id"],
                                     "broker": "alpaca",
+                                    **({"detail": _cexit_detail} if _cexit_detail else {}),
                                 }))
                         continue
                     if alpaca_held is not None and tk.upper() not in alpaca_held:
@@ -2225,13 +2513,20 @@ class PositionMonitorAgent(Agent):
                 # Continuous re-evaluation (Mike 6/29). Re-judges this position
                 # with the shared capability library and actively manages it
                 # (tighten stop / lower target / rotate / advise add).
-                # 2026-08-22: this comment used to say "Master-flagged OFF, so
-                # this is a no-op until enabled -- live behavior is unchanged
-                # today." That has been FALSE since the flag was flipped:
-                # TREZO_REEVAL_ENABLED=true in production, so this path is LIVE
-                # and 395 lines of reevaluator.py are actively managing open
-                # positions. Anyone reading the old note would have believed
-                # otherwise while debugging a moved stop.
+                # WHO REACHES THIS (corrected 2026-09-02): only INTERNAL-paper
+                # rows. Every broker=alpaca row leaves the loop at the
+                # `continue` that ends the Alpaca block above, so with every
+                # open row broker-routed (30 of 30 on 2026-09-02) this call
+                # was dead platform-wide -- zero reeval_check lines in the
+                # live log -- while the 2026-08-22 note here said the
+                # reevaluator was "actively managing open positions". The
+                # flag IS on in production (TREZO_REEVAL_ENABLED=true), so
+                # where this line is reached it is live; it simply was not
+                # being reached. Alpaca CRYPTO rows now get their own,
+                # narrower call inside the crypto branch (behind
+                # TREZO_CRYPTO_REEVAL, target=None, stop ratchet-up only).
+                # Alpaca STOCK rows still never reach the reevaluator; that
+                # branch belongs to the stock track.
                 # NEQ-05: the reevaluator tightens stops, lowers targets and
                 # closes on a TCS collapse -- all price management. It does
                 # not see a no_price_stop row at all (belt to its own

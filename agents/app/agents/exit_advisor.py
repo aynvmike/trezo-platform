@@ -1,7 +1,10 @@
 """Exit Advisor Agent — Phase 13d.
 
-The 19th agent. Ticks every 5 minutes during the US equity session.
-For each open paper_position, fetches the latest price, updates the
+The 19th agent. Ticks every 5 minutes, 24/7, on every book -- there is
+no session gate in tick() (the old "during the US equity session" here
+was stale by 2026-09-02; crypto rows are watched overnight and at
+weekends like any other). For each open paper_position, fetches the
+latest price, updates the
 running peak unrealized P&L on the row, and watches for the
 held-too-long pattern in real time:
 

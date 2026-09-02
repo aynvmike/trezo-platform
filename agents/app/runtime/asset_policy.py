@@ -519,3 +519,74 @@ def trail_policy_for(strategy: Optional[str]) -> TrailPolicy:
         if mode in s and f"crypto_{mode}" in TRAIL_POLICIES:
             return TRAIL_POLICIES[f"crypto_{mode}"]
     return DEFAULT_TRAIL
+
+
+# ---- per-STRATEGY exit policy for a LOSING coin (Mike 2026-09-02) ---------
+# The DOT bleed on the 75k (2026-08-24 -> 09-02, -$1,138): between a far
+# stop and the target NOTHING in the monitor acts on a losing coin. The
+# ladder and both trails only ever RAISE a winner's stop; the intraday time
+# stops are stock-only by Mike's 2026-08-05 decision; the reevaluator never
+# reached a broker-routed crypto row; the exit advisor acts on winners. So
+# a coin sat nine days and -13% while every agent "watched" it. This table
+# says, per crypto strategy, how far under water (MAE ceiling) and how long
+# (losing-time limit) a LOSER may be held before the monitor closes it.
+# Winners are never judged by it: position_monitor checks the gain first.
+#
+# Two of the three limits are gated OFF in the monitor until Mike says yes
+# (TREZO_CRYPTO_TIME_EXIT for the time limit; TREZO_CRYPTO_MAE_ADOPTED for
+# the ceiling on an ADOPTED row, whose entry is the broker's inherited
+# average). The ceiling on a lane-opened coin ships live.
+
+@dataclass(frozen=True)
+class StaleExitPolicy:
+    """How long, and how deep, a LOSING position of this strategy rides."""
+
+    mode: str
+    max_hold_days_losing: Optional[float]   # None = no losing-time limit
+    max_adverse_pct: Optional[float]        # None = no MAE ceiling
+    notes: str = ""
+
+    @property
+    def limits(self) -> tuple:
+        """(max_hold_days_losing, max_adverse_pct) -- for tests and reports."""
+        return (self.max_hold_days_losing, self.max_adverse_pct)
+
+
+CRYPTO_STALE_EXITS: dict[str, StaleExitPolicy] = {
+    "swing": StaleExitPolicy(
+        "swing", 4.0, 0.08,
+        notes=("A defined trade with a ~4% stop; 8% under water means the "
+               "stop already failed (re-adoption clamped it, or it never "
+               "rested) and four losing days means the swing is over.")),
+    "scalp": StaleExitPolicy(
+        "scalp", 1.0, 0.05,
+        notes="A scalp that is red after a day is not a scalp any more."),
+    "dca": StaleExitPolicy(
+        "dca", 7.0, 0.10,
+        notes=("MIKE'S CALL, flagged 2026-09-02: a 10% MAE sell on an "
+               "accumulation lane cuts against its premise (it buys dips). "
+               "Set on purpose; loosen or remove if he says so.")),
+    "hodl": StaleExitPolicy(
+        "hodl", None, None,
+        notes=("Deliberately exempt from both: a HODL rides on its "
+               "catastrophe stop and its own +40%/20% trail, nothing else.")),
+}
+
+CRYPTO_STALE_DEFAULT = StaleExitPolicy(
+    "default", 4.0, 0.08,
+    notes="adopted_crypto and anything unnamed: the swing limits.")
+
+
+def crypto_stale_exit_for(strategy: Optional[str]) -> StaleExitPolicy:
+    """Match a row's strategy tag to its losing-exit policy, as tolerant
+    of shape as trail_policy_for: 'crypto_swing', 'swing', 'adopted_crypto'
+    (-> default), '' (-> default) all resolve. Never raises."""
+    s = (strategy or "").strip().lower()
+    if not s:
+        return CRYPTO_STALE_DEFAULT
+    if s in CRYPTO_STALE_EXITS:
+        return CRYPTO_STALE_EXITS[s]
+    for mode in ("hodl", "swing", "dca", "scalp"):
+        if mode in s:
+            return CRYPTO_STALE_EXITS[mode]
+    return CRYPTO_STALE_DEFAULT
