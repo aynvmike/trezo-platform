@@ -340,13 +340,112 @@ HANDLERS = {
 
 # ---- the drain, called from ops_watchdog every tick ------------------
 
+# Jobs whose handler can outlive the ops_watchdog tick (its ceiling is
+# 600s). 2026-09-02: the first web_rebuild after the audit fixes took longer
+# than that on the server; asyncio.wait_for cancelled the tick, the npm
+# thread kept building, and nothing was left to mark the row done or
+# restart TrezoWeb -- the row sat in "running" forever. These kinds now run
+# to completion in their OWN asyncio task (tasks are not cancelled when the
+# tick is), which writes the durable result and does the restart itself.
+DETACHED_KINDS = {"web_rebuild"}
+STALE_RUNNING_MIN = 45   # a "running" row older than this was stranded
+
+
+def _parse_iso(ts) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def sweep_stranded(client) -> int:
+    """Mark long-abandoned "running" rows failed so the queue tells the
+    truth (and `relay.py check` stops showing a phantom pending job).
+    Returns the number of rows swept. Never raises."""
+    if client is None:
+        return 0
+    try:
+        def _q():
+            return (client.table("ops_tasks").select("id,kind,started_at")
+                    .eq("status", "running").limit(20).execute())
+        rows = (await asyncio.to_thread(_q)).data or []
+        now = datetime.now(timezone.utc)
+        n = 0
+        for r in rows:
+            st = _parse_iso(r.get("started_at"))
+            if st is None or (now - st) < timedelta(minutes=STALE_RUNNING_MIN):
+                continue
+            jid = r["id"]
+            def _mark(_jid=jid):
+                return (client.table("ops_tasks").update({
+                    "status": "failed",
+                    "result": ("STRANDED: still 'running' after "
+                               f"{STALE_RUNNING_MIN} min -- the tick that "
+                               "owned it was cancelled before it could "
+                               "record a result. Re-queue if still wanted."),
+                    "finished_at": now.isoformat(),
+                }).eq("id", _jid).execute())
+            await asyncio.to_thread(_mark)
+            n += 1
+        return n
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def _complete_detached(client, jid: str, kind: str, args: dict,
+                             attempts: int, fn) -> None:
+    """Run a DETACHED_KINDS handler to completion and write its result --
+    in its own task, so the watchdog tick's ceiling cannot orphan it."""
+    global _TICK_BUSY
+    try:
+        try:
+            out = await asyncio.to_thread(fn, args)
+            def _done():
+                return (client.table("ops_tasks").update({
+                    "status": "done", "result": out[:8000],
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", jid).execute())
+            await asyncio.to_thread(_done)
+            try:
+                from app.agents.activity_log import record
+                record("ops_relay", kind.upper(),
+                       reason=f"executed {kind} -> {out[-180:]}")
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            final = "failed" if attempts >= MAX_ATTEMPTS else "queued"
+            def _fail():
+                return (client.table("ops_tasks").update({
+                    "status": final, "result": f"ERROR: {e}"[:4000],
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", jid).execute())
+            try:
+                await asyncio.to_thread(_fail)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from app.agents.activity_log import record
+                record("ops_relay", kind.upper(),
+                       reason=f"{kind} FAILED ({attempts}/{MAX_ATTEMPTS}): {e}"[:280])
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        _TICK_BUSY = False
+
+
+_DETACHED_TASKS: set = set()
+
+
 async def drain_once(client) -> dict | None:
     """Claim and run ONE queued job. Returns a summary or None."""
     global _TICK_BUSY
     if _TICK_BUSY or client is None:
         return None
     _TICK_BUSY = True
+    handed_off = False
     try:
+        await sweep_stranded(client)
         def _q():
             return (client.table("ops_tasks").select("*")
                     .eq("status", "queued").order("created_at")
@@ -370,6 +469,23 @@ async def drain_once(client) -> dict | None:
                 "started_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", jid).execute())
         await asyncio.to_thread(_claim)
+
+        if kind in DETACHED_KINDS and kind in HANDLERS:
+            # Hand the long job to its own task and give the tick back.
+            # _TICK_BUSY stays True until that task finishes, so the drain
+            # still runs one job at a time.
+            handed_off = True
+            t = asyncio.create_task(_complete_detached(
+                client, jid, kind, args, attempts, HANDLERS[kind]))
+            _DETACHED_TASKS.add(t)
+            t.add_done_callback(_DETACHED_TASKS.discard)
+            try:
+                from app.agents.activity_log import record
+                record("ops_relay", kind.upper(),
+                       reason=f"{kind} started in a detached task (result lands when it finishes)")
+            except Exception:  # noqa: BLE001
+                pass
+            return {"kind": kind, "status": "started"}
 
         try:
             fn = HANDLERS.get(kind)
@@ -442,7 +558,8 @@ async def drain_once(client) -> dict | None:
     except Exception:  # noqa: BLE001
         return None
     finally:
-        _TICK_BUSY = False
+        if not handed_off:
+            _TICK_BUSY = False
 
 
 _LAST_PUSH = None
