@@ -53,6 +53,16 @@ wt = load_module("app.integrations.web_tokens")
 alp_data = load_module("app.brokers.alpaca_data")
 act = load_module("app.agents.activity_log")
 mu = load_module("app.data.market_universe")
+# Seams the wheel / overlay step drives cross on their way into the REAL
+# _wheel_auto_fire (every one is stubbed to stay off the network).
+wu = load_module("app.strategies.wheel_universe")
+rs = load_module("app.runtime.settings")
+cyc = load_module("app.data.cycles")
+ds = load_module("app.strategies.dividend_screen")
+wa = load_module("app.strategies.wheel_advisor")
+ca = load_module("app.data.corporate_actions")
+cm = load_module("app.data.candles")
+wd = load_module("app.agents.ops_watchdog")
 
 
 def _run(coro):
@@ -314,16 +324,35 @@ def test_harvest_skips_an_unresolvable_book_and_writes_nothing():
     assert "U-unknown-9" in binding.seen, "the row's book was never bound"
 
 
-def test_harvest_skips_a_halted_book_and_says_so():
+def test_harvest_still_exits_on_a_halted_book():
+    """rv:options_scanner :1681. Every order the re-score places is a
+    CLOSE (the 60%+ buy-back, the -50% cut, DTE<=3, the weekend theta
+    guard), so a halted book must still be allowed to REDUCE exposure:
+    the exit goes out under the row's own binding exactly as it does for
+    a live book, and the halt is not even consulted -- _user_halted fails
+    CLOSED, so consulting it let a DB blip withhold every exit for an
+    hour. Two contracts so the step-down bookkeeping follows the order."""
+    halt_calls: list[str] = []
+
+    async def _halted_and_counting(client, uid):
+        halt_calls.append(str(uid))
+        return True                         # the book IS halted
     stack, client, binding, submitted, activity = _harvest_seams(
         [_short_row("U-halted-1", contracts=2)])
-    with stack, _scanner_state(rescore_age_s=7200) as A:
+    with stack, _patched(scanner, _user_halted=_halted_and_counting), \
+            _scanner_state(rescore_age_s=7200) as A:
         _run(scanner.OptionsScannerAgent()._settle_expired(client))
-        assert submitted == []
-        assert client.writes("options_positions") == []
-        assert any(a["event"] == "option_harvest_skip"
-                   and a["user_id"] == "U-halted-1" for a in activity), activity
-        assert not A._harvested
+        assert len(submitted) == 1, submitted
+        assert submitted[0]["bound"] == "U-halted-1", submitted
+        assert submitted[0]["side"] == "buy" and submitted[0]["qty"] == 1, submitted
+        assert halt_calls == [], "the harvest consulted the halt; exits must not be gated on it"
+        assert not any(a["event"] == "option_harvest_skip" for a in activity), activity
+        assert any(a["event"] == "option_harvest" and a["user_id"] == "U-halted-1"
+                   for a in activity), activity
+        assert any(k.startswith("h:row-1:") for k in A._harvested)
+        assert [q for q in client.writes("options_positions") if q.op("update")], (
+            "step-down bookkeeping must follow the accepted exit")
+    assert binding.now is None, "binding leaked past the harvest"
 
 
 def test_step_down_bookkeeping_runs_only_after_a_bound_accepted_order():
@@ -693,6 +722,363 @@ def test_wheel_auto_fire_tracking_insert_can_see_its_client():
         j = body.index("self._wheel_auto_fire(")
         assert "client=client" in body[j:j + 400], "a call site does not pass client"
         body = body[j + 10:]
+
+
+# --- rv:options_scanner :2221 / :2922: the wheel and overlay STEPS, driven --
+
+def _tables(**rows):
+    """Query handler: one fixed row set per table name."""
+    def _h(q):
+        return list(rows.get(q.table_name, []))
+    return _h
+
+
+def _fake_leg(**over):
+    base = dict(underlying="AGNC", strike=9.5, expiration=_EXP_FUTURE,
+                credit_usd=40.0, contracts=1, option_type="put", live=True,
+                cash_secured_usd=950.0, decay_projected=False,
+                modeled_iv=None, premium_per_share=0.4)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+@contextlib.contextmanager
+def _wheel_module_state():
+    """A blocked fire writes a cooldown into module state and the overlay
+    marks its day on the class. Snapshot both, hand out a clean slate,
+    restore -- run_all shares one process across suites."""
+    saved_cd = dict(scanner._wheel_block_until)
+    saved_ov = dict(scanner.OptionsScannerAgent._overlay_day)
+    try:
+        scanner._wheel_block_until.clear()
+        scanner.OptionsScannerAgent._overlay_day.clear()
+        yield
+    finally:
+        scanner._wheel_block_until.clear()
+        scanner._wheel_block_until.update(saved_cd)
+        scanner.OptionsScannerAgent._overlay_day.clear()
+        scanner.OptionsScannerAgent._overlay_day.update(saved_ov)
+
+
+async def _raise(*a, **k):
+    raise RuntimeError("stubbed out -- no network inside the gate")
+
+
+def _step_seams(users, *, auto_execute=True, approval=0, oauth=False):
+    """Everything _run_wheel / _run_cc_overlay cross on their way into the
+    REAL _wheel_auto_fire, which is allowed to bind the book and is then
+    stopped at its options-approval gate (approval=0 -> wheel_auto_blocked)
+    -- the shortest real path that leaves a binding behind."""
+    binding = _Binding()
+    activity, rec = _recorder()
+    seen = {"ks_calls": 0, "acct_bound": [], "settings_bound": []}
+
+    async def _universe(uid):
+        return [types.SimpleNamespace(ticker="AGNC", source="seed", yield_pct=0.0)]
+
+    async def _states(client):
+        seen["ks_calls"] += 1
+        return {u: ks.KillSwitch(False, None, None) for u in users}
+
+    async def _acct(token=None):
+        seen["acct_bound"].append(binding.now)
+        return types.SimpleNamespace(options_approved_level=approval,
+                                     equity=25_000.0, options_buying_power=0.0,
+                                     buying_power=0.0)
+
+    def _bot(uid=None):
+        seen["settings_bound"].append(binding.now)
+        # The suggestion path's _greek_filter reads the three Bot Tuning
+        # option rules off this row before falling back to Settings.
+        return types.SimpleNamespace(wheel_auto_execute=auto_execute,
+                                     account_posture="growth",
+                                     options_min_dte=7,
+                                     options_max_premium_delta=0.35,
+                                     options_min_iv_rank_scalp=30.0)
+
+    async def _token(uid, broker):
+        return wt.BrokerToken(access_token=f"tok-{uid}") if oauth else None
+
+    async def _lots(token=None):
+        return [{"symbol": "AGNC", "qty": "100", "avg_entry_price": "10.0",
+                 "asset_class": "us_equity"}]
+
+    async def _cnd(sym, kind):
+        return _candles(close=10.0)
+
+    async def _yes(uid):
+        return True
+
+    async def _no_halt(client, uid):
+        return False
+
+    async def _identity(leg, spot=None):
+        return leg
+
+    client = _Client(_tables(paper_accounts=[{"user_id": u} for u in users]))
+    stack = contextlib.ExitStack()
+    stack.enter_context(_wheel_module_state())
+    stack.enter_context(_patched(
+        scanner, _user_has_alpaca=_yes, _user_halted=_no_halt,
+        fetch_candles_for=_cnd, evaluate_csp=lambda *a, **k: _fake_leg(),
+        evaluate_cc=lambda *a, **k: _fake_leg(option_type="call", strike=11.0),
+        refine_csp_live=_identity, decay_rate_monthly=lambda c: 0.0,
+        recall_decision_context=lambda **k: {"available": False}))
+    stack.enter_context(_patched(scanner.OptionsScannerAgent,
+                                 _log_to_mem0=lambda self, **k: None))
+    stack.enter_context(_patched(wu, get_wheel_universe=_universe))
+    stack.enter_context(_patched(rs, get_bot_settings=_bot))
+    stack.enter_context(_patched(cyc, get_cycle_position=_raise))
+    stack.enter_context(_patched(ds, screen=_raise))
+    stack.enter_context(_patched(ks, check_states=_states))
+    stack.enter_context(_patched(alp, get_account=_acct, get_positions=_lots,
+                                 alpaca_configured=lambda: True))
+    stack.enter_context(_patched(wt, get_user_broker_token=_token))
+    stack.enter_context(_patched(
+        accounts, set_account_for_user=binding.set_account_for_user,
+        clear_account=binding.clear_account,
+        bind_for_user=binding.bind_for_user))
+    stack.enter_context(_patched(route_guard, check_route=_route))
+    stack.enter_context(_patched(act, record=rec))
+    return stack, client, binding, seen, activity
+
+
+def test_wheel_step_clears_the_binding_each_fire_sets_and_reads_kill_states_once():
+    """Two books, one candidate each. The REAL _wheel_auto_fire binds each
+    book (visible at its get_account read); the step clears it right
+    after the fire -- so the second book's settings read runs unbound,
+    not under the first book -- and nothing is bound once the step
+    returns. check_states is read ONCE for the whole step, not per book."""
+    stack, client, binding, seen, activity = _step_seams(["U-w1", "U-w2"])
+    with stack:
+        out = _run(scanner.OptionsScannerAgent()._run_wheel(client))
+        assert binding.now is None, "wheel step returned with a book still bound"
+    assert binding.seen == ["U-w1", "U-w2"], binding.seen
+    assert seen["acct_bound"] == ["U-w1", "U-w2"], (
+        "the fire's broker read must run under its own book")
+    assert seen["settings_bound"] and all(b is None for b in seen["settings_bound"]), (
+        f"a settings read ran under a stale binding: {seen['settings_bound']}")
+    assert seen["ks_calls"] == 1, f"kill states read {seen['ks_calls']}x for a 2-book step"
+    evs = [(m.payload or {}).get("event") for m in out]
+    assert evs == ["wheel_auto_blocked", "wheel_auto_blocked"], evs
+
+
+def test_wheel_step_does_not_read_kill_states_when_no_book_can_fire():
+    stack, client, binding, seen, activity = _step_seams(["U-w3"], auto_execute=False)
+    with stack:
+        out = _run(scanner.OptionsScannerAgent()._run_wheel(client))
+    assert seen["ks_calls"] == 0, "kill states were read for a book that cannot auto-fire"
+    assert binding.seen == [], "nothing may bind when nothing fires"
+    assert [(m.payload or {}).get("event") for m in out] == ["wheel_suggestion"], out
+
+
+def test_cc_overlay_step_clears_the_binding_its_fire_set():
+    stack, client, binding, seen, activity = _step_seams(["U-ov1"], oauth=True)
+    with stack:
+        out = _run(scanner.OptionsScannerAgent()._run_cc_overlay(client))
+        assert binding.now is None, "overlay step returned with a book still bound"
+    assert binding.seen == ["U-ov1"], binding.seen
+    assert seen["acct_bound"] == ["U-ov1"], seen
+    assert seen["ks_calls"] == 1, seen
+    assert len(out) == 1 and out[0].payload.get("overlay") is True, out
+    assert out[0].payload["event"] == "wheel_auto_blocked", out[0].payload
+
+
+def test_wheel_step_clears_the_binding_even_when_the_body_raises():
+    """The step-level finally is the backstop for the per-fire clear: a
+    fire that raises after binding must still leave nothing bound."""
+    stack, client, binding, seen, activity = _step_seams(["U-w4"])
+
+    async def _bind_then_die(self, **kw):
+        accounts.set_account_for_user(kw["user_id"])
+        raise RuntimeError("broker exploded mid-fire")
+    with stack, _patched(scanner.OptionsScannerAgent, _wheel_auto_fire=_bind_then_die):
+        try:
+            _run(scanner.OptionsScannerAgent()._run_wheel(client))
+        except RuntimeError:
+            pass
+        assert binding.now is None, "a raising fire left its book bound"
+
+
+# --- rv:options_scanner :2390: the CSP gate's broker half is a STRICT read --
+
+def _fire_seams(*, strict, db_csp_rows, bp=0.0):
+    """Drive the REAL _wheel_auto_fire up to and through its CSP gate.
+    approval 3, market open, a listed pick; the gate's own DB read goes
+    to `db` (the gate opens its own client via runtime.settings._supabase)
+    and its broker half to the strict stub. bp=0 stops the fire right
+    after the gate ('fully deployed') so the advisor and the order are
+    never reached."""
+    binding = _Binding()
+    activity, rec = _recorder()
+    reads: list = []
+    submitted: list = []
+
+    async def _token(uid, broker):
+        return None
+
+    async def _acct(token=None):
+        return types.SimpleNamespace(options_approved_level=3, equity=25_000.0,
+                                     options_buying_power=bp, buying_power=bp)
+
+    async def _pick(und, opt_type, strike, exp):
+        cp = "P" if opt_type == "put" else "C"
+        return types.SimpleNamespace(occ=_occ(und, exp, cp, float(strike)),
+                                     strike=float(strike), expiration=exp,
+                                     premium=0.4)
+
+    async def _clock(token=None):
+        return {"is_open": True}
+
+    async def _strict(token=None):
+        reads.append(binding.now)
+        return strict
+
+    async def _submit(occ_symbol, contracts, side, time_in_force="day",
+                      limit_price=None, token=None):
+        submitted.append({"occ": occ_symbol, "qty": contracts, "side": side,
+                          "bound": binding.now})
+        return {"id": "ord-9", "status": "accepted"}, None
+
+    db = _Client(_tables(options_positions=list(db_csp_rows)))
+    stack = contextlib.ExitStack()
+    stack.enter_context(_wheel_module_state())
+    stack.enter_context(_patched(scanner.OptionsScannerAgent,
+                                 _log_to_mem0=lambda self, **k: None))
+    stack.enter_context(_patched(
+        rs, _supabase=lambda: db,
+        get_bot_settings=lambda uid=None: types.SimpleNamespace(
+            account_posture="growth", wheel_auto_execute=True)))
+    stack.enter_context(_patched(
+        alp, get_account=_acct, get_clock=_clock,
+        get_option_positions_strict=_strict, submit_option_order=_submit))
+    stack.enter_context(_patched(alp_data, live_option_pick=_pick))
+    stack.enter_context(_patched(wt, get_user_broker_token=_token))
+    stack.enter_context(_patched(
+        accounts, set_account_for_user=binding.set_account_for_user,
+        clear_account=binding.clear_account))
+    stack.enter_context(_patched(route_guard, check_route=_route))
+    stack.enter_context(_patched(act, record=rec))
+    return stack, db, binding, reads, submitted, activity
+
+
+def _fire(db, uid="U-fire-1", strategy="wheel_csp", leg=None):
+    for name in ("TREZO_WHEEL_MAX_OPEN_CSP", "TREZO_WHEEL_COLLATERAL_PCT",
+                 "TREZO_WHEEL_MAX_DTE"):
+        assert os.getenv(name) is None, f"{name} set in this shell; test env is dirty"
+    return _run(scanner.OptionsScannerAgent()._wheel_auto_fire(
+        user_id=uid, underlying="AGNC", leg=leg or _fake_leg(),
+        strategy=strategy, priced="Live-quoted", client=db))
+
+
+def test_csp_gate_on_an_unreadable_broker_falls_back_to_the_db_count_and_says_so():
+    """Strict read None, DB already at the growth max (1): the gate still
+    refuses on the DB count and the log names the unreadable read."""
+    stack, db, binding, reads, submitted, activity = _fire_seams(
+        strict=None, db_csp_rows=[{"strike": 9.5, "contracts": 1}])
+    with stack:
+        msg = _fire(db)
+    assert msg is not None and msg.payload["event"] == "wheel_limit", msg
+    assert reads == ["U-fire-1"], "the strict read must run under the book's binding"
+    assert any(a["event"] == "wheel_limit_unreadable" and a["user_id"] == "U-fire-1"
+               for a in activity), activity
+    assert submitted == []
+
+
+def test_csp_gate_on_an_unreadable_broker_with_an_empty_db_proceeds_but_logs():
+    """Strict read None, DB empty: non-destructive either way -- the fire
+    proceeds to the next gate (buying power 0 stops it) and the log is
+    honest that the broker half was missing."""
+    stack, db, binding, reads, submitted, activity = _fire_seams(
+        strict=None, db_csp_rows=[])
+    with stack:
+        msg = _fire(db)
+    assert msg is not None and msg.payload["event"] == "wheel_auto_blocked", msg
+    assert "buying power" in msg.payload["reason"], msg.payload
+    assert any(a["event"] == "wheel_limit_unreadable" for a in activity), activity
+    assert not any(a["event"] == "wheel_limit" for a in activity), activity
+    assert submitted == []
+
+
+def test_csp_gate_counts_the_brokers_own_short_puts_when_the_db_lags():
+    """The 2026-07-22 belt-and-suspenders merge, still bound: the DB shows
+    nothing open but the broker holds a short put -> the gate refuses,
+    and no 'unreadable' line is written for a good read."""
+    occ = _occ("AGNC", _EXP_FUTURE, "P", 9.5)
+    stack, db, binding, reads, submitted, activity = _fire_seams(
+        strict=[{"symbol": occ, "qty": "-1", "avg_entry_price": "0.4"}],
+        db_csp_rows=[])
+    with stack:
+        msg = _fire(db)
+    assert msg is not None and msg.payload["event"] == "wheel_limit", msg
+    assert reads == ["U-fire-1"], reads
+    assert not any(a["event"] == "wheel_limit_unreadable" for a in activity), activity
+    assert any(a["event"] == "wheel_limit" for a in activity), activity
+
+
+# --- rv:watchdog-health :949: option fills are filed under the option lane
+
+def test_wheel_auto_placed_is_filed_under_the_option_lane():
+    """Drive the REAL fire to its execute message (a covered call: no
+    CSP gate; the advisor block is stubbed fail-open, the order accepted)
+    and hand the payload to the REAL watchdog classifier."""
+    stack, db, binding, reads, submitted, activity = _fire_seams(
+        strict=[], db_csp_rows=[], bp=5_000.0)
+
+    async def _allow(**k):
+        return types.SimpleNamespace(allow=True, max_contracts=None)
+
+    async def _cnd(sym, kind):
+        return _candles(close=10.0)
+    with stack, _patched(wa, advise_wheel_leg=_allow), \
+            _patched(ca, dividend_history=_raise), _patched(ds, screen=_raise), \
+            _patched(cyc, get_cycle_position=_raise), \
+            _patched(cm, fetch_candles_for=_cnd):
+        msg = _fire(db, uid="U-fire-2", strategy="wheel_cc",
+                    leg=_fake_leg(option_type="call", strike=11.0))
+    assert msg is not None and msg.kind == "execute", msg
+    assert msg.payload["event"] == "wheel_auto_placed", msg.payload
+    assert msg.payload["lane"] == "option" and msg.payload["ticker"] == "AGNC", msg.payload
+    assert wd._lane_of(msg.payload) == "option", "the watchdog still files this fill as unknown"
+    assert submitted and submitted[0]["bound"] == "U-fire-2" and submitted[0]["side"] == "sell", submitted
+    ins = [q for q in db.writes("options_positions") if q.op("insert")]
+    assert ins and ins[0].op("insert")[0][1][0]["user_id"] == "U-fire-2", ins
+
+
+def test_every_execute_the_scanner_publishes_carries_the_option_lane():
+    """The three direct-fire lanes are OFF by default and not driven here;
+    hold every execute payload in the file to the same contract."""
+    src = (Path(__file__).resolve().parents[1]
+           / "app" / "agents" / "options_scanner.py").read_text(encoding="utf-8")
+    hits = [i for i in range(len(src)) if src.startswith('kind="execute"', i)]
+    assert len(hits) == 5, f"execute publish sites changed ({len(hits)}); re-check the lane stamp"
+    for i in hits:
+        window = src[i:i + 500]
+        assert '"lane": "option"' in window and '"ticker":' in window, (
+            f"an execute payload without lane/ticker near offset {i}: {window[:160]!r}")
+    assert wd._lane_of({"underlying": "AGNC", "occ": "AGNC260101C00011000"}) == "unknown", (
+        "the classifier changed; the stamp may no longer be needed")
+
+
+# --- NEQ-09 follow-up: the Settings names the switch reads exist, and are OFF
+
+def test_lane_switch_setting_names_are_declared_in_config_and_default_off():
+    """_lane_enabled reads getattr(Settings, env.lower()); app/config.py
+    must declare exactly those three names as bool = False, or the
+    Settings-first switch is built with nothing to read (source-level:
+    the real config cannot be imported in a bare checkout)."""
+    import re
+    cfg_src = (Path(__file__).resolve().parents[1]
+               / "app" / "config.py").read_text(encoding="utf-8")
+    for env in ("TREZO_DAY_OPTIONS", "TREZO_SPREADS", "TREZO_LONG_OPTIONS"):
+        attr = env.strip().lower()            # the derivation _lane_enabled uses
+        m = re.search(rf"^\s*{attr}\s*:\s*bool\s*=\s*(\w+)", cfg_src, re.M)
+        assert m, f"app/config.py declares no `{attr}: bool` -- NEQ-09 switch unbound"
+        assert m.group(1) == "False", f"{attr} must default OFF, found {m.group(1)}"
+        with _patched(scanner, get_settings=lambda a=attr: types.SimpleNamespace(**{a: True})):
+            assert scanner._lane_enabled(env) is True, attr
+        with _patched(scanner, get_settings=lambda a=attr: types.SimpleNamespace(**{a: False})):
+            assert scanner._lane_enabled(env) is False, attr
 
 
 if __name__ == "__main__":

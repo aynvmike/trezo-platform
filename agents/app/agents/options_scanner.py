@@ -176,9 +176,14 @@ def _lane_enabled(env_name: str) -> bool:
 
     Settings first -- pydantic is the only loader that sees agents/.env;
     a bare os.getenv never does -- then the process env for a real shell
-    override. Default OFF. These lanes were dark for as long as the
-    primary id lived only in .env, and moving that read onto Settings
-    must not switch three order-placing lanes on by itself."""
+    override. The Settings fields are the lower-cased env names,
+    exactly: trezo_day_options / trezo_spreads / trezo_long_options
+    (bool, default False, app/config.py). A Settings without the field
+    answers None and the process env is consulted; a field that is
+    present answers for both, since pydantic reads the shell too.
+    Default OFF. These lanes were dark for as long as the primary id
+    lived only in .env, and moving that read onto Settings must not
+    switch three order-placing lanes on by itself."""
     import os as _os
     attr = env_name.strip().lower()
     v = None
@@ -945,9 +950,15 @@ class OptionsScannerAgent(Agent):
                           f"{mv * 100:+.1f}% on {_pace:.1f}x volume pace; "
                           f"morning-only entry"),
                   extra={"user_id": uid})
+            # lane/ticker (rv:watchdog-health :949): ops_watchdog files an
+            # execute by payload "lane" (else by "ticker"); with only
+            # "underlying" every option fill landed in its "unknown"
+            # bucket and option starvation was invisible. Every execute
+            # this file publishes carries both.
             out.append(AgentMessage(
                 agent=self.name, kind="execute",
                 payload={"user_id": uid, "event": "option_day_open",
+                         "lane": "option", "ticker": sym,
                          "underlying": sym, "occ": str(pick.occ),
                          "debit_usd": round(debit * _ctn, 2)}))
         except Exception:  # noqa: BLE001
@@ -1146,6 +1157,7 @@ class OptionsScannerAgent(Agent):
             out.append(AgentMessage(
                 agent=self.name, kind="execute",
                 payload={"user_id": uid, "event": "spread_open",
+                         "lane": "option", "ticker": play.underlying,
                          "underlying": play.underlying,
                          "strategy": play.strategy,
                          "net_credit_usd": round(net * 100, 2)}))
@@ -1327,6 +1339,7 @@ class OptionsScannerAgent(Agent):
                 out.append(AgentMessage(
                     agent=self.name, kind="execute",
                     payload={"user_id": uid, "event": "long_option_open",
+                             "lane": "option", "ticker": sym,
                              "underlying": sym, "occ": str(pick.occ),
                              "debit_usd": round(debit, 2)}))
                 break   # one new long option per tick, by design
@@ -1661,11 +1674,26 @@ class OptionsScannerAgent(Agent):
                                     # binding -- so a 25k/75k book's
                                     # buy-back landed on the PRIMARY
                                     # account. Bind the ROW's book, verify
-                                    # the route, honour the book's halt,
-                                    # and only then submit (OAuth token
-                                    # else the bound account's env keys).
-                                    # A skipped row is NOT marked
-                                    # harvested: it is retried next hour.
+                                    # the route, and only then submit
+                                    # (OAuth token else the bound
+                                    # account's env keys). A skipped row
+                                    # is NOT marked harvested: it is
+                                    # retried next hour.
+                                    #
+                                    # The book's HALT is deliberately not
+                                    # consulted here (rv:options_scanner
+                                    # :1681). Every order this block
+                                    # places is a CLOSE -- the 60%+
+                                    # buy-back, the -50% cut, the DTE<=3
+                                    # time exit, the weekend theta guard
+                                    # -- and a halted book must still be
+                                    # allowed to REDUCE exposure. Nothing
+                                    # else in the codebase gates exits on
+                                    # trading_halted, and _user_halted
+                                    # fails CLOSED, so a DB blip here
+                                    # would have withheld every exit for
+                                    # the hour. _user_halted still gates
+                                    # the ENTRY lanes.
                                     _uid_h = str(lr.get("user_id") or "")
                                     from app.brokers.accounts import (
                                         bind_for_user as _bind_h)
@@ -1677,15 +1705,6 @@ class OptionsScannerAgent(Agent):
                                         if not _rok_h:
                                             _mm_h(_u, _uid_h, _rnote_h,
                                                   "option_harvest")
-                                            _fire = None
-                                        elif await _user_halted(client, _uid_h):
-                                            _arec("option_harvest_skip", _u,
-                                                  strategy=_strat_l,
-                                                  reason=("book halted -- no "
-                                                          "harvest order into a "
-                                                          "halted account; "
-                                                          "retried next hour"),
-                                                  extra={"user_id": _uid_h})
                                             _fire = None
                                         else:
                                             _tok_h, _routed_h = await _book_token(_uid_h)
@@ -2046,16 +2065,24 @@ class OptionsScannerAgent(Agent):
 
                 if (not broker_occ) and realized == 0.0 \
                         and "Reconciled" in exit_note:
-                    # Broker returned ZERO options while this row is open
-                    # and no closing fill exists -- likely a transient API
-                    # gap. HOLD the row instead of closing on no evidence.
+                    # THIS book's broker holds ZERO options while this row
+                    # is open and no closing fill exists. HOLD the row
+                    # instead of closing on no evidence. rv:options_scanner
+                    # :1927: now that each book is judged against its OWN
+                    # broker (TE-15), a row the old unbound reconcile
+                    # copied from the primary into a 25k/75k book lands
+                    # here every tick -- expected noise until those rows
+                    # are cleaned by hand (agents/tools/verify_books.py).
                     try:
                         from app.agents.activity_log import record as _hrec
                         _hrec("reconcile_hold", r["underlying"],
-                              reason=("kept open: broker options came back "
-                                      "empty and no closing fill was found "
-                                      "-- not closing on absence of "
-                                      "evidence"),
+                              reason=("kept open: this book's broker holds "
+                                      "no options and no closing fill was "
+                                      "found -- not closing on absence of "
+                                      "evidence (a row mis-adopted from the "
+                                      "primary by the old unbound reconcile "
+                                      "holds here every tick; verify_books "
+                                      "lists it for a manual close)"),
                               extra={"user_id": user_id})
                     except Exception:  # noqa: BLE001
                         pass
@@ -2195,6 +2222,10 @@ class OptionsScannerAgent(Agent):
         Outside gates (caller checks first):
           - wheel_auto_execute setting is on.
           - User's paper_account is not halted.
+
+        Binding: this binds THIS book inline (set_account_for_user) and
+        does not clear it -- every caller clears right after the call and
+        again at the end of its step (rv:options_scanner :2221).
         """
         from app.brokers.alpaca import (
             UserToken, submit_option_order, get_account,
@@ -2386,11 +2417,38 @@ class OptionsScannerAgent(Agent):
                         # count them too and take the stricter view.
                         _brk_csp_n = 0
                         _brk_coll = 0.0
+                        # rv:options_scanner :2390 / OG-9: the STRICT
+                        # read, under this book's token. The display read
+                        # collapsed a 429/timeout into [] and this gate
+                        # silently lost its broker-truth half -- the DB
+                        # count still governed (max of the two), so
+                        # nothing fired wrongly, but the 2026-07-22
+                        # DB-lag race quietly reopened on every failed
+                        # read. On None the gate falls back to the DB
+                        # count and SAYS so.
+                        _brk_rows = None
                         try:
                             from app.brokers.alpaca import (
-                                get_option_positions as _gop,
+                                get_option_positions_strict as _gops,
                             )
-                            for _bp in (await _gop() or []):
+                            _brk_rows = await _gops(token=token)
+                        except Exception:  # noqa: BLE001
+                            _brk_rows = None
+                        if _brk_rows is None:
+                            try:
+                                from app.agents.activity_log import (
+                                    record as _arecu)
+                                _arecu("wheel_limit_unreadable", underlying,
+                                       reason=(f"broker option positions "
+                                               f"unreadable -- CSP gate "
+                                               f"judged on the DB count "
+                                               f"alone ({len(_open_csp)} "
+                                               f"open) this tick"),
+                                       extra={"user_id": str(user_id)})
+                            except Exception:  # noqa: BLE001
+                                pass
+                        for _bp in (_brk_rows or []):
+                            try:
                                 _occ = str(_bp.get("symbol") or "")
                                 _bq = float(_bp.get("qty") or 0)
                                 if (len(_occ) > 15 and _occ[-9] == "P"
@@ -2398,8 +2456,8 @@ class OptionsScannerAgent(Agent):
                                     _brk_csp_n += int(abs(_bq))
                                     _brk_coll += ((int(_occ[-8:]) / 1000.0)
                                                   * 100.0 * abs(_bq))
-                        except Exception:  # noqa: BLE001
-                            pass
+                            except Exception:  # noqa: BLE001
+                                continue
                         _eff_csp_n = max(len(_open_csp), _brk_csp_n)
                         _eff_coll = max(_held_coll, _brk_coll)
                         # Feed the advisor the SAME ledger the hard cap
@@ -2688,6 +2746,8 @@ class OptionsScannerAgent(Agent):
             payload={
                 "user_id": user_id,
                 "event": "wheel_auto_placed",
+                "lane": "option",           # rv:watchdog-health :949
+                "ticker": underlying,
                 "underlying": underlying,
                 "strategy": strategy,
                 "occ": pick.occ,
@@ -2718,6 +2778,18 @@ class OptionsScannerAgent(Agent):
     _overlay_day: dict[str, str] = {}
 
     async def _run_cc_overlay(self, client) -> list[AgentMessage]:
+        """CC OVERLAY step. Same binding discipline as _run_wheel: the
+        auto-fire binds a book inline, so the step always clears it
+        (rv:options_scanner :2221). The overlay's own broker read
+        (get_positions) rides the book's OAuth token, not the binding."""
+        from app.brokers.accounts import clear_account
+        try:
+            return await self._cc_overlay_books(client)
+        finally:
+            clear_account()
+
+    async def _cc_overlay_books(self, client) -> list[AgentMessage]:
+        """Body of _run_cc_overlay; entered only through it."""
         out: list[AgentMessage] = []
         today = date.today().isoformat()
 
@@ -2726,13 +2798,21 @@ class OptionsScannerAgent(Agent):
 
         users = [u["user_id"] for u in
                  ((await asyncio.to_thread(_sync_users)).data or [])]
+        # KS-6 / rv:options_scanner :2735: one lazy kill-switch read per
+        # step, only once a book with wheel_auto_execute ON reaches the
+        # gate (see _wheel_books).
+        _ks_memo: dict = {}
+
+        async def _ks_states_once():
+            if "states" not in _ks_memo:
+                _ks_memo["states"] = await _book_kill_states(client)
+            return _ks_memo["states"]
+
         for user_id in users:
             if self._overlay_day.get(user_id) == today:
                 continue  # one new overlay write per day per user
             if not await _user_has_alpaca(user_id):
                 continue
-            # KS-6: THIS book's kill-switch verdict, read once per book.
-            _ks_states_u = await _book_kill_states(client)
             try:
                 from app.brokers.alpaca import get_positions, UserToken
                 from app.integrations.web_tokens import get_user_broker_token
@@ -2837,10 +2917,11 @@ class OptionsScannerAgent(Agent):
                 from app.runtime.settings import get_bot_settings
                 cfg = get_bot_settings(user_id)
                 halted = await _user_halted(client, user_id)
-                # KS-6 (see _run_wheel): computed halts / an unreadable
+                # KS-6 (see _wheel_books): computed halts / an unreadable
                 # kill-switch stand the overlay's auto-fire down too.
-                _blk_ks = _fire_block_reason(_ks_states_u, user_id,
-                                             "wheel_cc")
+                _blk_ks = (_fire_block_reason(await _ks_states_once(),
+                                              user_id, "wheel_cc")
+                           if cfg.wheel_auto_execute else None)
                 if _blk_ks and cfg.wheel_auto_execute and not halted:
                     halted = True
                     from app.agents.activity_log import record as _arec_ks
@@ -2848,14 +2929,21 @@ class OptionsScannerAgent(Agent):
                              reason=f"cc overlay auto-fire stood down: {_blk_ks}",
                              extra={"user_id": user_id})
                 if cfg.wheel_auto_execute and not halted:
-                    fired = await self._wheel_auto_fire(
-                        user_id=user_id, underlying=sym, leg=leg,
-                        strategy="wheel_cc",
-                        priced=("Live-quoted"
-                                if getattr(leg, "live", False)
-                                else "Modeled"),
-                        client=client,
-                    )
+                    # The fire binds THIS book inline; clear it the
+                    # moment it returns (rv:options_scanner :2221).
+                    from app.brokers.accounts import (
+                        clear_account as _clear_book)
+                    try:
+                        fired = await self._wheel_auto_fire(
+                            user_id=user_id, underlying=sym, leg=leg,
+                            strategy="wheel_cc",
+                            priced=("Live-quoted"
+                                    if getattr(leg, "live", False)
+                                    else "Modeled"),
+                            client=client,
+                        )
+                    finally:
+                        _clear_book()
                     if fired is not None:
                         ev = (fired.payload or {}).get("event")
                         if ev in ("wheel_auto_blocked",
@@ -2890,6 +2978,22 @@ class OptionsScannerAgent(Agent):
         return out
 
     async def _run_wheel(self, client) -> list[AgentMessage]:
+        """WHEEL step. _wheel_auto_fire binds each book inline with
+        set_account_for_user (the loop body is hundreds of lines, so no
+        context manager) and Python 3.12's wait_for runs every tick step
+        in the SAME task -- so, exactly as _reconcile_with_broker does
+        (rv:options_scanner :2221), the binding is always cleared here
+        before the next step runs. Each fire's call site also clears the
+        moment the fire returns, so one book's binding never outlives its
+        own fire."""
+        from app.brokers.accounts import clear_account
+        try:
+            return await self._wheel_books(client)
+        finally:
+            clear_account()
+
+    async def _wheel_books(self, client) -> list[AgentMessage]:
+        """Body of _run_wheel; entered only through it."""
         # Every user with a paper account participates in the Wheel.
         def _sync_users():
             return client.table("paper_accounts").select("user_id").execute()
@@ -2899,6 +3003,20 @@ class OptionsScannerAgent(Agent):
             return []
 
         out: list[AgentMessage] = []
+        # KS-6 / rv:options_scanner :2922: ONE kill-switch read per step,
+        # taken lazily the first time a book with wheel_auto_execute ON
+        # reaches its gate. check_states costs a paper_accounts read plus
+        # a broker /v2/account per book, and this loop read it once per
+        # user whether or not anyone could fire -- new broker traffic on
+        # the kill-switch path of a file with a 429 history. The dict is
+        # keyed per book, so one read still judges every book by its own
+        # state.
+        _ks_memo: dict = {}
+
+        async def _ks_states_once():
+            if "states" not in _ks_memo:
+                _ks_memo["states"] = await _book_kill_states(client)
+            return _ks_memo["states"]
         # Mike 2026-06-01: switched from a single static WHEEL_WATCHLIST
         # loop to a per-user dynamic universe. Each user's wheel can
         # consider any quality dividend stock they've surfaced via
@@ -2917,9 +3035,6 @@ class OptionsScannerAgent(Agent):
                                     "yield_pct": 0.0})()
                     for s in WHEEL_WATCHLIST
                 ]
-            # KS-6: THIS book's kill-switch verdict, read once per book
-            # (the candidate loop below can run for minutes).
-            _ks_states_u = await _book_kill_states(client)
             _ks_said: set = set()
             for cand in universe:
                 underlying = cand.ticker
@@ -3009,9 +3124,11 @@ class OptionsScannerAgent(Agent):
                     # KS-6: computed halts (row-sum daily %, rejects,
                     # slippage) and an unreadable kill-switch stand the
                     # auto-fire down too. wheel_csp / wheel_cc are
-                    # 'tighten' lanes, so recovery alone does not.
-                    _blk_ks = _fire_block_reason(_ks_states_u, user_id,
-                                                 strategy)
+                    # 'tighten' lanes, so recovery alone does not. Read
+                    # only when this book can actually fire.
+                    _blk_ks = (_fire_block_reason(await _ks_states_once(),
+                                                  user_id, strategy)
+                               if cfg.wheel_auto_execute else None)
                     if _blk_ks and cfg.wheel_auto_execute and not halted:
                         halted = True
                         if _blk_ks not in _ks_said:
@@ -3029,15 +3146,24 @@ class OptionsScannerAgent(Agent):
                         # "wheel auto blocked"). Retried after the cooldown.
                         if _wheel_in_cooldown(user_id, leg.underlying, strategy):
                             continue
-                        # AUTO-FIRE PATH
-                        autofire = await self._wheel_auto_fire(
-                            user_id=user_id,
-                            underlying=leg.underlying,
-                            leg=leg,
-                            strategy=strategy,
-                            priced=priced,
-                            client=client,
-                        )
+                        # AUTO-FIRE PATH. The fire binds THIS book
+                        # inline; clear it the moment it returns
+                        # (rv:options_scanner :2221) -- nothing after
+                        # this point needs the binding, and the next
+                        # fire rebinds for itself.
+                        from app.brokers.accounts import (
+                            clear_account as _clear_book)
+                        try:
+                            autofire = await self._wheel_auto_fire(
+                                user_id=user_id,
+                                underlying=leg.underlying,
+                                leg=leg,
+                                strategy=strategy,
+                                priced=priced,
+                                client=client,
+                            )
+                        finally:
+                            _clear_book()
                         if autofire is not None:
                             ev = (autofire.payload or {}).get("event")
                             if ev in ("wheel_auto_blocked",
@@ -3174,6 +3300,8 @@ class OptionsScannerAgent(Agent):
                     agent=self.name, kind="execute",
                     payload={
                         "user_id": user_id,
+                        "lane": "option",       # rv:watchdog-health :949
+                        "ticker": leg.underlying,
                         "underlying": leg.underlying,
                         "strategy": strategy,
                         "credit_usd": leg.credit_usd,

@@ -19,11 +19,12 @@ type Resp = {
 };
 
 /**
- * "Place trade now" — manual one-shot trade through Trezo's full
- * Risk Manager → Trade Execution → current venue chain. Venue is
- * whatever trading_mode resolves to (paper today, live later). The
- * same button works for both: when go-live flips, this routes to
- * the live broker automatically.
+ * "Place trade now" — manual one-shot trade sent straight to Trade
+ * Execution on the caller's book. TE-10 (audit 2026-09-01): it does NOT
+ * pass through the Risk Manager -- no TCS bar, no R:R gate, no per-book
+ * open-count cap; only the kill-switch at execution and the book binding
+ * stand between the click and the order. Venue is whatever trading_mode
+ * resolves to (paper today; the live executor does not exist yet).
  */
 export function ManualTradeButton() {
   const router = useRouter();
@@ -64,10 +65,10 @@ export function ManualTradeButton() {
       <div>
         <h2 className="font-serif text-xl text-weave-800">Place a trade now</h2>
         <p className="beginner-only text-xs text-weave-500 leading-relaxed mt-1">
-          Manual one-shot trade. Routes through Risk Manager → Trade
-          Execution → whichever venue is live (paper today, real-money
-          later when you flip the go-live switch). Same button for
-          both — no UI rework when live ships.
+          Manual one-shot trade on your own book. This goes straight to
+          Trade Execution and skips the Risk Manager&apos;s checks (no
+          confidence bar, no reward-to-risk gate) — only the kill-switch
+          can stop it. Paper venue today; live is not built yet.
         </p>
       </div>
 

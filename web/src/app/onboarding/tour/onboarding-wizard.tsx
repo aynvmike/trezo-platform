@@ -286,7 +286,11 @@ export function OnboardingWizard() {
 
   const totalSteps = stepMeta.length;
   const meta = stepMeta[step];
-  const canAdvance = step === 1 ? !!broker : true;
+  // rv:web-pages (onboarding :289): step 2 used to REQUIRE a broker pick,
+  // and only Alpaca (Paper) is selectable, so the tour forced "Alpaca" or
+  // the X. The pick carries no state (PAGES-04) -- it only decides whether
+  // to land on Connections afterwards -- so it is optional.
+  const canAdvance = true;
 
   const finish = async () => {
     setSaving(true);

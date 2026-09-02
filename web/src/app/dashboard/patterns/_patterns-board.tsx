@@ -281,7 +281,7 @@ function PatternCard({
       {open && (
         <div className="border-t border-weave-50 pt-3 space-y-2">
           <p className="text-[10px] uppercase tracking-widest text-weave-500">
-            Score breakdown — {s.score} of 1000
+            Score breakdown — {s.score} of 100
           </p>
           {breakdown.length === 0 && (
             <p className="text-xs text-weave-400">No factor detail for this scan.</p>

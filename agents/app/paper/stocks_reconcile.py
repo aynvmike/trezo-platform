@@ -58,7 +58,7 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
     paths produce the same result.
     """
     from app.brokers.alpaca import (
-        alpaca_configured, get_positions, UserToken,
+        alpaca_configured, get_positions_strict, UserToken,
     )
     from app.paper.engine import record_external_position
     from app.integrations.web_tokens import get_user_broker_token
@@ -87,6 +87,7 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
     total_inserted = 0
     total_closed = 0
     per_user: list[dict] = []
+    skipped: list[dict] = []
 
     for u in user_rows:
         user_id = u.get("user_id")
@@ -126,17 +127,23 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             expires_at=bt.expires_at,
         ) if bt else None
 
-        # HONEST NOTE (audit 2026-09-01): get_positions() never raises --
-        # it collapses a failed read into [] -- so fetch_ok is always True
-        # here and cannot tell a 429 from a flat account. The real net is
-        # trust_close below, which refuses to phantom-close on an EMPTY
-        # list. Behaviour deliberately left as-is in this pass.
-        fetch_ok = True
+        # STRICT read (rv:bound-hunter :136, audit 2026-09-01). The
+        # display read get_positions() collapsed a failed read into [],
+        # so nothing here could tell a 429 from a flat account and only
+        # trust_close below stood between a hiccup and a phantom close.
+        # None now means the read FAILED: skip this book, say so, touch
+        # nothing -- the same shape the balance and orphan passes use.
         try:
-            alpaca_positions = await get_positions(token=token)
+            alpaca_positions = await get_positions_strict(token=token)
         except Exception:
-            alpaca_positions = []
-            fetch_ok = False
+            alpaca_positions = None
+        if alpaca_positions is None:
+            logger.warning(
+                "stocks_reconcile.skip user=%s reason=broker positions "
+                "read failed; ledger left untouched", str(user_id)[:8])
+            skipped.append({"user_id": str(user_id),
+                            "reason": "broker read failed"})
+            continue
 
         alpaca_by_sym: dict[str, dict] = {}
         for p in alpaca_positions:
@@ -179,8 +186,11 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     from app.agents.position_monitor import (
                         _throttled_liquidate,
                     )
+                    # BI-05 (rv:position_monitor :182): name the book
+                    # explicitly so the throttle slot is this book's own,
+                    # not whatever the ContextVar happens to hold.
                     _res_n, _st_n = await _throttled_liquidate(
-                        _sym_neg, "stock")
+                        _sym_neg, "stock", user_id=str(user_id))
                 except Exception:  # noqa: BLE001
                     _st_n = "error"
             else:
@@ -198,11 +208,11 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             alpaca_by_sym.pop(_sym_neg, None)
 
         # Trust a "broker doesn't list this symbol" signal as a real
-        # close ONLY when the read returned >=1 stock position. An empty
-        # list -- which is also what a failed read looks like, see the
-        # fetch_ok note above -- must not phantom-close real rows at the
-        # open bell (2026-06-15 fix).
-        trust_close = fetch_ok and bool(alpaca_by_sym)
+        # close ONLY when the read returned >=1 stock position. A failed
+        # read is now None and skipped above; an EMPTY answer is kept as
+        # a second net anyway -- a flat account at the open bell must
+        # not phantom-close real rows (2026-06-15 fix).
+        trust_close = bool(alpaca_by_sym)
 
         def _trezo_open(uid=user_id):
             return (
@@ -522,6 +532,7 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
         "inserted": total_inserted,
         "closed": total_closed,
         "details": per_user,
+        "skipped": skipped,
     }
 
 
@@ -548,7 +559,7 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
     bind_for_user + check_route before its read; an unresolvable book is
     skipped with a logged reason, never defaulted to the primary."""
     from app.brokers.alpaca import alpaca_configured, get_account, UserToken
-    from app.brokers.accounts import bind_for_user
+    from app.brokers.accounts import bind_for_user, should_skip_unresolved
     from app.brokers.route_guard import check_route, record_mismatch
     from app.integrations.web_tokens import get_user_broker_token
     from app.config import get_settings
@@ -562,7 +573,6 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"Supabase client error: {e}"}
 
-    env_ok = alpaca_configured()
     DRIFT_MIN = 1.0  # ignore sub-dollar noise
 
     def _users():
@@ -577,15 +587,23 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
         user_id = u.get("user_id")
         if not user_id:
             continue
+        # rv:stocks_reconcile :590 (audit 2026-09-01): a paper_accounts
+        # row that is not a registered book (sim / paper-only) is skipped
+        # BEFORE binding, quietly. record_mismatch below is reserved for
+        # a KNOWN book whose binding came up wrong; letting unresolved
+        # rows reach it wrote a route_mismatch line every hour per row.
+        if should_skip_unresolved(str(user_id)):
+            logger.info("balance_reconcile.skip user=%s reason=unresolved "
+                        "book", str(user_id)[:8])
+            skipped.append({"user_id": str(user_id),
+                            "reason": "unresolved book"})
+            continue
         bt = await get_user_broker_token(user_id, "alpaca")
         token = UserToken(
             access_token=bt.access_token,
             refresh_token=bt.refresh_token,
             expires_at=bt.expires_at,
         ) if bt else None
-        # No broker at all for this user -> leave the modeled/sim ledger be.
-        if token is None and not env_ok:
-            continue
         # TE-16: the cash read MUST happen under this book's binding, and
         # the write below only ever uses a value read under that binding.
         with bind_for_user(str(user_id)):
@@ -598,6 +616,12 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
                                 "balance_reconcile")
                 skipped.append({"user_id": str(user_id),
                                 "reason": _route_note})
+                continue
+            # rv:stocks_reconcile :570: "configured" is a property of the
+            # BOUND account, so it is asked here, inside the binding. No
+            # broker at all for this book -> leave the modeled/sim ledger
+            # be.
+            if token is None and not alpaca_configured():
                 continue
             try:
                 acct = await get_account(token=token)
@@ -648,11 +672,29 @@ async def reconcile_account_balances_all_users() -> dict[str, Any]:
 
 async def run_integrity_sweep() -> dict[str, Any]:
     """One self-healing pass aligning Trezo to broker truth across every
-    dimension we can: cash ledger + stock positions (active repair) and an
-    orphan-option import (the "options" key is import_orphan_options'
-    {imported, skipped, details} report -- there is no drift report here;
-    broker_truth.py owns that). Idempotent; safe at startup or in a tick
-    loop. Each step is independently guarded."""
+    dimension we can. Idempotent; safe at startup or in a tick loop. Each
+    step is independently guarded. Report keys, in the order they run:
+
+      balances  reconcile_account_balances_all_users -- cash ledger
+      stocks    reconcile_stocks_all_users           -- stock rows
+      adopted   adoption.adopt_all_books             -- broker-held legs
+                the ledger (paper_positions) has NO row for, every asset
+                class whose policy is adoptable (options included)
+      options   import_orphan_options_all_users      -- {imported,
+                skipped, details}; there is no drift report here,
+                broker_truth.py owns that
+
+    ORDER MATTERS (rv:stocks_reconcile :664, audit 2026-09-01). Adoption
+    used to run LAST, so a genuinely untracked contract was first
+    imported into options_positions (wheel_csp/wheel_cc, managed by the
+    Options Scanner harvest) and then, in the same sweep, adopted into
+    paper_positions (managed by the engine / broker_truth) -- one
+    contract, two managers. paper_positions is the ledger of record for
+    broker-held legs (the platform's own docs say so), so adoption now
+    runs FIRST; the importer's LT-05 dedupe then sees the fresh ledger
+    row and leaves it alone. Nothing is deleted; existing
+    options_positions rows are untouched.
+    """
     report: dict[str, Any] = {"ok": True}
     try:
         report["balances"] = await reconcile_account_balances_all_users()
@@ -662,10 +704,6 @@ async def run_integrity_sweep() -> dict[str, Any]:
         report["stocks"] = await reconcile_stocks_all_users()
     except Exception as e:  # noqa: BLE001
         report["stocks"] = {"ok": False, "error": str(e)}
-    try:
-        report["options"] = await import_orphan_options_all_users()
-    except Exception as e:  # noqa: BLE001
-        report["options"] = {"ok": False, "error": str(e)}
     # Adoption closes the loop the other way round (2026-08-17). The steps
     # above fix rows we HAVE; this one writes rows for positions the
     # broker holds and we have NO row for -- which is the state the
@@ -681,6 +719,11 @@ async def run_integrity_sweep() -> dict[str, Any]:
                 dry_run=_os.getenv("TREZO_ADOPT_DRY_RUN", "0") == "1")
     except Exception as e:  # noqa: BLE001
         report["adopted"] = {"ok": False, "error": str(e)}
+    # After adoption on purpose -- see ORDER MATTERS above.
+    try:
+        report["options"] = await import_orphan_options_all_users()
+    except Exception as e:  # noqa: BLE001
+        report["options"] = {"ok": False, "error": str(e)}
     return report
 
 
@@ -721,7 +764,7 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
     from app.brokers.alpaca import (
         alpaca_configured, get_option_positions_strict, UserToken,
     )
-    from app.brokers.accounts import bind_for_user
+    from app.brokers.accounts import bind_for_user, should_skip_unresolved
     from app.brokers.route_guard import check_route, record_mismatch
     from app.integrations.web_tokens import get_user_broker_token
     from app.config import get_settings
@@ -735,8 +778,6 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"Supabase client error: {e}"}
 
-    env_ok = alpaca_configured()
-
     def _users():
         return client.table("paper_accounts").select("user_id").execute()
     rows = (await asyncio.to_thread(_users)).data or []
@@ -748,13 +789,20 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
         user_id = u.get("user_id")
         if not user_id:
             continue
+        # rv:stocks_reconcile :590 (same as the balance pass): an
+        # unresolved book is skipped before binding, without a mismatch
+        # record -- that record is for a KNOWN book bound wrong.
+        if should_skip_unresolved(str(user_id)):
+            logger.info("orphan_options.skip user=%s reason=unresolved book",
+                        str(user_id)[:8])
+            details.append({"user_id": str(user_id),
+                            "skipped": "unresolved book"})
+            continue
         bt = await get_user_broker_token(user_id, "alpaca")
         token = UserToken(
             access_token=bt.access_token, refresh_token=bt.refresh_token,
             expires_at=bt.expires_at,
         ) if bt else None
-        if token is None and not env_ok:
-            continue
         # TE-17: read THIS book's contracts under ITS binding. The strict
         # read returns None on any failed read -> skip the book, say so.
         with bind_for_user(str(user_id)):
@@ -767,6 +815,9 @@ async def import_orphan_options_all_users() -> dict[str, Any]:
                                 "orphan_options")
                 details.append({"user_id": str(user_id),
                                 "skipped": _route_note})
+                continue
+            # rv:stocks_reconcile :570: asked under the BOOK's binding.
+            if token is None and not alpaca_configured():
                 continue
             try:
                 broker_opts = await get_option_positions_strict(token=token)

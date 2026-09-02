@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
 import { LoadError, loadResult } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys, withBooks } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -42,18 +43,23 @@ export default async function ExtendedPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/extended");
 
+  // rv:web-pages sweep: paper_positions is keyed by BOOK (0047); read
+  // every book the person owns.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [openRes, closedRes, scanRes] = await Promise.all([
     supabase
       .from("paper_positions")
       .select("*")
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .eq("strategy", "extended")
       .eq("status", "open")
       .order("entry_at", { ascending: false }),
     supabase
       .from("paper_positions")
       .select("*")
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .eq("strategy", "extended")
       .neq("status", "open")
       .order("exit_at", { ascending: false })
@@ -67,8 +73,8 @@ export default async function ExtendedPage() {
   ]);
 
   // PAGES-03: keep "read failed" distinct from "nothing there".
-  const openLoad = loadResult("paper_positions", openRes, []);
-  const closedLoad = loadResult("paper_positions (closed)", closedRes, []);
+  const openLoad = withBooks(booksLoad, loadResult("paper_positions", openRes, []));
+  const closedLoad = withBooks(booksLoad, loadResult("paper_positions (closed)", closedRes, []));
   const scanLoad = loadResult("agent_messages", scanRes, []);
   const openPositions = openLoad.data ?? [];
   const closedPositions = closedLoad.data ?? [];

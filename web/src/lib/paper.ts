@@ -7,6 +7,7 @@
  */
 
 import { createClient } from "@/lib/supabase/server";
+import { loadResult, type LoadResult } from "@/components/dashboard/load-error";
 
 export type PaperAccount = {
   user_id: string;
@@ -46,16 +47,23 @@ export type VaultTx = {
   created_at: string;
 };
 
-/** `null` for both "no account row yet" and "read failed" — the latter is logged. */
-export async function getPaperAccount(userId: string): Promise<PaperAccount | null> {
+/**
+ * One BOOK's paper account (`bookKey` = trading_accounts.account_key, which
+ * is what `paper_accounts.user_id` holds since 0047).
+ *
+ * rv:web-pages (:50): this used to collapse "read failed" and "no row yet"
+ * into one null, contradicting the module header. It now returns a
+ * LoadResult: `failure` set when the read failed (logged), otherwise
+ * `data` is the row or null when the book has no account row yet.
+ */
+export async function getPaperAccount(bookKey: string): Promise<LoadResult<PaperAccount | null>> {
   const supabase = createClient();
-  const { data, error } = await supabase
+  const res = await supabase
     .from("paper_accounts")
     .select("*")
-    .eq("user_id", userId)
+    .eq("user_id", bookKey)
     .maybeSingle();
-  if (error) console.error(`[load] paper_accounts: ${error.message}`);
-  return (data as PaperAccount) ?? null;
+  return loadResult<PaperAccount | null>("paper_accounts", res as { data: PaperAccount | null; error: { message: string } | null });
 }
 
 export async function getOpenPositions(userId: string): Promise<PaperPosition[] | null> {

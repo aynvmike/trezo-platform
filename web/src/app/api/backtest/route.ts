@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
 
 /**
- * GET /api/backtest?symbol=AMD&strategy=default&tcs_threshold=700&stop_pct=0.05&target_pct=0.10
+ * GET /api/backtest?symbol=AMD&strategy=default&tcs_threshold=70&stop_pct=0.05&target_pct=0.10
  * Proxies a backtest run to the agents service, then persists the run to
  * `backtest_runs` so the history is kept and the agents can learn from it.
  * Auth-guarded — running a backtest is a signed-in user action.
@@ -23,7 +23,10 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const symbol = (searchParams.get("symbol") ?? "").trim().toUpperCase();
   const strategy = searchParams.get("strategy") ?? "default";
-  const tcs = searchParams.get("tcs_threshold") ?? "700";
+  // EQ-5 (rv:scanners-scale): TCS is 0-100 since 2026-07-08; the agents'
+  // /backtest endpoint defaults to 70. "700" here meant no bar was ever
+  // reached and every default backtest reported zero trades.
+  const tcs = searchParams.get("tcs_threshold") ?? "70";
   const stopPct = searchParams.get("stop_pct") ?? "0.05";
   const targetPct = searchParams.get("target_pct") ?? "0.10";
   if (!symbol) {

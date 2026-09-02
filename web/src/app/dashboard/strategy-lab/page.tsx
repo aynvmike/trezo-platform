@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { PageHeader } from "@/components/dashboard/page-header";
 import { createClient } from "@/lib/supabase/server";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 import {
   getOrSeedDefaultWatchlist,
   seedExampleWatchlists,
@@ -36,15 +37,20 @@ export default async function StrategyLabPage({
 
   // Live Patterns follows the PORTFOLIO (Mike 2026-07-14): chart what the
   // book actually holds right now; fall back to the watchlist when flat.
+  // rv:web-pages sweep: both tables are keyed by BOOK (0047); "what the
+  // book holds" means every book the person owns. Display-only here: a
+  // failed resolution simply falls back to the watchlist below.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
   const { data: openPos } = await supabase
     .from("paper_positions")
     .select("ticker, asset_type")
-    .eq("user_id", user.id)
+    .in("user_id", keys)
     .eq("status", "open");
   const { data: openOpt } = await supabase
     .from("options_positions")
     .select("underlying")
-    .eq("user_id", user.id)
+    .in("user_id", keys)
     .eq("status", "open");
   const held = Array.from(
     new Set([

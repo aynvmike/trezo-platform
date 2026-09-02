@@ -1,4 +1,4 @@
-"""Unit tests for per-stock strategy selection (app.strategies.selector).
+r"""Unit tests for per-stock strategy selection (app.strategies.selector).
 
 Covers the window gating that keeps the bot from picking a strategy
 outside its trading window, and the select_strategy contract.
@@ -7,6 +7,9 @@ Run with:
     cd agents
     .\.venv\Scripts\python.exe -m pytest -q
 """
+# GATE-06 (audit 2026-09-01): raw docstring -- it quotes a Windows path
+# whose "\." and "\S" are invalid escape sequences in a normal string (a
+# SyntaxWarning today, a SyntaxError in a future Python).
 
 from datetime import datetime, timedelta, timezone
 

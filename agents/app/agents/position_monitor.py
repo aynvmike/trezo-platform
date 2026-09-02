@@ -10,6 +10,16 @@ Ticks every 30 seconds. For every open paper position across all users:
     order has closed one, the Trezo tracking row is marked closed
   - Emits a `close` message for each closure
   - Triggers the Daily Profit Lock check after closures
+
+NO_PRICE_STOP rows (NEQ-05 / G3, audit 2026-09-01): a row whose
+source_payload carries `no_price_stop: true` is a screen-managed hold --
+the dividend ladder -- whose exits are the lane's (dividend cut, payout
+breach, recycling ratio), never a price. For those rows this agent does
+NOT close on stop or target, does NOT ratchet a trail or ladder, does
+NOT arm a broker stop or run the naked-position check, and does NOT let
+the reevaluator touch them. External-fill detection, a manual
+close_requested and ordinary bookkeeping still apply. One predicate,
+`_is_no_price_stop(row)`, decides it at every one of those sites.
 """
 
 from __future__ import annotations
@@ -60,6 +70,37 @@ def _utc_now():
     return _d.now(_z.utc)
 
 
+def _is_no_price_stop(row: dict) -> bool:
+    """NEQ-05 / G3: is this row a screen-managed hold with NO price stop?
+
+    True when the row's source_payload carries `no_price_stop` truthy --
+    the dividend ladder's contract (dividend_lt_agent sets it on every
+    signal; the executor writes the payload onto the row). Such a row is
+    held through drawdowns by design: the monitor must not close it on
+    price, ratchet a stop onto it, arm one at the broker, or count it
+    naked. Manual close_requested, external-fill detection and plain
+    bookkeeping are NOT gated by this.
+
+    Reads only the row (jsonb comes back as a dict; a string is parsed
+    defensively). Anything unreadable is NOT flagged: an unflagged row
+    keeps today's price management, which is the conservative side for
+    every lane except the ladder -- and the ladder's rows are written by
+    one executor path with the flag set explicitly. Never raises."""
+    try:
+        sp = row.get("source_payload")
+        if isinstance(sp, str):
+            import json as _json
+            sp = _json.loads(sp)
+        if not isinstance(sp, dict):
+            return False
+        v = sp.get("no_price_stop")
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _pre_break_review() -> None:
     """PRE-HOLIDAY REVIEW (Mike 2026-07-16): before every multi-day
     market close, re-evaluate what is held. His rule, encoded: if the
@@ -98,10 +139,11 @@ async def _pre_break_review() -> None:
             return
 
         def _q():
+            # NEQ-05: source_payload is read for the no_price_stop flag.
             return (client.table("paper_positions")
                     .select("id, ticker, user_id, side, quantity, "
                             "entry_price, stop_price, target_price, "
-                            "asset_type, broker, strategy")
+                            "asset_type, broker, strategy, source_payload")
                     .eq("status", "open").execute())
         rows = (await _aio.to_thread(_q)).data or []
         from app.agents.activity_log import record as _rec
@@ -113,11 +155,17 @@ async def _pre_break_review() -> None:
                 strat = str(r.get("strategy") or "").lower()
                 if str(r.get("asset_type") or "stock") == "crypto":
                     continue      # 24/7 market -- no closed-day gap risk
-                if any(k in strat for k in LONG_TERM):
+                # NEQ-05: a no_price_stop row rides the break whatever its
+                # strategy string says -- the flag is the contract, the
+                # name match is a heuristic. Neither a breakeven stop nor
+                # a "red into the break" close applies to it.
+                _lt = any(k in strat for k in LONG_TERM)
+                if _lt or _is_no_price_stop(r):
                     _rec("preholiday_review", tk,
                          reason=(f"market closed {brk} day(s) next -- "
-                                 f"long-term lane ({strat}) rides the "
-                                 f"break by design"),
+                                 + (f"long-term lane ({strat})" if _lt
+                                    else f"no_price_stop hold ({strat})")
+                                 + " rides the break by design"),
                          extra={"user_id": uid})
                     continue
                 entry = float(r.get("entry_price") or 0)
@@ -205,10 +253,11 @@ async def _gap_check_open_bell() -> None:
             return
 
         def _q():
+            # NEQ-05: source_payload is read for the no_price_stop flag.
             return (client.table("paper_positions")
                     .select("id, ticker, user_id, side, quantity, "
                             "entry_price, stop_price, target_price, "
-                            "asset_type, broker")
+                            "asset_type, broker, source_payload")
                     .eq("status", "open").eq("asset_type", "stock")
                     .execute())
         rows = (await _aio.to_thread(_q)).data or []
@@ -227,6 +276,17 @@ async def _gap_check_open_bell() -> None:
                 if abs(gap) < thr:
                     continue
                 uid = str(r.get("user_id") or "")
+                if _is_no_price_stop(r):
+                    # NEQ-05: the gap is SEEN and logged, but a screen-
+                    # managed hold gets no tightened stop and no broker
+                    # leg resync -- either would plant the price stop the
+                    # lane's contract says it does not have.
+                    _grec("gap_check", str(r["ticker"]),
+                          reason=(f"gapped {gap * 100:+.1f}% at the open -- "
+                                  f"no_price_stop hold rides it; exits are "
+                                  f"the lane's screen, not a price stop"),
+                          extra={"user_id": uid})
+                    continue
                 if gap <= -thr and str(r.get("side") or "long") == "long":
                     stop = float(r.get("stop_price") or 0)
                     new_s = round(cur * 0.98, 4)
@@ -1491,9 +1551,12 @@ class PositionMonitorAgent(Agent):
                                  payload={"error": "Supabase not configured"})]
 
         def _sync():
+            # NEQ-05: source_payload is selected so _is_no_price_stop(r)
+            # can read the flag -- without it every row read as unflagged
+            # and the exemption below was built but never bound.
             return (
                 client.table("paper_positions")
-                .select("id, user_id, ticker, asset_type, side, quantity, entry_price, stop_price, target_price, strategy, entry_at, broker, close_requested")
+                .select("id, user_id, ticker, asset_type, side, quantity, entry_price, stop_price, target_price, strategy, entry_at, broker, close_requested, source_payload")
                 .eq("status", "open")
                 .execute()
             )
@@ -1558,6 +1621,12 @@ class PositionMonitorAgent(Agent):
                 pass
             tk = r["ticker"]
             at = r["asset_type"]
+            # NEQ-05 / G3: decided ONCE per row, consulted at every price-
+            # management site below. True = a screen-managed hold (the
+            # dividend ladder): no stop/target close, no trail or ladder
+            # ratchet, no broker stop, no naked check, no reeval. Manual
+            # close_requested and external-fill detection still run.
+            _nps = _is_no_price_stop(r)
             # Broker truth for THIS book -- not for whichever account
             # happened to be bound first. Cached per book for the tick.
             if r.get("broker") == "alpaca":
@@ -1635,7 +1704,12 @@ class PositionMonitorAgent(Agent):
                     # wants (asset_policy.TRAIL_POLICIES) and this reads it,
                     # so a new strategy cannot be silently left out.
                     _tp = _trail_policy(_strat_a)
-                    if r["side"] == "long" and "hodl" in _strat_a:
+                    if _nps:
+                        # NEQ-05: no trail, no ladder, no breakeven arm on
+                        # a screen-managed hold -- every branch below
+                        # writes a price stop onto the row and the venue.
+                        pass
+                    elif r["side"] == "long" and "hodl" in _strat_a:
                         # A HODL is meant to ride: its own +40%/20% trail and
                         # the catastrophe stop, deliberately no giveback trail.
                         _t = await _maybe_trail_hodl(r, price_c)
@@ -1706,6 +1780,8 @@ class PositionMonitorAgent(Agent):
                     reason_c: str | None = None
                     if r.get("close_requested"):
                         reason_c = "manual"
+                    elif _nps:
+                        pass   # NEQ-05: no stop/target close on this row
                     elif r["side"] == "long":
                         if stop_c is not None and price_c <= stop_c:
                             reason_c = "stop"
@@ -1751,6 +1827,7 @@ class PositionMonitorAgent(Agent):
                     # daily-goal nudge -- sized by the asset policy, which
                     # knows coins are fractional and the venue never shuts.
                     if (reason_c is None and r["side"] == "long"
+                            and not _nps          # NEQ-05: no profit ladder
                             and os.getenv("TREZO_PROFIT_STEP_CRYPTO", "1") != "0"
                             and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
                         try:
@@ -1807,8 +1884,12 @@ class PositionMonitorAgent(Agent):
                         # a coin whose stop had not moved never reached
                         # the venue -- protection for the positions
                         # already doing well, and nothing for the rest.
-                        await _arm_broker_stop(r)
-                        await _push_crypto_tp(r, target_c)
+                        #
+                        # NEQ-05: not for a no_price_stop row -- arming
+                        # here is exactly the price stop it must not have.
+                        if not _nps:
+                            await _arm_broker_stop(r)
+                            await _push_crypto_tp(r, target_c)
                         alpaca_managed += 1
                         continue
                     _liq, _cstat = await _throttled_liquidate(
@@ -1936,6 +2017,7 @@ class PositionMonitorAgent(Agent):
                     if (os.getenv("TREZO_PROFIT_STEP_ALPACA", "1") != "0"
                             and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"
                             and _pol2.supports_partial_step
+                            and not _nps          # NEQ-05: no profit ladder
                             and r["side"] == "long"):
                         try:
                             _e2 = float(r.get("entry_price") or 0)
@@ -2033,7 +2115,13 @@ class PositionMonitorAgent(Agent):
                         # has NO stop and NO target at the broker (live
                         # case: AAPL). Alert-only -- auto-selling here
                         # could double-sell against legs that DO exist.
-                        if at == "stock":
+                        #
+                        # NEQ-05: a no_price_stop row is SUPPOSED to rest
+                        # at the broker with no exit legs. Arming a stop
+                        # (ensure_stock_protection) and the naked check's
+                        # orphan stop/target enforcement are both price
+                        # management this row does not get.
+                        if at == "stock" and not _nps:
                             _armed = await _arm_broker_stop(r)
                             if _armed:
                                 out.append(AgentMessage(
@@ -2103,7 +2191,7 @@ class PositionMonitorAgent(Agent):
             #  - SWING: a defined trade, so it keeps its fixed target but
             #    step-ladders the stop up to lock return-on-capital in stages,
             #    so a reversal before the target still banks most of the gain.
-            if at == "crypto" and side == "long":
+            if at == "crypto" and side == "long" and not _nps:   # NEQ-05
                 if "hodl" in strat:
                     _trail = await _maybe_trail_hodl(r, price)
                     if _trail is not None:
@@ -2119,7 +2207,8 @@ class PositionMonitorAgent(Agent):
                     if _ld is not None:
                         stop = _ld
 
-            if at == "stock" and side in ("long", "short") and STOCK_TRAIL_ENABLED:
+            if (at == "stock" and side in ("long", "short") and STOCK_TRAIL_ENABLED
+                    and not _nps):                               # NEQ-05
                 _strail = await _maybe_trail_stock_profit(r, price)
                 if _strail is not None:
                     stop = _strail
@@ -2134,8 +2223,12 @@ class PositionMonitorAgent(Agent):
             # and 395 lines of reevaluator.py are actively managing open
             # positions. Anyone reading the old note would have believed
             # otherwise while debugging a moved stop.
+            # NEQ-05: the reevaluator tightens stops, lowers targets and
+            # closes on a TCS collapse -- all price management. It does
+            # not see a no_price_stop row at all (belt to its own
+            # strategy-prefix exemption's braces).
             reeval_close: str | None = None
-            if reeval_is_enabled():
+            if reeval_is_enabled() and not _nps:
                 try:
                     _rv = await reevaluate_position(
                         r, price, side, at, strat, stop, target,
@@ -2158,7 +2251,9 @@ class PositionMonitorAgent(Agent):
                 close_reason, close_detail = "manual", "manual_close"
             elif reeval_close:
                 close_reason, close_detail = "reeval", reeval_close
-            if close_reason is None:
+            # NEQ-05: no stop/target close on a screen-managed hold; the
+            # manual branch above still applies to it.
+            if close_reason is None and not _nps:
                 if side == "long":
                     if stop is not None and price <= stop:
                         close_reason = "stop"
@@ -2204,6 +2299,7 @@ class PositionMonitorAgent(Agent):
             # 6/12). Tunables: TREZO_PROFIT_STEP_ENABLED / _AT / _FRACTION.
             if (close_reason is None and side == "long"
                     and r.get("broker") != "alpaca"
+                    and not _nps                  # NEQ-05: no profit ladder
                     and os.getenv("TREZO_PROFIT_STEP_ENABLED", "1") != "0"):
                 try:
                     _e = float(r.get("entry_price") or 0)
@@ -2256,6 +2352,15 @@ class PositionMonitorAgent(Agent):
                             "position_id": r["id"],
                         },
                     ))
+
+        # REVIEW position_monitor.py:28/:1545 (2026-09-01): the inline
+        # per-row binding left the LAST row's book set after the loop.
+        # Clear it here, as set_account_for_user's contract asks. Not a
+        # try/finally around the loop: an exception leaves tick() at once
+        # and the scheduler runs each tick in its own task (asyncio.wait_for
+        # copies the context), so a binding cannot outlive a raised tick;
+        # re-indenting 700 lines of live exit code buys nothing for that.
+        _pm_clear_account()
 
         # After closures, evaluate Daily Profit Lock for each affected user.
         for user_id in affected_users:

@@ -12,14 +12,49 @@ has no connection, or the shared secret is misconfigured, this
 returns None and the caller falls back to the env-driven keys. That
 lets the legacy single-tenant setup keep working through the
 transition.
+
+Review 2026-09-01 (rv:web-auth, :77): that fallback used to be SILENT for
+every non-200, including the web side's new loud 500s (missing
+SUPABASE_SERVICE_ROLE_KEY, failed broker_connections read). A
+misconfigured web tier therefore degraded the engine to the primary env
+account with nothing in the log. The fallback still happens (design), but
+a non-200 is now logged -- throttled per (broker, status) -- so it is
+visible. Never logs the token or the secret.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Optional
+
+log = logging.getLogger(__name__)
+
+_NON200_LOG_EVERY = 600.0   # seconds between repeats of the same (broker, status)
+_non200_logged_at: dict[tuple[str, int], float] = {}
+
+
+def _note_non_200(broker: str, status: int) -> None:
+    """Log (throttled) that the web's broker-token endpoint answered
+    `status`; the caller then falls back to env keys (legacy mode)."""
+    key = (broker, int(status))
+    now = time.time()
+    if now - _non200_logged_at.get(key, 0.0) < _NON200_LOG_EVERY:
+        return
+    _non200_logged_at[key] = now
+    if status == 404:
+        # "No active connection" is the normal answer for a book that
+        # trades on env keys; informational only.
+        log.info("web_tokens.no_connection broker=%s status=%s -> env keys",
+                 broker, status)
+        return
+    log.warning("web_tokens.non_200 broker=%s status=%s -> falling back to env "
+                "keys (legacy mode). 401/403: AGENTS_SHARED_SECRET differs "
+                "between agents/.env and web/.env.local; 500: web is missing "
+                "SUPABASE_SERVICE_ROLE_KEY or its broker_connections read failed.",
+                broker, status)
 
 
 @dataclass
@@ -75,6 +110,7 @@ async def get_user_broker_token(user_id: str, broker: str) -> Optional[BrokerTok
                 json={"user_id": user_id, "broker": broker},
             )
             if resp.status_code != 200:
+                _note_non_200(broker, resp.status_code)
                 return None
             data = resp.json()
     except Exception:  # noqa: BLE001

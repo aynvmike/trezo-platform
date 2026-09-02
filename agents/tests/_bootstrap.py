@@ -83,18 +83,30 @@ def load_module(dotted: str) -> types.ModuleType:
 
 
 def run_tests(namespace: dict) -> int:
-    """Tiny runner so these files work with or without pytest."""
+    """Tiny runner so these files work with or without pytest.
+
+    GATE-05 (audit 2026-09-01): a suite that collects ZERO test_ callables
+    is a FAILURE, not a green. A renamed helper, tests hidden behind a bad
+    `if`, or a file emptied by a merge used to print 'all green (0
+    failures)' and let the deploy through. The collected count is printed
+    per suite so the gate log shows what actually ran."""
+    tests = [(name, fn) for name, fn in sorted(namespace.items())
+             if name.startswith("test_") and callable(fn)]
+    print(f"  collected {len(tests)} tests")
+    if not tests:
+        print("  FAIL  NO TESTS COLLECTED -- an empty suite is not a green suite")
+        print("\nFAILED (1 failures)")
+        return 1
     fails = 0
-    for name, fn in sorted(namespace.items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  PASS  {name}")
-            except AssertionError as e:
-                fails += 1
-                print(f"  FAIL  {name}: {e}")
-            except Exception as e:  # noqa: BLE001
-                fails += 1
-                print(f"  ERROR {name}: {type(e).__name__}: {e}")
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"  PASS  {name}")
+        except AssertionError as e:
+            fails += 1
+            print(f"  FAIL  {name}: {e}")
+        except Exception as e:  # noqa: BLE001
+            fails += 1
+            print(f"  ERROR {name}: {type(e).__name__}: {e}")
     print(f"\n{'FAILED' if fails else 'all green'} ({fails} failures)")
     return 1 if fails else 0

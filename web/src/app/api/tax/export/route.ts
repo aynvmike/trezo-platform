@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
 import { holdingTerm, type ClosedPosition } from "@/lib/tax";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -18,12 +19,23 @@ export async function GET() {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  const { data } = await supabase
+  // rv:web-pages sweep: paper_positions is keyed by BOOK (0047); a tax
+  // export must cover every book the person owns. And a FAILED read must
+  // not export as an empty (i.e. "no gains") CSV.
+  const books = await getOwnerBookKeys(supabase, user.id);
+  if (books.failure) {
+    return new Response(`Could not resolve your books: ${books.failure.message}`, { status: 500 });
+  }
+  const { data, error } = await supabase
     .from("paper_positions")
     .select("id, ticker, side, quantity, entry_price, entry_at, exit_price, exit_at, realized_pnl_usd, status")
-    .eq("user_id", user.id)
+    .in("user_id", bookQueryKeys(books.data))
     .neq("status", "open")
     .order("exit_at", { ascending: true });
+  if (error) {
+    console.error(`[tax/export] paper_positions: ${error.message}`);
+    return new Response(`Could not read closed positions: ${error.message}`, { status: 500 });
+  }
 
   const positions = (data ?? []) as ClosedPosition[];
 

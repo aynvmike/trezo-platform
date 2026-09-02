@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { Disclosure } from "@/components/ui/disclosure";
 import { WheelReconcileButton } from "@/components/dashboard/wheel-reconcile-button";
 import { LoadError, loadResult } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys, withBooks } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -81,11 +82,16 @@ export default async function OptionsPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/options");
 
+  // rv:web-pages sweep: options_positions is keyed by BOOK (0047); read
+  // every book the person owns.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [bookRes, ideaRes] = await Promise.all([
     supabase
       .from("options_positions")
       .select("id, underlying, strategy, strike, expiration, contracts, net_premium_usd, status, realized_pnl_usd")
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .order("opened_at", { ascending: false }),
     supabase
       .from("agent_messages")
@@ -97,7 +103,7 @@ export default async function OptionsPage() {
   ]);
 
   // PAGES-03: keep "read failed" distinct from "nothing there".
-  const bookLoad = loadResult<BookRow[]>("options_positions", bookRes, []);
+  const bookLoad = withBooks(booksLoad, loadResult<BookRow[]>("options_positions", bookRes, []));
   const ideaLoad = loadResult<IdeaMessage[]>("agent_messages", ideaRes, []);
   const allBook = bookLoad.data ?? [];
   const ideas = (ideaLoad.data ?? [])

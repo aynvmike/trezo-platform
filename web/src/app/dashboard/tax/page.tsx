@@ -15,6 +15,7 @@ import {
 } from "@/lib/tax";
 import { TaxStrategySection } from "./_tax-strategy-section";
 import { LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -29,11 +30,16 @@ export default async function TaxPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/tax");
 
+  // rv:web-pages sweep: the closed book is keyed by BOOK (0047). A tax
+  // estimate over one of three books is the wrong number; read them all.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [posRes, profRes] = await Promise.all([
     supabase
       .from("paper_positions")
       .select("id, ticker, side, quantity, entry_price, entry_at, exit_price, exit_at, realized_pnl_usd, status")
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .neq("status", "open")
       .order("exit_at", { ascending: false }),
     supabase
@@ -58,7 +64,7 @@ export default async function TaxPage() {
     await supabase
       .from("options_positions")
       .select("id, underlying, contracts, realized_pnl_usd, status, created_at, closed_at")
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .neq("status", "open")
       .not("realized_pnl_usd", "is", null),
     []
@@ -134,7 +140,7 @@ export default async function TaxPage() {
     );
   }
   // Fatal for the estimate: anything that feeds gains or the bracket.
-  const estimateFailures = failuresOf(posLoad, optLoad, profLoad);
+  const estimateFailures = failuresOf(booksLoad, posLoad, optLoad, profLoad);
   // Non-fatal: only the Tax Strategy child-account panel depends on these.
   const sideFailures = [
     ...failuresOf(kidsLoad),

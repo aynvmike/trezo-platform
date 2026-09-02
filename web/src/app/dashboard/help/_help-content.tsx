@@ -49,7 +49,7 @@ const FAQ: Topic[] = [
     items: [
       {
         q: "What is a Trade Confidence Score?",
-        a: "Every potential trade gets a score from 0 to 1000 — the TCS. It blends the chart pattern, the volume, the news backdrop, and the risk-to-reward. The higher the score, the stronger the setup. You set the minimum score the bot will act on in Bot Tuning."
+        a: "Every potential trade gets a score from 0 to 100 — the TCS. It blends the chart pattern, the volume, the news backdrop, and the risk-to-reward. The higher the score, the stronger the setup. You set the minimum score the bot will act on in Bot Tuning."
       },
       {
         q: "How does the bot decide to trade?",

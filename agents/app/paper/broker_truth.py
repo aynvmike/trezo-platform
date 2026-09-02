@@ -15,13 +15,21 @@ from live trades on two books.
 
 WHY THE EXISTING DETECTOR DIDN'T CATCH IT
 `paper/stocks_reconcile.detect_option_drift_all_users` was written for
-exactly this and has TWO defects: nothing has ever called it (zero call
-sites repo-wide), and it counts rows in `options_positions` -- a table
+exactly this and had TWO defects: nothing ever called it (zero call
+sites repo-wide), and it counted rows in `options_positions` -- a table
 that holds ZERO open rows, because option positions actually live in
 `paper_positions` with asset_type='option'. So even wired up it would
 have compared the broker against an empty table and mis-flagged
 everything as a phantom. A detector pointed at the wrong table is worse
-than no detector: it reports confidently and wrongly.
+than no detector: it reports confidently and wrongly. It was deleted on
+2026-09-01 (audit, TE-17/LT-05); this module is the option-drift
+detector.
+
+BOOK-BOUND AND STRICT (OG-10, audit 2026-09-01). Each book's broker read
+runs under bind_for_user(<that book>) with the route guard checked, and
+it is the STRICT read: None means the read FAILED and the book is
+skipped with a reason. A failed read that read as an empty broker would
+alarm every live contract and close every expired one on the book.
 
 WHAT THIS DOES
 Per book, every pass:
@@ -114,42 +122,62 @@ async def _underlying_price(symbol: str) -> Optional[float]:
         return None
 
 
-async def _broker_option_symbols(user_id: str) -> Optional[set]:
-    """What Alpaca actually holds for this book. None on any failure —
-    and None must mean 'do nothing', never 'the broker holds nothing'.
-    A failed API call that read as an empty broker would close every
-    open option on the book."""
-    # bind_for_user is the SAME binder Trade Execution uses (it is how a
-    # book's calls reach ITS OWN Alpaca account). Reading the broker
-    # unbound would compare every book against the primary account and
-    # declare the other two entirely phantom.
+async def _broker_option_symbols(user_id: str) -> tuple[Optional[set], Optional[str]]:
+    """What Alpaca actually holds for THIS book.
+
+    Returns (symbols, None) on a good read and (None, reason) when the
+    book must be skipped. None must mean 'do nothing', never 'the broker
+    holds nothing': a failed API call that read as an empty broker would
+    close every expired option on the book and alarm every live one as a
+    routing incident, every 15 minutes.
+
+    OG-10 (rv:alpaca 1 / rv:bound-hunter 1, audit 2026-09-01):
+      * The read is get_option_positions_strict. The display read
+        get_option_positions() collapses a failed read into [], so the
+        `rows is None` guard below was DEAD and a 429/timeout reconciled
+        the book against an empty broker.
+      * bind_for_user yields None for a book it cannot resolve. Reading
+        on would compare that book against the PRIMARY's account and
+        declare every row phantom; the book is skipped, with a reason.
+      * The route is checked after binding, the same as Trade Execution
+        and the other reconcilers: bind + check_route, then read.
+    """
     try:
-        from app.brokers.accounts import bind_for_user as _bind
-    except Exception:  # noqa: BLE001
-        _bind = None
+        from app.brokers.accounts import bind_for_user, should_skip_unresolved
+        from app.brokers.route_guard import check_route, record_mismatch
+        from app.brokers.alpaca import get_option_positions_strict
+    except Exception as e:  # noqa: BLE001
+        # No binder means no way to know WHICH account a read would hit.
+        return None, f"broker binding unavailable: {str(e)[:80]}"
     try:
-        from app.brokers.alpaca import get_option_positions
-    except Exception:  # noqa: BLE001
-        return None
-    try:
-        if _bind is not None:
-            with _bind(user_id):
-                rows = await get_option_positions()
-        else:
-            rows = await get_option_positions()
+        with bind_for_user(user_id) as bound:
+            if bound is None and should_skip_unresolved(user_id):
+                log.warning("broker_truth.unresolved_book",
+                            user_id=user_id[:8])
+                return None, ("unresolved book — skipped, not defaulted "
+                              "to the primary")
+            ok, note = check_route(user_id)
+            if not ok:
+                log.warning("broker_truth.route_refused",
+                            user_id=user_id[:8], note=note)
+                record_mismatch("-", user_id, note, "broker_truth")
+                return None, f"route refused: {note}"
+            rows = await get_option_positions_strict()
     except Exception as e:  # noqa: BLE001
         log.warning("broker_truth.broker_read_failed",
                     user_id=user_id[:8], error=str(e)[:160])
-        return None
+        return None, "broker unreadable — took no action"
     if rows is None:
-        return None
+        log.warning("broker_truth.broker_read_failed",
+                    user_id=user_id[:8], error="strict read returned None")
+        return None, "broker unreadable — took no action"
     out = set()
     for r in rows:
         sym = (r.get("symbol") if isinstance(r, dict)
                else getattr(r, "symbol", None))
         if sym:
             out.add(str(sym).upper().strip())
-    return out
+    return out, None
 
 
 async def reconcile_options_for_book(client, user_id: str,
@@ -160,9 +188,12 @@ async def reconcile_options_for_book(client, user_id: str,
         "checked": 0, "skipped_reason": None,
     }
 
-    broker = await _broker_option_symbols(user_id)
+    broker, why = await _broker_option_symbols(user_id)
     if broker is None:
-        report["skipped_reason"] = "broker unreadable — took no action"
+        # OG-10: an unresolved book, a refused route or a failed read all
+        # land here. Nothing is closed, nothing is flagged; the report
+        # says why so a skipped book never looks like a clean one.
+        report["skipped_reason"] = why or "broker unreadable — took no action"
         return report
 
     def _ledger():
@@ -283,6 +314,9 @@ async def reconcile_options_all_books(*, dry_run: bool = False) -> dict:
     return {
         "ok": True,
         "books": len(reports),
+        # OG-10: books that took no action (unresolved, route refused,
+        # broker unreadable). Additive; the agent's summary is unchanged.
+        "skipped": sum(1 for r in reports if r.get("skipped_reason")),
         "closed": sum(len(r["closed"]) for r in reports),
         "flagged": sum(len(r["flagged"]) for r in reports),
         "orphans": sum(len(r["orphans"]) for r in reports),

@@ -1,4 +1,4 @@
-"""Unit tests for every pattern in the Trezo library.
+r"""Unit tests for every pattern in the Trezo library.
 
 Each pattern has at least one positive (should detect) and one negative
 (should not detect) case. Run with:
@@ -6,6 +6,9 @@ Each pattern has at least one positive (should detect) and one negative
     cd agents
     .\.venv\Scripts\python.exe -m pytest -q
 """
+# GATE-06 (audit 2026-09-01): raw docstring -- it quotes a Windows path
+# whose "\." and "\S" are invalid escape sequences in a normal string (a
+# SyntaxWarning today, a SyntaxError in a future Python).
 
 from datetime import datetime, timezone
 

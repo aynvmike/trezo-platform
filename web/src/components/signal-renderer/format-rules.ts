@@ -134,6 +134,12 @@ export function buildTerseReasoning(payload: {
  * by 100 rendered every modern signal as confidence 1. Divide by 10 for
  * the current scale; anything above 100 can only be a legacy 0-1000
  * value (old agent_messages rows), so keep the /100 path for those.
+ *
+ * Known edges (rv:main-exit-advisor, accepted): a legacy row whose
+ * 0-1000 tcs was <= 100 is indistinguishable from a live row and renders
+ * as if 0-100 (at most 10, where it used to be 1); a tcs of 0 clamps to
+ * the floor of 1 because the card's scale starts at 1. Neither can move a
+ * trade -- this feeds display copy only (to-terse-fields.ts).
  */
 export function tcsToConfidence(tcs: number | null | undefined): number | null {
   if (tcs === null || tcs === undefined || !Number.isFinite(tcs)) return null;

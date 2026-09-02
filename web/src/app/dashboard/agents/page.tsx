@@ -10,6 +10,7 @@ import {
 import { AgentsSettings } from "./_agents-settings";
 import { describeAgentMessage, type FeedMessage } from "@/lib/agent-message";
 import { LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -51,13 +52,19 @@ export default async function AgentsPage() {
   const monthIso = new Date(Date.now() - 30 * 864e5).toISOString();
   const todayKey = new Date().toISOString().slice(0, 10);
 
+  // rv:web-pages sweep: paper_positions is keyed by BOOK (0047); read
+  // across every book the person owns, not just the one whose key
+  // equals the auth uid.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [msgsRes, openRes, closedRes, memRes] = await Promise.all([
     supabase.from("agent_messages").select("agent_name, kind, payload, created_at")
       .or(`user_id.eq.${user.id},user_id.is.null`).gte("created_at", dayIso)
       .order("created_at", { ascending: false }).limit(150),
-    supabase.from("paper_positions").select("asset_type, strategy").eq("user_id", user.id).eq("status", "open"),
+    supabase.from("paper_positions").select("asset_type, strategy").in("user_id", keys).eq("status", "open"),
     supabase.from("paper_positions").select("realized_pnl_usd, entry_at, exit_at, asset_type, strategy")
-      .eq("user_id", user.id).neq("status", "open").gte("exit_at", monthIso),
+      .in("user_id", keys).neq("status", "open").gte("exit_at", monthIso),
     supabase.from("agent_memory").select("agent, category, content, weight, updated_at")
       .eq("scope", "shared").order("weight", { ascending: false }).order("updated_at", { ascending: false }).limit(12),
   ]);
@@ -70,7 +77,7 @@ export default async function AgentsPage() {
   const openLoad = loadResult<OpenRow[]>("paper_positions", openRes, []);
   const closedLoad = loadResult<ClosedRow[]>("paper_positions (closed)", closedRes, []);
   const memLoad = loadResult<Memory[]>("agent_memory", memRes, []);
-  const boardFailures = failuresOf(msgsLoad, openLoad, closedLoad);
+  const boardFailures = failuresOf(booksLoad, msgsLoad, openLoad, closedLoad);
   const msgs = msgsLoad.data ?? [];
   const open = openLoad.data ?? [];
   const closed = closedLoad.data ?? [];

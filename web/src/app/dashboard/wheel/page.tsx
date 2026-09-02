@@ -13,6 +13,7 @@ import { OpenOptionsTable } from "@/components/dashboard/open-options-table";
 import { WheelAcquisitionQueue } from "@/components/dashboard/wheel-acquisition-queue";
 import { OptionsApprovalBadge } from "@/components/dashboard/options-approval-badge";
 import { LoadError, loadResult } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys, withBooks } from "@/lib/books";
 import { fetchAlpacaSnapshot } from "@/lib/alpaca-snapshot";
 import {
   fetchWheelLiveSnapshot,
@@ -290,13 +291,19 @@ export default async function WheelPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/wheel");
 
+  // rv:web-pages sweep: options_positions is keyed by BOOK (0047); read
+  // every book the person owns. (bot_settings below stays keyed by the
+  // caller's own key: it is one book's dial, chosen on the settings page.)
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [rowsRes, botRes, lastTickRes, alpacaSnap, wheelLive] = await Promise.all([
     supabase
       .from("options_positions")
       .select(
         "id, underlying, strategy, strike, expiration, contracts, net_premium_usd, status, realized_pnl_usd, opened_at, closed_at"
       )
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .in("strategy", ["wheel_csp", "wheel_cc"])
       .order("opened_at", { ascending: false }),
     supabase
@@ -323,7 +330,7 @@ export default async function WheelPage() {
   // PAGES-03: keep "read failed" distinct from "nothing there". A failed
   // options_positions read blanks the modeled tiles/sections below; the
   // live (Alpaca-backed) panels have their own snapshot and still render.
-  const rowsLoad = loadResult<WheelRow[]>("options_positions", rowsRes, []);
+  const rowsLoad = withBooks(booksLoad, loadResult<WheelRow[]>("options_positions", rowsRes, []));
   const positions = rowsLoad.data ?? [];
 
   // Idle reason — Mike feedback 2026-05-29. The cards used to all say

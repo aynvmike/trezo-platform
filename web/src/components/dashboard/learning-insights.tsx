@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 import { PostmortemButton } from "./postmortem-button";
 
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
@@ -86,10 +87,13 @@ export async function LearningInsights() {
   // Post-mortem diagnosis breakdown — separate Supabase query.
   // Counts how many of the user's recent trades fall into each
   // diagnosis bucket (held_too_long, optimal, exited_too_early, etc.).
+  // rv:web-pages sweep: trade_outcomes is keyed by BOOK (0047); count the
+  // diagnoses across every book the person owns.
+  const books = await getOwnerBookKeys(supabase, user.id);
   const { data: diagRows } = await supabase
     .from("trade_outcomes")
     .select("postmortem_diagnosis")
-    .eq("user_id", user.id)
+    .in("user_id", bookQueryKeys(books.data))
     .not("postmortem_diagnosis", "is", null);
   const diagCounts: Record<string, number> = {};
   for (const r of (diagRows ?? []) as { postmortem_diagnosis: string }[]) {

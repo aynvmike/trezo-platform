@@ -3,6 +3,7 @@ import { LayerHero } from "@/components/dashboard/layer-hero";
 import { createClient } from "@/lib/supabase/server";
 import { CryptoCards } from "@/components/widgets/crypto-card";
 import { LoadError, loadResult } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys, withBooks } from "@/lib/books";
 import { cn } from "@/lib/utils";
 
 import { Disclosure } from "@/components/ui/disclosure";
@@ -28,11 +29,16 @@ export default async function CryptoPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/crypto");
 
+  // rv:web-pages sweep: paper_positions is keyed by BOOK (0047); read
+  // every book the person owns.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [openRes, scanRes] = await Promise.all([
     supabase
       .from("paper_positions")
       .select("*")
-      .eq("user_id", user.id)
+      .in("user_id", keys)
       .like("strategy", "crypto_%")
       .eq("status", "open")
       .order("entry_at", { ascending: false }),
@@ -46,7 +52,7 @@ export default async function CryptoPage() {
   ]);
 
   // PAGES-03: keep "read failed" distinct from "nothing there".
-  const openLoad = loadResult("paper_positions", openRes, []);
+  const openLoad = withBooks(booksLoad, loadResult("paper_positions", openRes, []));
   const scanLoad = loadResult("agent_messages", scanRes, []);
   const openCrypto = openLoad.data ?? [];
   const cryptoSignals = scanLoad.data ?? [];

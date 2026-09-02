@@ -54,7 +54,9 @@ begin
       raise notice 'QP-01: public.%.quantity already at scale %, skipped', t, sc;
     else
       execute format('alter table public.%I alter column quantity type numeric(30, 12)', t);
-      raise notice 'QP-01: public.%.quantity widened numeric(20,8) -> numeric(30,12)', t;
+      -- rv:data-lane: report the scale that was actually there (the
+      -- branch fires for ANY scale < 12, not only the original 8).
+      raise notice 'QP-01: public.%.quantity widened from scale % -> numeric(30,12)', t, sc;
     end if;
   end loop;
 end

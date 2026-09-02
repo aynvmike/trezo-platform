@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -34,11 +35,17 @@ export async function POST(req: Request) {
   }
 
   if (alertId) {
-    await supabase
-      .from("exit_advisor_alerts")
-      .update({ acknowledged_at: new Date().toISOString() })
-      .eq("id", alertId)
-      .eq("user_id", user.id);
+    // rv:web-pages sweep: alerts are keyed by BOOK (0047); the banner now
+    // shows every book's alerts, so Dismiss must reach them too. RLS still
+    // limits the update to the caller's own books.
+    const books = await getOwnerBookKeys(supabase, user.id);
+    if (!books.failure) {
+      await supabase
+        .from("exit_advisor_alerts")
+        .update({ acknowledged_at: new Date().toISOString() })
+        .eq("id", alertId)
+        .in("user_id", bookQueryKeys(books.data));
+    }
   }
 
   return NextResponse.redirect(new URL("/dashboard/paper", req.url));

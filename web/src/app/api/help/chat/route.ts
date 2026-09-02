@@ -16,7 +16,7 @@ THE SEVEN LAYERS (sidebar pages), most active to most protected:
 
 KEY THINGS
 - 17 background agents run Trezo. A Risk Manager approves or vetoes every trade — nothing skips it.
-- Trade Confidence Score (TCS): every potential trade scores 0-1000; higher = stronger setup. The minimum the bot acts on is set in Bot Tuning.
+- Trade Confidence Score (TCS): every potential trade scores 0-100; higher = stronger setup. The minimum the bot acts on is set in Bot Tuning.
 - Bot Tuning page: risk dials, strategy on/off toggles, autonomy modes (Suggest only / Guarded / Full).
 - Safety brakes: a daily loss limit, a losing-streak limit, per-coin crypto limits, a daily profit lock.
 - KINDRIP (Layer 7): routes a contribution into a child's Future Index Account, which auto-invests on an age-based glide path.

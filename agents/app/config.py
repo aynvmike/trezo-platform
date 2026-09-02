@@ -254,6 +254,49 @@ class Settings(BaseSettings):
     trezo_reeval_lower_target: bool = True
     trezo_reeval_rotate: bool = True
     trezo_reeval_average_down: bool = False
+    # Reevaluator numeric knobs (G19, audit 2026-09-01 rv:bound-hunter).
+    # reevaluator._settings_num reads these by name through getattr and,
+    # until they were declared here, `extra="ignore"` (line 8) silently
+    # dropped every agents/.env override and the value came from the
+    # process env (which never sees .env) -- i.e. always the default.
+    # Defaults copied EXACTLY from reevaluator._TUNABLES and the two
+    # inline reads; typed float because the reader coerces with float()
+    # and the old os.getenv path parsed floats, so "2.5" days must not
+    # become a startup validation error. tcs_rescore is a bool flag.
+    trezo_reeval_cooldown_sec: float = 900
+    trezo_reeval_stale_days: float = 3
+    trezo_reeval_rotate_days: float = 7
+    trezo_reeval_tighten_giveback: float = 0.30
+    trezo_reeval_tighten_band: float = 0.02
+    trezo_reeval_target_far_pct: float = 0.08
+    trezo_reeval_target_reach_band: float = 0.02
+    trezo_reeval_min_bank_profit: float = 0.005
+    trezo_reeval_avgdown_trigger: float = 0.08
+    trezo_reeval_tcs_collapse_frac: float = 0.5
+    trezo_reeval_shadow_far_pct: float = 0.03
+    trezo_reeval_tcs_rescore: bool = True
+
+    # ---- Direct-fire option lanes (NEQ-09, audit 2026-09-01) ------------
+    # options_scanner._lane_enabled reads these Settings fields FIRST
+    # (TREZO_DAY_OPTIONS / TREZO_SPREADS / TREZO_LONG_OPTIONS), then the
+    # process env. rv:bound-hunter: the switch was built but had nothing
+    # to read -- no field here meant getattr returned None and a value in
+    # agents/.env was dropped by extra="ignore". Default OFF keeps today's
+    # behaviour: the three order-placing lanes stay dark until Mike flips
+    # a switch in agents/.env.
+    trezo_day_options: bool = False
+    trezo_spreads: bool = False
+    trezo_long_options: bool = False
+
+    # ---- Dividends-LT lane on-switch (audit 2026-09-01) -----------------
+    # The dividend lane deliberately emits signals WITHOUT a `tcs` today,
+    # and Risk Manager forwards only signals that carry one (TE-06), so
+    # the lane is dark. 0 = keep emitting no tcs (dark, today's state).
+    # A positive value (0-100 scale) is the tcs the lane stamps on its
+    # ladder signals, which lets them through the Risk Manager -- turn it
+    # on only after NEQ-05 (no_price_stop honoured downstream) is fixed;
+    # that is Mike's call.
+    trezo_dividend_lt_tcs: int = 0
 
     # ---- Multi-account (2026-08-09, Mike) -------------------------------
     # Trezo's state layer (positions, pockets, kill-switch, equity) already

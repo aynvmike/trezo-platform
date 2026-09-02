@@ -136,11 +136,24 @@ async def _resync_bound(sym: str, qty: float, stop_p: float, tgt_p: float,
     _n, err = await cancel_open_orders_for(sym)
     if err:
         return False, f"cancel failed: {err}"
+    left = None
     for _ in range(6):
         left = await get_open_orders_for(sym)
-        if not left:
+        if left == []:
             break
         await asyncio.sleep(0.7)
+    # rv:alpaca :136 (audit 2026-09-01): get_open_orders_for returns None
+    # when the CALL failed and [] only when the broker confirmed nothing
+    # is open. `if not left` read None as "legs gone", so an unverified
+    # cancel went straight to the re-arm: a refused OCO, a refused stop
+    # and a false legs_naked_alert while the old legs kept protecting.
+    # Same rule as the profit-step harvest: an unverifiable check aborts,
+    # it does not assume. The old legs stand; the next pass retries.
+    if left is None:
+        _note("legs_resync_deferred", sym,
+              "could not verify legs were cancelled -- old legs left "
+              "standing; retry next pass", uid)
+        return False, "could not verify legs were cancelled"
     o, oerr = await submit_oco_sell(sym, qty, limit_price=round(tgt_p, 2),
                                     stop_price=round(stop_p, 2))
     if oerr or not o:

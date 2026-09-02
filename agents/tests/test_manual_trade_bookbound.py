@@ -224,6 +224,77 @@ def test_manual_trade_single_account_mode_is_unchanged():
     assert not mm
 
 
+@contextlib.contextmanager
+def _sizing_retry_seams():
+    """The 'Sizing produced 0 shares' retry path (rv:main-exit-advisor
+    coverage gap, 2026-09-01). The FIRST _execute_for_user answers with
+    that exact error; the handler then reads alpaca.get_account and the
+    tape, bumps risk to fit one share and submits AGAIN. TE-10 moved that
+    whole block inside the binding -- this seam records which account
+    was bound at the account read and at BOTH submits."""
+    alpaca = load_module("app.brokers.alpaca")
+    candles = load_module("app.data.candles")
+    calls, reads = [], []
+
+    async def _fake(self, user_id, ticker, side, payload):
+        calls.append({"user_id": user_id, "ticker": ticker, "side": side,
+                      "payload": dict(payload),
+                      "bound": accounts.current_account()})
+        if len(calls) == 1:
+            return [_Msg("error", {"ticker": ticker, "user_id": user_id,
+                                   "error": "Sizing produced 0 shares"})]
+        return [_Msg("execute", {"ticker": ticker, "user_id": user_id,
+                                 "venue": "paper", "quantity": 1,
+                                 "fill_price": 200.0})]
+
+    class _Acct:
+        buying_power = 5_000.0
+        equity = 25_000.0
+
+    async def _get_account(token=None):
+        reads.append({"bound": accounts.current_account()})
+        return _Acct()
+
+    class _Bar:
+        close = 200.0
+
+    async def _fetch(symbol, asset_type):
+        return [_Bar()]
+
+    class _Bus:
+        async def publish(self, m):
+            pass
+
+    with _patched(te.TradeExecutionAgent, _execute_for_user=_fake), \
+         _patched(alpaca, alpaca_configured=lambda: True, get_account=_get_account), \
+         _patched(candles, fetch_candles_for=_fetch), \
+         _patched(bus_mod, bus=_Bus()):
+        yield calls, reads
+
+
+def test_manual_trade_sizing_retry_stays_under_the_requested_book():
+    """rv:main-exit-advisor (2026-09-01): the retry submit and the
+    get_account read it depends on were the two broker calls TE-10 moved
+    inside `with _bind_acct(user_id)`. Drive the real handler through
+    that branch and check every one of them saw the 75k book bound."""
+    handler, _ = _load_manual_trade()
+    with _registry(multi=True), _mismatch_log() as mm, \
+            _sizing_retry_seams() as (calls, reads):
+        res = _run(handler(BOOK_75K, "AMZN", "long"))
+    assert res.get("ok") is True, res
+    assert res.get("risk_override_applied") is True, res
+    assert len(calls) == 2, calls
+    assert [c["bound"] for c in calls] == [ACCT_75K, ACCT_75K], (
+        "the sizing retry submitted under a different account than the "
+        "first attempt -- the retry escaped the binding")
+    assert calls[1]["payload"].get("force_min_qty") == 1
+    assert 0 < calls[1]["payload"].get("risk_pct_override", 0) <= 0.25
+    assert len(reads) == 1 and reads[0]["bound"] is ACCT_75K, (
+        f"buying power read from {reads!r}, not the 75k book")
+    assert not mm
+    assert accounts._active.get() is None
+
+
 def test_manual_trade_docstring_no_longer_claims_risk_manager():
     """The old docstring promised 'Risk Manager -> Trade Execution'. It
     never went through the Risk Manager. Keep the honest version."""

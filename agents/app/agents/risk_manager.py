@@ -8,13 +8,17 @@ Rules:
   - Veto if direction is "neutral" (no actionable bias)
   - Veto if the signal's strategy is paused by Adaptive Scope
   - Veto if the signal's ticker is flagged by Adaptive Scope
-  - Veto if TCS below the user's threshold (raised by the regime posture)
+  - Veto if TCS below the user's threshold (raised by the regime posture).
+    A scanner signal (no user_id) is judged at the LOWEST enabled book's
+    floor (BI-03) -- each book's own floor binds again at the fan-out
   - Veto if too many open signals already (configurable cap)
-  - Veto only when NO book can take the signal: per-book kill-switches,
-    the user-set daily $ brake and the per-coin bench are judged book by
-    book here and enforced again, per book, at the execution fan-out
+  - Kill-switches: a scanner signal is vetoed only when NO book can take
+    it (per-book halts, the user-set daily $ brake and the per-coin bench
+    are judged book by book here and enforced again at the fan-out); a
+    USER-SCOPED signal (payload.user_id) is judged for ITS book alone
   - Otherwise approve, forwarding strategy + stop/target geometry, with
-    stops tightened by the current Adaptive Scope posture
+    stops tightened by the current Adaptive Scope posture. A signal that
+    says no_price_stop=True gets NO stop geometry filled in (NEQ-05)
 """
 
 from __future__ import annotations
@@ -103,9 +107,11 @@ async def _find_rotation_candidate(
             return None
 
         # Only flag as a rotation when the incoming signal beats the
-        # weakest by a clear margin (>= 75 TCS). Otherwise the swap
-        # is noise.
-        if incoming_tcs - weakest_score < 75:
+        # weakest by a clear margin (>= 8 TCS). Otherwise the swap
+        # is noise. EQ-5 (review 2026-09-01): the gap was 75 -- a
+        # 0-1000-scale leftover that no 0-100 signal could clear, so
+        # the rotation hint never fired. Same band, rescaled.
+        if incoming_tcs - weakest_score < 8:
             return None
 
         pos, h = weakest
@@ -137,16 +143,20 @@ def _note_kill_switch_unknown(ticker: str) -> None:
     if (now - _LAST_KS_UNKNOWN_LOG) < 600.0:
         return
     _LAST_KS_UNKNOWN_LOG = now
+    # Wording (review 2026-09-01, rv:risk_manager :126): None has three
+    # causes -- no Supabase client, a killswitch import failure, or the
+    # paper_accounts read raising -- so say "unavailable", not "failed".
     _log.error(
-        "risk_manager: kill-switch states unavailable (paper_accounts read "
-        "failed) - per-book halts NOT evaluated here for %s; the execution "
-        "fan-out fails closed until the read recovers", ticker)
+        "risk_manager: kill-switch states unavailable (no client, or the "
+        "paper_accounts read did not complete) - per-book halts NOT "
+        "evaluated here for %s; the execution fan-out fails closed until "
+        "the read recovers", ticker)
     try:
         from app.agents.activity_log import record as _rec
         _rec("kill_switch_unknown", ticker,
-             reason=("check_states returned None (paper_accounts read "
-                     "failed) - per-book halts not evaluated at the risk "
-                     "gate; the fan-out fails closed"),
+             reason=("check_states returned None (kill-switch state "
+                     "unavailable) - per-book halts not evaluated at the "
+                     "risk gate; the fan-out fails closed"),
              extra={"user_id": "global"})
     except Exception:  # noqa: BLE001
         pass
@@ -459,8 +469,33 @@ class RiskManagerAgent(Agent):
         from app.runtime.settings import get_bot_settings
         # Per-user settings when the signal is user-scoped (#119);
         # the global row otherwise.
-        cfg = get_bot_settings(message.payload.get("user_id"))
+        _sig_uid = message.payload.get("user_id")
+        cfg = get_bot_settings(_sig_uid)
         min_tcs = cfg.tcs_threshold
+        # BI-03 (review 2026-09-01, rv:scanners-scale :462): a scanner
+        # signal has no user_id, so `cfg` above is the PRIMARY row and
+        # this floor was the primary's slider -- a secondary book with a
+        # lower slider was starved between its floor and the primary's,
+        # because this veto fired before the fan-out's per-book
+        # book_gate.admits ever ran. The scanners now emit at the LOWEST
+        # enabled book's floor; the risk gate must judge at the same
+        # floor or the scanner change never binds. Each book's own floor
+        # (plus its recovery / margin bumps) is re-applied per book at
+        # the fan-out. A user-scoped signal keeps its own book's row.
+        # Fails OPEN to the bare read on any failure.
+        if not _sig_uid:
+            try:
+                from app.runtime.settings import min_tcs_floor_across_books
+                min_tcs = int(min_tcs_floor_across_books())
+            except Exception:  # noqa: BLE001
+                min_tcs = cfg.tcs_threshold
+        # NEQ-05 / G3: the producer says this lane has NO price stop (the
+        # dividend ladder: exits are the spec's -- cut, payout breach,
+        # recycling -- not a price). Nothing below may fill a default
+        # stop, harmonize one in, or forward one. The flag travels on
+        # the approval so execution sizes by notional and submits a
+        # plain buy, and the ledger row says so for position_monitor.
+        _no_price_stop = bool(message.payload.get("no_price_stop"))
         # Strategy-coverage test mode (Mike 2026-07-02): drop the floor to
         # TREZO_COVERAGE_TCS (400) so EVERY strategy can find one live,
         # labeled trade instead of waiting on perfect tape.
@@ -767,6 +802,44 @@ class RiskManagerAgent(Agent):
             # here (the fan-out fails closed for every book on the same
             # None and is the enforcement point), but never silent.
             _note_kill_switch_unknown(ticker)
+        elif _sig_uid:
+            # USER-SCOPED signal (review 2026-09-01, rv:killswitch-
+            # contracts): judge ONLY this signal's own book. The all-books
+            # branch below asks "can ANY book act?", which is the right
+            # question for a shared scanner signal and the wrong one for
+            # a signal raised FOR one book -- a dividend-ladder buy for
+            # book B while B is hard-halted and A is open used to be
+            # approved (and, book_scoped, executed on B). The execution
+            # single-book path re-applies the same gate; this is the
+            # first line of defence, not the only one.
+            _st_own = _states.get(str(_sig_uid))
+            try:
+                _daily_over_own = await daily_dollar_over(_ks_client)
+            except Exception:  # noqa: BLE001
+                _daily_over_own = None
+            if _daily_over_own is None:
+                _daily_over_own = set()   # unknown: fail-open-but-logged
+            _who = f"book {str(_sig_uid)[:8]}"
+            if _st_own is not None and _st_own.halted and _st_own.mode != "recovery":
+                return [self._veto(
+                    ticker, tcs,
+                    f"Kill-switch [{_who}] - [{_st_own.scope}] {_st_own.reason}",
+                    strategy=strategy, user_id=_sig_uid)]
+            if str(_sig_uid) in _daily_over_own:
+                return [self._veto(
+                    ticker, tcs,
+                    f"Kill-switch [{_who}] - daily $ loss limit (user setting)",
+                    strategy=strategy, user_id=_sig_uid)]
+            if _st_own is not None and _st_own.mode == "recovery":
+                if recovery_policy(strategy) == "suspend":
+                    return [self._veto(
+                        ticker, tcs,
+                        f"Kill-switch [{_who}] - recovery suspends "
+                        f"{strategy or 'this lane'}",
+                        strategy=strategy, user_id=_sig_uid)]
+                recovery_bump = int(RECOVERY_TCS_BUMP)
+                recovery_reason = (f", weekly recovery +{recovery_bump} "
+                                   f"({_who} working back)")
         elif _states:
             # KS-12: the user-set daily $ brake, judged PER BOOK like the
             # percent one (killswitch.daily_dollar_over, which the fan-out
@@ -1007,7 +1080,11 @@ class RiskManagerAgent(Agent):
                             if s != (strategy or "").lower()]
                 except Exception:  # noqa: BLE001
                     fits = []
-                if fits and tcs >= 600:
+                # EQ-5 (review 2026-09-01, rv:risk_manager :1007): was
+                # `tcs >= 600`, a 0-1000-scale leftover -- unreachable on
+                # the 0-100 scale, so this learning hook never fired.
+                # Same band, rescaled.
+                if fits and tcs >= 60:
                     try:
                         mem = get_memory()
                         if mem.available:
@@ -1124,20 +1201,30 @@ class RiskManagerAgent(Agent):
             approve_payload["size_scale"] = 0.5
             approve_payload["reason"] += (
                 f"; probation: bar +10, HALF size [{scope.regime}]")
+        # NEQ-05 / G3: no stop geometry of any kind on a no-price-stop
+        # lane -- not the producer's, not the scope multiplier's, not
+        # the tier formulas', not the harmonizers'. The flag is the
+        # contract execution and position_monitor read.
+        if _no_price_stop:
+            approve_payload["no_price_stop"] = True
+            approve_payload["reason"] += "; no price stop (lane-managed exits)"
         # Adaptive Scope can tighten stops in rougher regimes.
-        if stop_pct is not None:
+        if stop_pct is not None and not _no_price_stop:
             tightened = round(float(stop_pct) * scope.stop_multiplier, 4)
             approve_payload["stop_pct"] = tightened
             if scope.stop_multiplier < 1.0:
                 approve_payload["stop_adjusted"] = True
                 approve_payload["reason"] += f"; stop tightened x{scope.stop_multiplier} [{scope.regime}]"
-        if target_pct is not None:
+        if target_pct is not None and not _no_price_stop:
             approve_payload["target_pct"] = target_pct
 
         # Market-cap tier formulas (2026-07-02): the LAST formula step.
         # Megas trade tight + quick (scalp-friendly); micros get room and
         # the risk math sizes them smaller via the wider stop. Fail-open.
-        if not _is_crypto:
+        # NEQ-05: skipped entirely for a no-price-stop lane -- this is
+        # the block that used to fill the DEFAULT 5% stop on a ladder
+        # name that asked for none.
+        if not _is_crypto and not _no_price_stop:
             try:
                 from app.strategies.cap_tiers import (
                     tier_for, adjust_stop_target,
@@ -1279,12 +1366,17 @@ class RiskManagerAgent(Agent):
         # the target -- tier multiplier, ATR realism, learned calibration --
         # the stop must follow, or sizing's reward:risk floor silently
         # rejects the trade (the 7/6 lesson, now enforced on EVERY path).
-        if not _is_crypto:
+        # NEQ-05: nothing to harmonize on a no-price-stop lane.
+        if not _is_crypto and not _no_price_stop:
             try:
                 _sf = approve_payload.get("stop_pct")
                 _tf = approve_payload.get("target_pct")
                 if _sf and _tf and float(_sf) > 0:
                     _rrf = float(getattr(cfg, "min_reward_risk", 1.5) or 1.5)
+                    # Judge against the floor sizing will actually apply
+                    # (it clamps to [0.3, 3.0]); the row's value is not
+                    # changed (review 2026-09-01, rv:trade_execution :589).
+                    _rrf = max(0.3, min(3.0, _rrf))
                     if float(_tf) / float(_sf) < _rrf:
                         _new_s = max(round(float(_tf) / max(_rrf, 0.1), 4),
                                      0.004)
@@ -1429,17 +1521,24 @@ class RiskManagerAgent(Agent):
                         + (f" on {_pat_t}" if _pat_t else "")
                         + f"; {_tier_t}-cap formulas sized the geometry"),
                 "exit_watch": (
-                    f"target +{_tp_pct:.1f}%, stop -{_sp_pct:.1f}%"
+                    ("no price stop -- exits are the lane's own rules"
+                     if _no_price_stop else
+                     f"target +{_tp_pct:.1f}%, stop -{_sp_pct:.1f}%")
                     + ("; intraday rules: 90-min max hold, 3:45 ET force-exit, "
                        "75-min stagnation exit" if _fast_t
                        else "; hourly re-score guards the thesis")),
                 "if_with_us": ("profit-step ladder banks 50% of what's left at "
                                "60/80/100% of the run; the trail locks the rest; "
                                "never round-trip a green trade"),
-                "if_against_us": (f"hard stop -{_sp_pct:.1f}% caps the loss; "
-                                  "hourly TCS re-score rotates out early if the "
-                                  "setup collapses; daily kill-switch caps the "
-                                  "book at -3%"),
+                "if_against_us": (
+                    ("held through drawdown by design -- the lane's exit "
+                     "rules (not a price) decide; daily kill-switch caps "
+                     "the book at -3%")
+                    if _no_price_stop else
+                    (f"hard stop -{_sp_pct:.1f}% caps the loss; "
+                     "hourly TCS re-score rotates out early if the "
+                     "setup collapses; daily kill-switch caps the "
+                     "book at -3%")),
             }
             # Playbook grounding (Mike 2026-07-13): one cited line from
             # the local knowledge library so the trade carries the craft

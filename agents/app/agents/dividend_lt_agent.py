@@ -31,6 +31,18 @@ WHAT IT DELIBERATELY DOES NOT DO
 MODE: ladder entries only fire in ACCUMULATE and PARTIAL. In INCOME mode
 the lane is drawing down, not building, so new ladder buys would work
 against the owner's stated intent.
+
+ACTIVATION SWITCH (TE-06, audit 2026-09-01). Risk Manager forwards only
+signals that carry a `tcs`, and vetoes one without it at TCS 0. This lane
+emits `tcs` ONLY when Settings.trezo_dividend_lt_tcs is > 0 -- i.e. when
+TREZO_DIVIDEND_LT_TCS is set in agents/.env (e.g. TREZO_DIVIDEND_LT_TCS=60).
+At the default 0 the signal carries no `tcs` and the lane stays dark, on
+purpose: every ladder signal is `no_price_stop: True`, and that contract
+has to be honoured live by the executor (no default price stop planted)
+and the monitor (no stop/target close, no trail, no broker stop -- NEQ-05)
+before a single ladder name is bought. Verify that end to end on paper,
+then flip the switch. `no_price_stop` and `max_notional` ride on every
+signal regardless of the switch.
 """
 
 from __future__ import annotations
@@ -62,6 +74,20 @@ def _supabase():
         return create_client(s.supabase_url, s.supabase_service_role_key)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _lane_tcs() -> int:
+    """TE-06: the lane's activation switch, read through Settings so
+    agents/.env controls it (os.getenv never sees that file). Returns
+    Settings.trezo_dividend_lt_tcs as an int, or 0 -- meaning "dark" --
+    when the field is absent (older config), unset, unparseable or
+    negative. Never raises: a broken read leaves the lane dark, which is
+    the side that cannot buy anything."""
+    try:
+        v = getattr(get_settings(), "trezo_dividend_lt_tcs", 0)
+        return max(0, int(float(v or 0)))
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _lane_inputs_for(row: dict, equity: float) -> Optional[LaneInputs]:
@@ -267,47 +293,56 @@ class DividendLTAgent(Agent):
 
         cap_pct = per_name_cap_pct(sizing)
         per_name_dollars = sizing.ladder_capital * cap_pct
+        # TE-06: the activation switch, read once per book per tick.
+        # > 0 -> the signal carries that tcs and Risk Manager judges it;
+        # 0 -> no `tcs` key at all and the lane stays dark (see the
+        # module docstring for why that is the default).
+        _tcs = _lane_tcs()
 
         for v in chosen:
+            _payload = {
+                "user_id": uid,
+                "ticker": v.ticker,
+                # TE-07 (audit 2026-09-01): the platform vocabulary is
+                # bullish/bearish. Trade Execution maps ONLY 'bullish'
+                # to a long; the 'long' this used to emit would have
+                # been routed as a SHORT of a dividend grower.
+                "direction": "bullish",
+                "strategy": "dividend_lt",
+                "asset_type": "stock",
+                # The ladder has no stop: a dividend grower is held
+                # through drawdowns, and the exits are the spec's
+                # (dividend cut, payout breach, recycling ratio), not
+                # a price stop. Signalled explicitly so Risk Manager
+                # does not infer a missing one, the executor plants
+                # none, and the monitor manages none (NEQ-05). On
+                # EVERY signal, switch or no switch.
+                "no_price_stop": True,
+                # Pin the ladder entry to THIS book. Without book_scoped the
+                # executor treats user_id as provenance and fans the approval
+                # out to every book at this book's per-name cap (Wave 3 review).
+                "book_scoped": True,
+                "max_notional": round(per_name_dollars, 2),
+                "dividend_lt": {
+                    "tier": v.tier,
+                    "yield_pct": v.yield_pct,
+                    "payout_ratio": v.payout_ratio,
+                    "raise_streak_years": v.raise_streak_years,
+                    "sector": v.sector,
+                    "rationale": v.explain(),
+                    "per_name_cap_pct": cap_pct,
+                    "ladder_names_target": sizing.ladder_names,
+                    "unlocks": sizing.unlocks,
+                },
+                }
+            if _tcs > 0:
+                # TE-06: the switch is on -- Risk Manager gets a score to
+                # judge instead of vetoing at TCS 0. Absent at 0 so the
+                # dark behaviour is byte-identical to before the switch.
+                _payload["tcs"] = _tcs
             out.append(AgentMessage(
                 agent=self.name, kind="signal", confidence=0.60,
-                payload={
-                    "user_id": uid,
-                    "ticker": v.ticker,
-                    # TE-07 (audit 2026-09-01): the platform vocabulary is
-                    # bullish/bearish. Trade Execution maps ONLY 'bullish'
-                    # to a long; the 'long' this used to emit would have
-                    # been routed as a SHORT of a dividend grower.
-                    "direction": "bullish",
-                    "strategy": "dividend_lt",
-                    "asset_type": "stock",
-                    # The ladder has no stop: a dividend grower is held
-                    # through drawdowns, and the exits are the spec's
-                    # (dividend cut, payout breach, recycling ratio), not
-                    # a price stop. Signalled explicitly so Risk Manager
-                    # does not infer a missing one.
-                    # TE-06 / NEQ-05 (audit 2026-09-01): deliberately NO
-                    # `tcs` on this signal. Risk Manager only forwards
-                    # signals that carry a tcs (TE-06), so the lane stays
-                    # dark -- but the `no_price_stop` contract is not yet
-                    # honoured downstream (NEQ-05): adding a tcs today
-                    # would put the default 5% price stop on every ladder
-                    # name. Turn the lane on only after NEQ-05 is fixed;
-                    # that is Mike's call, not this agent's.
-                    "no_price_stop": True,
-                    "max_notional": round(per_name_dollars, 2),
-                    "dividend_lt": {
-                        "tier": v.tier,
-                        "yield_pct": v.yield_pct,
-                        "payout_ratio": v.payout_ratio,
-                        "raise_streak_years": v.raise_streak_years,
-                        "sector": v.sector,
-                        "rationale": v.explain(),
-                        "per_name_cap_pct": cap_pct,
-                        "ladder_names_target": sizing.ladder_names,
-                        "unlocks": sizing.unlocks,
-                    },
-                }))
+                payload=_payload))
 
         if chosen:
             out.append(AgentMessage(

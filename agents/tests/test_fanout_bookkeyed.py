@@ -11,6 +11,15 @@ recovery conviction bump (KS-5) and the margin-territory bump (TE-19).
 And two contracts: a kill-switch state that cannot be read fails CLOSED
 (KS-11), and 'long' is a long (TE-07).
 
+Review 2026-09-01 added three more: BI-03 at the fan-out (an unscoped
+signal approved at the LOWEST book floor executes only on the books
+whose own floor it clears); the SINGLE-BOOK path (user_id + book_scoped)
+runs the same per-book gate as the fan-out -- one helper, _gate_book,
+so the two cannot drift; and NEQ-05 / G3 (an approval carrying
+no_price_stop is never re-harmonized, is sized by notional, reaches a
+PLAIN buy with no bracket legs, and lands on the ledger with NULL
+stop/target and no_price_stop=True in source_payload).
+
 These drive the REAL TradeExecutionAgent.on_message ->
 _execute_for_all_users -> book_gate.admits, with only the external
 seams stubbed (persistence client, account binding, route guard, the
@@ -531,6 +540,309 @@ def test_stock_path_refuses_an_unknown_side_instead_of_selling():
     assert len(out) == 1 and out[0].kind == "error"
     assert "unknown side" in out[0].payload.get("error", "")
     assert out[0].payload.get("lane") == "stock"
+
+
+# --- BI-03 at the fan-out: floors 40 / 70, an unscoped 55 -------------------
+# Risk Manager now approves a scanner signal at the LOWEST enabled floor
+# (tests/test_risk_manager_bookkeyed proves that half); this is where each
+# book's OWN floor binds. The approve payload below is exactly the shape
+# RM emits for that case: no user_id, no benched_books.
+
+def test_an_unscoped_signal_at_55_executes_only_on_the_40_floor_book():
+    books = {BOOK_A: Book(tcs_threshold=40), BOOK_B: Book(tcs_threshold=70)}
+    h = Harness(books)
+    out = h.run(_payload(tcs=55, stop_pct=0.02, target_pct=0.05),
+                via_on_message=True)
+    assert set(h.executed) == {BOOK_A}, h.executed
+    declined = _events(out, "book_declined", BOOK_B)
+    assert len(declined) == 1, out
+    assert "floor of 70" in declined[0].payload["note"]
+    assert _events(out, "book_declined", BOOK_A) == []
+
+
+def test_an_unscoped_signal_under_both_floors_executes_nowhere():
+    books = {BOOK_A: Book(tcs_threshold=40), BOOK_B: Book(tcs_threshold=70)}
+    h = Harness(books)
+    out = h.run(_payload(tcs=35), via_on_message=True)
+    assert h.executed == {}
+    assert {m.payload["user_id"] for m in _events(out, "book_declined")} == {BOOK_A, BOOK_B}
+
+
+# --- the single-book path runs the SAME gates as the fan-out ----------------
+# (review 2026-09-01, rv:killswitch-contracts / rv:bound-hunter :168). A
+# user_id + book_scoped approval used to go straight to _execute_for_user
+# with none of the gates below. The dividend lane is user-scoped.
+
+def _pinned(**kw):
+    return _payload(user_id=BOOK_B, book_scoped=True, **kw)
+
+
+def _halted():
+    return ks.KillSwitch(halted=True, scope="day",
+                         reason="Daily loss limit: down $400 (4.0%) today",
+                         mode="halt")
+
+
+def test_pinned_approval_fails_closed_when_the_kill_switch_state_is_unreadable():
+    for states in (None, _RAISE):
+        h = Harness(_books(), states=states)
+        out = h.run(_pinned(), via_on_message=True)
+        assert h.executed == {}, "no book may execute on an unknown state"
+        assert len(out) == 1 and out[0].kind == "error", out
+        p = out[0].payload
+        assert p.get("event") == "execute_error" and p.get("lane") == "stock"
+        assert "fail closed" in (p.get("reason") or "")
+        assert p.get("user_id") == BOOK_B, "the refusal names the pinned book"
+
+
+def test_pinned_approval_on_a_halted_book_is_skipped():
+    h = Harness(_books(), states={BOOK_B: _halted()})
+    out = h.run(_pinned(), via_on_message=True)
+    assert h.executed == {}, h.executed
+    skips = _events(out, "book_halted_skip", BOOK_B)
+    assert len(skips) == 1 and "Daily loss limit" in skips[0].payload["note"]
+
+
+def test_pinned_approval_on_a_healthy_book_executes_there_only():
+    """A halted NEIGHBOUR changes nothing for the pinned book -- and the
+    pin holds: nothing fans out to the neighbour either."""
+    h = Harness(_books(), states={BOOK_A: _halted()})
+    h.run(_pinned(), via_on_message=True)
+    assert set(h.executed) == {BOOK_B}, h.executed
+
+
+def test_pinned_approval_over_its_daily_dollar_limit_is_skipped():
+    h = Harness(_books(), dollar_over={BOOK_B})
+    out = h.run(_pinned(), via_on_message=True)
+    assert h.executed == {}
+    assert [m.payload["user_id"] for m in _events(out, "daily_dollar_limit_skip")] == [BOOK_B]
+    h2 = Harness(_books(), dollar_over={BOOK_A})
+    h2.run(_pinned(), via_on_message=True)
+    assert set(h2.executed) == {BOOK_B}, "a neighbour's $ limit is not this book's"
+
+
+def test_pinned_approval_on_a_benched_book_is_skipped():
+    h = Harness(_books())
+    out = h.run(_pinned(benched_books=[BOOK_B]), via_on_message=True)
+    assert h.executed == {}
+    assert [m.payload["user_id"] for m in _events(out, "coin_loss_halt_skip")] == [BOOK_B]
+
+
+def test_pinned_approval_is_reharmonized_to_its_own_books_floor():
+    h = Harness(_books())
+    h.run(_pinned(), via_on_message=True)              # 0.02 / 0.05 = R:R 0.4
+    p = h.executed[BOOK_B]
+    assert p["stop_pct"] == 0.04, p
+    assert p["rr_reharmonized"]["book_floor"] == 0.5
+    assert p["target_pct"] == 0.02
+
+
+def test_pinned_approval_on_a_recovering_book_faces_the_bump_and_tightens():
+    h = Harness(_books(), states={BOOK_B: _recovering()})
+    out = h.run(_pinned(tcs=75), via_on_message=True)   # clears 70, not 80
+    assert h.executed == {}
+    declined = _events(out, "book_declined", BOOK_B)
+    assert len(declined) == 1
+    assert f"floor of {70 + ks.RECOVERY_TCS_BUMP}" in declined[0].payload["note"]
+    h2 = Harness(_books(), states={BOOK_B: _recovering()})
+    h2.run(_pinned(tcs=70 + ks.RECOVERY_TCS_BUMP), via_on_message=True)
+    p = h2.executed[BOOK_B]
+    assert p.get("_recovery_mode") is True
+    assert abs(p["risk_pct_override"] - 0.05 * ks.RECOVERY_SIZE_FACTOR) < 1e-9
+
+
+def test_pinned_approval_on_a_recovering_book_suspends_speculative_lanes():
+    h = Harness(_books(), states={BOOK_B: _recovering()})
+    out = h.run(_pinned(strategy="orb", tcs=95), via_on_message=True)
+    assert h.executed == {}
+    assert len(_events(out, "recovery_suspend_skip", BOOK_B)) == 1
+
+
+def test_pinned_approval_gets_the_margin_bump_under_its_own_binding():
+    frac, bump = _margin_env()
+    h = Harness(_books(), accounts_by_book={
+        BOOK_A: _acct(cash=100_000 * frac * 4, equity=100_000),
+        BOOK_B: _acct(cash=100_000 * frac / 2, equity=100_000)})
+    out = h.run(_pinned(tcs=75), via_on_message=True)
+    assert h.executed == {}
+    declined = _events(out, "book_declined", BOOK_B)
+    assert len(declined) == 1 and "margin territory" in declined[0].payload["note"]
+    assert h.account_reads == [BOOK_B], "only the pinned book's account, under ITS binding"
+
+
+def test_both_paths_call_the_one_gate_helper():
+    """The point of the refactor: a gate added to _gate_book reaches both
+    paths. Source-shape guard so a re-inlined copy fails loudly."""
+    for fn in (te.TradeExecutionAgent.on_message,
+               te.TradeExecutionAgent._execute_for_all_users):
+        src = inspect.getsource(fn)
+        assert "self._gate_book(" in src, f"{fn.__name__} bypasses _gate_book"
+        assert "self._read_book_brakes(" in src, f"{fn.__name__} bypasses _read_book_brakes"
+
+
+# --- NEQ-05 / G3: no_price_stop through the fan-out and the single path ----
+
+def test_no_price_stop_approval_is_never_reharmonized():
+    """Contradictory input on purpose (a stop AND the flag): the flag is
+    the contract, so the 0.5-floor book leaves the geometry alone."""
+    h = Harness(_books())
+    h.run(_pinned(no_price_stop=True), via_on_message=True)
+    p = h.executed[BOOK_B]
+    assert "rr_reharmonized" not in p and p["stop_pct"] == 0.05, p
+    h2 = Harness(_books())
+    h2.run(_payload(no_price_stop=True))                  # the fan-out
+    for uid in (BOOK_A, BOOK_B):
+        assert "rr_reharmonized" not in h2.executed[uid], uid
+
+
+def _alpaca_no_stop_run(payload, *, side="long", remaining=10_000.0,
+                        acct=None, price=100.0):
+    """Drive the REAL _execute_alpaca with the broker seams stubbed.
+    Returns (out, calls): calls['buy'] / ['bracket'] / ['rows']."""
+    wt = load_module("app.integrations.web_tokens")
+    engine = load_module("app.paper.engine")
+    agent = te.TradeExecutionAgent()
+    calls: dict = {"buy": [], "bracket": [], "rows": []}
+    _a = acct or _acct(cash=50_000, equity=100_000)      # BP 200k
+
+    async def _no_token(_uid, _broker):
+        return None
+
+    async def _open(token=None):
+        return {"is_open": True}
+
+    async def _acct_ok(token=None):
+        return _a
+
+    async def _gate(_uid, _equity, _strategy, _at):
+        return ("income", 10_000.0, 0.0, remaining, "auto")
+
+    async def _buy(symbol, qty, token=None, **kw):
+        calls["buy"].append((symbol, qty, token))
+        return {"id": "ord-1"}, None
+
+    async def _bracket(**kw):
+        calls["bracket"].append(kw)
+        return {"id": "never"}, None
+
+    async def _rec(**kw):
+        calls["rows"].append(kw)
+        return engine.FillResult(ok=True, position_id="p1",
+                                 fill_price=kw["entry_price"])
+
+    agent._allocation_gate = _gate
+    with _quiet_activity_log(), \
+         _patched(wt, get_user_broker_token=_no_token), \
+         _patched(alpaca, get_clock=_open, get_account=_acct_ok,
+                  submit_market_buy=_buy, submit_bracket_order=_bracket), \
+         _patched(engine, record_external_position=_rec), \
+         _patched(settings_mod, get_bot_settings=lambda uid=None: Book()):
+        out = _run(agent._execute_alpaca(
+            BOOK_B, "PG", side, price, None, None, "dividend_lt", payload))
+    return out, calls
+
+
+def test_no_price_stop_approve_reaches_a_plain_buy_sized_by_the_notional_cap():
+    out, calls = _alpaca_no_stop_run(
+        {"no_price_stop": True, "max_notional": 420.0, "tcs": 75,
+         "strategy": "dividend_lt"})
+    assert calls["bracket"] == [], "NO bracket legs on a no-price-stop entry"
+    assert calls["buy"] == [("PG", 4.0, None)], calls["buy"]   # int(420 / 100)
+    row = calls["rows"][0]
+    assert row["stop_price"] is None and row["target_price"] is None, row
+    assert row["source_payload"]["no_price_stop"] is True
+    assert row["source_payload"]["broker_order_id"] == "ord-1"
+    assert row["quantity"] == 4.0 and row["side"] == "long"
+    assert len(out) == 1 and out[0].kind == "execute", out
+    assert out[0].payload["lane"] == "stock" and out[0].payload["no_price_stop"] is True
+
+
+def test_no_price_stop_pocket_and_buying_power_still_cap_the_notional():
+    _, calls = _alpaca_no_stop_run(
+        {"no_price_stop": True, "max_notional": 420.0}, remaining=250.0)
+    assert calls["buy"] == [("PG", 2.0, None)], calls["buy"]   # min(420, 250) / 100
+    _, calls = _alpaca_no_stop_run(
+        {"no_price_stop": True, "max_notional": 420.0},
+        acct=alpaca.AlpacaAccount(
+            equity=100_000.0, last_equity=100_000.0, cash=150.0,
+            buying_power=150.0, currency="USD", status="ACTIVE",
+            pattern_day_trader=False, daytrade_count=0,
+            trading_blocked=False))
+    assert calls["buy"] == [("PG", 1.0, None)], calls["buy"]   # BP 150 / 100
+
+
+def test_no_price_stop_in_recovery_is_half_size():
+    _, calls = _alpaca_no_stop_run(
+        {"no_price_stop": True, "max_notional": 420.0, "_recovery_mode": True})
+    assert calls["buy"] == [("PG", 2.0, None)], calls["buy"]   # 420 * 0.5 / 100
+
+
+def test_no_price_stop_without_max_notional_is_refused_not_guessed():
+    out, calls = _alpaca_no_stop_run({"no_price_stop": True})
+    assert calls["buy"] == [] and calls["rows"] == [] and calls["bracket"] == []
+    assert len(out) == 1 and out[0].kind == "error", out
+    assert out[0].payload.get("event") == "execute_error"
+    assert out[0].payload.get("lane") == "stock"
+    assert "max_notional" in out[0].payload.get("error", "")
+
+
+def test_no_price_stop_short_is_refused():
+    out, calls = _alpaca_no_stop_run(
+        {"no_price_stop": True, "max_notional": 420.0}, side="short")
+    assert calls["buy"] == [] and calls["rows"] == []
+    assert out[0].kind == "error" and "long-only" in out[0].payload.get("error", "")
+
+
+def test_no_price_stop_never_reaches_the_modeled_engine_with_a_default_stop():
+    """The modeled engine cannot open without a stop; refusing beats the
+    5% default it would otherwise plant (the NEQ-05 hole itself)."""
+    agent = te.TradeExecutionAgent()
+    opened: list = []
+
+    async def _open_position(**kw):
+        opened.append(kw)
+        return load_module("app.paper.engine").FillResult(ok=True)
+
+    with _quiet_activity_log(), _patched(te, open_position=_open_position):
+        out = _run(agent._execute_internal(
+            BOOK_B, "PG", "stock", "long", 100.0, None, None, "dividend_lt",
+            {"no_price_stop": True, "max_notional": 420.0}))
+    assert opened == [], "open_position must not run for a no-price-stop lane"
+    assert out[0].kind == "error" and out[0].payload.get("event") == "execute_error"
+    assert out[0].payload.get("lane") == "stock"
+    assert "no_price_stop" in out[0].payload.get("error", "")
+
+
+# --- alpaca.submit_market_buy: a bare buy, no legs ------------------------
+
+def test_submit_market_buy_posts_a_bare_market_order_with_no_legs():
+    posted: list = []
+
+    async def _post(path, body, token=None):
+        posted.append((path, body, token))
+        return {"id": "o1"}, None
+
+    with _patched(alpaca, _post=_post):
+        order, err = _run(alpaca.submit_market_buy("pg", 4.0, token=None))
+    assert err is None and order == {"id": "o1"}
+    path, body, _ = posted[0]
+    assert path == "/v2/orders"
+    assert body == {"symbol": "PG", "qty": "4", "side": "buy",
+                    "type": "market", "time_in_force": "day"}, body
+    for k in ("order_class", "take_profit", "stop_loss"):
+        assert k not in body
+
+
+def test_submit_market_buy_refuses_a_zero_share_quantity_without_posting():
+    posted: list = []
+
+    async def _post(path, body, token=None):
+        posted.append((path, body, token))
+        return {"id": "o1"}, None
+
+    with _patched(alpaca, _post=_post):
+        order, err = _run(alpaca.submit_market_buy("PG", 0.4))
+    assert order is None and err and posted == []
 
 
 def test_every_error_and_fill_message_in_the_module_carries_a_lane():

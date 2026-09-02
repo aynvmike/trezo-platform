@@ -263,19 +263,24 @@ def period_updates(account: dict,
 
 def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillSwitch:
     """Evaluate every kill-switch for one (already period-rolled) account."""
+    _legacy_week_recovery: KillSwitch | None = None
     if account.get("trading_halted"):
         # A PERSISTED weekly halt is a leftover from the pre-2026-08-27
         # behavior (weekly used to hard-halt and write trading_halted).
-        # Soften it to recovery here so the change takes effect without
+        # Soften it to recovery so the change takes effect without
         # waiting for Monday's roll; check_states clears the stale flag.
+        # KS-2 residual (rv:killswitch-contracts :271): do NOT return
+        # here -- the hard stops below still run for such a row, and the
+        # softened verdict is only handed back if none of them trips.
         if str(account.get("halt_scope") or "") == "week":
-            return KillSwitch(False, "week",
-                              account.get("halt_reason")
-                              or "Weekly loss limit — recovery mode",
-                              mode="recovery")
-        return KillSwitch(True, account.get("halt_scope"),
-                          account.get("halt_reason") or "Trading halted",
-                          mode="halt")
+            _legacy_week_recovery = KillSwitch(
+                False, "week",
+                account.get("halt_reason") or "Weekly loss limit — recovery mode",
+                mode="recovery")
+        else:
+            return KillSwitch(True, account.get("halt_scope"),
+                              account.get("halt_reason") or "Trading halted",
+                              mode="halt")
 
     # KS-2: the HARD stops (daily %, streak, rejects, slippage) are
     # evaluated BEFORE the weekly-recovery verdict. Recovery used to
@@ -334,6 +339,8 @@ def evaluate(account: dict, consec_limit: int = MAX_CONSECUTIVE_LOSSES) -> KillS
                           f"half size, +{RECOVERY_TCS_BUMP} TCS)",
                           mode="recovery")
 
+    if _legacy_week_recovery is not None:
+        return _legacy_week_recovery
     return KillSwitch(False, None, None)
 
 
@@ -707,6 +714,15 @@ async def coin_loss_halt_by_book(client, ticker: str) -> dict[str, tuple[bool, s
     ledger read this returns {} (no verdicts, nothing benched) and logs
     why, so the caller can see the difference between "all clear" and
     "could not look".
+
+    rv:killswitch-contracts :696 (audit 2026-09-01), why {} and not None:
+    the one consumer (risk_manager on_message) iterates the result
+    unguarded, and a dead ledger is already surfaced on the dashboard
+    one gate earlier in the same handler -- check_states() reads the
+    same paper_accounts table and its None raises the throttled
+    kill_switch_unknown activity row. Switching this to None without
+    that consumer changing would turn a benign "nothing benched" into
+    an exception inside the risk gate.
     """
     if not client:
         return {}

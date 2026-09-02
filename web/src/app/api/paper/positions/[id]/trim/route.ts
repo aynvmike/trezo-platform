@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 
@@ -54,14 +55,23 @@ export async function POST(
     );
   }
 
-  // Confirm position is owned by this user before invoking.
+  // Confirm the position sits in one of this person's BOOKS before
+  // invoking (rv:web-pages sweep: user_id is the book key since 0047, and
+  // the Trading page lists every book). A failed read is a 500, not a 404.
+  const books = await getOwnerBookKeys(supabase, user.id);
+  if (books.failure) {
+    return NextResponse.json({ ok: false, error: `Could not resolve your books: ${books.failure.message}` }, { status: 500 });
+  }
   const { data: pos, error: posErr } = await supabase
     .from("paper_positions")
-    .select("id, ticker, asset_type, status")
+    .select("id, user_id, ticker, asset_type, status")
     .eq("id", params.id)
-    .eq("user_id", user.id)
+    .in("user_id", bookQueryKeys(books.data))
     .maybeSingle();
-  if (posErr || !pos) {
+  if (posErr) {
+    return NextResponse.json({ ok: false, error: `Position read failed: ${posErr.message}` }, { status: 500 });
+  }
+  if (!pos) {
     return NextResponse.json({ ok: false, error: "Position not found" }, { status: 404 });
   }
   if (pos.status !== "open") {
@@ -75,7 +85,9 @@ export async function POST(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        user_id: user.id,
+        // The BOOK that holds the position, not the person: the agents
+        // bind the broker account by this id.
+        user_id: pos.user_id,
         position_id: params.id,
         ticker: pos.ticker,
         asset_type: pos.asset_type,

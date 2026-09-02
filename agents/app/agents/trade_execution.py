@@ -17,6 +17,9 @@ override UI ships, posture is always the AI default ('auto').
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional
+
 from app.data.candles import fetch_candles_for
 from app.paper.engine import open_position
 from app.runtime.trading_mode import get_trading_mode
@@ -63,6 +66,25 @@ def _lane_of(ticker: str, payload) -> str:
     if str(ticker or "").upper() in CRYPTO_SYMBOLS:
         return "crypto"
     return str((payload or {}).get("asset_type") or "stock").lower()
+
+
+@dataclass
+class _BookGate:
+    """One book's pre-execution verdict (TradeExecutionAgent._gate_book).
+
+    `skip` set means: emit that message INSTEAD of executing on this
+    book. Otherwise `payload` is what _execute_for_user must receive for
+    this book -- a copy whenever the book changed it, because the source
+    dict is shared across the fan-out. `tcs_bump` / `lev_note` are what
+    book_gate.admits judged with; `rr_note` is the re-harmonization line
+    for the activity log, set even when the book is later declined (as
+    the inline code always did)."""
+
+    payload: dict
+    skip: Optional[AgentMessage] = None
+    tcs_bump: int = 0
+    lev_note: str = ""
+    rr_note: Optional[str] = None
 
 
 class TradeExecutionAgent(Agent):
@@ -167,12 +189,33 @@ class TradeExecutionAgent(Agent):
         if not user_id:
             return await self._execute_for_all_users(ticker, side, message.payload)
 
+        # SINGLE-BOOK path (user_id + book_scoped). Review 2026-09-01
+        # (rv:killswitch-contracts, rv:bound-hunter :168): this branch
+        # went straight to _execute_for_user with NONE of the fan-out's
+        # per-book gates -- no kill-switch, no daily $ brake, no bench,
+        # no R:R re-harmonization, no recovery / margin bump -- so the
+        # first producer to pin a signal (the dividend ladder) would
+        # have executed on a hard-halted book. Both paths now run the
+        # SAME reads (_read_book_brakes) and the SAME gate (_gate_book),
+        # so they cannot drift. Capacity (max_open_positions per pocket)
+        # stays a fan-out concern: a pinned signal is one book's own
+        # decision about its own ladder.
+        from app.runtime.persistence import _client as _pclient
+        _lane = _lane_of(ticker, message.payload)
+        _book_ks, _dollar_over, _closed = await self._read_book_brakes(
+            _pclient(), ticker, side, message.payload, 1, user_id=user_id)
+        if _closed is not None:
+            return [_closed]
+        _benched = {str(b) for b in
+                    (message.payload.get("benched_books") or []) if b}
+
         # Bind THIS book's broker credentials before placing its order.
         # trade_execution already fans out across paper_accounts rows, but
         # nothing bound the account -- so every book's orders would have
         # gone to the primary Alpaca account (2026-08-09).
         from app.brokers.accounts import bind_for_user as _bind_acct
         from app.brokers.route_guard import check_route, record_mismatch
+        from app.runtime.settings import get_bot_settings as _bot_settings
         with _bind_acct(user_id):
             _ok, _note = check_route(user_id)
             if not _ok:
@@ -183,10 +226,20 @@ class TradeExecutionAgent(Agent):
                     agent=self.name, kind="error", confidence=1.0,
                     payload={"user_id": user_id, "ticker": ticker,
                              "event": "execute_error",
-                             "lane": _lane_of(ticker, message.payload),
+                             "lane": _lane,
                              "error": f"route check failed: {_note}"})]
+            _g = await self._gate_book(
+                user_id, ticker, side, message.payload,
+                cfg=_bot_settings(user_id),
+                ks_state=_book_ks.get(str(user_id)),
+                dollar_over=_dollar_over, benched=_benched, lane=_lane)
+            if _g.rr_note:
+                self._log_rr_notes(ticker, message.payload, _lane,
+                                   [_g.rr_note])
+            if _g.skip is not None:
+                return [_g.skip]
             return await self._execute_for_user(user_id, ticker, side,
-                                                message.payload)
+                                                _g.payload)
 
     async def _book_open_tickers(self) -> dict | None:
         """{user_id: {TICKER, ...}} of OPEN positions - one query serving
@@ -323,6 +376,251 @@ class TradeExecutionAgent(Agent):
             pass
         return 0, ""
 
+    async def _read_book_brakes(self, client, ticker: str, side: str,
+                                source_payload: dict, n_books: int, *,
+                                user_id=None):
+        """The two per-approval kill-switch reads BOTH execution paths
+        make before any book is gated (review 2026-09-01: the single-book
+        path made neither).
+
+        check_states -> {user_id: KillSwitch}. KS-11: None (not {}) means
+        the paper_accounts read FAILED -- "cannot evaluate" -- and
+        execution is the enforcement point, so NO book executes on this
+        approval: returns the execute_error to emit as the third item. A
+        dead database used to read as "no halts anywhere". An exception
+        is the same answer.
+
+        daily_dollar_over -> the books at their user-set daily $ limit
+        (KS-12), read once next to the percent brake. None is "unknown"
+        (read failed): said in the log, then proceeds -- the percent
+        brake still holds and the risk gate already applied this one.
+
+        Returns (states, dollar_over, fail_closed_msg)."""
+        _lane = _lane_of(ticker, source_payload)
+        _book_ks: dict | None = None
+        try:
+            from app.paper.killswitch import check_states as _ck_states
+            _book_ks = await _ck_states(client)
+        except Exception:  # noqa: BLE001
+            _book_ks = None
+        if _book_ks is None:
+            _ks_err = ("kill-switch state unreadable — fail closed: "
+                       f"{ticker} {side} not executed for any of "
+                       f"{n_books} book(s)")
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("execute_error", ticker,
+                      strategy=source_payload.get("strategy"),
+                      reason=_ks_err[:180],
+                      extra={"lane": _lane, "books": n_books,
+                             **({"user_id": str(user_id)} if user_id
+                                else {})})
+            except Exception:  # noqa: BLE001
+                pass
+            return None, None, AgentMessage(
+                agent=self.name, kind="error", confidence=1.0,
+                payload={**({"user_id": user_id} if user_id else {}),
+                         "ticker": ticker, "side": side,
+                         "event": "execute_error", "lane": _lane,
+                         "reason": "kill-switch state unreadable — fail closed",
+                         "error": _ks_err})
+        _dollar_over: set | None = None
+        try:
+            from app.paper.killswitch import daily_dollar_over as _ddo
+            _dollar_over = await _ddo(client)
+        except Exception:  # noqa: BLE001
+            _dollar_over = None
+        if _dollar_over is None:
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("daily_dollar_limit_unknown", ticker,
+                      strategy=source_payload.get("strategy"),
+                      reason=("daily $ loss limits unreadable -- proceeding "
+                              "on the percent brake alone"),
+                      extra={"lane": _lane})
+            except Exception:  # noqa: BLE001
+                pass
+        return _book_ks, _dollar_over, None
+
+    def _log_rr_notes(self, ticker: str, source_payload: dict, lane: str,
+                      notes: list) -> None:
+        """RR-2 / RR-3 / RM-6: one activity line per approval naming each
+        book whose geometry was re-harmonized to ITS floor (before ->
+        after). Shared by both execution paths."""
+        if not notes:
+            return
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("rr_reharmonized", ticker,
+                  strategy=source_payload.get("strategy"),
+                  reason="; ".join(notes)[:290],
+                  extra={"lane": lane, "books": len(notes)})
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _gate_book(self, uid, ticker: str, side: str,
+                         source_payload: dict, *, cfg, ks_state,
+                         dollar_over, benched, lane: str) -> _BookGate:
+        """Every per-book gate short of capacity, judged for ONE book with
+        ITS settings row, under ITS binding. The one place the fan-out and
+        the single-book path share (review 2026-09-01), so a gate added
+        here reaches both and neither can drift.
+
+        In order, exactly as the fan-out always ran them: this book's own
+        kill-switch verdict (hard halt -> skip; weekly recovery -> the
+        speculative lanes skip, everything else trades half size with the
+        KS-5 conviction bump and tighter stops downstream), its daily $
+        brake (KS-12), its per-coin bench (benched_books), its R:R
+        geometry against ITS min_reward_risk (RR-2/RR-3/RM-6 -- skipped
+        for a no_price_stop lane, NEQ-05), its margin-territory bump
+        (TE-19, read under its binding), then book_gate.admits (lane
+        toggles, auto-trade, its TCS floor plus the bumps).
+
+        Must be called inside bind_for_user(uid) after check_route: the
+        margin read goes to whichever account is bound."""
+        from app.runtime.book_gate import admits as _admits
+        _sp_uid = source_payload
+        _tcs_bump = 0    # KS-5 + TE-19, this book's own
+        _lev_note = ""
+        _rr_note: Optional[str] = None
+        _strat_b = str(source_payload.get("strategy") or "")
+
+        def _skip(event: str, note: str, **extra) -> _BookGate:
+            return _BookGate(payload=_sp_uid, skip=AgentMessage(
+                agent=self.name, kind="info", confidence=1.0,
+                payload={"user_id": uid, "ticker": ticker, "side": side,
+                         "lane": lane, "event": event, "note": note,
+                         **extra}))
+
+        # THIS book's own kill-switch verdict (2026-08-27). Hard halt
+        # (daily / streak / session) -> this book sits out; the others
+        # keep working. Weekly recovery -> speculative lanes sit out and
+        # everything else trades tightened (half size, tighter stops,
+        # done via the per-book payload below).
+        if ks_state is not None:
+            if ks_state.halted and ks_state.mode != "recovery":
+                return _skip("book_halted_skip",
+                             f"[{ks_state.scope}] {ks_state.reason}")
+            if ks_state.mode == "recovery":
+                from app.paper.killswitch import (
+                    RECOVERY_SIZE_FACTOR, RECOVERY_TCS_BUMP,
+                    recovery_policy)
+                if recovery_policy(_strat_b) == "suspend":
+                    return _skip("recovery_suspend_skip",
+                                 (f"weekly recovery suspends {_strat_b}: "
+                                  f"{ks_state.reason}"),
+                                 strategy=_strat_b)
+                # Tighten, per THIS book: half the book's own risk
+                # fraction (risk_pct_override is honored by every
+                # execution path) and flag the payload so stops tighten
+                # downstream. Copy, never mutate — the dict is shared
+                # across the fan-out.
+                try:
+                    _base_risk = float(
+                        source_payload.get("risk_pct_override")
+                        or getattr(cfg, "risk_per_trade_pct", 0.05)
+                        or 0.05)
+                except (TypeError, ValueError):
+                    _base_risk = 0.05
+                _sp_uid = {**source_payload,
+                           "_recovery_mode": True,
+                           "risk_pct_override":
+                           _base_risk * RECOVERY_SIZE_FACTOR}
+                # KS-5: a recovering book's conviction bar rises by
+                # RECOVERY_TCS_BUMP. Risk Manager adds it only when
+                # EVERY book is recovering (or for a user-scoped
+                # signal's own book); the per-book verdict belongs here.
+                _tcs_bump += int(RECOVERY_TCS_BUMP)
+        # KS-12 per book: at its own daily $ loss limit.
+        if dollar_over is not None and str(uid) in dollar_over:
+            return _skip("daily_dollar_limit_skip",
+                         (f"{ticker}: this book is at its daily $ loss "
+                          f"limit (profiles.daily_loss_limit_usd) - "
+                          f"skipped"))
+        # Per-coin loss halt tripped on THIS book (benched_books).
+        if str(uid) in (benched or ()):
+            return _skip("coin_loss_halt_skip",
+                         (f"{ticker}: per-coin daily loss halt is tripped "
+                          f"on this book (benched_books) - skipped"))
+        _atype = _lane_of(ticker, _sp_uid)
+        # RR-2 / RR-3 / RM-6: Risk Manager harmonized the stop against
+        # the SIGNAL user's min_reward_risk (0.4) while sizing judges
+        # each EXECUTING book against its own floor (0.5) -- 134
+        # rejections 'Reward:risk 0.4 below your 0.5 floor' and a dark
+        # equity lane. Re-harmonize per book, exactly as the global
+        # harmonizer does: stop = max(target / floor, 0.004), only ever
+        # tightening; crypto exempt there too. The floor values and the
+        # learned target are untouched.
+        # NEQ-05: a no_price_stop lane has no stop to harmonize -- and
+        # must not be handed one here.
+        if _atype != "crypto" and not _sp_uid.get("no_price_stop"):
+            try:
+                _sf = _sp_uid.get("stop_pct")
+                _tf = _sp_uid.get("target_pct")
+                if _sf and _tf and float(_sf) > 0:
+                    _rrf = float(getattr(cfg, "min_reward_risk", 1.5) or 1.5)
+                    # Judge against the floor sizing will actually apply
+                    # (it clamps to [0.3, 3.0]); the row's value is not
+                    # changed (review 2026-09-01, rv:trade_execution :589).
+                    _rrf = max(0.3, min(3.0, _rrf))
+                    if float(_tf) / float(_sf) < _rrf:
+                        _new_s = max(round(float(_tf) / max(_rrf, 0.1), 4),
+                                     0.004)
+                        # RV-1 (review 2026-09-01): round() can land the
+                        # 4-dp stop half a bp ABOVE target/floor
+                        # (0.0032/0.75 = 0.004266 -> 0.0043) and sizing's
+                        # 2-dp ratio then reads 0.74 < 0.75 -- the exact
+                        # rejection this block exists to prevent. Judge
+                        # it the way sizing will; one bp tighter always
+                        # clears a half-bp round-up.
+                        if (_new_s > 0.004
+                                and round(float(_tf) / _new_s, 2) < _rrf):
+                            _new_s = round(_new_s - 0.0001, 4)
+                        if _new_s < float(_sf):
+                            _sp_uid = {
+                                **_sp_uid, "stop_pct": _new_s,
+                                "rr_reharmonized": {
+                                    "book_floor": _rrf,
+                                    "stop_pct_from": float(_sf),
+                                    "stop_pct_to": _new_s}}
+                            _rr_note = (
+                                f"{str(uid)[:8]}: floor {_rrf:g}, "
+                                f"stop {float(_sf) * 100:.2f}% -> "
+                                f"{_new_s * 100:.2f}% (target "
+                                f"{float(_tf) * 100:.2f}%, R:R "
+                                f"{float(_tf) / float(_sf):.2f} -> "
+                                f"{float(_tf) / _new_s:.2f})")
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        # TE-19: margin-territory bump -- THIS book's cash vs THIS book's
+        # equity, read under its binding.
+        _lev_bump, _lev_note = await self._margin_territory_bump(
+            uid, ticker, _atype)
+        _tcs_bump += int(_lev_bump or 0)
+        _v = _admits(
+            cfg,
+            asset_type=_atype,
+            strategy=str(_sp_uid.get("strategy") or ""),
+            tcs=_sp_uid.get("tcs"),
+            tcs_bump=_tcs_bump)
+        if not _v.ok:
+            return _BookGate(
+                payload=_sp_uid, tcs_bump=_tcs_bump, lev_note=_lev_note,
+                rr_note=_rr_note,
+                skip=AgentMessage(
+                    agent=self.name, kind="info", confidence=1.0,
+                    payload={"user_id": uid, "ticker": ticker,
+                             "side": side, "lane": _atype,
+                             "event": _v.event,
+                             "strategy": source_payload.get("strategy"),
+                             "tcs": source_payload.get("tcs"),
+                             "tcs_bump": _tcs_bump,
+                             "note": (f"{ticker}: {_v.reason}"
+                                      + (f"; {_lev_note}"
+                                         if _lev_note else ""))}))
+        return _BookGate(payload=_sp_uid, tcs_bump=_tcs_bump,
+                         lev_note=_lev_note, rr_note=_rr_note)
+
     async def _execute_for_all_users(
         self,
         ticker: str,
@@ -338,13 +636,14 @@ class TradeExecutionAgent(Agent):
         exist (fresh install) we emit a single info row so the trace panel
         records what happened instead of silently dropping the approve.
 
-        Every per-book gate lives here, under bind_for_user(uid), because
-        this is the first line where a book has a name: route check, its
-        own kill-switch verdict (halt / recovery with the KS-5 bump), its
-        daily $ brake (KS-12), its per-coin bench (benched_books), its R:R
-        geometry against ITS floor (RR-2/RR-3), its margin-territory bump
-        (TE-19), then book_gate.admits and capacity. A kill-switch state
-        that cannot be read fails CLOSED for every book (KS-11).
+        Every per-book gate runs here, under bind_for_user(uid), because
+        this is the first line where a book has a name: route check, then
+        _gate_book (its own kill-switch verdict with the KS-5 bump, its
+        daily $ brake KS-12, its per-coin bench, its R:R geometry against
+        ITS floor RR-2/RR-3, its margin-territory bump TE-19, then
+        book_gate.admits) -- shared with the single-book path -- and
+        finally capacity. A kill-switch state that cannot be read fails
+        CLOSED for every book (KS-11, _read_book_brakes).
         """
         import asyncio
         from app.runtime.persistence import _client
@@ -392,7 +691,6 @@ class TradeExecutionAgent(Agent):
         from app.brokers.accounts import bind_for_user as _bind_acct
         from app.brokers.route_guard import check_route as _check_route
         from app.brokers.route_guard import record_mismatch as _rec_mm
-        from app.runtime.book_gate import admits as _admits
         from app.runtime.settings import get_bot_settings as _bot_settings
         # Book-first capacity (Mike 2026-08-20): "make the agents look
         # at the books as a default and not the account. no matter
@@ -405,57 +703,16 @@ class TradeExecutionAgent(Agent):
         # PER-BOOK kill-switch states (Mike 2026-08-27: "the agents are
         # not treating each book as their own book"). Fetched once per
         # signal (row sums are 30s-cached inside); each book is then
-        # judged on ITS OWN halt/recovery below — a tripped primary no
-        # longer decides anything for the 25k or the 75k.
-        # KS-11: None (not {}) means the paper_accounts read FAILED --
-        # "cannot evaluate" -- and the fan-out is the enforcement point,
-        # so NO book executes on this approval. A dead database used to
-        # read as "no halts anywhere". An exception is the same answer.
+        # judged on ITS OWN halt/recovery in _gate_book — a tripped
+        # primary no longer decides anything for the 25k or the 75k.
+        # KS-11 (None -> fail closed for every book) and KS-12 (the $
+        # brake, None -> unknown, logged) live in _read_book_brakes,
+        # shared with the single-book path.
         _lane = _lane_of(ticker, source_payload)
-        _book_ks: dict | None = None
-        try:
-            from app.paper.killswitch import check_states as _ck_states
-            _book_ks = await _ck_states(client)
-        except Exception:  # noqa: BLE001
-            _book_ks = None
-        if _book_ks is None:
-            _ks_err = ("kill-switch state unreadable — fail closed: "
-                       f"{ticker} {side} not executed for any of "
-                       f"{len(users)} book(s)")
-            try:
-                from app.agents.activity_log import record as _arec
-                _arec("execute_error", ticker,
-                      strategy=source_payload.get("strategy"),
-                      reason=_ks_err[:180],
-                      extra={"lane": _lane, "books": len(users)})
-            except Exception:  # noqa: BLE001
-                pass
-            return [AgentMessage(
-                agent=self.name, kind="error", confidence=1.0,
-                payload={"ticker": ticker, "side": side,
-                         "event": "execute_error", "lane": _lane,
-                         "reason": "kill-switch state unreadable — fail closed",
-                         "error": _ks_err})]
-        # KS-12: the per-book DOLLAR brake (profiles.daily_loss_limit_usd),
-        # read once per approval next to the percent brake above. None is
-        # "unknown" (read failed): say so and proceed -- the percent brake
-        # still holds and the risk gate already applied this one upstream.
-        _dollar_over: set | None = None
-        try:
-            from app.paper.killswitch import daily_dollar_over as _ddo
-            _dollar_over = await _ddo(client)
-        except Exception:  # noqa: BLE001
-            _dollar_over = None
-        if _dollar_over is None:
-            try:
-                from app.agents.activity_log import record as _arec
-                _arec("daily_dollar_limit_unknown", ticker,
-                      strategy=source_payload.get("strategy"),
-                      reason=("daily $ loss limits unreadable -- proceeding "
-                              "on the percent brake alone"),
-                      extra={"lane": _lane})
-            except Exception:  # noqa: BLE001
-                pass
+        _book_ks, _dollar_over, _closed = await self._read_book_brakes(
+            client, ticker, side, source_payload, len(users))
+        if _closed is not None:
+            return [_closed]
         # Per-coin loss halt, measured PER BOOK by Risk Manager
         # (killswitch.coin_loss_halt_by_book) and carried on the approval
         # as benched_books. Read defensively -- older producers omit it.
@@ -485,154 +742,23 @@ class TradeExecutionAgent(Agent):
                     # scanner read. This is the first line where a book
                     # has a name, so it is where its own answer counts.
                     _cfg = _bot_settings(uid)
-                    # THIS book's own kill-switch verdict (2026-08-27).
-                    # Hard halt (daily / streak / session) -> this book
-                    # sits out; the others keep working. Weekly recovery
-                    # -> speculative lanes sit out and everything else
-                    # trades tightened (half size, tighter stops, done
-                    # via the per-book payload below).
-                    _ks_b = _book_ks.get(str(uid))
-                    _sp_uid = source_payload
-                    _tcs_bump = 0    # KS-5 + TE-19, this book's own
-                    _lev_note = ""
-                    if _ks_b is not None:
-                        if _ks_b.halted and _ks_b.mode != "recovery":
-                            out.append(AgentMessage(
-                                agent=self.name, kind="info", confidence=1.0,
-                                payload={"user_id": uid, "ticker": ticker,
-                                         "side": side,
-                                         "event": "book_halted_skip",
-                                         "note": (f"[{_ks_b.scope}] "
-                                                  f"{_ks_b.reason}")}))
-                            continue
-                        if _ks_b.mode == "recovery":
-                            from app.paper.killswitch import (
-                                RECOVERY_SIZE_FACTOR, RECOVERY_TCS_BUMP,
-                                recovery_policy)
-                            _strat_b = str(source_payload.get("strategy")
-                                           or "")
-                            if recovery_policy(_strat_b) == "suspend":
-                                out.append(AgentMessage(
-                                    agent=self.name, kind="info",
-                                    confidence=1.0,
-                                    payload={"user_id": uid,
-                                             "ticker": ticker,
-                                             "side": side,
-                                             "event":
-                                             "recovery_suspend_skip",
-                                             "strategy": _strat_b,
-                                             "note": (f"weekly recovery "
-                                                      f"suspends "
-                                                      f"{_strat_b}: "
-                                                      f"{_ks_b.reason}")}))
-                                continue
-                            # Tighten, per THIS book: half the book's own
-                            # risk fraction (risk_pct_override is honored
-                            # by every execution path) and flag the
-                            # payload so stops tighten downstream. Copy,
-                            # never mutate — the dict is shared across
-                            # the fan-out.
-                            try:
-                                _base_risk = float(
-                                    source_payload.get("risk_pct_override")
-                                    or getattr(_cfg, "risk_per_trade_pct",
-                                               0.05) or 0.05)
-                            except (TypeError, ValueError):
-                                _base_risk = 0.05
-                            _sp_uid = {**source_payload,
-                                       "_recovery_mode": True,
-                                       "risk_pct_override":
-                                       _base_risk * RECOVERY_SIZE_FACTOR}
-                            # KS-5: a recovering book's conviction bar
-                            # rises by RECOVERY_TCS_BUMP. Risk Manager
-                            # adds it only when EVERY book is recovering;
-                            # the per-book verdict belongs here.
-                            _tcs_bump += int(RECOVERY_TCS_BUMP)
-                    # KS-12 per book: at its own daily $ loss limit.
-                    if _dollar_over is not None and str(uid) in _dollar_over:
-                        out.append(AgentMessage(
-                            agent=self.name, kind="info", confidence=1.0,
-                            payload={"user_id": uid, "ticker": ticker,
-                                     "side": side, "lane": _lane,
-                                     "event": "daily_dollar_limit_skip",
-                                     "note": (f"{ticker}: this book is at "
-                                              f"its daily $ loss limit "
-                                              f"(profiles.daily_loss_limit"
-                                              f"_usd) - skipped")}))
+                    # Every per-book gate short of capacity: kill-switch
+                    # (halt / recovery + KS-5 bump), daily $ brake, bench,
+                    # R:R re-harmonization to ITS floor, margin bump
+                    # (TE-19), book_gate.admits -- one helper, shared with
+                    # the single-book path so the two cannot drift.
+                    _g = await self._gate_book(
+                        uid, ticker, side, source_payload, cfg=_cfg,
+                        ks_state=_book_ks.get(str(uid)),
+                        dollar_over=_dollar_over, benched=_benched,
+                        lane=_lane)
+                    if _g.rr_note:
+                        _rr_notes.append(_g.rr_note)
+                    if _g.skip is not None:
+                        out.append(_g.skip)
                         continue
-                    # Per-coin loss halt tripped on THIS book (benched_books).
-                    if str(uid) in _benched:
-                        out.append(AgentMessage(
-                            agent=self.name, kind="info", confidence=1.0,
-                            payload={"user_id": uid, "ticker": ticker,
-                                     "side": side, "lane": _lane,
-                                     "event": "coin_loss_halt_skip",
-                                     "note": (f"{ticker}: per-coin daily "
-                                              f"loss halt is tripped on "
-                                              f"this book (benched_books) "
-                                              f"- skipped")}))
-                        continue
+                    _sp_uid = _g.payload
                     _atype = _lane_of(ticker, _sp_uid)
-                    # RR-2 / RR-3 / RM-6: Risk Manager harmonized the stop
-                    # against the SIGNAL user's min_reward_risk (0.4)
-                    # while sizing judges each EXECUTING book against its
-                    # own floor (0.5) -- 134 rejections 'Reward:risk 0.4
-                    # below your 0.5 floor' and a dark equity lane.
-                    # Re-harmonize per book, exactly as the global
-                    # harmonizer does: stop = max(target / floor, 0.004),
-                    # only ever tightening; crypto exempt there too. The
-                    # floor values and the learned target are untouched.
-                    if _atype != "crypto":
-                        try:
-                            _sf = _sp_uid.get("stop_pct")
-                            _tf = _sp_uid.get("target_pct")
-                            if _sf and _tf and float(_sf) > 0:
-                                _rrf = float(getattr(_cfg, "min_reward_risk",
-                                                     1.5) or 1.5)
-                                if float(_tf) / float(_sf) < _rrf:
-                                    _new_s = max(round(float(_tf)
-                                                       / max(_rrf, 0.1), 4),
-                                                 0.004)
-                                    # RV-1 (review 2026-09-01): round()
-                                    # can land the 4-dp stop half a bp
-                                    # ABOVE target/floor (0.0032/0.75 =
-                                    # 0.004266 -> 0.0043) and sizing's
-                                    # 2-dp ratio then reads 0.74 < 0.75
-                                    # -- the exact rejection this block
-                                    # exists to prevent. Judge it the way
-                                    # sizing will; one bp tighter always
-                                    # clears a half-bp round-up.
-                                    if (_new_s > 0.004
-                                            and round(float(_tf) / _new_s, 2)
-                                            < _rrf):
-                                        _new_s = round(_new_s - 0.0001, 4)
-                                    if _new_s < float(_sf):
-                                        _sp_uid = {
-                                            **_sp_uid, "stop_pct": _new_s,
-                                            "rr_reharmonized": {
-                                                "book_floor": _rrf,
-                                                "stop_pct_from": float(_sf),
-                                                "stop_pct_to": _new_s}}
-                                        _rr_notes.append(
-                                            f"{str(uid)[:8]}: floor {_rrf:g}, "
-                                            f"stop {float(_sf) * 100:.2f}% -> "
-                                            f"{_new_s * 100:.2f}% (target "
-                                            f"{float(_tf) * 100:.2f}%, R:R "
-                                            f"{float(_tf) / float(_sf):.2f} -> "
-                                            f"{float(_tf) / _new_s:.2f})")
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            pass
-                    # TE-19: margin-territory bump -- THIS book's cash vs
-                    # THIS book's equity, read under its binding.
-                    _lev_bump, _lev_note = await self._margin_territory_bump(
-                        uid, ticker, _atype)
-                    _tcs_bump += int(_lev_bump or 0)
-                    _v = _admits(
-                        _cfg,
-                        asset_type=_atype,
-                        strategy=str(_sp_uid.get("strategy") or ""),
-                        tcs=_sp_uid.get("tcs"),
-                        tcs_bump=_tcs_bump)
                     # THIS book's slot count vs THIS book's cap. A book
                     # already holding the ticker may still add to it
                     # (accumulation) - a full book only refuses NEW names.
@@ -640,7 +766,7 @@ class TradeExecutionAgent(Agent):
                     # POCKET's share of the slots (Mike 2026-08-21) - a
                     # crypto run can no longer occupy the stock pocket's
                     # chairs.
-                    if _v.ok and open_by_book is not None:
+                    if open_by_book is not None:
                         _held = open_by_book.get(str(uid), {})
                         _cap = int(getattr(_cfg, "max_open_positions", 14)
                                    or 14)
@@ -674,19 +800,6 @@ class TradeExecutionAgent(Agent):
                                                   f"pockets keep their "
                                                   f"chairs")}))
                             continue
-                    if not _v.ok:
-                        out.append(AgentMessage(
-                            agent=self.name, kind="info", confidence=1.0,
-                            payload={"user_id": uid, "ticker": ticker,
-                                     "side": side, "lane": _atype,
-                                     "event": _v.event,
-                                     "strategy": source_payload.get("strategy"),
-                                     "tcs": source_payload.get("tcs"),
-                                     "tcs_bump": _tcs_bump,
-                                     "note": (f"{ticker}: {_v.reason}"
-                                              + (f"; {_lev_note}"
-                                                 if _lev_note else ""))}))
-                        continue
                     msgs = await self._execute_for_user(uid, ticker, side,
                                                         _sp_uid)
                 out.extend(msgs or [])
@@ -703,15 +816,7 @@ class TradeExecutionAgent(Agent):
                 ))
         # RR-2 / RR-3 / RM-6: one line per approval naming each book whose
         # geometry was re-harmonized to ITS floor (before -> after).
-        if _rr_notes:
-            try:
-                from app.agents.activity_log import record as _arec
-                _arec("rr_reharmonized", ticker,
-                      strategy=source_payload.get("strategy"),
-                      reason="; ".join(_rr_notes)[:290],
-                      extra={"lane": _lane, "books": len(_rr_notes)})
-            except Exception:  # noqa: BLE001
-                pass
+        self._log_rr_notes(ticker, source_payload, _lane, _rr_notes)
         return out
 
     async def _execute_for_user(
@@ -1077,6 +1182,30 @@ class TradeExecutionAgent(Agent):
         from app.runtime.settings import get_bot_settings
         from app.paper.engine import get_account
 
+        # NEQ-05 / G3: the modeled engine sizes from a stop distance and
+        # writes stop_price on the row -- it has no stop-free entry.
+        # Refusing beats planting the 5% default on a lane that asked
+        # for none (that default IS the NEQ-05 failure). The broker
+        # stock path has the plain-buy entry (_execute_alpaca_no_stop).
+        if (source_payload or {}).get("no_price_stop"):
+            _why = ("no_price_stop entries need the broker stock path "
+                    "(plain buy, no bracket); the modeled engine has no "
+                    "stop-free entry -- refused rather than planting a "
+                    "default stop")
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("execute_error", ticker, strategy=strategy,
+                      reason=_why[:180],
+                      extra={"user_id": str(user_id), "lane": asset_type})
+            except Exception:  # noqa: BLE001
+                pass
+            return [AgentMessage(
+                agent=self.name, kind="error",
+                payload={"user_id": user_id, "ticker": ticker,
+                         "event": "execute_error", "lane": asset_type,
+                         "error": _why},
+            )]
+
         account = await get_account(user_id)
         equity = 0.0
         if account:
@@ -1214,6 +1343,16 @@ class TradeExecutionAgent(Agent):
         if remaining <= 0:
             if not (source_payload or {}).get("coverage_trade"):
                 return await self._budget_skip(user_id, ticker, mt, budget, deployed, posture)
+
+        # NEQ-05 / G3: a no-price-stop lane never reaches the bracket
+        # path below -- that path invents a 5% stop when none was sent
+        # (`sp = ... else 0.05`), sizes from it, and hands the venue a
+        # stop leg the lane said it does not want.
+        if (source_payload or {}).get("no_price_stop"):
+            return await self._execute_alpaca_no_stop(
+                user_id, ticker, side, market_price, strategy,
+                source_payload, acct=acct, remaining=remaining,
+                token=token, routed=routed, err=_err)
 
         sp = float(stop_pct) if isinstance(stop_pct, (int, float)) and stop_pct > 0 else 0.05
         tp = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
@@ -1420,6 +1559,135 @@ class TradeExecutionAgent(Agent):
             )
         ]
 
+
+    async def _execute_alpaca_no_stop(
+        self, user_id, ticker, side, market_price, strategy,
+        source_payload, *, acct, remaining, token, routed, err,
+    ) -> list[AgentMessage]:
+        """NEQ-05 / G3: the no-price-stop stock entry (the dividend
+        ladder). Called from _execute_alpaca after the clock, account and
+        pocket gates, so those hold here too.
+
+        The ladder holds through drawdowns by design -- its exits are the
+        spec's (dividend cut, payout breach, recycling ratio), not a
+        price -- so there is no stop distance to size from and no exit
+        leg to hand the venue. Sized by NOTIONAL instead: the tightest of
+        the lane's own max_notional (the per-name concentration cap it
+        computed for THIS book), the pocket's remaining budget, the
+        broker's buying power, and the same concentration clamp the
+        bracket path applies (max_position_pct of equity, 90% of BP);
+        weekly recovery halves it like every other entry. Whole shares.
+        Submits a PLAIN market buy -- no bracket legs -- and writes the
+        ledger row with stop_price / target_price NULL and
+        no_price_stop=True in source_payload so position_monitor honours
+        it. Long-only; REFUSES (execute_error) rather than guess when the
+        lane sent no max_notional or the side is not long."""
+        from app.brokers.alpaca import submit_market_buy
+        from app.paper.engine import record_external_position
+
+        if side != "long":
+            return err("no_price_stop is long-only -- refusing a short "
+                       "with no stop rather than defaulting")
+        _cap = _lane_cap_f(source_payload)
+        if _cap is None:
+            return err("no_price_stop without max_notional -- refusing "
+                       "rather than guessing a size")
+        try:
+            _bp = float(getattr(acct, "buying_power", 0) or 0)
+            _eq = float(getattr(acct, "equity", 0) or 0)
+        except (TypeError, ValueError):
+            _bp, _eq = 0.0, 0.0
+        notional = min(float(_cap), float(remaining), _bp)
+        # Weekly recovery: half size, per book (the fan-out / single-book
+        # gate set _recovery_mode for THIS book).
+        if (source_payload or {}).get("_recovery_mode"):
+            try:
+                from app.paper.killswitch import RECOVERY_SIZE_FACTOR
+                notional *= float(RECOVERY_SIZE_FACTOR)
+            except Exception:  # noqa: BLE001
+                notional *= 0.5
+        # The bracket path's concentration clamp, same numbers: the
+        # account-size curve (or THIS book's own max_position_pct slider
+        # when set, as sizing honours it) and 90% of buying power.
+        try:
+            from app.paper.allocation import position_pct_for_equity
+            _mp_pct = float(position_pct_for_equity(_eq))
+        except Exception:  # noqa: BLE001
+            _mp_pct = 0.25
+        try:
+            from app.runtime.settings import get_bot_settings as _gbs_ns
+            _user_cap = getattr(_gbs_ns(user_id), "max_position_pct", None)
+            if _user_cap is not None and 0.01 <= float(_user_cap) <= 1.0:
+                _mp_pct = float(_user_cap)
+        except Exception:  # noqa: BLE001
+            pass
+        _clamp_usd = min(_mp_pct * _eq, 0.90 * _bp)
+        if _clamp_usd > 0:
+            notional = min(notional, _clamp_usd)
+        qty = float(int(notional / max(float(market_price), 0.01)))
+        if qty < 1:
+            return err(f"no_price_stop sizing produced 0 shares: notional "
+                       f"cap ${notional:,.2f} at ${float(market_price):,.2f} "
+                       f"(lane cap ${float(_cap):,.2f}, pocket "
+                       f"${float(remaining):,.2f}, BP ${_bp:,.2f})")
+        order, oerr = await submit_market_buy(symbol=ticker, qty=qty,
+                                              token=token)
+        if oerr or not order:
+            from app.paper.killswitch import record_broker_reject
+            record_broker_reject(str(user_id))  # THIS book's reject
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("broker_reject", ticker, strategy=strategy,
+                      reason=str(oerr)[:200],
+                      extra={"user_id": str(user_id), "asset_type": "stock"})
+            except Exception:  # noqa: BLE001
+                pass
+            return err(f"Alpaca rejected the order: {oerr}")
+        order_id = order.get("id")
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("submitted", ticker, strategy=strategy,
+                  reason=(f"long {qty:g} @ ~{market_price} (plain buy, NO "
+                          f"price stop; notional cap ${notional:,.2f})"),
+                  extra={"user_id": str(user_id), "asset_type": "stock",
+                         "no_price_stop": True})
+        except Exception:  # noqa: BLE001
+            pass
+        await record_external_position(
+            user_id=user_id,
+            ticker=ticker,
+            asset_type="stock",
+            side=side,
+            quantity=qty,
+            entry_price=market_price,
+            stop_price=None,
+            target_price=None,
+            strategy=strategy,
+            broker="alpaca",
+            broker_order_id=order_id,
+            source_payload={**source_payload, "broker": "alpaca",
+                            "broker_order_id": order_id,
+                            "no_price_stop": True},
+        )
+        return [
+            AgentMessage(
+                agent=self.name, kind="execute", confidence=1.0,
+                payload={
+                    "user_id": user_id,
+                    "ticker": ticker,
+                    "side": side,
+                    "lane": "stock",
+                    "broker": "alpaca",
+                    "broker_order_id": order_id,
+                    "strategy": strategy,
+                    "quantity": qty,
+                    "no_price_stop": True,
+                    "routed_via": routed,
+                    "note": (f"Submitted {ticker} {side} via Alpaca (plain "
+                             f"buy, no price stop), order_id={order_id}"),
+                },
+            )
+        ]
 
     async def _execute_alpaca_crypto(
         self, user_id, ticker, side, market_price,

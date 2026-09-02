@@ -1,16 +1,27 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { requireOwner } from "@/lib/auth-guards";
+import { getOwnerBookKeys, resolveBookKey } from "@/lib/books";
 
 export const dynamic = "force-dynamic";
 const AGENTS_BASE = process.env.AGENTS_BASE_URL ?? "http://localhost:8001";
 
 /**
  * POST /api/admin/manual-trade
- * Body: { ticker, side: 'long'|'short', stop_pct?, target_pct? }
+ * Body: { ticker, side: 'long'|'short', stop_pct?, target_pct?, account_key? }
  *
- * Manual trade trigger — runs through Risk Manager → Trade Execution →
- * current venue (paper today, live later). Owner-gated.
+ * Manual trade trigger, forwarded to the agents' /admin/manual-trade.
+ * rv:trade_execution (:12) / TE-10: that handler goes STRAIGHT to Trade
+ * Execution on the named book -- it BYPASSES the Risk Manager (no TCS bar,
+ * no R:R gate, no open-count cap); only the kill-switch and the book
+ * binding stand between this call and an order. Owner-gated.
+ *
+ * rv:trade_execution (:37): the agents' route guard refuses any user_id
+ * that is not a registered BOOK key, and the owner's auth id is not
+ * necessarily one. Resolve the book from the owner's active
+ * trading_accounts: `account_key` when given (must be theirs), else the
+ * caller's own key when it is a book, else their only book. Never the
+ * primary by default.
  */
 export async function POST(request: Request) {
   // ADM-01: owner-only (TREZO_OWNER_USER_IDS allowlist; unset => 403).
@@ -18,11 +29,31 @@ export async function POST(request: Request) {
   const guard = await requireOwner(supabase);
   if (!guard.ok) return guard.response;
   const user = guard.user;
-  let body: { ticker?: string; side?: string; stop_pct?: number; target_pct?: number };
+  let body: {
+    ticker?: string;
+    side?: string;
+    stop_pct?: number;
+    target_pct?: number;
+    account_key?: string;
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
     return NextResponse.json({ ok: false, error: "Bad JSON body." }, { status: 400 });
+  }
+  const books = await getOwnerBookKeys(supabase, user.id);
+  if (books.failure) {
+    return NextResponse.json(
+      { ok: false, error: `Could not resolve your books: ${books.failure.message}` },
+      { status: 500 }
+    );
+  }
+  const bookKey = resolveBookKey(books.data, user.id, body.account_key);
+  if (!bookKey) {
+    return NextResponse.json(
+      { ok: false, error: "Book not resolvable: pass account_key (one of your active trading accounts)." },
+      { status: 400 }
+    );
   }
   const ticker = (body.ticker ?? "").trim().toUpperCase();
   if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(ticker)) {
@@ -33,7 +64,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "side must be 'long' or 'short'." }, { status: 400 });
   }
   const qs = new URLSearchParams({
-    user_id: user.id,
+    user_id: bookKey,
     ticker,
     side,
     ...(body.stop_pct != null ? { stop_pct: String(body.stop_pct) } : {}),

@@ -39,10 +39,17 @@ from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
 
 stub_config()
 wd = load_module("app.agents.ops_watchdog")
+alerts = load_module("app.runtime.alerts")
+activity_log = load_module("app.agents.activity_log")
+_REAL_NOTIFY = alerts.notify
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class _Msg:
@@ -54,20 +61,48 @@ class _Msg:
 
 @contextlib.contextmanager
 def _patched(mod, **attrs):
-    old = {k: getattr(mod, k, None) for k in attrs}
+    # rv:test-contract (2026-09-01): restore by SENTINEL, not by None-check.
+    # The old `if v is not None: setattr` left a patched attribute whose
+    # real value was None (e.g. a lazily-filled module cache) patched
+    # forever in run_all's single process.
+    missing = object()
+    old = {k: getattr(mod, k, missing) for k in attrs}
     try:
         for k, v in attrs.items():
             setattr(mod, k, v)
         yield
     finally:
         for k, v in old.items():
-            if v is not None:
+            if v is missing:
+                if hasattr(mod, k):
+                    delattr(mod, k)
+            else:
                 setattr(mod, k, v)
+
+
+async def _no_notify(title, body="", **kw):
+    """Webhook seam for the flow tests: never leaves the process."""
+    return False
 
 
 def _agent(open_market=True):
     a = wd.OpsWatchdogAgent()
     a._persist_alert = lambda **kw: asyncio.sleep(0)     # no Supabase
+    # rv:test-contract (2026-09-01): the flow tests reach the REAL
+    # app.runtime.alerts.notify via _raise_flow; it only stays offline
+    # because no webhook is configured in the gate shell. Export
+    # TREZO_ALERT_WEBHOOK there and these tests would post. So the agent's
+    # own _check_flow runs under a patched-and-restored notify -- unless a
+    # test has already swapped notify itself (NET2-REV-03 records what
+    # arrives), in which case its recorder is left in charge.
+    real_check = a._check_flow
+
+    async def _offline_check():
+        if alerts.notify is _REAL_NOTIFY:
+            with _patched(alerts, notify=_no_notify):
+                return await real_check()
+        return await real_check()
+    a._check_flow = _offline_check
     return a
 
 
@@ -276,9 +311,20 @@ def test_unlabelled_scanner_signals_are_laned_the_way_the_executor_lanes_them():
     assert _lane(a, "stock")["signals"] == 1 and _lane(a, "stock")["approves"] == 1
     assert _lane(a, "crypto")["signals"] == 3 and _lane(a, "crypto")["vetoes"] == 1
     assert _lane(a, "unknown")["signals"] == 0, lanes
-    # and the classifier really is the executor's set, not a hardcoded 4
-    assert "XLM" in wd._crypto_symbols() or len(wd._crypto_symbols()) == 4, (
-        "COIN_MAP import fell back silently -- check app.data.candles")
+    # and the classifier really is the executor's set, not a hardcoded 4.
+    # rv:test-contract (2026-09-01): the old guard ("XLM" in set OR len==4)
+    # was true in BOTH the real and the fallback case, and every ticker
+    # fed above sits in the 4-coin fallback too -- a silent fallback that
+    # laned DOT (the audit's coin) as 'stock' would have passed. Compare
+    # against trade_execution's own set and feed a coin only COIN_MAP has.
+    te = load_module("app.agents.trade_execution")
+    assert set(wd._crypto_symbols()) == set(te.CRYPTO_SYMBOLS), (
+        "the watchdog's lane classifier drifted from trade_execution's "
+        "CRYPTO_SYMBOLS -- COIN_MAP import fell back silently?")
+    assert "DOT" in wd._crypto_symbols(), "DOT missing: fallback set in use"
+    _run(a.on_message(_Msg("signal", {"ticker": "DOT"})))
+    assert _lane(a, "crypto")["signals"] == 4, a._flow["lanes"]
+    assert _lane(a, "stock")["signals"] == 1, "DOT was laned as stock"
     src = (Path(__file__).resolve().parents[1]
            / "app" / "agents" / "trade_execution.py").read_text(encoding="utf-8")
     assert "from app.data.candles import COIN_MAP" in src, (
@@ -593,6 +639,7 @@ def test_the_webhook_is_pinged_once_not_per_message():
 
 # --- net 1, EXECUTED: not "the source mentions it" but "it fires" -------
 
+@contextlib.contextmanager
 def _load_router():
     """Pull the REAL _route and _announce_handler_failure out of
     bootstrap.py and run them against stubs.
@@ -602,6 +649,16 @@ def _load_router():
     Booting the real engine here is out of the question -- it would wire
     30 agents to live broker keys -- so the next best thing is to
     execute the actual function bodies, unedited, in a sandbox.
+
+    rv:test-contract (2026-09-01): a contextmanager now. The announcer's
+    late imports (`from app.agents.activity_log import record`,
+    `from app.runtime.alerts import notify`) resolve against the REAL
+    modules, so every gate run used to append fabricated handler_failed
+    rows -- carrying the 8/27 outage's exact text -- to the live activity
+    log, and would have pinged the real webhook with TREZO_ALERT_WEBHOOK
+    exported. Both seams are recorders here, restored on exit; the
+    recorded calls are handed back so the tests can assert the announcer
+    still REACHES them (net 1 is bus + log + webhook, not bus alone).
     """
     import ast as _ast
     import textwrap
@@ -617,6 +674,8 @@ def _load_router():
 
     published = []
     logged = []
+    recorded = []      # activity_log.record calls
+    notified = []      # alerts.notify calls
 
     class _Bus:
         async def publish(self, m):
@@ -632,35 +691,45 @@ def _load_router():
         def error(self, *a, **k):
             logged.append((a, k))
 
+    def _record(event, ticker, **kw):
+        recorded.append((event, ticker, kw))
+
+    async def _notify(title, body="", **kw):
+        notified.append((title, kw.get("severity"), kw.get("key")))
+        return False
+
     ns = {
         "bus": _Bus(), "log": _Log(), "AgentMessage": _Msg,
         "_handler_fail_seen": {}, "registry": None,
         "asyncio": asyncio, "published": published,
+        "recorded": recorded, "notified": notified,
     }
     for c in chunks:
         exec(compile(c, "bootstrap.py", "exec"), ns)
-    return ns, published, logged, _Registry
+    with _patched(activity_log, record=_record), \
+            _patched(alerts, notify=_notify):
+        yield ns, published, logged, _Registry
 
 
 def test_a_crashing_handler_really_does_reach_the_bus():
-    ns, published, logged, _Registry = _load_router()
+    with _load_router() as (ns, published, logged, _Registry):
 
-    class _Impl:
-        name = "risk_manager"
-        async def on_message(self, m):
-            # the exact shape of the outage
-            raise UnboundLocalError(
-                "cannot access local variable 'recovery_bump' where it is "
-                "not associated with a value")
+        class _Impl:
+            name = "risk_manager"
+            async def on_message(self, m):
+                # the exact shape of the outage
+                raise UnboundLocalError(
+                    "cannot access local variable 'recovery_bump' where it is "
+                    "not associated with a value")
 
-    class _State:
-        name = "risk_manager"
-        enabled = True
-        impl = _Impl()
-        message_count = 0
+        class _State:
+            name = "risk_manager"
+            enabled = True
+            impl = _Impl()
+            message_count = 0
 
-    ns["registry"] = _Registry([_State()])
-    _run(ns["_route"](_Msg("signal", {"ticker": "KO"}, agent="pattern_detection")))
+        ns["registry"] = _Registry([_State()])
+        _run(ns["_route"](_Msg("signal", {"ticker": "KO"}, agent="pattern_detection")))
 
     assert logged, "the stdout log line was lost in the rewrite"
     assert published, "THE OUTAGE WOULD STILL BE SILENT -- nothing published"
@@ -671,49 +740,57 @@ def test_a_crashing_handler_really_does_reach_the_bus():
     assert m.payload["trigger_kind"] == "signal"
     assert m.payload["ticker"] == "KO"
     assert m.agent == "risk_manager", "must publish AS the failing agent"
+    # net 1 is bus + activity log + webhook: the other two legs fired too,
+    # into recorders -- never the real log file or channel.
+    assert [(e, t) for e, t, _ in ns["recorded"]] == [("handler_failed", "KO")], ns["recorded"]
+    assert ns["notified"] and ns["notified"][0][1] == "urgent", ns["notified"]
+    assert ns["notified"][0][2] == "handler_failed:risk_manager"
+    assert alerts.notify is _REAL_NOTIFY, "notify seam not restored"
 
 
 def test_a_healthy_handler_publishes_no_failure_report():
-    ns, published, logged, _Registry = _load_router()
+    with _load_router() as (ns, published, logged, _Registry):
 
-    class _Impl:
-        name = "risk_manager"
-        async def on_message(self, m):
-            return [_Msg("approve", {"ticker": "KO"}, agent="risk_manager")]
+        class _Impl:
+            name = "risk_manager"
+            async def on_message(self, m):
+                return [_Msg("approve", {"ticker": "KO"}, agent="risk_manager")]
 
-    class _State:
-        name = "risk_manager"
-        enabled = True
-        impl = _Impl()
-        message_count = 0
+        class _State:
+            name = "risk_manager"
+            enabled = True
+            impl = _Impl()
+            message_count = 0
 
-    ns["registry"] = _Registry([_State()])
-    _run(ns["_route"](_Msg("signal", {"ticker": "KO"}, agent="pattern_detection")))
+        ns["registry"] = _Registry([_State()])
+        _run(ns["_route"](_Msg("signal", {"ticker": "KO"}, agent="pattern_detection")))
     assert not logged
     assert len(published) == 1 and published[0].kind == "approve"
+    assert ns["recorded"] == [] and ns["notified"] == []
 
 
 def test_repeated_crashes_count_up_but_alert_once():
-    ns, published, logged, _Registry = _load_router()
-    alerts = []
+    with _load_router() as (ns, published, logged, _Registry):
 
-    class _Impl:
-        name = "trade_execution"
-        async def on_message(self, m):
-            raise KeyError("user_id")
+        class _Impl:
+            name = "trade_execution"
+            async def on_message(self, m):
+                raise KeyError("user_id")
 
-    class _State:
-        name = "trade_execution"
-        enabled = True
-        impl = _Impl()
-        message_count = 0
+        class _State:
+            name = "trade_execution"
+            enabled = True
+            impl = _Impl()
+            message_count = 0
 
-    ns["registry"] = _Registry([_State()])
-    for _ in range(5):
-        _run(ns["_route"](_Msg("approve", {"ticker": "KO"})))
+        ns["registry"] = _Registry([_State()])
+        for _ in range(5):
+            _run(ns["_route"](_Msg("approve", {"ticker": "KO"})))
     fails = [m for m in published if m.payload.get("event") == "handler_failed"]
     assert len(fails) == 5, "every crash belongs on the bus"
     assert [f.payload["occurrences"] for f in fails] == [1, 2, 3, 4, 5]
+    assert len(ns["recorded"]) == 5, "every crash belongs in the activity log"
+    assert len(ns["notified"]) == 1, "the webhook must be pinged once, not per message"
 
 
 if __name__ == "__main__":

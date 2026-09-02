@@ -25,9 +25,21 @@ Rules pinned:
   - TE-24: approve_payload no longer carries the dead position_pct.
   - TE-19: the unbound primary-account margin read is gone; a stock
     signal never touches alpaca.get_account here.
-  - EQ-5 / BI-18: the staleness bands are on the 0-100 TCS scale.
+  - EQ-5 / BI-18: the staleness bands are on the 0-100 TCS scale (and,
+    review 2026-09-01, the reattribution / rotation gates too).
   - And the outage itself: a signal carrying a real direction reaches
     the gates BELOW the confidence bar without raising.
+  - BI-03 (review 2026-09-01): a scanner signal (no user_id) is judged
+    at the LOWEST enabled book's floor via the REAL
+    settings.min_tcs_floor_across_books; a user-scoped signal keeps its
+    own book's floor; a failed enumeration falls open to the bare read.
+  - User-scoped kill-switch (review 2026-09-01): a signal with a
+    user_id is judged for THAT book alone -- halted -> veto naming the
+    book, its daily $ limit -> veto, recovery -> its lane policy and the
+    RECOVERY_TCS_BUMP on its bar; a halted neighbour changes nothing.
+  - NEQ-05 / G3: no_price_stop=True gets NO stop geometry (no default
+    fill, no harmonizer, nothing forwarded) and the flag rides the
+    approval with the lane's max_notional.
 
 Deliberately dependency-free (no pytest, no .env, no network) so the
 deploy gate (tests/run_all.py) can run them in a bare checkout.
@@ -58,6 +70,7 @@ market_filter = load_module("app.strategies.market_filter")
 candles = load_module("app.data.candles")
 activity_log = load_module("app.agents.activity_log")
 library = load_module("app.knowledge.library")
+cap_tiers = load_module("app.strategies.cap_tiers")
 
 
 def _run(coro):
@@ -145,13 +158,39 @@ class _Calls:
 
 @contextlib.contextmanager
 def _desk(*, states, daily_over=frozenset(), verdicts=None,
-          coin_veto=None, bias="unknown", rows=None):
+          coin_veto=None, bias="unknown", rows=None, books=None,
+          pass_market=False):
     """Yield (agent, calls). `states` is what check_states returns (a
     dict of real KillSwitch objects, None, or an Exception instance to
     raise). `verdicts` is coin_loss_halt_by_book's answer; `coin_veto`
-    is coin_loss_halt's (the user-scoped path)."""
+    is coin_loss_halt's (the user-scoped path).
+
+    `books` (BI-03): {user_id: BotSettings} -- the per-book rows
+    get_bot_settings(uid) answers with, AND the enabled-book list the
+    REAL settings.min_tcs_floor_across_books enumerates (its
+    _enabled_book_ids seam). A bare get_bot_settings() -- the PRIMARY
+    row -- stays the default BotSettings() (floor 70) so the test can
+    tell "judged at the primary's floor" from "judged at the lowest".
+
+    `pass_market`: the stock market-quality gates (liquidity,
+    overextension, spread) answer None and one candle is on the tape,
+    so a STOCK signal reaches the approval instead of dying at 'No
+    price data'; the cap tier reads 'unknown' (no fundamentals fetch)."""
     calls = _Calls()
     client = _Client(paper_positions=[], paper_accounts=[], profiles=[])
+    _books = dict(books or {})
+
+    def _gbs(user_id=None, *_a, **_k):
+        if user_id and str(user_id) in _books:
+            return _books[str(user_id)]
+        return settings.BotSettings()
+
+    if pass_market and rows is None:
+        rows = [types.SimpleNamespace(close=100.0)]
+    _mkt = ({"liquidity_check": lambda *_a, **_k: None,
+             "overextension_check": lambda *_a, **_k: None,
+             "spread_quality_check": _async(None)}
+            if pass_market else {})
 
     if isinstance(states, BaseException):
         _check_states = _raising(states)
@@ -191,14 +230,16 @@ def _desk(*, states, daily_over=frozenset(), verdicts=None,
                   get_memory=lambda: _no_mem,
                   recall_decision_context=lambda **_k: {"available": False}), \
          _patched(persistence, _supabase=client), \
-         _patched(settings, get_bot_settings=lambda *_a, **_k: settings.BotSettings()), \
+         _patched(settings, get_bot_settings=_gbs,
+                  _enabled_book_ids=lambda: list(_books)), \
          _patched(overrides, get_disabled_reason=_async(None)), \
          _patched(daily_goal, goal_state=_async({"hit": False})), \
          _patched(engine, get_account=_async(
              {"current_cash_usd": 1_000.0, "vault_balance_usd": 0.0})), \
          _patched(alp, get_account=_acct), \
-         _patched(market_filter, get_market_bias=_async(_bias)), \
+         _patched(market_filter, get_market_bias=_async(_bias), **_mkt), \
          _patched(candles, fetch_candles_for=_async(list(rows or []))), \
+         _patched(cap_tiers, tier_for=_async("unknown")), \
          _patched(activity_log, record=lambda *_a, **_k: None), \
          _patched(library, search=lambda *_a, **_k: []), \
          _patched(ks, check_states=_check_states, daily_dollar_over=_ddo,
@@ -326,12 +367,18 @@ def test_check_states_raising_is_also_cannot_evaluate():
 
 
 def test_the_unknown_log_is_throttled_not_spammed():
+    # Review 2026-09-01 (rv:test-contract :320): these two calls ran
+    # OUTSIDE _desk, so the real activity_log.record appended a
+    # kill_switch_unknown row to logs/activity-<today>.jsonl on every
+    # gate run -- the live feed ops_relay mirrors. record is imported
+    # late inside the function, so the module-attribute patch binds.
     saved = rm._LAST_KS_UNKNOWN_LOG
     try:
         rm._LAST_KS_UNKNOWN_LOG = 0.0
-        rm._note_kill_switch_unknown("XRP")
-        first = rm._LAST_KS_UNKNOWN_LOG
-        rm._note_kill_switch_unknown("XRP")
+        with _patched(activity_log, record=lambda *_a, **_k: None):
+            rm._note_kill_switch_unknown("XRP")
+            first = rm._LAST_KS_UNKNOWN_LOG
+            rm._note_kill_switch_unknown("XRP")
         assert rm._LAST_KS_UNKNOWN_LOG == first, "a veto storm must not become a log storm"
     finally:
         rm._LAST_KS_UNKNOWN_LOG = saved
@@ -474,6 +521,175 @@ def test_an_agent_urgency_tag_still_wins_over_the_band():
     f = rm.RiskManagerAgent._stale_deadline_for
     assert f(10, "urgent") == 60
     assert f(95, "low") == 300
+
+
+# --- BI-03: an unscoped signal is judged at the LOWEST enabled floor -------
+# (review 2026-09-01, rv:scanners-scale :462). Two books, floors 40 and
+# 70. The scanners emit at 40 now; the risk gate used to judge at the
+# PRIMARY's 70 and veto before the fan-out's per-book gate ever ran, so
+# the 40 book was starved between 40 and 70. tests/test_fanout_bookkeyed
+# proves the other half: the same approval executes on the 40 book only.
+
+TWO_OPEN = {"A": _open(), "B": _open()}
+
+
+def _two_floors():
+    return {"A": settings.BotSettings(tcs_threshold=40),
+            "B": settings.BotSettings(tcs_threshold=70)}
+
+
+def test_unscoped_signal_is_judged_at_the_lowest_book_floor():
+    with _desk(states=TWO_OPEN, books=_two_floors(), pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(_stock(tcs=55))))
+    assert v.kind == "approve", v.payload
+    assert v.payload.get("user_id") is None, "a scanner signal stays unscoped"
+
+
+def test_unscoped_signal_under_every_floor_is_still_vetoed():
+    with _desk(states=TWO_OPEN, books=_two_floors(), pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(_stock(tcs=35))))
+    assert v.kind == "veto" and "below threshold 40" in v.payload["reason"], v.payload
+
+
+def test_user_scoped_signal_keeps_its_own_books_floor():
+    """The 70 book's own signal at 55 is judged at 70 -- not at the
+    platform minimum, which would let one book's slider loosen another's."""
+    with _desk(states=TWO_OPEN, books=_two_floors(), pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(_stock(tcs=55, user_id="B"))))
+    assert v.kind == "veto" and "below threshold 70" in v.payload["reason"], v.payload
+
+
+def test_a_failed_book_enumeration_falls_open_to_the_bare_read():
+    """min_tcs_floor_across_books cannot enumerate books -> the old
+    single-row read (the primary's 70) decides, as it always did."""
+
+    def _boom():
+        raise RuntimeError("accounts.json unreadable")
+
+    with _desk(states=TWO_OPEN, books=_two_floors(), pass_market=True) as (agent, _), \
+         _patched(settings, _enabled_book_ids=_boom):
+        v = _verdict(_run(agent.on_message(_stock(tcs=55))))
+    assert v.kind == "veto" and "below threshold 70" in v.payload["reason"], v.payload
+
+
+# --- user-scoped signals: the kill-switch judges THAT book alone -----------
+# (review 2026-09-01, rv:killswitch-contracts). The all-books rule asks
+# "can ANY book act?" -- right for a shared scanner signal, wrong for a
+# signal raised FOR one book: B's own signal while B is halted and A is
+# open used to be approved.
+
+def test_user_scoped_signal_on_a_halted_book_is_vetoed_naming_that_book():
+    with _desk(states={"A": _open(), "B": _halt()}, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+    assert v.kind == "veto", v.payload
+    assert v.payload["reason"].startswith("Kill-switch [book B]"), v.payload["reason"]
+    assert "Daily loss limit" in v.payload["reason"]
+    assert v.payload["user_id"] == "B", "the veto is attributed to the book it judged"
+
+
+def test_user_scoped_signal_on_an_open_book_ignores_a_halted_neighbour():
+    with _desk(states={"A": _halt(), "B": _open()}, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+    assert v.kind == "approve" and v.payload["user_id"] == "B", v.payload
+
+
+def test_user_scoped_signal_at_its_own_daily_dollar_limit_is_vetoed():
+    with _desk(states=TWO_OPEN, daily_over={"B"}, coin_veto=None) as (agent, calls):
+        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+    assert v.kind == "veto" and "daily $ loss limit" in v.payload["reason"], v.payload
+    assert v.payload["reason"].startswith("Kill-switch [book B]")
+    assert calls.daily_dollar_over == 1
+
+
+def test_user_scoped_signal_is_not_braked_by_a_neighbours_dollar_limit():
+    with _desk(states=TWO_OPEN, daily_over={"A"}, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="B"))))
+    assert v.kind == "approve", v.payload
+
+
+def test_user_scoped_signal_on_a_recovering_book_faces_the_recovery_bump():
+    """crypto_swing runs at the 35 crypto floor; B in weekly recovery
+    raises ITS bar to 45 (RECOVERY_TCS_BUMP) even though A is open --
+    the all-books rule only bumped when EVERY book was recovering."""
+    states = {"A": _open(), "B": _recovering()}
+    with _desk(states=states, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", tcs=40))))
+    assert v.kind == "veto", v.payload
+    assert f"below threshold {35 + ks.RECOVERY_TCS_BUMP}" in v.payload["reason"], v.payload
+    assert "weekly recovery" in v.payload["reason"] and "book B" in v.payload["reason"]
+    with _desk(states=states, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal(user_id="B", tcs=50))))
+    assert v.kind == "approve", v.payload
+
+
+def test_user_scoped_signal_on_a_recovering_book_suspends_speculative_lanes():
+    with _desk(states={"A": _open(), "B": _recovering()}, coin_veto=None) as (agent, _):
+        v = _verdict(_run(agent.on_message(
+            _signal(user_id="B", strategy="crypto_scalp", tcs=90))))
+    assert v.kind == "veto" and "recovery suspends crypto_scalp" in v.payload["reason"], v.payload
+
+
+def test_a_scanner_signal_still_uses_the_all_books_rule():
+    """Control: unscoped, one halted + one open -> approve, unchanged."""
+    with _desk(states={"A": _halt(), "B": _open()}, verdicts={}) as (agent, _):
+        v = _verdict(_run(agent.on_message(_signal())))
+    assert v.kind == "approve", v.payload
+
+
+# --- NEQ-05 / G3: no_price_stop gets NO stop geometry -----------------------
+# The dividend ladder holds through drawdowns by design; its producer says
+# no_price_stop=True. The cap-tier block used to fill the DEFAULT 5% stop
+# on exactly that signal.
+
+def _ladder(**over):
+    p = {"ticker": "PG", "asset_type": "stock", "direction": "bullish",
+         "tcs": 75, "strategy": "dividend_lt", "user_id": "B",
+         "no_price_stop": True, "max_notional": 420.0}
+    p.update(over)
+    return rm.AgentMessage(agent="dividend_lt", kind="signal",
+                           payload=p, confidence=0.6)
+
+
+def test_no_price_stop_signal_gets_no_stop_geometry_and_carries_the_flag():
+    with _desk(states=TWO_OPEN, pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(_ladder())))
+    assert v.kind == "approve", v.payload
+    assert v.payload.get("no_price_stop") is True
+    assert "stop_pct" not in v.payload and "target_pct" not in v.payload, v.payload
+    assert v.payload.get("max_notional") == 420.0, "the lane cap must ride the approval"
+    assert v.payload["user_id"] == "B"
+    assert "no price stop" in v.payload["thesis"]["exit_watch"]
+
+
+def test_the_same_signal_without_the_flag_still_gets_the_default_stop():
+    """Control: proves the block the flag skips is live -- without the
+    flag the default stop IS filled in (that default is the NEQ-05 hole)."""
+    m = _ladder()
+    m.payload.pop("no_price_stop")
+    with _desk(states=TWO_OPEN, pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(m)))
+    assert v.kind == "approve", v.payload
+    assert "no_price_stop" not in v.payload
+    assert v.payload.get("stop_pct") == 0.05, v.payload
+
+
+def test_no_price_stop_wins_over_a_stop_the_producer_also_sent():
+    """Contradictory input: the flag is the contract; no stop is forwarded."""
+    with _desk(states=TWO_OPEN, pass_market=True) as (agent, _):
+        v = _verdict(_run(agent.on_message(_ladder(stop_pct=0.03, target_pct=0.09))))
+    assert v.kind == "approve" and v.payload.get("no_price_stop") is True
+    assert "stop_pct" not in v.payload and "target_pct" not in v.payload, v.payload
+
+
+# --- EQ-5 leftovers on the 0-1000 scale (review 2026-09-01) ----------------
+
+def test_the_reattribution_and_rotation_gates_are_on_the_0_100_scale():
+    import inspect
+    src = inspect.getsource(rm)
+    assert "if fits and tcs >= 600" not in src,         "the Mem0 reattribution hook can never fire at >= 600"
+    assert "weakest_score < 75" not in src,         "no 0-100 signal clears a 75-point rotation gap"
+    assert "if fits and tcs >= 60:" in src
+    assert "incoming_tcs - weakest_score < 8" in src
 
 
 if __name__ == "__main__":

@@ -97,6 +97,20 @@ _cache: dict[Optional[str], tuple[BotSettings, float]] = {}
 _TTL = 30.0
 
 
+def is_fallback_settings(bs: BotSettings) -> bool:
+    """True when `bs` is the shared fallback get_bot_settings() hands out
+    on a missing client, a failed query or a book with no row -- i.e.
+    NOT this book's own numbers.
+
+    REVIEW reevaluator.py:215 (2026-09-01): get_bot_settings() fails
+    OPEN to _DEFAULTS by design (every consumer must keep working through
+    a DB blip), so a caller that must NOT act on a guessed value had no
+    way to tell a real 70 from a fallback 70. This is that way, kept
+    next to _DEFAULTS so the identity contract cannot drift: a real row
+    always comes back as a fresh BotSettings from _from_row()."""
+    return bs is _DEFAULTS
+
+
 def _primary_user_id():
     """The settings row every consumer anchors to.
 
@@ -361,12 +375,21 @@ def lane_enabled_any(field_name: str, default: bool = True) -> bool:
     return False
 
 
-def min_tcs_floor_across_books() -> int:
+def min_tcs_floor_across_books(lane_field: Optional[str] = None) -> int:
     """The LOWEST tcs_threshold across enabled books -- the floor a shared
     scanner must emit at so no book is starved by another's slider. The
     fan-out re-applies each book's own floor (book_gate.min_tcs_for).
     Falls back to the single-book read when multi-account is not active
-    or the book enumeration fails."""
+    or the book enumeration fails.
+
+    `lane_field` (REVIEW settings.py:378, 2026-09-01): the bot_settings
+    toggle of the lane asking, e.g. "stms_enabled". When given, a book
+    with that lane OFF does not lower the floor -- it will never take the
+    signal, so its slider is not a reason to emit more for everyone else
+    (the extra emissions were pruned per book, so the cost was veto
+    noise, not a trade). None keeps today's behaviour: every enabled
+    book counts. If no book has the lane on, every book counts again --
+    lane_enabled_any() is the gate for "nobody wants this", not this."""
     try:
         books = _enabled_book_ids()
     except Exception as e:  # noqa: BLE001
@@ -375,6 +398,12 @@ def min_tcs_floor_across_books() -> int:
         books = []
     if not books:
         return int(get_bot_settings().tcs_threshold or _DEFAULTS.tcs_threshold)
-    floors = [int(get_bot_settings(uid).tcs_threshold or _DEFAULTS.tcs_threshold)
-              for uid in books]
+    per_book = {uid: get_bot_settings(uid) for uid in books}
+    if lane_field:
+        on = [uid for uid, bs in per_book.items()
+              if getattr(bs, lane_field, None) is not False]
+        if on:
+            per_book = {uid: per_book[uid] for uid in on}
+    floors = [int(bs.tcs_threshold or _DEFAULTS.tcs_threshold)
+              for bs in per_book.values()]
     return min(floors)

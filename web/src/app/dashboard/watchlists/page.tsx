@@ -10,6 +10,7 @@ import { addHolding } from "@/app/dashboard/yieldmax/_actions";
 import { NewWatchlistButton } from "./_new-watchlist-button";
 import { WatchlistGrid } from "./_watchlist-grid";
 import { GlobalTickerAdd } from "@/components/dashboard/global-ticker-add";
+import { LoadError } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -62,6 +63,16 @@ export default async function WatchlistsIndex() {
 
       <GlobalTickerAdd chips={chips} />
 
+      {/* rv:web-pages (:74): a failed user_positions read used to be
+          coerced to [] and the chips silently lost their "held" mark --
+          the one PAGES-03 consumer that still hid a failure. Say so. */}
+      {heldYieldMax === null ? (
+        <LoadError
+          table="user_positions"
+          message="Income-ETF holdings could not be read; the 'held' marks below are missing, not empty."
+        />
+      ) : null}
+
       <WatchlistGrid
         lists={lists.map((l) => ({
           id: l.id,
@@ -71,7 +82,7 @@ export default async function WatchlistsIndex() {
           tickers: tickersById.get(l.id) ?? []
         }))}
         library={INCOME_ETF_LIBRARY}
-        heldTickers={(heldYieldMax ?? []).map((p) => p.ticker)} // PAGES-03: null = read failed; chips just lose the "held" mark
+        heldTickers={(heldYieldMax ?? []).map((p) => p.ticker)} // null = read failed; the LoadError above says so
         addHolding={addHolding}
       />
     </div>

@@ -10,9 +10,13 @@ The asymmetry that matters (house rule 3): a row whose market_value is
 MISSING or unparseable is not "small". It is unknown, and unknown must
 still flag. Only a present, parseable value below DUST_MIN_USD is dust.
 
+NEQ-05 / G3: a ledger row whose source_payload carries no_price_stop
+(the dividend ladder) has no price stop by contract, so invariant 2 --
+"past its own stop and still open" -- must not alarm on it.
+
 Drives the REAL _check_book: the module is loaded from its file and only
-its two seams -- book_scope.positions and alerts.notify -- are stubbed,
-always restored.
+its seams -- book_scope.positions, alerts.notify and (where a test needs
+a price) the agent's own _price -- are stubbed, always restored.
 """
 
 from __future__ import annotations
@@ -37,15 +41,18 @@ def _run(coro):
 
 @contextlib.contextmanager
 def _patched(mod, **attrs):
-    """Swap module attributes and ALWAYS put the originals back."""
-    old = {k: getattr(mod, k, None) for k in attrs}
+    """Swap module attributes and ALWAYS put the originals back. A
+    sentinel, not None, marks "was absent" (rv:test-contract): a real
+    attribute whose value is None must be restored, never deleted."""
+    _missing = object()
+    old = {k: getattr(mod, k, _missing) for k in attrs}
     try:
         for k, v in attrs.items():
             setattr(mod, k, v)
         yield
     finally:
         for k, v in old.items():
-            if v is None:
+            if v is _missing:
                 if hasattr(mod, k):
                     delattr(mod, k)
             else:
@@ -80,8 +87,9 @@ class _Client:
         return _Query(self._open if name == "paper_positions" else [])
 
 
-def _check(broker_rows, open_rows=(), *, uid="book-1"):
-    """Run the real _check_book with the two seams stubbed."""
+def _check(broker_rows, open_rows=(), *, uid="book-1", price=None):
+    """Run the real _check_book with the seams stubbed. `price`, when
+    given, is what every ticker trades at (invariant 2 needs one)."""
     sent = []
 
     async def _positions(user_id, **_kw):
@@ -93,7 +101,15 @@ def _check(broker_rows, open_rows=(), *, uid="book-1"):
         return True
 
     agent = bh.BookHealthAgent()
-    type(agent)._open_findings = {}            # class-level; isolate
+    # rv:test-contract (:96): an INSTANCE dict, so the real class
+    # attribute on BookHealthAgent is never replaced or leaked across
+    # suites in run_all's shared process. The code reads through self.,
+    # so the instance attribute shadows correctly.
+    agent._open_findings = {}
+    if price is not None:
+        async def _p(ticker, asset_type):
+            return price
+        agent._price = _p
     with _patched(bh.book_scope, positions=_positions), \
             _patched(bh, notify=_notify):
         findings = _run(agent._check_book(_Client(list(open_rows)), uid, "Book"))
@@ -183,12 +199,53 @@ def test_a_failed_broker_read_says_nothing_rather_than_all_clear():
         return True
 
     agent = bh.BookHealthAgent()
-    type(agent)._open_findings = {"unmanaged:book-1": "unmanaged"}
+    agent._open_findings = {"unmanaged:book-1": "unmanaged"}   # instance, see _check
     with _patched(bh.book_scope, positions=_none), _patched(bh, notify=_notify):
         findings = _run(agent._check_book(_Client([]), "book-1", "Book"))
     assert findings == []
     assert sent == [], "a failed read announced a recovery"
-    assert type(agent)._open_findings == {"unmanaged:book-1": "unmanaged"}
+    assert agent._open_findings == {"unmanaged:book-1": "unmanaged"}
+
+
+def test_the_suite_leaves_the_real_class_attribute_alone():
+    """rv:test-contract (:96): nothing above may replace the class-level
+    dict on BookHealthAgent -- the shared run_all process runs every
+    suite against the same module object."""
+    cls_dict = bh.BookHealthAgent.__dict__["_open_findings"]
+    _check([_row("KO", "250")])
+    assert bh.BookHealthAgent.__dict__["_open_findings"] is cls_dict
+    assert "unmanaged:book-1" not in bh.BookHealthAgent._open_findings
+
+
+# --- NEQ-05 / G3: no price stop by contract --------------------------------
+
+def test_a_no_price_stop_row_is_never_past_its_stop():
+    """Two ledger rows under a $60 stop at $10. The ordinary one is a
+    stop that did not fire -- alarm. The flagged one is a screen-managed
+    hold that has no price stop by contract, whatever stale number sits
+    in stop_price -- no alarm, not even a mention."""
+    broker = [_row("KO", "100"), _row("PG", "100")]
+    ledger = [{"id": 1, "ticker": "KO", "side": "long", "stop_price": 60.0,
+               "asset_type": "stock"},
+              {"id": 2, "ticker": "PG", "side": "long", "stop_price": 60.0,
+               "asset_type": "stock",
+               "source_payload": {"no_price_stop": True}}]
+    findings, sent = _check(broker, ledger, price=10.0)
+    past = [f for f in findings if f["finding"] == "past_stop"]
+    assert past == [{"finding": "past_stop", "count": 1}], findings
+    body = next(s for s in sent if s.get("key") == "paststop:book-1")["body"]
+    assert "KO" in body and "PG" not in body, body
+
+
+def test_the_flag_is_selected_by_the_query_that_feeds_invariant_2():
+    """BUILT BUT NOT BOUND guard: the exemption reads source_payload off
+    the row, so the ledger SELECT must name it, and the ONE predicate
+    must be the monitor's."""
+    src = (Path(bh.__file__)).read_text(encoding="utf-8")
+    assert "stop_price, asset_type, source_payload" in src
+    assert "from app.agents.position_monitor import _is_no_price_stop" in src
+    inv2 = src[src.index("INVARIANT 2"):src.index("INVARIANT 3")]
+    assert "_is_no_price_stop(r)" in inv2
 
 
 def test_the_floor_is_bound_at_the_call_site_not_just_defined():

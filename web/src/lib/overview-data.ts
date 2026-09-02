@@ -3,6 +3,7 @@ import { fetchAlpacaSnapshot, type AlpacaPosition } from "@/lib/alpaca-snapshot"
 import type { OverviewData, OVLayer, OVActivity } from "@/components/dashboard/overview-view-redesign";
 import type { HeroGoal } from "@/components/dashboard/woven-basket-hero";
 import { loadResult, failuresOf, type LoadFailure } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 /**
  * PAGES-03: `data` is null whenever any Supabase read failed, and
@@ -65,6 +66,11 @@ type PaperPos = {
   strategy: string | null;
 };
 type ClosedRow = { realized_pnl_usd: number | null; exit_at: string | null };
+type AcctRow = {
+  current_cash_usd: number | null;
+  vault_balance_usd: number | null;
+  today_realized_pnl_usd: number | null;
+};
 type OptRow = {
   underlying: string;
   strategy: string | null;
@@ -115,20 +121,35 @@ function layerOf(assetType: string, strategy: string): number {
   return 2;
 }
 
+/** `userId` is the signed-in PERSON (auth uid). The books are resolved
+ *  from trading_accounts; see lib/books.ts. */
 export async function buildOverviewData(userId: string): Promise<OverviewLoad> {
   const supabase = createClient();
   const sinceIso = new Date(Date.now() - 7 * 864e5).toISOString();
+
+  // rv:web-pages MAJOR (:122): since 0047 `user_id` on the book tables is
+  // the BOOK key, not the auth uid. Scoping by auth uid showed at most the
+  // one book whose key happens to equal it -- "0 of 8 active" while the
+  // brokers held positions in three books. Resolve the person's books first;
+  // a failed resolution is a failure card, never an empty basket.
+  const booksLoad = await getOwnerBookKeys(supabase, userId);
+  if (booksLoad.failure) return { data: null, failures: [booksLoad.failure] };
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [accountRes, openRes, closedRes, alpaca, activity, goalInfo, optRes] = await Promise.all([
-    supabase.from("paper_accounts").select("*").eq("user_id", userId).maybeSingle(),
+    supabase
+      .from("paper_accounts")
+      .select("current_cash_usd, vault_balance_usd, today_realized_pnl_usd")
+      .in("user_id", keys),
     supabase
       .from("paper_positions")
       .select("ticker, asset_type, quantity, entry_price, strategy")
-      .eq("user_id", userId)
+      .in("user_id", keys)
       .eq("status", "open"),
     supabase
       .from("paper_positions")
       .select("realized_pnl_usd, exit_at")
-      .eq("user_id", userId)
+      .in("user_id", keys)
       .neq("status", "open")
       .gte("exit_at", sinceIso),
     fetchAlpacaSnapshot(),
@@ -137,18 +158,20 @@ export async function buildOverviewData(userId: string): Promise<OverviewLoad> {
     supabase
       .from("options_positions")
       .select("underlying, strategy, option_type, strike, contracts, expiration")
-      .eq("user_id", userId)
+      .in("user_id", keys)
       .eq("status", "open"),
   ]);
 
-  const accountLoad = loadResult<Record<string, number> | null>("paper_accounts", accountRes);
+  const accountLoad = loadResult<AcctRow[]>("paper_accounts", accountRes, []);
   const openLoad = loadResult<PaperPos[]>("paper_positions", openRes, []);
   const closedLoad = loadResult<ClosedRow[]>("paper_positions (closed)", closedRes, []);
   const optLoad = loadResult<OptRow[]>("options_positions", optRes, []);
   const failures = failuresOf(accountLoad, openLoad, closedLoad, optLoad);
   if (failures.length > 0) return { data: null, failures };
 
-  const account = accountLoad.data ?? null;
+  // One paper_accounts row per book: the person's picture is the SUM.
+  const accounts = accountLoad.data ?? [];
+  const sumAcct = (k: keyof AcctRow) => accounts.reduce((s, a) => s + Number(a[k] ?? 0), 0);
   const open = openLoad.data ?? [];
   const closed = closedLoad.data ?? [];
 
@@ -157,10 +180,13 @@ export async function buildOverviewData(userId: string): Promise<OverviewLoad> {
   const stale = !!alpaca?.stale;
   const asOf = alpaca?.cached_at ?? null;
   const buyingPower = alpacaActive ? Number(alpaca!.account!.buying_power) : null;
+  // NOTE: the Alpaca snapshot is the engine's default (primary) account, so
+  // when it is active the headline equity is that one book's; the modeled
+  // fallback sums every book. Per-book broker equity is a follow-up.
   const portfolioValue = alpacaActive
     ? Number(alpaca!.account!.equity)
-    : Number(account?.current_cash_usd ?? 0) + Number(account?.vault_balance_usd ?? 0);
-  const todayPnl = Number(account?.today_realized_pnl_usd ?? 0);
+    : sumAcct("current_cash_usd") + sumAcct("vault_balance_usd");
+  const todayPnl = sumAcct("today_realized_pnl_usd");
 
   const apos = (alpaca?.positions ?? []) as AlpacaPosition[];
   const findAp = (sym: string): AlpacaPosition | undefined => {

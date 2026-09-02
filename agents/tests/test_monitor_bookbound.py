@@ -19,6 +19,15 @@ BI-05          The liquidation throttle / circuit was keyed by symbol
                circuit decays.
 PH-3           The crypto gone-at-broker reconcile-close dropped its
                reason and was booked as 'alpaca_bracket'.
+NEQ-05 / G3    A row whose source_payload carries no_price_stop (the
+               dividend ladder) is a screen-managed hold. The monitor
+               must not close it on stop/target, ratchet a trail onto
+               it, arm a broker stop, run the naked check or show it to
+               the reevaluator -- while external-fill detection and a
+               manual close_requested still apply. One predicate,
+               _is_no_price_stop(row), at every site; the flag must be
+               SELECTed or the whole exemption is built and unbound.
+REVIEW :28/:1545  The inline per-row binding is cleared after the loop.
 
 Every test here drives the REAL function out of the real module (loaded
 through _bootstrap, no engine boot) and stubs only the external seams
@@ -58,6 +67,12 @@ alog = load_module("app.agents.activity_log")
 engine = load_module("app.paper.engine")
 leg_sync = load_module("app.paper.leg_sync")
 pm = load_module("app.agents.position_monitor")
+# Seams the NEQ-05 real-tick tests pin: the equity session gate the
+# broker-stop arm consults, and the holiday calendar the pre-break
+# review consults. Both are lazy imports inside the monitor, so they
+# are patched on their own modules.
+ops_watchdog = load_module("app.agents.ops_watchdog")
+options_scanner = load_module("app.agents.options_scanner")
 
 
 def _run(coro):
@@ -66,15 +81,18 @@ def _run(coro):
 
 @contextlib.contextmanager
 def _patched(mod, **attrs):
-    """Swap module attributes and ALWAYS put the originals back."""
-    old = {k: getattr(mod, k, None) for k in attrs}
+    """Swap module attributes and ALWAYS put the originals back. A
+    sentinel, not None, marks "was absent" (rv:test-contract): a real
+    attribute whose value is None must be restored, never deleted."""
+    _missing = object()
+    old = {k: getattr(mod, k, _missing) for k in attrs}
     try:
         for k, v in attrs.items():
             setattr(mod, k, v)
         yield
     finally:
         for k, v in old.items():
-            if v is None:
+            if v is _missing:
                 if hasattr(mod, k):
                     delattr(mod, k)
             else:
@@ -688,6 +706,322 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
         f"crypto reconcile-close booked as {seen.get('reason')!r}")
     closes = [m for m in out if m.kind == "close"]
     assert closes and closes[0].payload["reason"] == "alpaca_external", out
+
+
+# =======================================================================
+# NEQ-05 / G3: a no_price_stop row gets no price management
+# =======================================================================
+
+_FLAG = {"no_price_stop": True}
+
+
+def _row_for(uid, tk, **over):
+    """An open long stock row at $50 with a $60 stop -- so any price
+    below 60 is 'far below its stop'. Modeled by default; broker='alpaca'
+    for the broker branch."""
+    r = {"id": f"pos-{tk}", "user_id": uid, "ticker": tk,
+         "asset_type": "stock", "side": "long", "quantity": 10,
+         "entry_price": 50.0, "stop_price": 60.0, "target_price": 80.0,
+         "strategy": "momentum", "entry_at": "2026-08-01T00:00:00+00:00",
+         "broker": "paper", "close_requested": False}
+    r.update(over)
+    return r
+
+
+@contextlib.contextmanager
+def _real_tick(client, price, **extra):
+    """Drive the REAL PositionMonitorAgent.tick() with only the external
+    seams swapped: the DB, the price, the tick-start passes, the profit
+    lock, the profit-step ladder's DB-backed counter, and the activity
+    log. Anything in `extra` is patched onto the monitor too."""
+    async def _price(tk, at):
+        return price
+
+    async def _noop():
+        return None
+
+    async def _nolock(user_id):
+        return None
+
+    async def _nostep(*_a, **_k):
+        return False, 0          # keeps the step ladder off the database
+
+    saved = (pm.PositionMonitorAgent._recon_tick_counter,
+             pm.PositionMonitorAgent._did_initial_reconcile)
+    pm.PositionMonitorAgent._recon_tick_counter = 0
+    pm.PositionMonitorAgent._did_initial_reconcile = True
+    try:
+        with _patched(pm, _supabase=lambda: client, _latest_price=_price,
+                      _manage_day_options=_noop, _gap_check_open_bell=_noop,
+                      _pre_break_review=_noop, check_and_lock_profit=_nolock,
+                      _step_check=_nostep, **extra), \
+                _patched(alog, record=_norec):
+            yield
+    finally:
+        (pm.PositionMonitorAgent._recon_tick_counter,
+         pm.PositionMonitorAgent._did_initial_reconcile) = saved
+        accounts.clear_account()
+
+
+@contextlib.contextmanager
+def _clean_naked():
+    """The naked-check / stop-arm throttles, cleared for one test and
+    restored after it."""
+    saved = (dict(pm._naked_checked_at), dict(pm._naked_alerted_at),
+             dict(pm._stop_armed_at))
+    for d in (pm._naked_checked_at, pm._naked_alerted_at, pm._stop_armed_at):
+        d.clear()
+    try:
+        yield
+    finally:
+        for d, s in zip((pm._naked_checked_at, pm._naked_alerted_at,
+                         pm._stop_armed_at), saved):
+            d.clear()
+            d.update(s)
+
+
+def test_the_predicate_reads_the_flag_and_nothing_else():
+    f = pm._is_no_price_stop
+    assert f({"source_payload": {"no_price_stop": True}})
+    assert f({"source_payload": {"no_price_stop": "true"}})
+    assert f({"source_payload": {"no_price_stop": 1}})
+    assert f({"source_payload": '{"no_price_stop": true}'}), "jsonb as text"
+    for row in ({}, {"source_payload": None}, {"source_payload": {}},
+                {"source_payload": {"no_price_stop": False}},
+                {"source_payload": {"no_price_stop": "false"}},
+                {"source_payload": "not json"}, {"source_payload": 7},
+                {"strategy": "dividend_lt"}):
+        assert not f(row), f"flagged without the flag: {row}"
+
+
+def test_a_flagged_modeled_row_far_below_a_stale_stop_is_not_closed():
+    """THE CASE. Two modeled rows in one book at $10 against a $60 stop:
+    the ordinary one closes on 'stop'; the no_price_stop one -- even
+    with a stale stop_price sitting on the row -- is not closed, not
+    trailed and never shown to the reevaluator."""
+    rows = [_row_for("book-a", "KO"),
+            _row_for("book-a", "PG", strategy="dividend_lt",
+                     source_payload=dict(_FLAG))]
+    client = _Client({"paper_positions": rows})
+    closed, reeval_seen, trail_seen = [], [], []
+
+    async def _close(user_id, pid, price, reason="stop"):
+        closed.append((pid, reason))
+        return engine.FillResult(ok=True, position_id=pid, fill_price=price,
+                                 realized_pnl_usd=-400.0)
+
+    async def _reeval(r, *a, **k):
+        reeval_seen.append(r["ticker"])
+        return None
+
+    async def _trail(r, price, min_gain=None):
+        trail_seen.append(r["ticker"])
+        return None
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _real_tick(client, 10.0, close_position=_close,
+                                   reeval_is_enabled=lambda: True,
+                                   reevaluate_position=_reeval,
+                                   _maybe_trail_stock_profit=_trail):
+        out = _run(agent.tick())
+    assert closed == [("pos-KO", "stop")], closed
+    assert reeval_seen == ["KO"], f"the reevaluator saw a flagged row: {reeval_seen}"
+    assert trail_seen == ["KO"], f"the trail touched a flagged row: {trail_seen}"
+    assert [m.payload["ticker"] for m in out if m.kind == "close"] == ["KO"], out
+
+
+def test_a_flagged_alpaca_row_gets_no_broker_stop_and_no_naked_check():
+    """Broker branch, same $10-vs-$60 setup, both rows held at Alpaca.
+    The ordinary row arms a stop (ensure_stock_protection), fails the
+    naked check and has its orphan stop enforced at market. The flagged
+    row: no arm, no orders query, no liquidation -- it is SUPPOSED to
+    rest at the broker with no exit legs."""
+    rows = [_row_for("book-a", "KO", broker="alpaca"),
+            _row_for("book-a", "PG", broker="alpaca", strategy="dividend_lt",
+                     source_payload=dict(_FLAG))]
+    client = _Client({"paper_positions": rows})
+    armed, asked, liquidated = [], [], []
+
+    async def _held(user_id, *, where="", max_age_s=None):
+        return {"KO", "PG"}
+
+    async def _ensure(sym, qty, stop, target=None):
+        armed.append((sym, stop))
+        return True, "stop armed"
+
+    async def _open(sym):
+        asked.append(sym)
+        return []                        # naked: no exit legs resting
+
+    async def _liq(symbol, asset_type="stock"):
+        liquidated.append(symbol)
+        return {"id": "liq"}, None
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _clean_liq(), _clean_naked(), _real_tick(client, 10.0), \
+            _patched(book_scope, held_symbols=_held), \
+            _patched(alp, ensure_stock_protection=_ensure,
+                     get_open_orders_for=_open, liquidate_position=_liq), \
+            _patched(ops_watchdog, _us_market_open=lambda: True):
+        out = _run(agent.tick())
+    assert armed == [("KO", 60.0)], f"broker stop armed on the wrong rows: {armed}"
+    assert asked == ["KO"], f"naked check ran on the wrong rows: {asked}"
+    assert liquidated == ["KO"], f"liquidated the wrong rows: {liquidated}"
+    assert not [m for m in out if m.kind == "close"], out
+    pg = [m for m in out if m.payload.get("ticker") == "PG"]
+    assert pg == [], f"a flagged row produced messages: {[m.payload for m in pg]}"
+
+
+def test_a_manual_close_still_closes_a_flagged_row():
+    rows = [_row_for("book-a", "PG", strategy="dividend_lt",
+                     source_payload=dict(_FLAG), close_requested=True)]
+    client = _Client({"paper_positions": rows})
+    closed = []
+
+    async def _close(user_id, pid, price, reason="stop"):
+        closed.append((pid, reason))
+        return engine.FillResult(ok=True, position_id=pid, fill_price=price,
+                                 realized_pnl_usd=0.0)
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _real_tick(client, 10.0, close_position=_close,
+                                   reeval_is_enabled=lambda: False):
+        _run(agent.tick())
+    assert closed == [("pos-PG", "manual")], closed
+
+
+def test_external_fill_detection_still_applies_to_a_flagged_row():
+    """The broker no longer holds it -> the ledger is reconciled, flag or
+    no flag. Bookkeeping is not price management."""
+    rows = [_row_for("book-a", "PG", broker="alpaca", strategy="dividend_lt",
+                     source_payload=dict(_FLAG))]
+    client = _Client({"paper_positions": rows})
+    seen = {}
+
+    async def _held(user_id, *, where="", max_age_s=None):
+        return {"KO"}                    # PG is gone at the broker
+
+    async def _rec_close(user_id, position_id, exit_price,
+                         reason="alpaca_bracket"):
+        seen.update(pid=position_id, reason=reason)
+        return engine.FillResult(ok=True, position_id=position_id,
+                                 fill_price=exit_price, realized_pnl_usd=1.0)
+
+    agent = pm.PositionMonitorAgent()
+    with _registry([]), _real_tick(client, 10.0), \
+            _patched(book_scope, held_symbols=_held), \
+            _patched(engine, record_external_close=_rec_close):
+        out = _run(agent.tick())
+    assert seen == {"pid": "pos-PG", "reason": "alpaca_bracket"}, seen
+    assert [m.payload["reason"] for m in out if m.kind == "close"] == ["alpaca_bracket"]
+
+
+def test_gap_check_leaves_a_flagged_row_alone_but_logs_the_read():
+    """Same -5% open as the TE-12 gap test; the flagged row gets no
+    tightened stop and no leg resync (either would plant the price stop
+    it does not have), but the gap is still SEEN in the log."""
+    rows = [{"id": "p1", "ticker": "AMZN", "user_id": "book-b",
+             "side": "long", "quantity": 5, "entry_price": 100.0,
+             "stop_price": 90.0, "target_price": 120.0,
+             "asset_type": "stock", "broker": "alpaca",
+             "source_payload": dict(_FLAG)}]
+    client = _Client({"paper_positions": rows})
+    got, logged = [], []
+
+    async def _cnd(tk, at):
+        return [_Candle(100.0), _Candle(95.0)]
+
+    async def _resync(row, new_stop=None, new_target=None, why="", *,
+                      user_id=None):
+        got.append(row["ticker"])
+        return True, "ok"
+
+    def _rec(event, ticker, **kw):
+        logged.append((event, ticker, kw.get("reason", "")))
+
+    at_open = datetime(2026, 9, 1, 13, 45, tzinfo=timezone.utc)
+    with _patched(pm, _utc_now=lambda: at_open, _GAP_DAY="",
+                  fetch_candles_for=_cnd), \
+            _patched(rsettings, _supabase=lambda: client), \
+            _patched(leg_sync, resync_alpaca_legs=_resync), \
+            _patched(alog, record=_rec):
+        _run(pm._gap_check_open_bell())
+    assert got == [], f"a flagged row was resynced: {got}"
+    assert client.updates == [], client.updates
+    assert any(e == "gap_check" and t == "AMZN" and "no_price_stop" in r
+               for e, t, r in logged), logged
+
+
+def test_pre_break_review_lets_a_flagged_red_row_ride_by_flag_not_by_name():
+    """Two red 'momentum' rows on a break's eve -- neither matches the
+    long-term name list. The ordinary one is sold into the break; the
+    flagged one rides, because the flag is the contract."""
+    # stop 40 < entry 50: NOT profit-locked, so the review's only reasons
+    # to let a red row ride are the long-term name list or the flag.
+    rows = [_row_for("book-a", "KO", stop_price=40.0),
+            _row_for("book-a", "PG", stop_price=40.0, source_payload=dict(_FLAG))]
+    client = _Client({"paper_positions": rows})
+    logged = []
+
+    async def _brk():
+        return 3
+
+    async def _cnd(tk, at):
+        return [_Candle(10.0)]           # red: 10 vs entry 50
+
+    def _rec(event, ticker, **kw):
+        logged.append((event, ticker, kw.get("reason", "")))
+
+    eve = datetime(2026, 9, 4, 18, 30, tzinfo=timezone.utc)
+    with _patched(pm, _utc_now=lambda: eve, _PRE_BREAK_DAY="",
+                  fetch_candles_for=_cnd), \
+            _patched(options_scanner, _multi_day_break=_brk), \
+            _patched(rsettings, _supabase=lambda: client), \
+            _patched(alog, record=_rec):
+        _run(pm._pre_break_review())
+    assert client.updates == [("paper_positions", {"close_requested": True})], (
+        client.updates)
+    rode = [t for e, t, r in logged if e == "preholiday_review" and "rides" in r]
+    sold = [t for e, t, r in logged if e == "preholiday_review" and "selling" in r]
+    assert rode == ["PG"] and sold == ["KO"], logged
+
+
+def test_the_flag_is_selected_and_consulted_where_it_is_read():
+    """BUILT BUT NOT BOUND guard. The predicate is only as good as the
+    SELECT that feeds it: every query the monitor and book_health read
+    rows from must name source_payload, and the per-row decision must
+    reach the sites it gates."""
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "app/agents/position_monitor.py").read_text(
+        encoding="utf-8", errors="replace")
+    for anchor in ('"asset_type, broker, strategy, source_payload"',   # pre-break
+                   '"asset_type, broker, source_payload"',             # gap check
+                   'close_requested, source_payload")',                # the tick
+                   "_nps = _is_no_price_stop(r)",
+                   "if reeval_is_enabled() and not _nps:",
+                   "if close_reason is None and not _nps:",
+                   'if at == "stock" and not _nps:',
+                   "elif _nps:"):
+        assert anchor in src, f"position_monitor lost: {anchor}"
+    bh_src = (root / "app/agents/book_health.py").read_text(
+        encoding="utf-8", errors="replace")
+    assert "stop_price, asset_type, source_payload" in bh_src
+    assert "_is_no_price_stop(r)" in bh_src
+
+
+# =======================================================================
+# REVIEW :28/:1545: the inline binding does not outlive the loop
+# =======================================================================
+
+def test_the_tick_clears_its_inline_binding_when_the_loop_is_done():
+    rows = [_row_for("book-b", "KO", quantity=1)]
+    client = _Client({"paper_positions": rows})
+    agent = pm.PositionMonitorAgent()
+    with _registry(_two_books()), \
+            _real_tick(client, 55.0, reeval_is_enabled=lambda: False):
+        _run(agent.tick())
+        left = accounts._active.get()
+    assert left is None, f"the last row's book stayed bound: {left}"
 
 
 if __name__ == "__main__":

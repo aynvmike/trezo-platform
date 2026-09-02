@@ -184,13 +184,35 @@ async def _alpaca_rows(sym: str) -> list:
         return []
 
 
+def _alpaca_answered(sym: str) -> bool:
+    """Did Alpaca ANSWER for `sym` on this pass -- even with an empty
+    calendar? dividend_history returns [] for "pays nothing" and for
+    "call failed" alike, but corporate_actions caches ONLY successful
+    reads, so a FRESH cache entry right after _alpaca_rows() is proof of
+    an answer. Review 2026-09-01 (rv:data-lane, :191): without this a
+    genuine non-payer was indistinguishable from an outage and, with no
+    Alpha Vantage key (or its 25/day spent), warned 'unresolved' every
+    15 minutes and was never cached for the day. Read-only peek; any
+    surprise (module shape, missing cache) reads as "not answered", which
+    is the old behaviour."""
+    try:
+        from app.data import corporate_actions as _ca
+        hit = _ca._cache.get(sym)
+        return bool(hit) and (time.time() - hit[1]) < _ca._CACHE_TTL
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _fetch_history(sym: str) -> tuple:
     """(rows, ok). `ok` is True only when SOME source answered; a chain
-    that produced nothing but silence is a failed read (AV-4)."""
+    that produced nothing but silence is a failed read (AV-4). An Alpaca
+    answer of "no cash dividends" counts as an answer once the keyed
+    fallbacks (Finnhub, Alpha Vantage) have also had their turn."""
     # 1. Alpaca corporate actions -- the in-repo source of record (AV-2).
     rows = parse_corporate_actions(sym, await _alpaca_rows(sym))
     if rows:
         return rows, True
+    alpaca_answered = _alpaca_answered(sym)
 
     s = get_settings()
 
@@ -223,7 +245,11 @@ async def _fetch_history(sym: str) -> tuple:
         log.warning("dividend_schedule.alpha_vantage_failed",
                     symbol=sym, reason=reason)
 
-    return [], False
+    # Nothing from any fallback. If Alpaca itself answered "no cash
+    # dividends", that IS the day's answer (a confirmed non-payer), not a
+    # failed read -- cache it and stop re-asking. Silence everywhere is
+    # still a failed read.
+    return [], alpaca_answered
 
 
 async def ex_dividend_history(symbol: str) -> list:

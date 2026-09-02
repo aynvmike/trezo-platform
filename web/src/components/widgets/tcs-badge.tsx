@@ -3,12 +3,16 @@
 import { cn } from "@/lib/utils";
 
 /**
- * TCS badge — color-codes a Trade Confidence Score (0-1000) by tier.
+ * TCS badge — color-codes a Trade Confidence Score (0-100) by tier.
  *
- *  - 0-499:    grey (no signal)
- *  - 500-649:  amber (watch)
- *  - 650-799:  weave (good)
- *  - 800-1000: treasure (strong)
+ * EQ-5 (rv:scanners-scale, 2026-09-01): the engine moved TCS to ONE
+ * 0-100 scale on 2026-07-08 (patterns/scoring.py). The tiers here were
+ * still 800/650/500, so every live pattern score rendered "weak".
+ *
+ *  - 0-49:   grey (no signal)
+ *  - 50-64:  amber (watch)
+ *  - 65-79:  weave (good)
+ *  - 80-100: treasure (strong)
  */
 export function TcsBadge({
   tcs,
@@ -20,7 +24,7 @@ export function TcsBadge({
   label?: string;
 }) {
   const tier =
-    tcs >= 800 ? "strong" : tcs >= 650 ? "good" : tcs >= 500 ? "watch" : "weak";
+    tcs >= 80 ? "strong" : tcs >= 65 ? "good" : tcs >= 50 ? "watch" : "weak";
 
   const palette: Record<typeof tier, string> = {
     strong: "bg-treasure-200 text-treasure-800 ring-treasure-300",
@@ -36,7 +40,7 @@ export function TcsBadge({
         palette[tier],
         size === "sm" ? "px-2 py-0.5 text-[10px]" : "px-2.5 py-1 text-xs"
       )}
-      title={label ?? `Trade Confidence Score ${tcs}/1000`}
+      title={label ?? `Trade Confidence Score ${tcs}/100`}
     >
       {label && <span className="font-sans text-[10px] uppercase tracking-widest opacity-70">{label}</span>}
       <span>{tcs}</span>

@@ -14,6 +14,10 @@ constant, and check what actually leaves the agent on the bus.
   MIG-02 the KINDRIP bridge selected profiles.full_name/email, neither
          of which exists; the error was swallowed and every draft
          instruction was stamped 'Trezo Parent'.
+  TE-06  the lane's activation switch: the signal carries `tcs` if and
+         only if Settings.trezo_dividend_lt_tcs is > 0 (TREZO_DIVIDEND_LT_TCS
+         in agents/.env). At 0 the lane stays dark exactly as before;
+         no_price_stop and max_notional ride on every signal either way.
 
 Plain zero-arg test_ functions, no pytest, no fixtures, no network, no
 .env -- this file must run under tests/run_all.py.
@@ -161,13 +165,57 @@ def test_ladder_signal_direction_is_bullish_not_long():
         assert m.payload["user_id"] == "book-1"
 
 
-def test_ladder_signal_carries_no_tcs_until_neq_05_is_fixed():
-    """TE-06 is deliberately NOT done: a tcs would switch the lane on and,
-    with NEQ-05 unfixed, put a 5% price stop on every ladder name."""
+# --- TE-06: the activation switch ------------------------------------------
+
+class _Cfg:
+    """A stand-in for the pydantic Settings object: only the attributes
+    a case sets exist on it, so 'field absent' is a real case."""
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_ladder_signal_carries_tcs_iff_the_switch_is_on():
+    """tcs present <=> Settings.trezo_dividend_lt_tcs > 0. The dark cases
+    (0, absent, junk, negative) must leave NO tcs key -- Risk Manager
+    reads payload.get('tcs', 0), so the lane stays dark exactly as it
+    did before the switch existed."""
     verdicts = {"PG": _verdict("PG", "Staples")}
-    out = _tick([], ["PG"], verdicts)
-    for m in _signals(out):
-        assert "tcs" not in m.payload, "TE-06 landed without NEQ-05"
+    cases = [
+        (_Cfg(trezo_dividend_lt_tcs=0), None),
+        (_Cfg(), None),                                  # older config
+        (_Cfg(trezo_dividend_lt_tcs=None), None),
+        (_Cfg(trezo_dividend_lt_tcs="junk"), None),
+        (_Cfg(trezo_dividend_lt_tcs=-5), None),
+        (_Cfg(trezo_dividend_lt_tcs=60), 60),
+        (_Cfg(trezo_dividend_lt_tcs="55"), 55),          # env strings
+    ]
+    for cfg, want in cases:
+        with _patched(agent_mod, get_settings=lambda cfg=cfg: cfg):
+            out = _tick([], ["PG"], verdicts)
+        sigs = _signals(out)
+        assert sigs, f"no signal left the agent for {cfg.__dict__}"
+        for m in sigs:
+            if want is None:
+                assert "tcs" not in m.payload, (cfg.__dict__, m.payload)
+            else:
+                assert m.payload["tcs"] == want, (cfg.__dict__, m.payload)
+            # The contract rides on every signal, switch or no switch.
+            assert m.payload["no_price_stop"] is True, m.payload
+            assert m.payload["max_notional"] > 0, m.payload
+            assert m.payload["strategy"] == "dividend_lt"
+
+
+def test_the_switch_is_a_real_settings_field_read_by_name():
+    """BUILT BUT NOT BOUND guard: _lane_tcs reads
+    Settings.trezo_dividend_lt_tcs; the pydantic field must exist so
+    TREZO_DIVIDEND_LT_TCS in agents/.env actually reaches it."""
+    cfg = (Path(__file__).resolve().parents[1] / "app/config.py").read_text(
+        encoding="utf-8", errors="replace")
+    assert "trezo_dividend_lt_tcs: int = 0" in cfg, (
+        "Settings has no trezo_dividend_lt_tcs field -- the switch is dead")
+    src = Path(agent_mod.__file__).read_text(encoding="utf-8", errors="replace")
+    assert 'getattr(get_settings(), "trezo_dividend_lt_tcs", 0)' in src
+    assert "TREZO_DIVIDEND_LT_TCS" in src, "the switch is not documented"
 
 
 # --- TE-07: ladder count ----------------------------------------------------

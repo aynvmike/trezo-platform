@@ -14,9 +14,16 @@ every sweep -- 232 churn rows, phantom collateral on acct3.
 What these pin:
   * every broker read happens INSIDE that book's binding,
   * an unresolvable book is skipped with a logged reason (never the
-    primary's numbers),
-  * a failed (None) read writes nothing,
+    primary's numbers) -- and skipped BEFORE binding, without a
+    route_mismatch record, which is reserved for a known book bound
+    wrong (rv:stocks_reconcile :590),
+  * a failed (None) read writes nothing -- on the stock pass too, which
+    now uses the STRICT read (rv:bound-hunter :136),
   * a leg already open in the real ledger is never re-imported,
+  * the integrity sweep ADOPTS before it imports, so a broker-held leg
+    lands in paper_positions once, not in two tables with two managers
+    (rv:stocks_reconcile :664),
+  * the oversell cover names its book (rv:position_monitor :182),
   * a ghost close resets ONLY that book's reject window.
 
 The code under test is the REAL module (loaded via _bootstrap.load_module);
@@ -37,6 +44,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
 
 stub_config()
+# app.runtime must be stubbed BEFORE position_monitor imports
+# app.runtime.asset_policy, or the real package __init__ boots the bus.
+load_module("app.runtime.asset_policy")
 alp = load_module("app.brokers.alpaca")
 accounts = load_module("app.brokers.accounts")
 route_guard = load_module("app.brokers.route_guard")
@@ -44,29 +54,55 @@ web_tokens = load_module("app.integrations.web_tokens")
 book_scope = load_module("app.runtime.book_scope")
 killswitch = load_module("app.paper.killswitch")
 sr = load_module("app.paper.stocks_reconcile")
+adoption = load_module("app.paper.adoption")
+pm = load_module("app.agents.position_monitor")
 
 import supabase  # noqa: E402  -- real package; only create_client is swapped
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+_MISSING = object()
 
 
 @contextlib.contextmanager
 def _patched(mod, **attrs):
-    """Swap module attributes and always put the originals back."""
-    old = {k: getattr(mod, k, None) for k in attrs}
+    """Swap module attributes and always put the originals back. Sentinel
+    based (rv:test-contract): a real attribute whose value is None is
+    restored as None, never deleted."""
+    old = {k: getattr(mod, k, _MISSING) for k in attrs}
     try:
         for k, v in attrs.items():
             setattr(mod, k, v)
         yield
     finally:
         for k, v in old.items():
-            if v is None:
+            if v is _MISSING:
                 if hasattr(mod, k):
                     delattr(mod, k)
             else:
                 setattr(mod, k, v)
+
+
+@contextlib.contextmanager
+def _no_activity_files():
+    """activity_log.record writes jsonl side-files unless told not to."""
+    import os
+    _prev = os.environ.get("TREZO_ACTIVITY_LOG")
+    os.environ["TREZO_ACTIVITY_LOG"] = "0"
+    try:
+        yield
+    finally:
+        if _prev is None:
+            os.environ.pop("TREZO_ACTIVITY_LOG", None)
+        else:
+            os.environ["TREZO_ACTIVITY_LOG"] = _prev
 
 
 # --- a tiny in-memory Supabase stand-in -----------------------------------
@@ -444,7 +480,7 @@ def test_a_ghost_close_resets_only_that_books_reject_window():
                       should_skip_unresolved=lambda uid: False), \
              _patched(book_scope, verify=lambda uid: (True, "ok"),
                       invalidate=lambda uid=None: None), \
-             _patched(alp, get_positions=_positions,
+             _patched(alp, get_positions_strict=_positions,
                       get_recent_closed_orders=_no_orders,
                       alpaca_configured=lambda: True), \
              _patched(killswitch,
@@ -481,6 +517,226 @@ def test_reset_broker_rejects_with_a_book_leaves_other_books_alone():
     finally:
         ts.clear()
         ts.update(saved)
+
+
+# --- rv:stocks_reconcile :590 -- unresolved books skip BEFORE binding ---------
+
+def test_balance_reconcile_skips_an_unresolved_book_before_binding_quietly():
+    """A sim / paper-only paper_accounts row under multi-account is not a
+    book. It is skipped before bind_for_user, with a plain reason and NO
+    route_mismatch record -- that record is for a known book bound wrong
+    and was firing hourly for every such row."""
+    binder = _Binder()
+    reads: list = []
+    mismatches: list = []
+
+    async def _get_account(token=None):
+        reads.append(binder.bound)
+        return _Acct(BROKER_CASH.get(binder.bound, 5000.0))
+
+    client = FakeClient({"paper_accounts": [
+        {"user_id": u, "current_cash_usd": 1.0}
+        for u in ["primary-book", "sim-row"]]})
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder,
+                  should_skip_unresolved=lambda uid: uid == "sim-row"), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda t, uid, note, where:
+                  mismatches.append((uid, where))), \
+         _patched(alp, get_account=_get_account,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.reconcile_account_balances_all_users())
+
+    assert binder.seen == ["primary-book"], binder.seen
+    assert reads == ["primary-book"], reads
+    assert mismatches == [], mismatches
+    assert out["skipped"] == [{"user_id": "sim-row",
+                               "reason": "unresolved book"}], out
+    touched = [w["eq"][0][1] for w in client.writes]
+    assert touched == ["primary-book"], touched
+
+
+def test_orphan_import_skips_an_unresolved_book_before_binding_quietly():
+    binder = _Binder()
+    reads = {"n": 0}
+    mismatches: list = []
+
+    async def _opts(token=None):
+        reads["n"] += 1
+        return _broker_rows()
+
+    client = FakeClient({"paper_accounts": [{"user_id": "sim-row"}],
+                         "options_positions": [], "paper_positions": []})
+    with _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, bind_for_user=binder,
+                  should_skip_unresolved=lambda uid: uid == "sim-row"), \
+         _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                  record_mismatch=lambda t, uid, note, where:
+                  mismatches.append((uid, where))), \
+         _patched(alp, get_option_positions_strict=_opts,
+                  alpaca_configured=lambda: True), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        out = _run(sr.import_orphan_options_all_users())
+    assert binder.seen == [] and reads["n"] == 0, (binder.seen, reads)
+    assert mismatches == [] and client.writes == []
+    assert out["details"] == [{"user_id": "sim-row",
+                               "skipped": "unresolved book"}], out
+
+
+# --- rv:bound-hunter :136 -- the stock pass reads STRICT ----------------------
+
+def _stock_tables(uid="acct2-book"):
+    return {
+        "paper_accounts": [{"user_id": uid}],
+        "paper_positions": [
+            {"id": 1, "user_id": uid, "ticker": "AMZN", "side": "long",
+             "quantity": 1, "entry_price": 100, "status": "open",
+             "asset_type": "stock"},
+            {"id": 2, "user_id": uid, "ticker": "SOFI", "side": "long",
+             "quantity": 5, "entry_price": 10, "status": "open",
+             "asset_type": "stock"},
+        ],
+    }
+
+
+@contextlib.contextmanager
+def _stock_seams(client, positions, **alp_extra):
+    async def _no_orders(sym, token=None):
+        return []
+
+    with _no_activity_files(), \
+         _patched(supabase, create_client=lambda *_a, **_k: client), \
+         _patched(accounts, set_account_for_user=lambda uid: True,
+                  should_skip_unresolved=lambda uid: False), \
+         _patched(book_scope, verify=lambda uid: (True, "ok"),
+                  invalidate=lambda uid=None: None), \
+         _patched(alp, get_positions_strict=positions,
+                  get_recent_closed_orders=_no_orders,
+                  alpaca_configured=lambda: True, **alp_extra), \
+         _patched(killswitch, reset_broker_rejects=lambda user_id=None: None), \
+         _patched(web_tokens, get_user_broker_token=_no_token):
+        yield
+
+
+def test_a_failed_stock_read_skips_the_book_and_closes_nothing():
+    """None is 'the read FAILED'. Before this the display read turned a
+    429 into [] and only trust_close stood between it and a phantom
+    close; now the book is skipped with a reason and nothing is written."""
+    async def _none(token=None):
+        return None
+
+    client = FakeClient(_stock_tables())
+    with _stock_seams(client, _none):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert client.writes == [], client.writes
+    assert out["closed"] == 0 and out["users_touched"] == 0, out
+    assert out["skipped"] == [{"user_id": "acct2-book",
+                               "reason": "broker read failed"}], out
+
+
+def test_the_stock_pass_never_calls_the_collapsing_read():
+    """Patch the display read to explode: the pass must not reach it."""
+    async def _boom(token=None):
+        raise AssertionError("get_positions() (non-strict) was called")
+
+    async def _strict(token=None):
+        return [{"symbol": "AMZN", "asset_class": "us_equity", "qty": "1",
+                 "avg_entry_price": "100"}]
+
+    client = FakeClient(_stock_tables())
+    with _stock_seams(client, _strict, get_positions=_boom):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert out["closed"] == 1, out          # SOFI is a real ghost
+
+
+# --- rv:position_monitor :182 -- the oversell cover names its book -----------
+
+def test_the_oversell_cover_is_throttled_under_the_rows_own_book():
+    """A negative stock qty at the broker is covered through
+    _throttled_liquidate; the call must carry THIS book's user_id so the
+    BI-05 throttle slot is the book's own, not the ContextVar's."""
+    calls: list = []
+
+    async def _neg(token=None):
+        return [{"symbol": "DRAM", "asset_class": "us_equity", "qty": "-2",
+                 "avg_entry_price": "20"}]
+
+    async def _no_open(path, token=None):
+        return []
+
+    async def _liq(symbol, asset_type="stock", user_id=None):
+        calls.append((symbol, asset_type, user_id))
+        return {"id": "cover"}, "ok"
+
+    client = FakeClient(_stock_tables(uid="acct3-book"))
+    with _stock_seams(client, _neg, _get=_no_open), \
+         _patched(pm, _throttled_liquidate=_liq):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert calls == [("DRAM", "stock", "acct3-book")], calls
+    assert out["closed"] == 0, "a short is never reconciled as a long row"
+
+
+# --- rv:stocks_reconcile :664 -- the sweep adopts BEFORE it imports ----------
+
+def test_the_integrity_sweep_adopts_before_it_imports_orphans():
+    """Drives the real run_integrity_sweep and the real orphan importer.
+    Adoption (stubbed at its seam) writes the broker-held leg into
+    paper_positions FIRST; the importer then sees the ledger row and
+    imports nothing into options_positions -- one contract, one manager."""
+    import os
+    order: list = []
+    binder = _Binder()
+    client = FakeClient({
+        "paper_accounts": [{"user_id": "acct3-book"}],
+        "options_positions": [],
+        "paper_positions": [],
+    })
+
+    async def _balances():
+        order.append("balances")
+        return {"ok": True, "synced": 0}
+
+    async def _stocks():
+        order.append("stocks")
+        return {"ok": True, "closed": 0}
+
+    async def _adopt(*, dry_run=False):
+        order.append("adopted")
+        client.tables["paper_positions"].append(
+            {"user_id": "acct3-book", "ticker": OCC_ORPHAN,
+             "status": "open", "asset_type": "option"})
+        return {"ok": True, "adopted": 1}
+
+    async def _opts(token=None):
+        order.append("options-read")
+        return [_broker_rows()[1]]            # the PG contract only
+
+    _prev = os.environ.get("TREZO_ADOPT_ORPHANS")
+    os.environ["TREZO_ADOPT_ORPHANS"] = "1"
+    try:
+        with _patched(sr, reconcile_account_balances_all_users=_balances,
+                      reconcile_stocks_all_users=_stocks), \
+             _patched(adoption, adopt_all_books=_adopt), \
+             _patched(supabase, create_client=lambda *_a, **_k: client), \
+             _patched(accounts, bind_for_user=binder), \
+             _patched(route_guard, check_route=lambda uid: (True, "ok"),
+                      record_mismatch=lambda *a, **k: None), \
+             _patched(alp, get_option_positions_strict=_opts,
+                      alpaca_configured=lambda: True), \
+             _patched(web_tokens, get_user_broker_token=_no_token):
+            out = _run(sr.run_integrity_sweep())
+    finally:
+        if _prev is None:
+            os.environ.pop("TREZO_ADOPT_ORPHANS", None)
+        else:
+            os.environ["TREZO_ADOPT_ORPHANS"] = _prev
+
+    assert order == ["balances", "stocks", "adopted", "options-read"], order
+    assert list(out) == ["ok", "balances", "stocks", "adopted", "options"], list(out)
+    assert out["options"]["imported"] == 0, out["options"]
+    inserts = [w for w in client.writes if w["op"] == "insert"]
+    assert inserts == [], "the adopted leg was imported a second time"
 
 
 if __name__ == "__main__":

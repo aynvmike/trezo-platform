@@ -28,6 +28,7 @@ import { SignalTracePanel } from "@/components/dashboard/signal-trace-panel";
 import { TodaysExecutionFeed } from "@/components/dashboard/todays-execution-feed";
 import { BotSettingsPanel } from "@/components/dashboard/bot-settings-panel";
 import { LoadError, LoadErrors, loadResult, failuresOf } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 import { requestClose } from "./_actions";
 
 export const dynamic = "force-dynamic";
@@ -167,16 +168,24 @@ export default async function PaperPage() {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/paper");
 
+  // rv:web-pages (Overview MAJOR, swept here): book tables are keyed by
+  // BOOK since 0047; resolve the person's books and read across them.
+  const booksLoad = await getOwnerBookKeys(supabase, user.id);
+  const keys = bookQueryKeys(booksLoad.data);
+
   const [accountRes, openRes, closedRes, msgsRes, alpaca, advice, botRes, profileRes] = await Promise.all([
-    supabase.from("paper_accounts").select("*").eq("user_id", user.id).maybeSingle(),
+    supabase
+      .from("paper_accounts")
+      .select("current_cash_usd, vault_balance_usd, today_realized_pnl_usd")
+      .in("user_id", keys),
     supabase
       .from("paper_positions")
       .select("id, ticker, asset_type, side, quantity, entry_price, strategy, stop_price, target_price, entry_at")
-      .eq("user_id", user.id).eq("status", "open").order("entry_at", { ascending: false }),
+      .in("user_id", keys).eq("status", "open").order("entry_at", { ascending: false }),
     supabase
       .from("paper_positions")
       .select("id, ticker, side, entry_price, exit_price, realized_pnl_usd, status")
-      .eq("user_id", user.id).neq("status", "open").order("exit_at", { ascending: false }).limit(20),
+      .in("user_id", keys).neq("status", "open").order("exit_at", { ascending: false }).limit(20),
     supabase
       .from("agent_messages")
       .select("id, agent_name, kind, payload, created_at")
@@ -192,15 +201,24 @@ export default async function PaperPage() {
   // account + open-position reads feed every headline number, so if
   // either failed the trading view is replaced by the error card rather
   // than rendering a $0 / flat book.
-  const accountLoad = loadResult<Record<string, number> | null>("paper_accounts", accountRes);
+  type AcctRow = {
+    current_cash_usd: number | null;
+    vault_balance_usd: number | null;
+    today_realized_pnl_usd: number | null;
+  };
+  const accountLoad = loadResult<AcctRow[]>("paper_accounts", accountRes, []);
   const openLoad = loadResult<OpenPos[]>("paper_positions", openRes, []);
   const closedLoad = loadResult<ClosedPos[]>("paper_positions (closed)", closedRes, []);
   const msgsLoad = loadResult<MsgRow[]>("agent_messages", msgsRes, []);
   const botLoad = loadResult<{ auto_trade_enabled?: boolean } | null>("bot_settings", botRes);
   const profileLoad = loadResult<{ daily_loss_limit_usd?: number } | null>("profiles", profileRes);
-  const coreFailures = failuresOf(accountLoad, openLoad);
+  // A failed book resolution is a core failure: without the keys, every
+  // book read above is an empty read, not an empty book.
+  const coreFailures = failuresOf(booksLoad, accountLoad, openLoad);
   const sideFailures = failuresOf(closedLoad, msgsLoad, botLoad, profileLoad);
-  const account = accountLoad.data ?? null;
+  // One paper_accounts row per book -- the person's numbers are the sum.
+  const accounts = accountLoad.data ?? [];
+  const sumAcct = (k: keyof AcctRow) => accounts.reduce((s, a) => s + Number(a[k] ?? 0), 0);
   const open = openLoad.data ?? [];
   const closed = closedLoad.data ?? [];
   const fxSymbols = open
@@ -214,11 +232,11 @@ export default async function PaperPage() {
   const snapshotStale = !!alpaca?.stale;
   const snapshotAsOf = alpaca?.cached_at ?? null;
   const aAcct = alpaca?.account;
-  const displayCash = alpacaActive ? Number(aAcct!.cash) : Number(account?.current_cash_usd ?? 0);
+  const displayCash = alpacaActive ? Number(aAcct!.cash) : sumAcct("current_cash_usd");
   const portfolioValue = alpacaActive
     ? Number(aAcct!.equity)
-    : Number(account?.current_cash_usd ?? 0) + Number(account?.vault_balance_usd ?? 0);
-  const todayPnl = Number(account?.today_realized_pnl_usd ?? 0);
+    : sumAcct("current_cash_usd") + sumAcct("vault_balance_usd");
+  const todayPnl = sumAcct("today_realized_pnl_usd");
 
   const apos = (alpaca?.positions ?? []) as AlpacaPosition[];
   const findAp = (sym: string): AlpacaPosition | undefined => {

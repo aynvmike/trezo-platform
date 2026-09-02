@@ -36,7 +36,13 @@ ks = load_module("app.paper.killswitch")
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    # rv:test-contract :38 -- close the loop; a fresh loop per call that is
+    # never closed leaks and emits ResourceWarnings as the suite grows.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 @contextlib.contextmanager

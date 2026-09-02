@@ -72,7 +72,15 @@ def _agent_with_probe():
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # GATE-07 (audit 2026-09-01): get_event_loop() is deprecated with no
+    # running loop (DeprecationWarning under pytest, an error in a future
+    # Python) and silently reused whatever loop an earlier suite left in
+    # run_all's single process. Fresh loop per call, always closed.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # --- the rules -------------------------------------------------------------

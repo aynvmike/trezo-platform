@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 import { TrimDialog } from "./trim-dialog";
 import { OptionsTrimButton } from "./options-trim-button";
 
@@ -73,12 +74,15 @@ export async function ExitAdvisorAlerts() {
   // advisories only while FRESH -- after 45 minutes they live on in the
   // backend audit table (plus the activity log) instead of the screen.
   const freshCutoff = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  // rv:web-pages sweep: exit_advisor_alerts is keyed by BOOK (0047); an
+  // urgent alert on the 75k book must reach the person who owns it.
+  const books = await getOwnerBookKeys(supabase, user.id);
   const { data: rows } = await supabase
     .from("exit_advisor_alerts")
     .select(
       "id, ticker, alert_kind, severity, message, current_price, peak_price, giveback_pct, unrealized_pnl_usd, raised_at, position_id"
     )
-    .eq("user_id", user.id)
+    .in("user_id", bookQueryKeys(books.data))
     .is("acknowledged_at", null)
     .or(`severity.eq.urgent,raised_at.gte.${freshCutoff}`)
     .order("severity", { ascending: false })

@@ -1,5 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
+import { LoadError } from "@/components/dashboard/load-error";
+import { getOwnerBookKeys, bookQueryKeys } from "@/lib/books";
 
 type Row = {
   id: string;
@@ -58,14 +60,23 @@ export async function OpenOptionsTable() {
   } = await supabase.auth.getUser();
   if (!user) return null;
 
-  const { data: rowsRaw } = await supabase
+  // rv:web-pages sweep: options_positions is keyed by BOOK (0047); show
+  // every book the person owns. A failed read (books or rows) renders as
+  // a failure, not as the EmptyCard.
+  const books = await getOwnerBookKeys(supabase, user.id);
+  const { data: rowsRaw, error } = await supabase
     .from("options_positions")
     .select(
       "id, underlying, strategy, option_type, strike, expiration, contracts, net_premium_usd, status, opened_at"
     )
-    .eq("user_id", user.id)
+    .in("user_id", bookQueryKeys(books.data))
     .eq("status", "open")
     .order("opened_at", { ascending: false });
+  if (books.failure) return <LoadError {...books.failure} />;
+  if (error) {
+    console.error(`[load] options_positions: ${error.message}`);
+    return <LoadError table="options_positions" message={error.message} />;
+  }
 
   const rows = (rowsRaw ?? []) as Row[];
 

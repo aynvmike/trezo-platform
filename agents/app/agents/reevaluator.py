@@ -207,12 +207,22 @@ async def _log(emit, agent_name, user_id, ticker, action, reason) -> None:
 
 def _collapse_bar(user_id):
     """This book's TCS entry bar (0-100) for the collapse check, or None
-    when the settings read raises. G4: None means "do not judge" -- the
-    caller skips the collapse check rather than closing on a data
-    failure. A row with no threshold set falls to the 70 default."""
+    when the bar is UNKNOWN. G4: None means "do not judge" -- the caller
+    skips the collapse check rather than closing on a data failure.
+
+    REVIEW reevaluator.py:215 (2026-09-01): get_bot_settings() never
+    raises -- on a missing client, a query failure or no row it caches
+    and returns the shared _DEFAULTS (bar 70). So the old `except` never
+    fired and a DB blip judged a book at 50 against 70, closing on a TCS
+    the book's real bar would have kept. settings.is_fallback_settings()
+    tells that answer from a real row; a fallback is None here. A REAL
+    row whose threshold is unset still falls to the 70 default."""
     try:
-        from app.runtime.settings import get_bot_settings
-        return int(get_bot_settings(user_id).tcs_threshold or 70)
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        bs = get_bot_settings(user_id)
+        if is_fallback_settings(bs):
+            return None
+        return int(bs.tcs_threshold or 70)
     except Exception:  # noqa: BLE001
         return None
 
@@ -341,8 +351,8 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
                               + ((f"; fresh TCS {fresh_tcs} vs bar {_thr}"
                                   if _thr is not None else
                                   f"; fresh TCS {fresh_tcs}, bar UNKNOWN "
-                                  "(settings read failed) -- collapse "
-                                  "check skipped")
+                                  "(settings read failed or fell back to "
+                                  "defaults) -- collapse check skipped")
                                  if fresh_tcs is not None else "")
                               + (" -- thesis COLLAPSED" if collapsed else "")),
                       extra={"user_id": str(user_id or "shared")})

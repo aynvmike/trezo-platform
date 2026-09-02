@@ -3,13 +3,16 @@
 Mike, 2026-08-18: "I also do not think the agents are responding to each
 book's own setting." He was right, and this is where it went wrong.
 
-Scanners run once for the platform, not once per book. A scanner reads
-`get_bot_settings()` with no argument -- the global row -- to decide
-whether its strategy is on and what TCS floor to use. Risk Manager then
-scores the signal against `get_bot_settings(payload.user_id)`, and a
-scanner signal has no user_id, so that is the global row too. Only then
-does Trade Execution fan the approved signal out across every book in
-paper_accounts.
+Scanners run once for the platform, not once per book. A scanner used to
+read `get_bot_settings()` with no argument -- the global row -- to decide
+whether its strategy is on and what TCS floor to use, and Risk Manager
+then scored the signal against `get_bot_settings(payload.user_id)`, which
+for a scanner signal (no user_id) was the global row too. Only then did
+Trade Execution fan the approved signal out across every book in
+paper_accounts. (BI-03, 2026-09-01: scanners and the risk gate now judge
+an unscoped signal at the LOWEST enabled book's floor -- as permissive as
+the most permissive book -- precisely so that the per-book floor applied
+HERE is the one that binds.)
 
 The result: one book's toggles decided for all of them. Turning crypto
 off on the 25k book did nothing, because the primary's crypto_enabled

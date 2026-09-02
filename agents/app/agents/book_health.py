@@ -38,6 +38,12 @@ unmanaged position -- it is the crumb a fractional close leaves behind
 -- and is skipped. A row whose market_value is MISSING or unparseable
 still flags: a failed read must never read as "nothing there".
 
+No price stop (NEQ-05 / G3): a ledger row whose source_payload carries
+`no_price_stop` is a screen-managed hold (the dividend ladder). It has
+no price stop BY CONTRACT, so invariant 2 -- "past its own stop and
+still open" -- does not apply to it and must not alarm on it. The one
+predicate lives in position_monitor._is_no_price_stop.
+
 Findings go out through app.runtime.alerts, which is the channel this
 platform did not have. Detection was never the problem.
 """
@@ -167,9 +173,11 @@ class BookHealthAgent(Agent):
             return findings
 
         def _open():
+            # NEQ-05: source_payload is selected so the no_price_stop
+            # exemption in invariant 2 can actually read the flag.
             return (client.table("paper_positions")
                     .select("id, ticker, side, quantity, entry_price, "
-                            "stop_price, asset_type")
+                            "stop_price, asset_type, source_payload")
                     .eq("user_id", uid).eq("status", "open").execute())
         rows = (await self._thread(_open)).data or []
         have = {(str(r.get("ticker") or "").upper(),
@@ -222,8 +230,15 @@ class BookHealthAgent(Agent):
                          f"matching open row.", severity="good", key="")
 
         # ---- INVARIANT 2: an open position past its own stop ---------
+        # NEQ-05 / G3: the ONE predicate the monitor uses, so this check
+        # and the monitor's exemption can never disagree about a row.
+        # Imported here, not at module top: position_monitor is heavy and
+        # this agent must stay importable on its own.
+        from app.agents.position_monitor import _is_no_price_stop
         past: list[str] = []
         for r in rows:
+            if _is_no_price_stop(r):
+                continue      # NEQ-05: no price stop by contract -> no alarm
             try:
                 stop = float(r.get("stop_price") or 0)
             except (TypeError, ValueError):

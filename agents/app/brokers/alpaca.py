@@ -1332,6 +1332,35 @@ async def submit_market_sell(
     })
 
 
+async def submit_market_buy(
+    symbol: str, qty: float, *, time_in_force: str = "day",
+    token: Optional["UserToken"] = None,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Plain market BUY -- NO bracket legs (NEQ-05 / G3, 2026-09-01).
+
+    The dividend-ladder lane holds through drawdowns by design: its exits
+    are the spec's (cut, payout breach, recycling ratio), not a price. A
+    bracket would plant a stop and a target the lane never asked for, so
+    its entries go in as a bare market buy and position_monitor honours
+    the row's no_price_stop. The mirror of submit_market_sell above, with
+    the per-user token the stock path resolves. Whole shares only; DAY
+    time-in-force (a resting GTC market buy is never wanted). Returns
+    (order, None) or (None, error) -- never raises."""
+    try:
+        shares = int(qty)
+    except (TypeError, ValueError):
+        return None, "Invalid quantity"
+    if shares < 1:
+        return None, "Quantity rounds to zero shares"
+    return await _post("/v2/orders", {
+        "symbol": symbol.upper(),
+        "qty": str(shares),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": (time_in_force or "day").strip().lower(),
+    }, token=token)
+
+
 def _equity_sell_tif(qty: float) -> str:
     """GTC for whole shares; DAY when the quantity is fractional.
 

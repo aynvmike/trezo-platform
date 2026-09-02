@@ -28,6 +28,15 @@
 --    So this is added SAFELY: a diagnostic first, then NOT VALID (so the
 --    constraint definition lands without scanning), then VALIDATE (which
 --    scans and FAILS LOUDLY on a mismatch, rolling the whole file back).
+--    ON DELETE RESTRICT, not CASCADE (review 2026-09-01, :108): with
+--    0047's CASCADE from trading_accounts to every book table, a CASCADE
+--    here would let ONE click in the Supabase Auth dashboard (delete the
+--    owner) hard-delete all three paper books' positions, trades and
+--    outcomes in a single statement. RESTRICT gives the same integrity
+--    guarantee (no orphan can be created) and turns that click into a
+--    refusal: delete the accounts deliberately first, then the person.
+--    Idempotent: a database that already carries the CASCADE form of
+--    this constraint from an earlier draft is re-pointed to RESTRICT.
 --
 -- Apply by hand in the Supabase SQL editor (whole file at once).
 
@@ -105,11 +114,25 @@ begin
                    and conrelid = 'public.trading_accounts'::regclass) then
     alter table public.trading_accounts
       add constraint trading_accounts_owner_id_fkey
-      foreign key (owner_id) references auth.users(id) on delete cascade
+      foreign key (owner_id) references auth.users(id) on delete restrict
       not valid;
-    raise notice 'AUTH-05: trading_accounts_owner_id_fkey added NOT VALID';
+    raise notice 'AUTH-05: trading_accounts_owner_id_fkey added NOT VALID (ON DELETE RESTRICT)';
+  elsif exists (select 1 from pg_constraint
+                where conname = 'trading_accounts_owner_id_fkey'
+                  and conrelid = 'public.trading_accounts'::regclass
+                  and confdeltype = 'c') then
+    -- Earlier draft of this file used CASCADE (review 2026-09-01, :108):
+    -- re-point it so deleting the owner is refused, not fanned out into
+    -- every book table.
+    alter table public.trading_accounts
+      drop constraint trading_accounts_owner_id_fkey;
+    alter table public.trading_accounts
+      add constraint trading_accounts_owner_id_fkey
+      foreign key (owner_id) references auth.users(id) on delete restrict
+      not valid;
+    raise notice 'AUTH-05: trading_accounts_owner_id_fkey re-created as ON DELETE RESTRICT (was CASCADE)';
   else
-    raise notice 'AUTH-05: trading_accounts_owner_id_fkey already present';
+    raise notice 'AUTH-05: trading_accounts_owner_id_fkey already present (ON DELETE RESTRICT)';
   end if;
 end
 $auth05_add$;
@@ -119,8 +142,9 @@ alter table public.trading_accounts validate constraint trading_accounts_owner_i
 
 comment on constraint trading_accounts_owner_id_fkey on public.trading_accounts is
   'AUTH-05 (0060): the person at the root of the person -> accounts -> '
-  'books chain must exist. Delete a person and their accounts (and, via '
-  '0047, their books) go with them instead of lingering orphaned.';
+  'books chain must exist. ON DELETE RESTRICT: deleting the person is '
+  'refused while accounts (and, via 0047, books) still hang off them -- '
+  'remove the accounts deliberately first. No orphan, no one-click wipe.';
 
 -- Ledger (0058 convention).
 insert into public.schema_migrations (version, assumed, notes) values
