@@ -158,6 +158,35 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             if sym:
                 alpaca_by_sym[sym] = p
 
+        # The book's open stock rows, read up front so the oversell guard
+        # and the close pass agree on what a negative broker quantity IS.
+        def _trezo_open(uid=user_id):
+            return (
+                client.table("paper_positions")
+                .select(
+                    "id, ticker, side, quantity, entry_price, "
+                    "stop_price, target_price, strategy"
+                )
+                .eq("user_id", uid)
+                .eq("status", "open")
+                .eq("asset_type", "stock")
+                .execute()
+            )
+        trezo_rows = (await asyncio.to_thread(_trezo_open)).data or []
+        tracked_shorts = {
+            str(r.get("ticker") or "").upper() for r in trezo_rows
+            if str(r.get("side") or "long") == "short"
+        }
+        # 2026-09-02: a negative broker quantity that the ledger KNOWS as an
+        # open side='short' row is a deliberate short (a bearish scalp /
+        # extended entry the executor placed with a bracket), not a stale
+        # double-sell. Keep those in their own map so the close pass sees
+        # them as HELD; popping them (the previous behaviour) made every
+        # short row read as "broker no longer holds it" once an hour,
+        # close it with P/L unknown, and adoption re-created it minutes
+        # later -- thirty cycles per row before this was found.
+        alpaca_short_by_sym: dict = {}
+
         # OVERSELL GUARD (Mike 2026-07-22, the DRAM -2 incident): the
         # stock book is LONG-ONLY. A negative stock quantity at the
         # broker means stale exit orders double-sold (a GTC leg filled
@@ -170,6 +199,10 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
             except (TypeError, ValueError):
                 continue
             if _q_neg >= 0:
+                continue
+            if _sym_neg in tracked_shorts:
+                # Tracked short: held, not an accident. Not covered here.
+                alpaca_short_by_sym[_sym_neg] = alpaca_by_sym.pop(_sym_neg)
                 continue
             _st_n = "skipped"
             try:
@@ -212,21 +245,7 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
         # read is now None and skipped above; an EMPTY answer is kept as
         # a second net anyway -- a flat account at the open bell must
         # not phantom-close real rows (2026-06-15 fix).
-        trust_close = bool(alpaca_by_sym)
-
-        def _trezo_open(uid=user_id):
-            return (
-                client.table("paper_positions")
-                .select(
-                    "id, ticker, side, quantity, entry_price, "
-                    "stop_price, target_price, strategy"
-                )
-                .eq("user_id", uid)
-                .eq("status", "open")
-                .eq("asset_type", "stock")
-                .execute()
-            )
-        trezo_rows = (await asyncio.to_thread(_trezo_open)).data or []
+        trust_close = bool(alpaca_by_sym or alpaca_short_by_sym)
 
         updated = 0
         closed = 0
@@ -236,7 +255,12 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
         # 1) Close or patch existing Trezo rows.
         for r in trezo_rows:
             sym = str(r["ticker"]).upper()
-            ap = alpaca_by_sym.get(sym)
+            # Side-aware lookup: a short row is held by a NEGATIVE broker
+            # quantity, a long row by a positive one. Never cross them.
+            if str(r.get("side") or "long") == "short":
+                ap = alpaca_short_by_sym.get(sym)
+            else:
+                ap = alpaca_by_sym.get(sym)
             if ap is None:
                 # An empty or errored broker read must never be treated
                 # as a close (open-bell phantom-close race, 2026-06-15).

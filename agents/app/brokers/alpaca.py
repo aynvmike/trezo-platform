@@ -895,6 +895,29 @@ async def ratchet_stop(symbol: str, new_stop: float, *,
     return False, "no stop leg and no quantity to protect"
 
 
+async def _clamp_to_venue_qty(symbol: str, qty):
+    """Never ask the venue to sell more than it says it holds.
+
+    2026-09-02 (QYLD): the ledger stored 103.72347444 (8 dp, rounded UP
+    from the venue's 103.723474436), and the protective OCO 403'd with
+    "insufficient qty available" -- the QP-01 funnel on the STOCK side,
+    the same disease the crypto ratchet already guards against. Read the
+    position and, when the ledger asks for more than the venue holds,
+    submit the venue's OWN quantity string verbatim (no float re-round).
+    A failed read leaves qty untouched (the order then surfaces its own
+    error, honestly)."""
+    try:
+        bp = await _get(f"/v2/positions/{str(symbol).upper()}")
+        if isinstance(bp, dict) and bp.get("qty") is not None:
+            vq_s = str(bp.get("qty")).lstrip("-")
+            vq = float(vq_s)
+            if vq > 0 and float(qty) > vq:
+                return vq_s
+    except Exception:  # noqa: BLE001
+        pass
+    return qty
+
+
 async def ensure_stock_protection(
     symbol: str, qty: float, stop: float, target: Optional[float] = None,
 ) -> tuple[bool, str]:
@@ -932,6 +955,9 @@ async def ensure_stock_protection(
         if o.get("id"):
             await _delete(f"/v2/orders/{o.get('id')}")
     lost_target = bool(resting_sells)
+
+    # QP-01 (stock side): clamp to what the venue actually holds.
+    qty = await _clamp_to_venue_qty(sym, qty)
 
     if target and target > 0:
         _o, err = await submit_oco_sell(sym, qty, target, stop)

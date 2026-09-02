@@ -741,3 +741,81 @@ def test_the_integrity_sweep_adopts_before_it_imports_orphans():
 
 if __name__ == "__main__":
     sys.exit(run_tests(dict(vars())))
+
+
+# --- 2026-09-02: a TRACKED short is held, not a phantom and not a double-sell
+
+def test_a_tracked_short_is_held_not_closed_and_not_covered():
+    """XLF/XLP: side='short' ledger rows against a NEGATIVE broker quantity
+    were popped out of the holdings map, read as 'broker no longer holds
+    it', closed with P/L unknown, and re-adopted -- every hour. They must
+    read as HELD, and the oversell cover must leave them alone."""
+    calls: list = []
+
+    async def _short(token=None):
+        return [{"symbol": "XLF", "asset_class": "us_equity", "qty": "-340",
+                 "avg_entry_price": "57.53"}]
+
+    async def _liq(symbol, asset_type="stock", user_id=None):
+        calls.append((symbol, asset_type, user_id))
+        return {"id": "cover"}, "ok"
+
+    tables = {
+        "paper_accounts": [{"user_id": "acct3-book"}],
+        "paper_positions": [
+            {"id": 7, "user_id": "acct3-book", "ticker": "XLF", "side": "short",
+             "quantity": 340, "entry_price": 57.53, "status": "open",
+             "asset_type": "stock"},
+        ],
+    }
+    client = FakeClient(tables)
+    with _stock_seams(client, _short), _patched(pm, _throttled_liquidate=_liq):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert out["closed"] == 0, out
+    assert calls == [], f"a tracked short must not be covered: {calls}"
+    assert all("closed" not in str(w).lower() for w in client.writes), client.writes
+
+
+def test_an_untracked_negative_quantity_is_still_covered():
+    """The DRAM -2 case the guard was written for: no ledger row -> cover."""
+    calls: list = []
+
+    async def _neg(token=None):
+        return [{"symbol": "DRAM", "asset_class": "us_equity", "qty": "-2",
+                 "avg_entry_price": "20"}]
+
+    async def _no_open(path, token=None):
+        return []
+
+    async def _liq(symbol, asset_type="stock", user_id=None):
+        calls.append((symbol, asset_type, user_id))
+        return {"id": "cover"}, "ok"
+
+    client = FakeClient(_stock_tables(uid="acct3-book"))
+    with _stock_seams(client, _neg, _get=_no_open), _patched(pm, _throttled_liquidate=_liq):
+        _run(sr.reconcile_stocks_all_users())
+    assert calls == [("DRAM", "stock", "acct3-book")], calls
+
+
+def test_a_long_row_is_not_matched_by_a_short_broker_quantity():
+    """Side-aware lookup: a NEGATIVE broker qty never 'holds' a LONG row."""
+    async def _short(token=None):
+        return [{"symbol": "AMZN", "asset_class": "us_equity", "qty": "-1",
+                 "avg_entry_price": "100"},
+                {"symbol": "XLF", "asset_class": "us_equity", "qty": "5",
+                 "avg_entry_price": "57"}]
+
+    async def _no_open(path, token=None):
+        return []
+
+    calls: list = []
+
+    async def _liq(symbol, asset_type="stock", user_id=None):
+        calls.append(symbol)
+        return {"id": "cover"}, "ok"
+
+    client = FakeClient(_stock_tables())   # AMZN long 1, SOFI long 5, no short rows
+    with _stock_seams(client, _short, _get=_no_open), _patched(pm, _throttled_liquidate=_liq):
+        out = _run(sr.reconcile_stocks_all_users())
+    assert "AMZN" in calls                    # untracked negative -> covered
+    assert out["closed"] >= 1                 # AMZN long row is NOT held by -1 -> ghost-closed

@@ -203,3 +203,45 @@ def test_a_held_leg_with_no_status_is_still_kept():
 if __name__ == "__main__":
     import sys
     sys.exit(_bootstrap.run_tests(dict(vars())))
+
+
+def test_stock_protection_never_asks_for_more_than_the_venue_holds():
+    """QYLD 2026-09-02: ledger 103.72347444 (8dp round-up) vs venue 103.723474436."""
+    submitted = []
+
+    async def fake_get(path, **kw):
+        if path.startswith("/v2/orders"):
+            return []
+        if path.startswith("/v2/positions/QYLD"):
+            return {"symbol": "QYLD", "qty": "103.723474436"}
+        return None
+
+    async def fake_oco(sym, qty, target, stop):
+        submitted.append(("oco", sym, qty))
+        return {}, None
+
+    async def fake_stop(sym, qty, stop):
+        submitted.append(("stop", sym, qty))
+        return {}, None
+
+    with _patched(alpaca, _get=fake_get, submit_oco_sell=fake_oco, submit_stop_sell=fake_stop):
+        changed, note = _run(alpaca.ensure_stock_protection("QYLD", 103.72347444, 17.46, target=18.5))
+    assert changed is True, note
+    assert submitted and submitted[0][2] == "103.723474436", submitted
+
+
+def test_stock_protection_leaves_a_smaller_ledger_qty_alone():
+    submitted = []
+
+    async def fake_get(path, **kw):
+        if path.startswith("/v2/orders"):
+            return []
+        return {"symbol": "XLE", "qty": "12"}
+
+    async def fake_oco(sym, qty, target, stop):
+        submitted.append(qty)
+        return {}, None
+
+    with _patched(alpaca, _get=fake_get, submit_oco_sell=fake_oco):
+        _run(alpaca.ensure_stock_protection("XLE", 12, 60.86, target=67.26))
+    assert submitted == [12]
