@@ -313,7 +313,15 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         # setup is GONE -- rotate the capital instead of babysitting it.
         # Tunables: TREZO_REEVAL_TCS_RESCORE / TREZO_REEVAL_TCS_COLLAPSE_FRAC.
         try:
-            if (now - _hb_at.get(pid, 0.0)) >= 3600.0:
+            # First sight of a position re-scores IMMEDIATELY (default
+            # -3600, 2026-09-02): time.monotonic() counts from SYSTEM
+            # boot, so with a default of 0.0 a machine up less than an
+            # hour never passed this gate -- live that meant a freshly
+            # rebooted box silently skipped every thesis re-score for
+            # its first hour, and the deploy gate's collapse test failed
+            # on any runner younger than 3600s while passing everywhere
+            # else. Hourly per-position throttling is unchanged.
+            if (now - _hb_at.get(pid, now - 3600.0)) >= 3600.0:
                 _hb_at[pid] = now
                 fresh_tcs = None
                 if _settings_flag("trezo_reeval_tcs_rescore",
