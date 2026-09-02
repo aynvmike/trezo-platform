@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -234,6 +235,22 @@ def _npm_exe() -> str:
     return "npm.cmd" if sys.platform.startswith("win") else "npm"
 
 
+def _web_service_is_dev_mode() -> bool:
+    """True when the TrezoWeb service is launched with `next dev` / `npm run
+    dev`. Read from nssm's own AppParameters so the answer is the truth on
+    THIS host, not an assumption. Unreadable -> False (build path, as
+    before). Overridable with TREZO_WEB_MODE=dev|prod."""
+    forced = str(os.environ.get("TREZO_WEB_MODE", "")).strip().lower()
+    if forced in ("dev", "prod"):
+        return forced == "dev"
+    try:
+        out = _run([NSSM, "get", "TrezoWeb", "AppParameters"], timeout=30)
+        body = out.split("\n", 1)[1] if "\n" in out else out
+        return " dev" in f" {body.strip().lower()} " or "run dev" in body.lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _h_web_rebuild(args: dict) -> str:
     """AUDIT 2026-08-27: this used to restart TrezoWeb unconditionally
     after the build -- a failed `npm run build` restarted the site onto
@@ -242,6 +259,18 @@ def _h_web_rebuild(args: dict) -> str:
     no restart unless the build output says it compiled, and the refusal
     is stated in the row AND alerted."""
     web = REPO / "web"
+    if _web_service_is_dev_mode():
+        # 2026-09-02: a production build against a running `next dev`
+        # corrupts the dev server's .next and fails ("Cannot find module
+        # for page" while collecting page data) -- and the site serves
+        # raw HTML until the dev server restarts. For a dev-mode service
+        # the rebuild IS the restart: it recompiles from the source the
+        # deploy just pulled.
+        out = ("[exit 0]\nTrezoWeb runs in dev mode (next dev): skipped "
+               "`next build` (it would race the dev server's .next); "
+               "restarting so it recompiles from the pulled source.")
+        out += "\n" + _run([NSSM, "restart", "TrezoWeb"], timeout=300)
+        return out
     out = _run([_npm_exe(), "--prefix", str(web), "run", "build"], timeout=1800)
     ok = "[exit 0]" in out  # exit code only (2026-08-28): _run keeps the
         # LAST 4000 chars and Next prints "Compiled successfully" BEFORE an

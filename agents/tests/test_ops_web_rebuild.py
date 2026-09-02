@@ -63,7 +63,8 @@ def test_the_rebuild_spawns_the_resolved_executable_and_restarts_only_on_exit_ze
         calls.append(list(cmd))
         return "[exit 0]\nCompiled successfully" if cmd[1] == "--prefix" else "[exit 0]\nrestarted"
 
-    with _patched(relay, _npm_exe=lambda: r"C:\nodejs\npm.cmd", _run=fake_run, _tell=lambda *a, **k: None):
+    with _patched(relay, _npm_exe=lambda: r"C:\nodejs\npm.cmd", _run=fake_run, _tell=lambda *a, **k: None), \
+         _patched_dict(relay.os.environ, TREZO_WEB_MODE="prod"):
         out = relay._h_web_rebuild({})
     assert calls[0][0].endswith("npm.cmd"), calls[0]
     assert calls[0][1:3] == ["--prefix", str(relay.REPO / "web")]
@@ -79,7 +80,8 @@ def test_a_failed_build_never_restarts_the_site():
         calls.append(list(cmd))
         return "[exit 1]\nType error"
 
-    with _patched(relay, _npm_exe=lambda: "npm.cmd", _run=fake_run, _tell=lambda msg, **k: told.append(msg)):
+    with _patched(relay, _npm_exe=lambda: "npm.cmd", _run=fake_run, _tell=lambda msg, **k: told.append(msg)), \
+         _patched_dict(relay.os.environ, TREZO_WEB_MODE="prod"):
         out = relay._h_web_rebuild({})
     assert len(calls) == 1 and "NOT restarted" in out and told
 
@@ -203,3 +205,54 @@ def test_inline_kinds_still_release_the_latch_when_they_finish():
         assert relay._TICK_BUSY is False
     with _patched(relay, HANDLERS=dict(relay.HANDLERS)), _patched(_alog, record=lambda *a, **k: None):
         _run_loop(scenario())
+
+
+# ---- dev-mode service: rebuild == restart (2026-09-02) ----------------------
+
+def test_a_dev_mode_web_service_is_restarted_not_built():
+    calls = []
+
+    def fake_run(cmd, timeout=900, cwd=None):
+        calls.append(list(cmd))
+        if cmd[:2] == [relay.NSSM, "get"]:
+            return "[exit 0]\nC:\\Trezo\\trezo-platform\\web run dev"
+        return "[exit 0]\nrestarted"
+
+    with _patched(relay, _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
+         _patched_dict(relay.os.environ, TREZO_WEB_MODE=""):
+        out = relay._h_web_rebuild({})
+    assert not any("--prefix" in c for c in calls), f"next build must not run in dev mode: {calls}"
+    assert any(c[:3] == [relay.NSSM, "restart", "TrezoWeb"] for c in calls), calls
+    assert "dev mode" in out
+
+
+def test_a_prod_mode_web_service_still_builds_then_restarts():
+    calls = []
+
+    def fake_run(cmd, timeout=900, cwd=None):
+        calls.append(list(cmd))
+        if cmd[:2] == [relay.NSSM, "get"]:
+            return "[exit 0]\nC:\\Trezo\\trezo-platform\\web run start"
+        if cmd[1:2] == ["--prefix"]:
+            return "[exit 0]\nCompiled successfully"
+        return "[exit 0]\nrestarted"
+
+    with _patched(relay, _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
+         _patched_dict(relay.os.environ, TREZO_WEB_MODE=""):
+        relay._h_web_rebuild({})
+    assert any("--prefix" in c for c in calls), calls
+    assert any(c[:3] == [relay.NSSM, "restart", "TrezoWeb"] for c in calls), calls
+
+
+def test_the_mode_override_wins_over_nssm():
+    calls = []
+
+    def fake_run(cmd, timeout=900, cwd=None):
+        calls.append(list(cmd))
+        return "[exit 0]\nok"
+
+    with _patched(relay, _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
+         _patched_dict(relay.os.environ, TREZO_WEB_MODE="dev"):
+        relay._h_web_rebuild({})
+    assert not any(c[:2] == [relay.NSSM, "get"] for c in calls)
+    assert not any("--prefix" in c for c in calls)
