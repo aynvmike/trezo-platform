@@ -26,7 +26,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -216,6 +218,22 @@ def _h_git_pull_restart(args: dict) -> str:
     return out + "\n" + RESTART_SENTINEL
 
 
+def _npm_exe() -> str:
+    """The npm executable this host can actually spawn WITHOUT a shell.
+
+    2026-09-02: the first web_rebuild queued after the audit fixes died on
+    the server with `[WinError 2] The system cannot find the file
+    specified` -- subprocess.run(["npm", ...], shell=False) cannot resolve
+    the npm shim on Windows (it is npm.cmd; CLAUDE.md gotcha #1). Resolve
+    the real file first, prefer the .cmd on Windows, and fall back to the
+    bare name only where a shell-less spawn can find it (POSIX)."""
+    for name in (("npm.cmd", "npm") if sys.platform.startswith("win") else ("npm",)):
+        found = shutil.which(name)
+        if found:
+            return found
+    return "npm.cmd" if sys.platform.startswith("win") else "npm"
+
+
 def _h_web_rebuild(args: dict) -> str:
     """AUDIT 2026-08-27: this used to restart TrezoWeb unconditionally
     after the build -- a failed `npm run build` restarted the site onto
@@ -224,7 +242,7 @@ def _h_web_rebuild(args: dict) -> str:
     no restart unless the build output says it compiled, and the refusal
     is stated in the row AND alerted."""
     web = REPO / "web"
-    out = _run(["npm", "--prefix", str(web), "run", "build"], timeout=1800)
+    out = _run([_npm_exe(), "--prefix", str(web), "run", "build"], timeout=1800)
     ok = "[exit 0]" in out  # exit code only (2026-08-28): _run keeps the
         # LAST 4000 chars and Next prints "Compiled successfully" BEFORE an
         # ~8KB route table, so the string match refused every good build
