@@ -835,6 +835,26 @@ class TradeExecutionAgent(Agent):
                                                   f"{len(_held)}/{_cap} open "
                                                   f"positions - no free "
                                                   f"slot")}))
+                            # AUDIBLE (2026-09-03). This refusal was an
+                            # AgentMessage and nothing else, so a book at
+                            # capacity dropped every new name with no trace
+                            # in the log Mike reads. Eight stock approvals
+                            # died in silence this afternoon and the only
+                            # signal was an EXECUTION STARVATION alert an
+                            # hour later saying "none of them produced an
+                            # outcome at all". A trade that is refused on
+                            # purpose must say so, like pocket_skip does.
+                            try:
+                                from app.agents.activity_log import record as _arec_cap
+                                _arec_cap("book_at_capacity", ticker,
+                                          strategy=str(_sp_uid.get("strategy") or ""),
+                                          reason=(f"book holds {len(_held)}/{_cap} "
+                                                  f"open positions - no free slot "
+                                                  f"for a new name"),
+                                          extra={"user_id": str(uid),
+                                                 "open": len(_held), "cap": _cap})
+                            except Exception:  # noqa: BLE001
+                                pass
                             continue
                         if (ticker.upper() not in _held
                                 and _popen >= _pcap):
@@ -850,6 +870,24 @@ class TradeExecutionAgent(Agent):
                                                   f"book's slots - other "
                                                   f"pockets keep their "
                                                   f"chairs")}))
+                            # AUDIBLE (2026-09-03) -- see book_at_capacity
+                            # above. This is the one that actually fired:
+                            # on 09-03 the stock pocket was 3/3 on primary
+                            # and 6/5 on acct3, so every new stock name was
+                            # refused here, invisibly, on two books at once.
+                            try:
+                                from app.agents.activity_log import record as _arec_pk
+                                _arec_pk("pocket_at_capacity", ticker,
+                                         strategy=str(_sp_uid.get("strategy") or ""),
+                                         reason=(f"'{_atype}' pocket holds "
+                                                 f"{_popen}/{_pcap} of this book's "
+                                                 f"slots - new name refused so the "
+                                                 f"other pockets keep their chairs"),
+                                         extra={"user_id": str(uid),
+                                                "market_type": _atype,
+                                                "open": _popen, "cap": _pcap})
+                            except Exception:  # noqa: BLE001
+                                pass
                             continue
                     msgs = await self._execute_for_user(uid, ticker, side,
                                                         _sp_uid)

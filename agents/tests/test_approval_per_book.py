@@ -154,6 +154,50 @@ def test_an_unpinned_pocket_gets_the_book_cap_not_zero_slots():
     assert cap(none_at_all, "stock", 14) == 14
 
 
+
+# --- 2026-09-03: a refusal that says nothing is a silent trade-dropper -----
+# EXECUTION STARVATION [stock]: 8 approvals in 20 minutes produced zero
+# fills and "none of them produced an outcome at all". The cause was
+# ordinary and correct -- the stock pocket was 3/3 on primary and 6/5 on
+# acct3 -- but both capacity refusals were an AgentMessage and nothing
+# else, so the log Mike reads showed an approval and then silence. Two
+# reviewers flagged this class before it cost anything; it then cost an
+# hour of diagnosis. Every deliberate refusal must be audible.
+
+def test_both_capacity_refusals_write_an_activity_row():
+    import inspect
+    te = _bootstrap.load_module("app.agents.trade_execution")
+    src = inspect.getsource(te)
+    for event in ("book_at_capacity", "pocket_at_capacity"):
+        # the AgentMessage the dashboard reads
+        assert f'"event": "{event}"' in src, event
+        # AND the activity row the live log reads
+        assert f'_arec_cap("{event}"' in src or f'_arec_pk("{event}"' in src, (
+            f"{event} refuses a trade without saying so in the live log")
+
+
+def test_the_capacity_rows_carry_the_book_and_the_numbers():
+    """A refusal Mike cannot act on is only half a fix: the row has to name
+    which book, which pocket, and how full it was."""
+    import inspect
+    te = _bootstrap.load_module("app.agents.trade_execution")
+    src = inspect.getsource(te)
+    i = src.index('_arec_pk("pocket_at_capacity"')
+    block = src[i:i + 700]
+    for needed in ('"user_id": str(uid)', '"market_type": _atype',
+                   '"open": _popen', '"cap": _pcap'):
+        assert needed in block, needed
+
+
+def test_the_capacity_rows_are_late_imports_like_every_other_record():
+    """A module-level bind would be invisible to the suites' record stub
+    and to run_all's leak net."""
+    import inspect
+    te = _bootstrap.load_module("app.agents.trade_execution")
+    src = inspect.getsource(te)
+    assert "from app.agents.activity_log import record as _arec_cap" in src
+    assert "from app.agents.activity_log import record as _arec_pk" in src
+
 if __name__ == "__main__":
     import sys
     sys.exit(_bootstrap.run_tests(dict(vars())))
