@@ -1759,6 +1759,7 @@ class TradeExecutionAgent(Agent):
         )
         from app.paper.sizing import plan_position
         from app.paper.engine import record_external_position
+        from app.paper import crypto_settle
         from app.runtime.settings import get_bot_settings
         from app.integrations.web_tokens import get_user_broker_token
 
@@ -1929,6 +1930,30 @@ class TradeExecutionAgent(Agent):
                                   f"reject it and trip the kill-switch")},
             )]
 
+        # FEE IN KIND (2026-09-03). Alpaca's crypto commission comes out of
+        # the COIN, not the cash: the order says 23.326114883 XRP filled and
+        # the wallet is credited 23.27479743. Booking the order's quantity
+        # overstated every crypto row from the day it opened. The arrival is
+        # a DELTA, so the wallet has to be read BEFORE the order goes -- a
+        # book already holding this coin makes the post-fill snapshot mean
+        # nothing on its own. A failed read yields None here, and
+        # crypto_settle honours that by dropping a rung rather than
+        # pretending the book was flat (house rule 3).
+        _qty_before, _before_err = await crypto_settle.position_qty(
+            ticker, token=token)
+        if _qty_before is None:
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("crypto_prefill_read_failed", ticker, strategy=strategy,
+                      reason=(f"could not read this book's {ticker} wallet "
+                              f"before ordering ({_before_err}); the fill's "
+                              f"arrival cannot be measured, so the row will "
+                              f"be booked from the broker's receipt and left "
+                              f"for the QA inspector"),
+                      extra={"user_id": str(user_id), "asset_type": "crypto"})
+            except Exception:  # noqa: BLE001
+                pass
+
         order, err = await submit_crypto_order(
             symbol=ticker,
             side=order_side,
@@ -1955,12 +1980,29 @@ class TradeExecutionAgent(Agent):
                   extra={"user_id": str(user_id), "asset_type": "crypto"})
         except Exception:  # noqa: BLE001
             pass
+        # What the book actually OWNS, not what it asked for. BUYS only:
+        # a sell delivers exactly the coin it names (the 720h window
+        # arithmetic on every book closes with the fee on the buy side
+        # alone), and Alpaca does not permit crypto shorts anyway, so an
+        # order_side of "sell" here is left completely untouched.
+        _book_qty = float(plan.quantity)
+        _arrived = None
+        if order_side == "buy":
+            _arrived = await crypto_settle.arrived_buy_quantity(
+                symbol=ticker,
+                order_id=order_id,
+                submitted_qty=float(plan.quantity),
+                qty_before=_qty_before,
+                token=token,
+                user_id=str(user_id),
+            )
+            _book_qty = float(_arrived.quantity)
         await record_external_position(
             user_id=user_id,
             ticker=ticker,
             asset_type="crypto",
             side=side,
-            quantity=plan.quantity,
+            quantity=_book_qty,
             entry_price=market_price,
             stop_price=stop_price,
             target_price=target_price,
@@ -1971,6 +2013,12 @@ class TradeExecutionAgent(Agent):
                 **source_payload, "broker": "alpaca",
                 "broker_order_id": order_id,
                 "alpaca_crypto": True,
+                # Provenance of the booked size, so a human reading the row
+                # later can tell a measured arrival from a fallback without
+                # re-deriving anything.
+                "qty_source": (_arrived.source if _arrived else "request"),
+                "submitted_qty": float(plan.quantity),
+                "arrival_note": (_arrived.reason if _arrived else ""),
             },
         )
         return [
@@ -1985,7 +2033,8 @@ class TradeExecutionAgent(Agent):
                     "broker": "alpaca",
                     "broker_order_id": order_id,
                     "strategy": strategy,
-                    "quantity": plan.quantity,
+                    "quantity": _book_qty,
+                    "qty_source": (_arrived.source if _arrived else "request"),
                     "entry_price": market_price,
                     "stop_price": stop_price,
                     "target_price": target_price,
