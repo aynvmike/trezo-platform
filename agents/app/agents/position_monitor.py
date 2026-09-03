@@ -533,6 +533,73 @@ SCALP_TRAIL_MIN_GAIN = float(os.getenv("TREZO_SCALP_TRAIL_MIN_GAIN", "0.02"))
 STOCK_TRAIL_GIVEBACK = float(os.getenv("TREZO_STOCK_TRAIL_GIVEBACK", "0.30"))
 
 
+def _adopted_time_exit_enabled() -> bool:
+    """May a BACKDATED entry_at, on its own, fire a time exit? OFF BY
+    DEFAULT -- and that default is the safe side of this switch.
+
+    2026-09-03. Until today an adopted row's entry_at was the moment the
+    reconciler noticed the position, so a time rule measured from adoption
+    and could never fire on the first tick. entry_receipt now writes the
+    broker's REAL fill time, which is right for the record and right for
+    every report -- and means a row can be born already past the
+    90-minute intraday cap. Live example on book 49acafdd: XLP, adopted
+    2026-09-02 12:22 with the inherited strategy tag "scalp", whose
+    opening fill was 546760a2 at 2026-09-01 16:37 -- 1185 minutes earlier.
+    With an honest clock that row is 13x past max_hold_90min the instant
+    it exists, and the very next tick market-sells 120 shares.
+
+    adoption.py's contract is the argument: "Adoption exists to put a
+    position back under management. It must never, by itself, be a
+    trading decision." So the exit is shielded for exactly as long as the
+    BACKDATE is what triggered it -- see _backdate_shields_time_exit. The
+    shield expires on its own: once the row has genuinely been under
+    Trezo's management for the threshold, the rule fires normally.
+
+    Same shape and same default as _crypto_mae_adopted_enabled above,
+    which exists for the same reason on the price axis.
+    Set TREZO_ADOPTED_TIME_EXIT=1 to let a backdated clock exit at once.
+    """
+    return os.getenv("TREZO_ADOPTED_TIME_EXIT", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _backdate_min(r: dict) -> float:
+    """How far entry_receipt moved this row's clock BACK when it was
+    created, in minutes. 0 for every row that was not backdated -- which
+    is every row written before 2026-09-03 and every row whose receipt did
+    not settle. Never raises."""
+    try:
+        sp = r.get("source_payload")
+        if isinstance(sp, str):
+            import json as _json
+            sp = _json.loads(sp)
+        if not isinstance(sp, dict):
+            return 0.0
+        return max(0.0, float(sp.get("entry_at_backdated_min") or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _backdate_shields_time_exit(r: dict, held_min: float,
+                                threshold_min: float) -> bool:
+    """Would this time rule be firing ONLY because the row was backdated?
+
+    held_min is measured from entry_at (the trade's real clock).
+    held_min - backdate is measured from the moment the ROW was created,
+    i.e. how long Trezo has actually been managing it. When the second is
+    under the threshold and the first is over it, the backdate is the sole
+    cause and the exit is adoption making a trading decision.
+
+    Returns False for every non-backdated row, so nothing that existed
+    before today changes behaviour, and False once the row has been
+    managed for the threshold, so the shield cannot become permanent.
+    """
+    bd = _backdate_min(r)
+    if bd <= 0 or _adopted_time_exit_enabled():
+        return False
+    return (held_min - bd) < threshold_min
+
+
 def _decide_time_stop(
     r: dict,
     side: str,
@@ -579,8 +646,18 @@ def _decide_time_stop(
     # 2026-07-08 (Mike): STMS trades all day now -- the 11 AM force-stop
     # is retired; the generic intraday rules below still govern it.
     if now.hour > 19 or (now.hour == 19 and now.minute >= 45):
+        # The 3:45 force-exit is a CALENDAR rule, not an age rule: it says
+        # "the session is ending", which is true of a backdated row too.
+        # Deliberately not shielded.
         return "eod", "force_exit_345pm"
     if held >= MAX_HOLD_MINUTES:
+        if _backdate_shields_time_exit(r, held, MAX_HOLD_MINUTES):
+            return None, ("adopted_backdated: past max_hold_90min only "
+                          "because the broker's receipt dated this row "
+                          f"{_backdate_min(r):.0f} min before it was created; "
+                          "adopting is not a trading decision. Fires normally "
+                          "once managed 90 min, or now with "
+                          "TREZO_ADOPTED_TIME_EXIT=1")
         return "time", "max_hold_90min"
     if held >= STAGNATION_MINUTES and stop is not None:
         r_dist = abs(float(r.get("entry_price") or 0) - stop)
@@ -588,6 +665,9 @@ def _decide_time_stop(
             entry = float(r.get("entry_price") or 0)
             favorable = (price - entry) if side == "long" else (entry - price)
             if favorable < STAGNATION_R * r_dist:
+                if _backdate_shields_time_exit(r, held, STAGNATION_MINUTES):
+                    return None, ("adopted_backdated: past stagnation_75min "
+                                  "only because of the receipt backdate")
                 return "time", "stagnation_75min"
 
     return None, ""
@@ -613,11 +693,21 @@ def _crypto_time_exit_enabled() -> bool:
     swing 4d / scalp 1d / dca 7d). OFF BY DEFAULT: Mike's 2026-08-05 note in
     _decide_time_stop excluded crypto from every time-based exit, and that
     note stands until he says today's 24/7 decision supersedes it. Set
-    TREZO_CRYPTO_TIME_EXIT=1 to turn it on. The clock is the ROW's
-    entry_at -- for an adopted row that is its adoption time (the engine's
-    record_external_position inserts no entry_at), NOT the broker's
-    original fill; a coin re-adopted after every phantom close restarts
-    this clock each time."""
+    TREZO_CRYPTO_TIME_EXIT=1 to turn it on.
+
+    THE CLOCK, corrected 2026-09-03. This used to read "for an adopted row
+    that is its adoption time (the engine's record_external_position
+    inserts no entry_at), NOT the broker's original fill; a coin
+    re-adopted after every phantom close restarts this clock each time."
+    That was true and it was the DOT bug. record_external_position now
+    takes an entry_at, and adoption fills it from the broker's receipt
+    (app/paper/entry_receipt.py) whenever the paperwork settles it, so a
+    re-adopted coin keeps the age of the fills that built the position the
+    broker is actually holding. When the paperwork does NOT settle it the
+    old behaviour stands -- the row says so in source_payload rather than
+    pretending -- so this clock is honest-or-young, never honest-looking
+    and wrong. A row the receipt backdated is shielded from firing this
+    limit on its first ticks; see _backdate_shields_time_exit."""
     return os.getenv("TREZO_CRYPTO_TIME_EXIT", "0").strip().lower() in (
         "1", "true", "yes", "on")
 
@@ -712,12 +802,27 @@ def _decide_crypto_stale_exit(r: dict, price: float) -> tuple[str | None, str]:
                             + (" [adopted row, TREZO_CRYPTO_MAE_ADOPTED=1]"
                                if adopted else ""))
     if _crypto_time_exit_enabled() and pol.max_hold_days_losing is not None:
-        days = _minutes_since(r.get("entry_at")) / 1440.0
+        _held_min = _minutes_since(r.get("entry_at"))
+        days = _held_min / 1440.0
         if days >= pol.max_hold_days_losing:
+            if _backdate_shields_time_exit(
+                    r, _held_min, pol.max_hold_days_losing * 1440.0):
+                # Convention of this function: a non-empty detail with no
+                # reason is "seen, not acted on". Appended, not replaced --
+                # an adopted_underwater pending line must not be swallowed.
+                _shielded = (f"adopted_backdated: {pol.mode} losing-time "
+                             f"limit reached only because the receipt dated "
+                             f"this row {_backdate_min(r):.0f} min before it "
+                             f"was created; not sold without "
+                             f"TREZO_ADOPTED_TIME_EXIT=1")
+                return None, (f"{pending} | {_shielded}" if pending
+                              else _shielded)
+            _clock = ("broker receipt" if _backdate_min(r) > 0
+                      else "row entry_at" + (" = adoption time" if adopted
+                                             else ""))
             return "time", (f"crypto_time_exit: losing {abs(gain) * 100:.1f}% "
                             f"after {days:.1f}d >= {pol.max_hold_days_losing:g}d "
-                            f"for {pol.mode} (clock: row entry_at"
-                            f"{' = adoption time' if adopted else ''})")
+                            f"for {pol.mode} (clock: {_clock})")
     return None, pending
 
 
@@ -2295,7 +2400,21 @@ class PositionMonitorAgent(Agent):
                         # them WITHOUT their strategy tags). A just-submitted
                         # order needs time to appear: skip reconcile-close
                         # for rows younger than 5 minutes.
-                        if _minutes_since(r.get("entry_at")) < 5.0:
+                        # REVIEW 2026-09-03, BLOCKING. This grace used to
+                        # measure the ROW's age, because entry_at WAS the
+                        # row's age. Now entry_at is the TRADE's age, so a
+                        # backdated adopted row arrives with the grace
+                        # already spent -- zero protection on its very
+                        # first tick, on exactly the rows this change
+                        # touches. If held_symbols momentarily omits the
+                        # symbol, the row is phantom-closed and re-adopted:
+                        # the DOT loop, made faster by the fix meant to
+                        # end it. Measure the grace against how long TREZO
+                        # has managed the row, which is what the grace was
+                        # always about.
+                        _held_min_g = _minutes_since(r.get("entry_at"))
+                        if (_held_min_g < 5.0
+                                or _backdate_shields_time_exit(r, _held_min_g, 5.0)):
                             alpaca_managed += 1
                             continue
                         # QA SHIELD (2026-09-02, BLOCKER 3). The grace above

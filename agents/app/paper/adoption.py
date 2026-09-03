@@ -37,6 +37,37 @@ from app.runtime import book_scope
 from app.runtime.asset_policy import ALIASES, policy_for
 
 
+_UNLOADED = object()
+
+
+def _no_receipt(why: str):
+    """An unsettled answer shaped like entry_receipt.EntryEvidence, for the
+    one case that module cannot answer for itself: not being importable."""
+    class _None:
+        entry_at = None
+        broker_order_id = None
+        source = ""
+        settled = False
+
+        def __init__(self, w):
+            self.why = w
+
+        def payload(self):
+            return {"entry_at_source": "adoption_clock",
+                    "entry_at_unresolved": self.why,
+                    "entry_at_read_failed": False}
+    return _None(why)
+
+
+async def _load_receipts(user_id: str):
+    """This book's fill window, or None when the module is unavailable."""
+    try:
+        from app.paper.entry_receipt import BookReceipts
+        return await BookReceipts.load(user_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _supabase():
     from app.config import get_settings
     s = get_settings()
@@ -220,6 +251,22 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
 
     from app.paper.engine import record_external_position
 
+    # THE CLOCK (2026-09-03). An adopted row used to be stamped with the
+    # moment adoption NOTICED the position: record_external_position sent
+    # no entry_at and the column defaulted to now(). entry_at drives the
+    # time stops and the re-score staleness rules, so every adoption reset
+    # the position's age to zero -- and a coin re-adopted after each
+    # phantom close (DOT, 2026-08-26..29, seven times in four days) kept
+    # reporting itself as hours old while it was really nine days into the
+    # trade. The broker's receipt settles the real entry; entry_receipt
+    # reads it once per book and REFUSES rather than guesses, because a
+    # wrong entry_at silently moves an exit and a late one only makes a
+    # position look young. Built lazily: a book with nothing to adopt
+    # makes no broker call. FAIL SOFT: if the resolver cannot be reached
+    # at all, adoption still happens -- an unmanaged position is worse
+    # than a young-looking one -- and the row says which clock it has.
+    receipts = _UNLOADED
+
     for bp in rows:
         try:
             qty = float(bp.get("qty") or 0)
@@ -280,6 +327,19 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
 
         strategy = inh.get("strategy") or f"adopted_{at}"
 
+        # The receipt: WHEN the broker says this position was entered, and
+        # WHICH order opened it. Unsettled is a normal answer -- the row is
+        # then created exactly as before, with the reason recorded.
+        # Resolved BEFORE the dry-run branch on purpose: a dry run's whole
+        # job is to show what a real run would write, and the clock is now
+        # part of that. Both reads are read-only.
+        if receipts is _UNLOADED:
+            receipts = await _load_receipts(str(user_id))
+        ev = (await receipts.resolve(bp, asset_type=at)
+              if receipts is not None
+              else _no_receipt("the entry-time resolver is not available "
+                               "in this build"))
+
         if dry_run:
             out["adopted"].append({
                 "ticker": ticker, "asset_type": at, "side": side,
@@ -287,7 +347,11 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
                 "price_now": price_now,
                 "stop_price": stop, "target_price": target,
                 "strategy": strategy, "inherited": bool(inh),
-                "clamped": clamped, "dry_run": True})
+                "clamped": clamped, "dry_run": True,
+                "entry_at": ev.entry_at,
+                "entry_at_source": ev.source or "adoption_clock",
+                "entry_at_why": ev.why,
+                "broker_order_id": ev.broker_order_id})
             continue
 
         try:
@@ -295,13 +359,16 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
                 user_id=str(user_id), ticker=ticker, asset_type=at,
                 side=side, quantity=abs(qty), entry_price=entry,
                 stop_price=float(stop), target_price=float(target),
-                strategy=strategy, broker="alpaca", broker_order_id=None,
+                strategy=strategy, broker="alpaca",
+                broker_order_id=ev.broker_order_id,
                 source_payload={"adopted": True,
                                 "adopted_at": datetime.now(timezone.utc).isoformat(),
                                 "broker_asset_class": bp.get("asset_class"),
                                 "inherited": bool(inh),
                                 "geometry_clamped": clamped,
-                                "price_at_adoption": price_now})
+                                "price_at_adoption": price_now,
+                                **ev.payload()},
+                entry_at=ev.entry_at)
         except Exception as e:  # noqa: BLE001
             out["skipped"].append({"ticker": ticker, "why": f"insert failed: {e}"})
             continue
@@ -317,7 +384,16 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
             "price_now": price_now,
             "stop_price": stop, "target_price": target,
             "strategy": strategy, "inherited": bool(inh),
-            "clamped": clamped})
+            "clamped": clamped,
+            "entry_at": ev.entry_at,
+            "entry_at_source": ev.source or "adoption_clock",
+            "broker_order_id": ev.broker_order_id})
+        try:
+            from app.paper.entry_receipt import announce as _announce
+            _announce(ev, user_id=str(user_id), ticker=ticker,
+                      strategy=strategy, asset_type=at)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from app.agents.activity_log import record
             record("position_adopted", ticker,

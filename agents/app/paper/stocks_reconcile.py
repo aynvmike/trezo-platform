@@ -24,6 +24,47 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------------------
+# The entry clock (2026-09-03). See app/paper/entry_receipt.py. Loaded
+# lazily and FAIL SOFT: if the resolver cannot be reached at all, this pass
+# must still adopt the position -- an unmanaged position is worse than a
+# young-looking one -- and the row records that the clock is the adoption
+# clock rather than pretending otherwise.
+# ---------------------------------------------------------------------------
+
+_UNLOADED = object()
+
+
+def _no_receipt(why: str):
+    """An unsettled answer shaped like EntryEvidence, for the case where
+    entry_receipt itself could not be imported."""
+    class _None:
+        entry_at = None
+        broker_order_id = None
+        source = ""
+        settled = False
+
+        def __init__(self, w):
+            self.why = w
+
+        def payload(self):
+            return {"entry_at_source": "adoption_clock",
+                    "entry_at_unresolved": self.why,
+                    "entry_at_read_failed": False}
+    return _None(why)
+
+
+async def _load_receipts(user_id: str):
+    """The book's fill window, or None when the module is unavailable."""
+    try:
+        from app.paper.entry_receipt import BookReceipts
+        return await BookReceipts.load(user_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stocks_reconcile.entry_receipt unavailable: %s",
+                       str(e)[:160])
+        return None
+
+
 async def _roll_realized(client, user_id, pnl: float) -> None:
     """Fold a reconcile-close P/L into the account realized counters
     (today/week/ytd). P/L stats only -- cash is deliberately untouched so
@@ -445,6 +486,19 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     pass
 
         # 2) Insert any Alpaca positions Trezo missed.
+        #
+        # THE CLOCK (2026-09-03, the XDTE row). Every row this pass created
+        # was stamped with now() -- engine.record_external_position sent no
+        # entry_at, so the column defaulted -- which meant an XDTE position
+        # filled at 13:30:49 in four pieces was recorded as entered at
+        # 14:20:53, the moment this loop noticed it. entry_at drives time
+        # stops and the staleness rules, so the position's age was reset to
+        # zero by the act of reconciling it. The broker's receipt settles
+        # the real time; app/paper/entry_receipt.py reads it, ONE activities
+        # call per book, and refuses rather than guesses when the paperwork
+        # does not close the question. `_receipts` is built lazily so a book
+        # with nothing to insert makes no broker call at all.
+        _receipts = _UNLOADED
         trezo_syms = {str(r["ticker"]).upper() for r in trezo_rows}
         for sym, ap in alpaca_by_sym.items():
             if sym in trezo_syms:
@@ -546,6 +600,18 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                 if inherited.get("target_price"):
                     target_price = float(inherited["target_price"])
 
+            # WHEN was it bought, and on WHICH order? The receipt answers
+            # both or neither: broker_order_id used to be hard-coded None
+            # here even when exactly one order had produced the position,
+            # which is why the QA inspector's I4 check had to guess at it
+            # afterwards.
+            if _receipts is _UNLOADED:
+                _receipts = await _load_receipts(str(user_id))
+            _ev = (await _receipts.resolve(ap, asset_type="stock")
+                   if _receipts is not None else _no_receipt(
+                       "the entry-time resolver is not available in this "
+                       "build"))
+
             try:
                 await record_external_position(
                     user_id=str(user_id),
@@ -558,16 +624,27 @@ async def reconcile_stocks_all_users() -> dict[str, Any]:
                     target_price=target_price,
                     strategy=strategy_label,
                     broker="alpaca",
-                    broker_order_id=None,
+                    broker_order_id=_ev.broker_order_id,
                     source_payload={
                         "auto_reconcile": True,
                         "alpaca_avg_entry": ap_entry,
+                        **_ev.payload(),
                     },
+                    entry_at=_ev.entry_at,
                 )
                 inserted += 1
                 notes_list.append(
-                    f"{sym} inserted from broker (qty {qty_abs})"
+                    f"{sym} inserted from broker (qty {qty_abs}"
+                    + (f", entry {_ev.entry_at} from order "
+                       f"{_ev.broker_order_id}" if _ev.settled
+                       else ", entry time unresolved") + ")"
                 )
+                try:
+                    from app.paper.entry_receipt import announce as _announce
+                    _announce(_ev, user_id=str(user_id), ticker=sym,
+                              strategy=strategy_label, asset_type="stock")
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception:
                 continue
 

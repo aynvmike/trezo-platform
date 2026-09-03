@@ -683,10 +683,30 @@ async def record_external_position(
     broker: str,
     broker_order_id: Optional[str],
     source_payload: Optional[dict] = None,
+    entry_at: Optional[str] = None,
 ) -> FillResult:
     """Insert a tracking row for a position executed on an external broker
     (e.g. Alpaca). No cash math here - the broker holds the real account;
     this row exists so Trezo's dashboard and monitor can see the position.
+
+    `entry_at` (2026-09-03, the XDTE clock): WHEN the position was bought,
+    as the broker's own receipt records it. Optional and OFF by default in
+    the sense that omitting it reproduces the old behaviour exactly -- the
+    column is left out of the insert and Postgres defaults it to now().
+    That default is the defect: an adopted row was stamped with the moment
+    the reconciler NOTICED the position (row 37d36b9e: entry_at ==
+    created_at == updated_at == 14:20:53.914599Z, while the four fills that
+    built it landed 13:30:49 .. 13:33:52). entry_at drives every time-based
+    exit and the staleness rules, so every adoption silently reset a
+    position's age to zero. Callers that can produce a RECEIPT -- see
+    app/paper/entry_receipt.py -- pass it; callers that cannot must pass
+    nothing rather than a guess.
+
+    The MERGE below deliberately ignores `entry_at`. A position's entry is
+    the FIRST fill that built it, so folding an add into an open row must
+    never move that row's clock: forward would hide its age, backward
+    would age it into an exit it has not earned. One position, one entry,
+    set when the row is created.
 
     MERGES an add into the existing open row for the same ticker+side
     (Mike 2026-07-28: "the multiple entries of crypto should be changed
@@ -793,37 +813,39 @@ async def record_external_position(
             pass   # fall through to a normal insert
 
     def _sync_insert():
-        return (
-            client.table("paper_positions")
-            .insert({
-                "user_id": user_id,
-                "ticker": ticker.upper(),
-                "asset_type": asset_type,
-                "side": side,
-                "quantity": quantity,
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "target_price": target_price,
-                "status": "open",
-                "strategy": strategy,
-                # Fixed 2026-06-11 PM: broker/broker_order_id were ONLY
-                # stored inside source_payload, never in their real
-                # columns -- so every Alpaca-routed row landed as
-                # broker="paper" and the Position Monitor's entire
-                # Alpaca branch (bracket reconcile, time stops, crypto
-                # exits, broker-aware close) skipped it. AAPL was held
-                # live at Alpaca while Trezo managed it as internal
-                # paper because of this.
+        _row = {
+            "user_id": user_id,
+            "ticker": ticker.upper(),
+            "asset_type": asset_type,
+            "side": side,
+            "quantity": quantity,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "status": "open",
+            "strategy": strategy,
+            # Fixed 2026-06-11 PM: broker/broker_order_id were ONLY
+            # stored inside source_payload, never in their real
+            # columns -- so every Alpaca-routed row landed as
+            # broker="paper" and the Position Monitor's entire
+            # Alpaca branch (bracket reconcile, time stops, crypto
+            # exits, broker-aware close) skipped it. AAPL was held
+            # live at Alpaca while Trezo managed it as internal
+            # paper because of this.
+            "broker": broker,
+            "broker_order_id": broker_order_id,
+            "source_payload": {
+                **(source_payload or {}),
                 "broker": broker,
                 "broker_order_id": broker_order_id,
-                "source_payload": {
-                    **(source_payload or {}),
-                    "broker": broker,
-                    "broker_order_id": broker_order_id,
-                },
-            })
-            .execute()
-        )
+            },
+        }
+        # Omitted, not None: sending entry_at=None would OVERRIDE the
+        # column default with a NULL and every age calculation on the
+        # platform reads an unparseable entry_at as 0 days.
+        if entry_at:
+            _row["entry_at"] = entry_at
+        return client.table("paper_positions").insert(_row).execute()
 
     try:
         ins = await asyncio.to_thread(_sync_insert)

@@ -55,7 +55,7 @@ SUITES = sorted(p.stem for p in HERE.glob("test_*.py"))
 # vf:gate-harness -- which is precisely the drift GATE-04 exists to catch,
 # so RAISE THIS NUMBER in the same commit that adds a suite). `>=` because
 # suites are added over time -- nothing should ever lower it.
-EXPECTED_MIN_SUITES = 59
+EXPECTED_MIN_SUITES = 60
 
 # The env vars the leak net depends on. A suite that changes either and
 # does not put it back would blind the net for every suite after it

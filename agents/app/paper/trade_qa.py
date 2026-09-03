@@ -852,6 +852,17 @@ def _entry_fill_at(opening_fills: list, order_id: str) -> str:
     Returns "" when nothing usable is present; the caller falls back to
     the ORDER's own filled_at, which is still the venue's record and not
     an invention.
+
+    TWO CALLERS AS OF 2026-09-03, and that is deliberate. _handle_orphan
+    below uses it for the rows THIS module books; app/paper/entry_receipt.py
+    uses this exact function object (and _arith_gate, and ledger_symbol,
+    and lookback_h) for the rows ADOPTION books, so the platform has ONE
+    answer to "which fill is the entry" instead of two that drift until
+    the inspector starts flagging rows the adopter had just written
+    correctly. tests/test_entry_receipt.py asserts the identity, so
+    renaming or reimplementing either side is a gate failure, not a
+    silent divergence. If you change the convention here, that suite is
+    where it has to be changed too.
     """
     best_raw = ""
     best_dt = None
