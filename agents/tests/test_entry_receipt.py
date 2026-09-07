@@ -164,7 +164,18 @@ def _bound(resolve=True, skip=False):
 
 @contextlib.contextmanager
 def _reads(fills=None, order=None, order_fn=None, calls=None):
-    """The two broker seams entry_receipt has."""
+    """The two broker seams entry_receipt has -- plus the CLOCK.
+
+    FROZEN CLOCK (2026-09-07). The acceptance fixtures are REAL broker
+    records from 2026-09-03 and stay byte-exact, but BookReceipts.load()
+    computes window_start from the WALL clock (now - lookback). The
+    first cut of this suite left that unpinned, so 72 hours after the
+    incident every fixture fell out of its own evidence window and all
+    sixteen evidence tests went red -- on the server gate that means a
+    ROLLED-BACK deploy for whoever ships next, about nothing. A gate
+    suite must not carry an expiry date: the window is anchored to the
+    same NOW the resolve() calls already use, through the same
+    _after_iso the production path calls, Z-form and all."""
     async def _f(after):
         if calls is not None:
             calls.append(("fills", after))
@@ -176,7 +187,12 @@ def _reads(fills=None, order=None, order_fn=None, calls=None):
         if order_fn is not None:
             return await order_fn(oid)
         return order if order is not None else (None, None)
-    with _patched(er, _read_fills=_f, _read_order=_one):
+
+    def _after_from_pinned_now(hours):
+        return (NOW - timedelta(hours=float(hours))
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _patched(er, _read_fills=_f, _read_order=_one), \
+            _patched(qa, _after_iso=_after_from_pinned_now):
         yield
 
 
@@ -332,7 +348,8 @@ def test_backdate_never_exceeds_the_lookback():
     """Stated as an invariant over the real knob, not one example."""
     with _env(TREZO_QA_LOOKBACK_H="72"), _bound(), _reads(fills=_xdte_fills()):
         book = _load()
-        ev = _run(book.resolve(_xdte_position(), asset_type="stock"))
+        ev = _run(book.resolve(_xdte_position(), asset_type="stock",
+                               now=NOW))
     assert ev.settled
     assert ev.backdated_min <= 72 * 60.0 + 1, ev.backdated_min
 
@@ -540,7 +557,7 @@ def test_same_lookback_knob_as_the_inspector():
     after = calls[0][1]
     assert after == qa._after_iso(12.0)[:len(after)] or after.endswith("Z"), after
     parsed = qa._parse_ts(after)
-    hours = (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0
+    hours = (NOW - parsed).total_seconds() / 3600.0   # frozen clock
     assert 11.9 < hours < 12.2, hours
 
 
@@ -634,13 +651,38 @@ def test_engine_omits_entry_at_entirely_when_it_has_none():
 
 XLP_BACKDATE_MIN = 1185.2
 
+# FROZEN CLOCK, second axis (2026-09-07). _decide_time_stop's FIRST
+# branch is the 3:45 PM ET calendar force-exit, read off the wall clock
+# -- so every shield test below went red the moment the gate ran after
+# 19:45Z, and a Sunday-evening deploy rolled back over "failures" that
+# were only the time of day. The shield tests pin BOTH sides of the
+# clock to mid-session on the acceptance day: the rows are built from
+# PM_NOW and position_monitor's datetime reads PM_NOW, so ages stay
+# exact and the calendar branch stays out of the way. The eod branch
+# itself is covered by test_the_345_force_exit_is_a_calendar_rule_...,
+# which inspects the source rather than racing the clock.
+PM_NOW = datetime(2026, 9, 3, 14, 0, 0, tzinfo=timezone.utc)  # 10:00 ET
+
+
+class _PMFrozenDT(datetime):
+    @classmethod
+    def now(cls, tz=None):  # noqa: D102
+        return PM_NOW.astimezone(tz) if tz else PM_NOW.replace(tzinfo=None)
+
+
+@contextlib.contextmanager
+def _midday():
+    """position_monitor's clock, pinned to PM_NOW for the shield tests."""
+    with _patched(pm, datetime=_PMFrozenDT):
+        yield
+
 
 def _scalp_row(*, backdated: float, managed_min: float) -> dict:
     """The XLP shape: a scalp-tagged adopted row whose entry_at sits
     `backdated` minutes before the moment the row was created, and which
-    has now existed for `managed_min` minutes."""
-    entry = (datetime.now(timezone.utc)
-             - timedelta(minutes=backdated + managed_min))
+    has now existed for `managed_min` minutes. Anchored to PM_NOW, the
+    same clock _midday() pins position_monitor to."""
+    entry = PM_NOW - timedelta(minutes=backdated + managed_min)
     sp = {"adopted": True}
     if backdated:
         sp["entry_at_backdated_min"] = backdated
@@ -651,14 +693,17 @@ def _scalp_row(*, backdated: float, managed_min: float) -> dict:
 def test_todays_behaviour_reproduced_a_fresh_row_never_times_out():
     """The defect, stated as a test: with entry_at = now() the 90-minute
     cap can never fire on an adopted scalp, however old it really is."""
-    assert pm._decide_time_stop(
-        _scalp_row(backdated=0, managed_min=2), "short", 85.0, 86.0) == (None, "")
+    with _midday():
+        assert pm._decide_time_stop(
+            _scalp_row(backdated=0, managed_min=2),
+            "short", 85.0, 86.0) == (None, "")
 
 
 def test_backdated_row_is_not_market_sold_on_its_first_tick():
-    reason, detail = pm._decide_time_stop(
-        _scalp_row(backdated=XLP_BACKDATE_MIN, managed_min=2),
-        "short", 85.0, 86.0)
+    with _midday():
+        reason, detail = pm._decide_time_stop(
+            _scalp_row(backdated=XLP_BACKDATE_MIN, managed_min=2),
+            "short", 85.0, 86.0)
     assert reason is None, (reason, detail)
     assert "adopted_backdated" in detail
     assert "TREZO_ADOPTED_TIME_EXIT=1" in detail
@@ -667,9 +712,10 @@ def test_backdated_row_is_not_market_sold_on_its_first_tick():
 def test_the_shield_expires_by_itself():
     """Once the ROW has genuinely been managed for the threshold the rule
     fires normally -- the shield can never become a permanent exemption."""
-    reason, detail = pm._decide_time_stop(
-        _scalp_row(backdated=XLP_BACKDATE_MIN, managed_min=200),
-        "short", 85.0, 86.0)
+    with _midday():
+        reason, detail = pm._decide_time_stop(
+            _scalp_row(backdated=XLP_BACKDATE_MIN, managed_min=200),
+            "short", 85.0, 86.0)
     assert (reason, detail) == ("time", "max_hold_90min")
 
 
@@ -677,7 +723,7 @@ def test_the_switch_defaults_to_the_safe_side_and_can_be_turned_off():
     row = _scalp_row(backdated=XLP_BACKDATE_MIN, managed_min=2)
     assert os.environ.get("TREZO_ADOPTED_TIME_EXIT") in (None, "", "0"), (
         "the shipped default must be the safe side")
-    with _env(TREZO_ADOPTED_TIME_EXIT="1"):
+    with _env(TREZO_ADOPTED_TIME_EXIT="1"), _midday():
         assert pm._decide_time_stop(row, "short", 85.0, 86.0) == (
             "time", "max_hold_90min")
 
@@ -686,12 +732,12 @@ def test_pre_existing_rows_are_untouched_by_the_shield():
     """No entry_at_backdated_min in the payload -> backdate 0 -> shield
     False. Nothing written before 2026-09-03 changes behaviour."""
     old = {"strategy": "scalp", "side": "short", "entry_price": 85.42,
-           "entry_at": (datetime.now(timezone.utc)
-                        - timedelta(minutes=400)).isoformat(),
+           "entry_at": (PM_NOW - timedelta(minutes=400)).isoformat(),
            "source_payload": {"adopted": True}}
     assert pm._backdate_min(old) == 0.0
-    assert pm._decide_time_stop(old, "short", 85.0, 86.0) == (
-        "time", "max_hold_90min")
+    with _midday():
+        assert pm._decide_time_stop(old, "short", 85.0, 86.0) == (
+            "time", "max_hold_90min")
 
 
 def test_the_345_force_exit_is_a_calendar_rule_and_is_not_shielded():
@@ -707,7 +753,8 @@ def test_stagnation_rule_is_shielded_on_the_same_terms():
     row = _scalp_row(backdated=XLP_BACKDATE_MIN, managed_min=2)
     # 80 minutes managed would trip stagnation but not max hold; here the
     # backdate trips both, so the earlier shield answers first.
-    reason, detail = pm._decide_time_stop(row, "short", 85.0, 86.0)
+    with _midday():
+        reason, detail = pm._decide_time_stop(row, "short", 85.0, 86.0)
     assert reason is None
     src = (Path(__file__).resolve().parents[1]
            / "app/agents/position_monitor.py").read_text(encoding="utf-8")
@@ -720,19 +767,17 @@ def test_crypto_losing_time_limit_is_shielded_too():
     act of adopting it either."""
     coin = {"asset_type": "crypto", "side": "long", "strategy": "crypto_scalp",
             "entry_price": 100.0,
-            "entry_at": (datetime.now(timezone.utc)
-                         - timedelta(minutes=1441 + 2)).isoformat(),
+            "entry_at": (PM_NOW - timedelta(minutes=1441 + 2)).isoformat(),
             "source_payload": {"adopted": True,
                                "entry_at_backdated_min": 1441.0}}
-    with _env(TREZO_CRYPTO_TIME_EXIT="1"):
+    with _env(TREZO_CRYPTO_TIME_EXIT="1"), _midday():
         reason, detail = pm._decide_crypto_stale_exit(coin, 99.0)
         assert reason is None, (reason, detail)
         assert "adopted_backdated" in detail
         # and it still fires once the row itself is old enough
         coin_managed = dict(coin)
         coin_managed["entry_at"] = (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=1441 + 1500)).isoformat()
+            PM_NOW - timedelta(minutes=1441 + 1500)).isoformat()
         reason2, _ = pm._decide_crypto_stale_exit(coin_managed, 99.0)
         assert reason2 == "time", reason2
 
@@ -743,11 +788,11 @@ def test_crypto_shield_does_not_swallow_the_underwater_line():
     """
     coin = {"asset_type": "crypto", "side": "long", "strategy": "crypto_swing",
             "entry_price": 100.0,
-            "entry_at": (datetime.now(timezone.utc)
-                         - timedelta(minutes=5761 + 2)).isoformat(),
+            "entry_at": (PM_NOW - timedelta(minutes=5761 + 2)).isoformat(),
             "source_payload": {"adopted": True,
                                "entry_at_backdated_min": 5761.0}}
-    with _env(TREZO_CRYPTO_TIME_EXIT="1", TREZO_CRYPTO_MAE_ADOPTED=None):
+    with _env(TREZO_CRYPTO_TIME_EXIT="1", TREZO_CRYPTO_MAE_ADOPTED=None), \
+            _midday():
         reason, detail = pm._decide_crypto_stale_exit(coin, 85.0)
     assert reason is None
     assert "adopted_underwater" in detail and "adopted_backdated" in detail
