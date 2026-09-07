@@ -137,6 +137,22 @@ FLOW_MIN_SIGNALS = int(float(_os.getenv("TREZO_FLOW_MIN_SIGNALS", "15") or 15))
 # the window before "every one of them died at execution" is evidence.
 FLOW_MIN_APPROVES_FOR_KILL = 3
 
+# NET2-REFUSED (2026-09-07): the executor's DELIBERATE refusals, made
+# audible by 4ed24ad after the 09-03 stock window. An approval refused
+# on purpose -- a full pocket, a book that already holds the name -- IS
+# an outcome. Alarm B counted it as "no outcome at all" and pinged
+# urgent every 30 minutes all Labor Day weekend while every book sat
+# correctly at capacity (crypto pockets 3/2, 6/6; stock 5/4, 6/5, 3/3).
+# A window whose approvals are ALL refused on purpose is a CAPACITY
+# LOCK: worth one warn -- Mike must free a slot or raise a cap for the
+# lane to trade -- but it is a policy state, not a malfunction, and the
+# 8/27 outage shape it must never mask is the VANISHED approve, which
+# still alarms urgent below. Spellings are asserted against
+# trade_execution's own source by the guard suite so the two files
+# cannot drift apart.
+_DELIBERATE_REFUSALS = ("book_at_capacity", "pocket_at_capacity",
+                        "book_already_holds")
+
 # NET2-GLOBAL: the flow counters are keyed by LANE. A single global
 # count let one crypto approve (24/7 lane) silence a starving stock lane
 # for the whole of the equity starvation. Lane comes from the payload:
@@ -187,7 +203,8 @@ def _lane_of(payload: Any) -> str:
 
 def _new_lane_counters() -> dict[str, Any]:
     return {"signals": 0, "approves": 0, "vetoes": 0, "executes": 0,
-            "kills": 0, "handler_fails": 0, "kill_reasons": {}}
+            "kills": 0, "handler_fails": 0, "kill_reasons": {},
+            "refusals": 0, "refusal_reasons": {}}
 
 
 def _lane_market_applies(lane: str, market_open: bool) -> bool:
@@ -238,6 +255,21 @@ class OpsWatchdogAgent(Agent):
                 lane["vetoes"] += 1
             elif k == "execute":
                 lane["executes"] += 1
+            elif k == "info":
+                # NET2-REFUSED: trade_execution's audible refusals ride
+                # kind="info" with payload.event naming the refusal
+                # (4ed24ad). Deliberate refusals are outcomes; without
+                # this arm a capacity-locked lane read as "none of them
+                # produced an outcome at all" -- urgent, wrong, and
+                # repeating -- through the whole Labor Day weekend.
+                if p.get("event") in _DELIBERATE_REFUSALS:
+                    lane["refusals"] += 1
+                    note = str(p.get("event") or "")
+                    detail = str(p.get("note") or p.get("reason") or "")[:70]
+                    if detail:
+                        note = f"{note}: {detail}"
+                    rs = lane["refusal_reasons"]
+                    rs[note] = rs.get(note, 0) + 1
             elif k == "error":
                 ev = p.get("event")
                 if ev == "handler_failed":
@@ -292,10 +324,16 @@ class OpsWatchdogAgent(Agent):
              starved for days.
           B. EXECUTION STARVATION -- at least FLOW_MIN_APPROVES_FOR_KILL
              approvals and zero executes: the gate said yes and nothing
-             filled. The note splits them into killed-with-a-reason
-             (execute_error, or the executor crashing on the approve)
-             and vanished (no outcome at all: a kind="info" skip, a
-             disabled executor, a dropped message).
+             filled. The note splits them THREE ways since NET2-REFUSED:
+             killed-with-a-reason (execute_error, or the executor
+             crashing on the approve), refused ON PURPOSE (the audible
+             capacity / already-held refusals from 4ed24ad), and
+             vanished (no outcome at all: a disabled executor, a
+             dropped message). A window whose approvals were ALL
+             refused on purpose is not this alarm at all: it reports
+             once as a warn CAPACITY LOCK -- free a slot or raise a cap
+             -- because a book correctly full is policy, not the 8/27
+             outage shape.
              NET2-COUNT-BEFORE-KILL: approvals were counted at approve
              time, so an approve killed at execution still read as "the
              pipeline works" through the whole equity starvation. The
@@ -337,6 +375,7 @@ class OpsWatchdogAgent(Agent):
         executes, kills = int(c.get("executes", 0)), int(c.get("kills", 0))
         key_a = ("approval_starvation", lane)
         key_b = ("execution_starvation", lane)
+        key_c = ("capacity_lock", lane)
 
         # ---- A: signals in, nothing approved ---------------------------
         if signals >= FLOW_MIN_SIGNALS and approves == 0:
@@ -384,16 +423,54 @@ class OpsWatchdogAgent(Agent):
         # many died with a reason and how many produced no outcome at
         # all, the same accounted/unaccounted split alarm A makes.
         if approves >= FLOW_MIN_APPROVES_FOR_KILL and executes == 0:
+            refusals = int(c.get("refusals", 0))
             reasons = c.get("kill_reasons") or {}
             top, top_n = (max(reasons.items(), key=lambda kv: kv[1])
                           if reasons else ("(no reason given)", 0))
-            unaccounted_b = max(0, approves - kills)
-            shape_b = (
-                f"{kills} died at execution; top kill reason ({top_n}x): {top}"
-                if kills else "none of them produced an outcome at all")
-            if kills and unaccounted_b:
-                shape_b += (f"; {unaccounted_b} produced NO outcome at all "
-                            f"-- not a fill, not a rejection")
+            # NET2-REFUSED: refusals are per BOOK (one approval fans out
+            # to up to three), so they can legitimately exceed approves;
+            # the clamp keeps the arithmetic honest either way.
+            unaccounted_b = max(0, approves - kills - refusals)
+            if kills == 0 and refusals and unaccounted_b == 0:
+                # Every approval was answered with a deliberate refusal:
+                # the lane is CAPACITY-LOCKED. One warn, actionable, and
+                # NOT the 8/27 shape -- nothing vanished.
+                rref = c.get("refusal_reasons") or {}
+                rtop, rtop_n = (max(rref.items(), key=lambda kv: kv[1])
+                                if rref else ("(unrecorded)", 0))
+                msg = (
+                    f"CAPACITY LOCK [{lane}]: {approves} approval(s) in "
+                    f"{window_min:.0f} min were ALL refused on purpose "
+                    f"({refusals} per-book refusal(s); top ({rtop_n}x): "
+                    f"{rtop}). Nothing on this lane fills until a "
+                    f"position exits or a cap changes in Bot Tuning -- "
+                    f"a policy state, not a malfunction."
+                )
+                await self._raise_flow(
+                    key_c, severity="warn",
+                    title=f"Trezo: {lane} lane is capacity-locked",
+                    msg=msg)
+                out.append(AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={"event": "capacity_lock", "lane": lane,
+                             "approves": approves, "refusals": refusals,
+                             "top_refusal": rtop,
+                             "window_min": round(window_min, 1),
+                             "note": msg}))
+                return out
+            parts = []
+            if kills:
+                parts.append(f"{kills} died at execution; top kill "
+                             f"reason ({top_n}x): {top}")
+            if refusals:
+                parts.append(f"{refusals} per-book refusal(s) on purpose "
+                             f"(capacity / already-held)")
+            if unaccounted_b:
+                parts.append(f"{unaccounted_b} produced NO outcome at all "
+                             f"-- not a fill, not a rejection, not a "
+                             f"refusal")
+            shape_b = ("; ".join(parts)
+                       or "none of them produced an outcome at all")
             msg = (
                 f"EXECUTION STARVATION [{lane}]: {approves} approval(s) in "
                 f"{window_min:.0f} min produced ZERO fills on the {lane} "
@@ -409,12 +486,14 @@ class OpsWatchdogAgent(Agent):
                 agent=self.name, kind="error",
                 payload={"event": "execution_starvation", "lane": lane,
                          "approves": approves, "executes": 0,
-                         "kills": kills, "unaccounted": unaccounted_b,
+                         "kills": kills, "refusals": refusals,
+                         "unaccounted": unaccounted_b,
                          "top_kill_reason": top,
                          "window_min": round(window_min, 1), "note": msg}))
         elif executes > 0:
             # NET2-REV-02 (as above): a fill is recovery; silence is not.
             self._open_alerts.discard(key_b)
+            self._open_alerts.discard(key_c)
         return out
 
     async def _raise_flow(self, key: tuple[str, str], *, severity: str,
