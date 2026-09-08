@@ -24,8 +24,14 @@ Run: python -m agents.tests.test_ops_deploy   (or pytest)
 
 from __future__ import annotations
 
+from contextlib import contextmanager, redirect_stdout
+import importlib.util
+import io
+import os
+import shutil
 import sys
 from pathlib import Path
+import types
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -168,6 +174,86 @@ def test_only_whitelisted_services_can_be_restarted():
     except ValueError:
         return
     raise AssertionError("an arbitrary service name must be refused")
+
+
+@contextmanager
+def _isolated_gate():
+    """Load the real gate without redirecting the enclosing suite's leak net."""
+    previous_dir = os.environ.get("TREZO_ACTIVITY_LOG_DIR")
+    previous_path = list(sys.path)
+    spec = importlib.util.spec_from_file_location(
+        "trezo_test_gate_diagnostics", Path(__file__).with_name("run_all.py"))
+    gate = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(gate)
+        yield gate
+    finally:
+        if previous_dir is None:
+            os.environ.pop("TREZO_ACTIVITY_LOG_DIR", None)
+        else:
+            os.environ["TREZO_ACTIVITY_LOG_DIR"] = previous_dir
+        sys.path[:] = previous_path
+        if hasattr(gate, "_ACTIVITY_DIR"):
+            shutil.rmtree(gate._ACTIVITY_DIR, ignore_errors=True)
+
+
+def test_gate_failure_function_and_import_error_survive_deployment_tail_capture():
+    def test_windows_handle():
+        raise PermissionError("[WinError 32] database is still open")
+
+    def test_later_progress():
+        for _ in range(80):
+            print("later-suite progress " + "x" * 80)
+
+    def import_suite(name):
+        if name.endswith("early_failure"):
+            return types.SimpleNamespace(test_windows_handle=test_windows_handle)
+        if name.endswith("import_failure"):
+            raise ImportError("missing test dependency")
+        return types.SimpleNamespace(test_later_progress=test_later_progress)
+
+    with _isolated_gate() as gate:
+        gate.SUITES = ["early_failure", "import_failure", "later_success"]
+        gate.EXPECTED_MIN_SUITES = len(gate.SUITES)
+        gate.importlib = types.SimpleNamespace(import_module=import_suite)
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            result = gate.main()
+        output = captured.getvalue()
+        tail = output[-4000:]
+        assert result == 1
+        assert len(output) > 8000, "must exercise a genuinely truncated deployment log"
+        assert "test_windows_handle: PermissionError: [WinError 32]" in tail
+        assert "import_failure: ERROR importing: ImportError: missing test dependency" in tail
+        assert "FAILED suites: early_failure, import_failure" in tail
+        assert "all green across" not in output
+
+
+def test_gate_failure_tail_is_bounded_and_clean_suite_stays_green():
+    def test_large_error():
+        raise RuntimeError("reason " + "x" * 10000)
+
+    with _isolated_gate() as gate:
+        gate.SUITES = ["large_error"]
+        gate.EXPECTED_MIN_SUITES = 1
+        gate.importlib = types.SimpleNamespace(import_module=lambda name:
+                                              types.SimpleNamespace(test_large_error=test_large_error))
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            assert gate.main() == 1
+        tail = captured.getvalue().split("FAILURE DETAILS", 1)[1]
+        assert len(tail) < 1000
+        assert "test_large_error: RuntimeError: reason" in tail
+        assert "FAILED suites: large_error" in tail
+
+        gate.SUITES = ["clean"]
+        gate.importlib = types.SimpleNamespace(import_module=lambda name:
+                                              types.SimpleNamespace(test_clean=lambda: None))
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            assert gate.main() == 0
+        assert "all green across 1 suites (floor 1)" in captured.getvalue()
+        assert "FAILURE DETAILS" not in captured.getvalue()
 
 
 if __name__ == "__main__":
