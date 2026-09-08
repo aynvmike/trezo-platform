@@ -9,6 +9,8 @@ registry's bookkeeping.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
+import math
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -134,6 +136,22 @@ def start_scheduler() -> None:
         if interval <= 0:
             log.info("agent.registered", agent=state.name, interval=0, mode="event-driven")
             continue
+        initial_run = {}
+        delay = getattr(impl, "tick_initial_delay_seconds", None)
+        if delay is not None:
+            try:
+                if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+                    raise ValueError("initial delay must be numeric")
+                delay = float(delay)
+                if not math.isfinite(delay) or not 0 <= delay <= interval:
+                    raise ValueError("initial delay is outside the interval")
+                # Override only the first fire of this SAME interval job.
+                # The normal enabled gate, coalescing and single-instance
+                # limit still govern it; no separate startup task is created.
+                initial_run["next_run_time"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay))
+            except (TypeError, ValueError, OverflowError):
+                log.warning("agent.initial_delay.ignored", agent=state.name)
         _scheduler.add_job(
             _tick_agent,
             trigger=IntervalTrigger(seconds=interval),
@@ -142,6 +160,7 @@ def start_scheduler() -> None:
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            **initial_run,
         )
         log.info("agent.registered", agent=state.name, interval=interval, mode="scheduled")
 

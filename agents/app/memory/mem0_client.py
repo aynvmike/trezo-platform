@@ -299,6 +299,25 @@ class TradeOutcome:
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
+@dataclass(frozen=True)
+class RecallResult:
+    """One search's rows and evidence, returned together across worker threads.
+
+    A cache hit retains the timestamp of the successful API read that
+    populated it. Failed reads may retain that same query's previous
+    success time, but never claim that this attempt succeeded.
+    """
+
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    state: str = "client_unavailable"
+    source: str = "none"
+    last_success_at: Optional[str] = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.state in ("ok", "ok_empty")
+
+
 class TrezoMemory:
     """
     Thin, safe wrapper around the Mem0 SDK.
@@ -466,6 +485,19 @@ class TrezoMemory:
         ticker: Optional[str] = None,
         kind: Optional[str] = None,
     ) -> list[dict[str, Any]]:
+        """Compatibility reader; use recall_similar_result for read diagnostics."""
+        return self.recall_similar_result(
+            query=query, limit=limit, agent=agent, ticker=ticker, kind=kind,
+        ).rows
+
+    def recall_similar_result(
+        self,
+        query: str,
+        limit: int = DEFAULT_RECALL_LIMIT,
+        agent: Optional[str] = None,
+        ticker: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> RecallResult:
         """
         Semantic search for past memories similar to the query.
 
@@ -474,22 +506,33 @@ class TrezoMemory:
         agent  - optional filter on which agent created the memory
         ticker - optional filter on symbol
         kind   - 'decision' or 'outcome' or None for both
+
+        The returned status belongs to this call, never a shared
+        mutable last-status field. Client initialization alone does
+        not establish that the service accepted a search.
         """
-        if not self._available:
-            return []
+        if not self._available or self._client is None:
+            return RecallResult()
         # Shared-recall cache (2026-07-02): agents asking the same question
         # within the TTL share ONE Mem0 search -- saves tokens + budget.
         _ck = f"{query}|{limit}|{agent}|{ticker}|{kind}".lower()
+        last_success_at = None
         try:
             _hit = _SEARCH_CACHE.get(_ck)
+            if _hit:
+                last_success_at = _dt.fromtimestamp(_hit[0], _tz.utc).isoformat()
             _ttl = float(_os.getenv("TREZO_MEM0_RECALL_TTL_SEC", "180"))
             if _hit and (_time.time() - _hit[0]) < _ttl:
-                return list(_hit[1])
+                rows = list(_hit[1])
+                return RecallResult(
+                    rows, "ok" if rows else "ok_empty", "cache", last_success_at,
+                )
         except Exception:  # noqa: BLE001
             pass
         if not _budget_try_spend("search"):
             _budget_throttle_log("search")
-            return []
+            return RecallResult(state="budget_blocked",
+                                last_success_at=last_success_at)
         try:
             # Fixed 2026-06-11: mem0ai 2.x rejects top-level user_id in
             # search() ("Top-level entity parameters ... not supported.
@@ -503,8 +546,9 @@ class TrezoMemory:
                 filters={"user_id": self.user_id},
                 limit=max(int(limit) * 3, int(limit)),
             )
-            rows = (results.get("results", [])
-                    if isinstance(results, dict) else list(results))
+            rows = results.get("results") if isinstance(results, dict) else results
+            if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+                raise ValueError("Mem0 search returned an invalid result shape")
 
             def _meta(r: Any) -> dict:
                 return (r.get("metadata") or {}) if isinstance(r, dict) else {}
@@ -517,16 +561,21 @@ class TrezoMemory:
             if kind:
                 rows = [r for r in rows if _meta(r).get("kind") == kind]
             out = rows[:int(limit)]
+            success_time = _time.time()
+            last_success_at = _dt.fromtimestamp(success_time, _tz.utc).isoformat()
             try:
-                _SEARCH_CACHE[_ck] = (_time.time(), list(out))
+                _SEARCH_CACHE[_ck] = (success_time, list(out))
                 if len(_SEARCH_CACHE) > 512:
                     _SEARCH_CACHE.clear()
             except Exception:  # noqa: BLE001
                 pass
-            return out
+            return RecallResult(
+                out, "ok" if out else "ok_empty", "api", last_success_at,
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning("Mem0 recall_similar failed for %r: %s", query, e)
-            return []
+            return RecallResult(state="request_failed", source="api",
+                                last_success_at=last_success_at)
 
     # ------------------------------------------------------------------
     # Batch digest -- token-lean shorthand delivery (Mike 2026-07-01)
@@ -584,6 +633,7 @@ class TrezoMemory:
 
     @property
     def available(self) -> bool:
+        """SDK client initialized; NOT evidence of successful service access."""
         return self._available
 
     def health(self) -> dict[str, Any]:

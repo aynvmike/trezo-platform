@@ -328,13 +328,19 @@ def test_replace_order_sends_only_what_changed():
         sent["path"] = path
         sent["body"] = body
         return {}, None
-    alp._patch = _patch
-    _run(alp.replace_order("abc", stop_price=12.345))
-    assert sent["path"] == "/v2/orders/abc"
-    assert set(sent["body"]) == {"stop_price"}, (
-        "sending fields the caller did not ask to change risks silently "
-        "rewriting quantity or price")
-    assert sent["body"]["stop_price"] == "12.35"
+    original = alp._patch
+    try:
+        alp._patch = _patch
+        _run(alp.replace_order("abc", stop_price=12.345))
+        assert sent["path"] == "/v2/orders/abc"
+        assert set(sent["body"]) == {"stop_price"}, (
+            "sending fields the caller did not ask to change risks silently "
+            "rewriting quantity or price")
+        assert sent["body"]["stop_price"] == "12.35"
+    finally:
+        # run_all imports the next suite AFTER this test has run. A fake
+        # left here makes that suite capture the fake as its real broker.
+        alp._patch = original
 
 
 def test_replace_order_refuses_an_empty_change():

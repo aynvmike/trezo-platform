@@ -16,6 +16,7 @@ the only hard limit above it is available buying power.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from math import isfinite
 from typing import Optional
 
 
@@ -105,6 +106,19 @@ def plan_position(
         return SizingPlan(ok=False, account_equity=equity, account_tier=tier,
                           reject_reason="Missing or invalid entry/stop price")
 
+    # None means no budget was supplied. An exhausted broker balance,
+    # pocket or lane cap is a real constraint, never an absent one. Both
+    # broker execution paths pass their tightest budget into this field.
+    if buying_power is not None:
+        try:
+            buying_power = float(buying_power)
+        except (TypeError, ValueError, OverflowError):
+            buying_power = float("nan")
+        if not isfinite(buying_power) or buying_power <= 0:
+            return SizingPlan(
+                ok=False, account_equity=equity, account_tier=tier,
+                reject_reason="Buying power is unavailable or exhausted - cannot size a trade")
+
     stop_distance = abs(entry_price - stop_price)
     if stop_distance <= 0:
         return SizingPlan(ok=False, account_equity=equity, account_tier=tier,
@@ -144,7 +158,7 @@ def plan_position(
     except Exception:  # noqa: BLE001
         pass
     notional_cap = equity * cap_pct
-    if buying_power is not None and buying_power > 0:
+    if buying_power is not None:
         notional_cap = min(notional_cap, buying_power)
 
     qty = risk_qty

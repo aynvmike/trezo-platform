@@ -5,7 +5,8 @@ decisions and surface a tiny summary of past similar situations
 (outcomes won/lost) so the next decision is informed by history.
 
 Design contract:
-  * NEVER raises. Memory failures return an empty hint dict.
+  * Memory failures return explicit diagnostic states, not evidence of
+    a successful search with no matching memories.
   * Returns a structured dict the callers can attach to their payload
     so the UI can render "11 similar setups in memory; 7 won, 4 lost".
   * Limits to top-N most-similar memories to keep query cost bounded.
@@ -25,7 +26,10 @@ def recall_decision_context(*, ticker: str, strategy: str,
     strategy. Returns a dict with summary stats the caller can attach
     to their decision payload.
 
-    Empty dict on Mem0 unavailable.
+    ``available`` remains the legacy client-initialized capability flag
+    so existing consumers retain failure diagnostics in their payloads.
+    It does NOT mean successfully connected: use retrieval_succeeded,
+    retrieval_state, and the per-query receipts to assess actual reads.
     Shape:
       {
         "available": True,
@@ -40,30 +44,35 @@ def recall_decision_context(*, ticker: str, strategy: str,
     """
     try:
         from app.memory import get_memory
+        from app.memory.mem0_client import RecallResult
+        mem = get_memory()
     except Exception:  # noqa: BLE001
-        return {"available": False}
-
-    mem = get_memory()
-    if not mem.available:
-        return {"available": False}
+        return {
+            "available": False, "client_available": False,
+            "retrieval_succeeded": False,
+            "retrieval_state": "client_unavailable",
+            "last_success_at": None,
+            "recall_receipts": {},
+            "n_decisions": 0, "n_outcomes": 0,
+            "wins": 0, "losses": 0,
+            "last_pnl_usd": None, "median_pnl_usd": None,
+            "summary": "Mem0 client unavailable; recall was not attempted.",
+        }
 
     query = f"{ticker} {strategy} setup"
     if extra_query:
         query = f"{query} {extra_query}"
 
-    try:
-        decisions = mem.recall_similar(
-            query=query, limit=limit, ticker=ticker, kind="decision",
-        )
-    except Exception:  # noqa: BLE001
-        decisions = []
-
-    try:
-        outcomes = mem.recall_similar(
-            query=query, limit=limit, ticker=ticker, kind="outcome",
-        )
-    except Exception:  # noqa: BLE001
-        outcomes = []
+    results = {}
+    for kind in ("decision", "outcome"):
+        try:
+            results[kind] = mem.recall_similar_result(
+                query=query, limit=limit, ticker=ticker, kind=kind,
+            )
+        except Exception:  # noqa: BLE001
+            results[kind] = RecallResult(state="request_failed")
+    decisions = results["decision"].rows
+    outcomes = results["outcome"].rows
 
     pnls: list[float] = []
     wins = losses = 0
@@ -91,8 +100,40 @@ def recall_decision_context(*, ticker: str, strategy: str,
         wins=wins, losses=losses, median=median,
     )
 
+    succeeded = all(r.succeeded for r in results.values())
+    if succeeded:
+        state = "ok" if decisions or outcomes else "ok_empty"
+    elif any(r.succeeded for r in results.values()):
+        state = "partial"
+    else:
+        states = {r.state for r in results.values()}
+        state = next(iter(states)) if len(states) == 1 else "mixed_failure"
+    if not succeeded:
+        meanings = {
+            "ok": "returned matches", "ok_empty": "returned no matches",
+            "client_unavailable": "client unavailable",
+            "budget_blocked": "blocked by search budget",
+            "request_failed": "request failed",
+        }
+        summary = ("Memory recall incomplete: " if state == "partial"
+                   else "Memory recall unavailable: ") + "; ".join(
+                       f"{kind}s {meanings.get(r.state, 'unavailable')}"
+                       for kind, r in results.items()) + "."
+    successes = [r.last_success_at for r in results.values() if r.last_success_at]
+
     return {
-        "available": True,
+        # Kept for callers that attach learning_context only when available.
+        # Successful retrieval is deliberately a separate field.
+        "available": bool(mem.available),
+        "client_available": bool(mem.available),
+        "retrieval_succeeded": succeeded,
+        "retrieval_state": state,
+        "last_success_at": max(successes) if successes else None,
+        "recall_receipts": {
+            kind: {"state": r.state, "source": r.source,
+                   "last_success_at": r.last_success_at}
+            for kind, r in results.items()
+        },
         "n_decisions": len(decisions),
         "n_outcomes": len(outcomes),
         "wins": wins,

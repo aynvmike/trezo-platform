@@ -20,6 +20,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 from app.config import get_settings
+from app.brokers.endpoints import paper_base_url
 
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
@@ -117,8 +118,8 @@ def _base_url() -> str:
         return LIVE_BASE_URL
     a = _account_ctx()
     if a is not None:
-        return a.base_url
-    return get_settings().alpaca_base_url or PAPER_BASE_URL
+        return paper_base_url(a.base_url)
+    return paper_base_url(get_settings().alpaca_base_url)
 
 
 def _headers() -> dict:
@@ -514,7 +515,7 @@ def tradable_crypto_symbols() -> frozenset:
         # venue fact, identical for every account under one login, and it
         # is cached process-wide for 6h. Any valid key can read it.
         s = get_settings()
-        base = (s.alpaca_base_url or PAPER_BASE_URL).rstrip("/")
+        base = paper_base_url(s.alpaca_base_url)
         req = _u.Request(
             base + "/v2/assets?asset_class=crypto&status=active",
             headers={"APCA-API-KEY-ID": s.alpaca_api_key,

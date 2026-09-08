@@ -31,6 +31,9 @@ def _supabase():
 class StrategyDiscoveryAgent(Agent):
     name = "strategy_discovery"
     tick_interval_seconds = 3600  # hourly
+    # Begin the durable daily research after boot without waiting an hour.
+    # Subsequent fires remain hourly; the cycle journal prevents duplicates.
+    tick_initial_delay_seconds = 30
 
     async def tick(self) -> list[AgentMessage]:
         client = _supabase()
@@ -52,7 +55,7 @@ class StrategyDiscoveryAgent(Agent):
 
             # With enough history, flag the weakest strategy as a refinement hint.
             weakest = None
-            if rep.total_trades >= 10 and rep.by_strategy:
+            if rep.history_complete and rep.total_trades >= 10 and rep.by_strategy:
                 worst = min(rep.by_strategy, key=lambda s: s["total_pnl_usd"])
                 if worst["total_pnl_usd"] < 0:
                     weakest = worst["strategy"]
@@ -60,10 +63,12 @@ class StrategyDiscoveryAgent(Agent):
             out.append(AgentMessage(
                 agent=self.name,
                 kind="metrics",
-                confidence=min(rep.total_trades / 100.0, 1.0),
+                # Record count is not statistical confidence in profitability.
+                confidence=0.0,
                 payload={
+                    **rep.to_dict(),
                     "user_id": uid,
-                    "note": "Performance report",
+                    "note": "Recorded closed-row performance report: " + rep.note,
                     "total_trades": rep.total_trades,
                     "win_rate": rep.win_rate,
                     "profit_factor": rep.profit_factor,
@@ -71,16 +76,29 @@ class StrategyDiscoveryAgent(Agent):
                     "total_realized_usd": rep.total_realized_usd,
                     "max_drawdown_usd": rep.max_drawdown_usd,
                     "by_strategy": rep.by_strategy,
-                    "review_due": rep.review_due,
+                    "review_due": rep.history_complete and rep.review_due,
                     "weakest_strategy": weakest,
                 },
             ))
-            if rep.review_due:
+            if rep.history_complete and rep.review_due:
                 out.append(AgentMessage(
                     agent=self.name, kind="alert",
                     payload={"user_id": uid, "event": "performance_review_due",
-                             "note": f"{rep.total_trades} trades logged - time for a 25-trade review"},
+                             "note": f"{rep.total_trades} closed records logged - review the recorded outcomes"},
                 ))
+
+            # Direct internal research path: the durable cycle owns daily
+            # idempotence and trial evidence. Discord/telemetry is never a queue.
+            # Research freezes current broker equity or an explicit scenario;
+            # unreconciled P&L counters never supply its capital.
+            try:
+                from app.research.bridge import research_for_book
+                research = await research_for_book(uid)
+            except Exception as exc:
+                research = {"event": "internal_research", "user_id": uid,
+                            "status": "failed", "reason": "research_binding_failed",
+                            "error_type": type(exc).__name__, "execution_enabled": False}
+            out.append(AgentMessage(agent=self.name, kind="info", payload=research))
 
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",
@@ -98,8 +116,9 @@ class StrategyDiscoveryAgent(Agent):
             if weak:
                 await self.remember(
                     topic=f"weak_strategy:{weak}",
-                    content=(f"The {weak} strategy is running at a net loss in "
-                             f"paper trading - a refinement candidate."),
+                    content=(f"The {weak} strategy has negative recorded closed-row "
+                             "P&L. Fees and execution evidence remain unverified; "
+                             "this is a review hint, not promotion evidence."),
                     category="warning")
         insight = await self._backtest_insight(client)
         if insight:

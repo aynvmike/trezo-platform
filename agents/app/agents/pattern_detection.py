@@ -87,13 +87,13 @@ class PatternDetectionAgent(Agent):
         "XRP", "ETH", "SOL"
     ]
 
-    # Per-ticker backtest history is a slow-moving quality gate, so it is
-    # refreshed only every 15 minutes rather than every tick.
+    # Per-book, per-ticker backtest history is a slow-moving quality gate,
+    # so it is refreshed only every 15 minutes rather than every tick.
     _BT_TTL = 900.0
 
     def __init__(self) -> None:
-        self._bt_history: dict[str, dict[str, float]] = {}
-        self._bt_at: float = 0.0
+        self._bt_history: dict[str, dict[str, dict[str, float]]] = {}
+        self._bt_at: dict[str, float] = {}
         # Per-(user, ticker) memory of the last chosen strategy AND
         # its TCS at the time of selection. Used to (a) surface
         # strategy-change events on the next tick, and (b) enforce
@@ -161,30 +161,34 @@ class PatternDetectionAgent(Agent):
         except Exception:  # noqa: BLE001
             return [(None, self.watchlist)]
 
-    async def _backtest_history(self) -> dict[str, dict[str, float]]:
-        """{SYMBOL: {strategy: avg_return_pct}} from the backtest_runs log.
+    async def _backtest_history(self, user_id: str | None) -> dict[str, dict[str, float]]:
+        """This book's {SYMBOL: {strategy: avg_return_pct}} backtest log.
 
-        This is the quality gate for strategy selection - it favours
-        strategies proven on a stock and drops ones that lost on it.
-        Cached for 15 minutes; it changes only when the user runs a
-        backtest, so it does not need to be re-read every tick."""
+        This is an existing selection hint, not a strategy promotion
+        verdict. The service-role client bypasses RLS, so both the query
+        and its cache must be book-scoped. An unscoped fallback scan gets
+        no private history. A failed refresh keeps only this book's last
+        successful result without marking it fresh; the next tick retries.
+        """
+        if not user_id:
+            return {}
+        cached = self._bt_history.get(user_id, {})
         now = time.time()
-        if self._bt_history and (now - self._bt_at) < self._BT_TTL:
-            return self._bt_history
+        if user_id in self._bt_at and (now - self._bt_at[user_id]) < self._BT_TTL:
+            return cached
         client = _supabase()
         if not client:
-            self._bt_at = now
-            return self._bt_history
+            return cached
         try:
             def _q():
                 return (client.table("backtest_runs")
                         .select("symbol, strategy, total_return_pct, trades")
+                        .eq("user_id", user_id)
                         .order("created_at", desc=True).limit(600).execute())
             res = await asyncio.to_thread(_q)
             rows = res.data or []
         except Exception:  # noqa: BLE001
-            self._bt_at = now
-            return self._bt_history
+            return cached
 
         agg: dict[str, dict[str, list]] = {}
         for r in rows:
@@ -196,12 +200,12 @@ class PatternDetectionAgent(Agent):
             strat = str(r.get("strategy") or "default")
             agg.setdefault(sym, {}).setdefault(strat, []).append(
                 float(r.get("total_return_pct") or 0.0))
-        self._bt_history = {
+        self._bt_history[user_id] = {
             sym: {st: sum(v) / len(v) for st, v in smap.items() if v}
             for sym, smap in agg.items()
         }
-        self._bt_at = now
-        return self._bt_history
+        self._bt_at[user_id] = now
+        return self._bt_history[user_id]
 
     async def _maybe_seed_prev_strategy(self) -> None:
         if self._seeded_prev_strategy:
@@ -230,14 +234,14 @@ class PatternDetectionAgent(Agent):
         in_orb = bool(_orb_window()[0])
         in_swing = bool(_swing_window())
 
-        history = await self._backtest_history()
-
         scan_summary: dict[str, dict] = {}
 
         for user_id, tickers in await self._scan_targets():
             cfg = get_bot_settings(user_id)
             if not cfg.pattern_enabled:
                 continue
+
+            history = await self._backtest_history(user_id)
 
             # Outcome-weighted selection (2026-06-16): this user's learned
             # per-strategy edge, fetched once per tick (cached 10 min). The

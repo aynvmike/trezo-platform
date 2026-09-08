@@ -35,6 +35,7 @@ from typing import Optional, Tuple
 from app.brokers.accounts import (
     account_for_user, current_account, multi_account_active, load_accounts,
 )
+from app.brokers.endpoints import paper_base_url
 
 
 def check_route(user_id: str) -> Tuple[bool, str]:
@@ -93,7 +94,7 @@ async def audit_routes() -> list[dict]:
         held: dict[str, set] = {}
         for acct in load_accounts():
             try:
-                req = _u.Request(acct.base_url + "/v2/positions",
+                req = _u.Request(paper_base_url(acct.base_url) + "/v2/positions",
                                  headers=acct.headers())
                 rows = _j.load(_u.urlopen(req, timeout=15))
                 held[acct.account_id] = {

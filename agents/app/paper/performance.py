@@ -15,6 +15,8 @@ import asyncio
 from dataclasses import dataclass, asdict, field
 
 REVIEW_EVERY = 25   # the document reviews performance every 25 trades
+HISTORY_PAGE_SIZE = 500
+MAX_HISTORY_ROWS = 100_000
 
 
 @dataclass
@@ -41,6 +43,18 @@ class PerformanceReport:
     by_strategy: list = field(default_factory=list)
     review_due: bool = False
     note: str = ""
+    # Legacy numeric fields above describe recorded closes, not verified
+    # account returns. A successful history read does not reconcile fees,
+    # partial-close lineage, execution receipts, open losses or cash flows.
+    metric_basis: str = "recorded_closed_position_rows"
+    recorded_closed_row_count: int = 0
+    fee_treatment: str = "mixed_or_unverified"
+    history_read_status: str = "not_requested"
+    history_complete: bool = False
+    history_rows_fetched: int = 0
+    account_return_pct: float | None = None
+    strategy_performance_verified: bool = False
+    strategy_promotion_eligible: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -96,6 +110,7 @@ def compute_performance(positions: list) -> PerformanceReport:
 
     return PerformanceReport(
         total_trades=n,
+        recorded_closed_row_count=n,
         wins=len(wins),
         losses=len(losses),
         win_rate=round(len(wins) / n, 3),
@@ -112,22 +127,71 @@ def compute_performance(positions: list) -> PerformanceReport:
 
 
 async def performance_for_user(client, user_id: str) -> PerformanceReport:
-    """Fetch a user's closed paper positions and compute the report."""
+    """Read one book's complete closed-row history, or report its failure.
+
+    Exact counts detect truncated and changing reads; an ID tiebreaker
+    keeps rows with the same exit timestamp stable across pages. Advance
+    by the returned length because a server may cap pages below our size.
+    Partial results must never look like a complete performance report.
+    """
     if not client:
-        return PerformanceReport(note="Supabase not configured.")
+        return PerformanceReport(note="Supabase not configured.",
+                                 history_read_status="not_configured")
 
-    def _sync():
-        return (
-            client.table("paper_positions")
-            .select("strategy, realized_pnl_usd, status, exit_at")
-            .eq("user_id", user_id)
-            .neq("status", "open")
-            .order("exit_at", desc=False)
-            .execute()
-        )
+    rows, seen = [], set()
+    expected = None
 
-    try:
-        res = await asyncio.to_thread(_sync)
-    except Exception:  # noqa: BLE001
-        return PerformanceReport(note="Could not read trade history.")
-    return compute_performance(res.data or [])
+    def _incomplete(note: str) -> PerformanceReport:
+        return PerformanceReport(note=note, history_read_status="incomplete",
+                                 history_rows_fetched=len(rows))
+
+    while True:
+        offset = len(rows)
+
+        def _sync():
+            return (
+                client.table("paper_positions")
+                .select("id, strategy, realized_pnl_usd, status, exit_at", count="exact")
+                .eq("user_id", user_id)
+                .neq("status", "open")
+                .order("exit_at", desc=False)
+                .order("id", desc=False)
+                .range(offset, offset + HISTORY_PAGE_SIZE - 1)
+                .execute()
+            )
+
+        try:
+            res = await asyncio.to_thread(_sync)
+        except Exception:  # noqa: BLE001
+            return PerformanceReport(
+                note="Could not read complete trade history.",
+                history_read_status="incomplete" if rows else "failed",
+                history_rows_fetched=len(rows))
+
+        page = getattr(res, "data", None)
+        count = getattr(res, "count", None)
+        if (not isinstance(page, list) or not isinstance(count, int)
+                or isinstance(count, bool) or count < 0):
+            return _incomplete("Trade history response was incomplete or invalid.")
+        if expected is None:
+            expected = count
+        elif count != expected:
+            return _incomplete("Trade history changed during pagination; retry required.")
+        if expected > MAX_HISTORY_ROWS:
+            return _incomplete("Trade history exceeds this report's read limit.")
+        if not page and len(rows) != expected:
+            return _incomplete("Trade history ended before the reported row count.")
+        for row in page:
+            rid = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(rid, str) or not rid or rid in seen:
+                return _incomplete("Trade history contains missing or repeated row IDs.")
+            seen.add(rid)
+            rows.append(row)
+        if len(rows) > expected:
+            return _incomplete("Trade history exceeded the reported row count.")
+        if len(rows) == expected:
+            report = compute_performance(rows)
+            report.history_read_status = "complete"
+            report.history_complete = True
+            report.history_rows_fetched = len(rows)
+            return report

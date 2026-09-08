@@ -74,6 +74,20 @@ class Settings(BaseSettings):
     # Anthropic
     anthropic_api_key: str = ""
 
+    # Internal research pilot: bound to strategy_discovery, never order execution.
+    # Mike authorized activation on 2026-09-08. These are initial historical
+    # research cost estimates, not measured broker costs or trading settings.
+    # Environment overrides remain authoritative; explicit missing costs block.
+    # The single-engine SQLite journal and JSON artifacts must be backed up.
+    trezo_research_enabled: bool = True
+    trezo_research_symbol: str = "SPY"
+    trezo_research_asset_type: str = "stock"
+    trezo_research_capital_mode: str = "broker_equity"
+    trezo_research_capitals: str = "1000,5000"
+    trezo_research_commission_bps: float | None = 2.0
+    trezo_research_slippage_bps: float | None = 5.0
+    trezo_research_db_path: str = ""
+
     # Market data
     finnhub_api_key: str = ""
     # Nasdaq Data Link API key for the macro adapter's Nasdaq backend.
