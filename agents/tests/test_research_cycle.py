@@ -77,8 +77,19 @@ def _assert_raises(kind, fn):
 
 
 def _query(path, sql):
-    with sqlite3.connect(path) as connection:
+    # WINDOWS GATE TRUTH (2026-09-08): `with sqlite3.connect(...)` commits
+    # on exit but does NOT close, so every query here left the database
+    # file open. Linux happily deletes an open file, so the suite was
+    # green in the container that wrote it -- and RED on the server,
+    # where TemporaryDirectory cleanup cannot remove a file a handle
+    # still locks. That one leak rolled back a whole deploy. The store
+    # under test closes its own connections (store.py, finally: close);
+    # the suite must hold itself to the same standard.
+    connection = sqlite3.connect(path)
+    try:
         return connection.execute(sql).fetchall()
+    finally:
+        connection.close()
 
 
 def test_actual_cycle_records_all_variants_and_repeated_cycle_is_idempotent():
@@ -316,9 +327,14 @@ def test_fixed_scenario_identity_and_legacy_completed_evidence_remain_compatible
                          if key not in {"capital_basis", "capital_snapshot"}}
         legacy_request = {key: value for key, value in request.items()
                           if key not in {"capital_basis", "capital_snapshot"}}
-        with sqlite3.connect(path) as connection:
-            connection.execute("UPDATE research_jobs SET request_json=?, result_json=?",
-                               (json.dumps(legacy_request), json.dumps(legacy_result)))
+        connection = sqlite3.connect(path)   # closed below: see _query's note
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE research_jobs SET request_json=?, result_json=?",
+                    (json.dumps(legacy_request), json.dumps(legacy_result)))
+        finally:
+            connection.close()
         cached = _run(path, capital_basis="fixed_scenario")
         assert {**cached, "cached": False} == legacy_result
         second = _run(path, cycle_key="day-two")
