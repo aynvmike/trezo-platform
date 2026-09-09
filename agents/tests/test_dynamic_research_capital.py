@@ -14,7 +14,7 @@ import tempfile
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _bootstrap import load_module, run_tests, stub_config
+from _bootstrap import load_module, quiet_activity_log, run_tests, stub_config
 
 stub_config()
 accounts = load_module("app.brokers.accounts")
@@ -236,6 +236,150 @@ def test_failed_equity_blocks_the_actual_bridge_before_data_or_storage():
         assert result["capital_basis"] == "broker_equity"
         assert not path.exists()
     assert len(calls) == 1 and fetches == []
+
+
+@contextmanager
+def _diagnostic_transport(book, outcome, calls):
+    """Exercise the actual GET and parser with only the HTTP client replaced."""
+    import httpx
+    real_get, real_note = alpaca._get, alpaca._note_read_error
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs == {"timeout": 10.0}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, *, headers):
+            assert url == book.base_url + "/v2/account"
+            assert headers == book.headers()
+            calls.append(url)
+            return await outcome()
+
+    with _transport([book], {}, []), quiet_activity_log(), \
+            _patched(alpaca, _get=real_get, _note_read_error=real_note,
+                     _LAST_READ_ERROR={}, _READ_ERROR_LOGGED_AT={}), \
+            _patched(httpx, AsyncClient=Client):
+        yield
+
+
+def test_actual_bridge_receives_sanitized_current_transport_failure():
+    import httpx
+    a = _book()
+    sensitive = "private-account-token-must-not-escape"
+    cases = [
+        (httpx.Response(401, text=sensitive), "authentication_failed", 401),
+        (httpx.Response(429, text=sensitive), "rate_limited", 429),
+        (httpx.Response(503, text=sensitive), "broker_unavailable", 503),
+        (httpx.ConnectTimeout(sensitive), "connect_timeout", None),
+        (httpx.ReadTimeout(sensitive), "read_timeout", None),
+        (httpx.ConnectError(sensitive), "connection_failed", None),
+        (httpx.Response(200, text=sensitive), "invalid_response", None),
+        (httpx.Response(200, json={sensitive: "missing amounts"}), "invalid_response", None),
+    ]
+    for response, category, status in cases:
+        async def outcome():
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, _diagnostic_transport(a, outcome, calls):
+            path = Path(tmp) / "research.sqlite3"
+            result = asyncio.run(bridge.research_for_book(a.account_key, settings=_research_settings(path)))
+            assert result["status"] == "blocked" and result["reason"] == "research_equity_read_failed"
+            expected = {"endpoint": "/v2/account", "category": category}
+            if status is not None:
+                expected["http_status"] = status
+            assert result["capital_read_diagnostic"] == expected, result
+            assert sensitive not in json.dumps(result)
+            assert result["execution_enabled"] is False and not path.exists()
+        assert len(calls) == 1
+        assert alpaca._READ_FAILURE_CAPTURE.get() is None
+
+
+def test_concurrent_same_book_reads_keep_their_own_failure_diagnostics():
+    import httpx
+    a = _book()
+    calls = []
+
+    async def together():
+        ready = asyncio.Event()
+        count = 0
+
+        async def outcome():
+            nonlocal count
+            status = 401 if count == 0 else 503
+            count += 1
+            if count == 2:
+                ready.set()
+            await asyncio.wait_for(ready.wait(), timeout=1)
+            return httpx.Response(status, text="private failure detail")
+
+        with _diagnostic_transport(a, outcome, calls):
+            return await asyncio.gather(capital.read_capital_snapshot(a.account_key),
+                                        capital.read_capital_snapshot(a.account_key), return_exceptions=True)
+
+    results = asyncio.run(together())
+    assert all(isinstance(result, capital.CapitalUnavailable) for result in results), results
+    assert [result.diagnostic["http_status"] for result in results] == [401, 503]
+    assert len(calls) == 2 and alpaca._READ_FAILURE_CAPTURE.get() is None
+
+
+def test_unclassified_read_does_not_reuse_a_historical_or_other_endpoint_error():
+    a = _book()
+    calls = []
+    real_note = alpaca._note_read_error
+
+    async def other_endpoint(uid):
+        # A nested failure for another endpoint is not evidence about account equity.
+        real_note("/v2/positions", "HTTP 503: private response", log=False)
+
+    with _transport([a], {a.key_id: None}, calls, on_read=other_endpoint), \
+            _patched(alpaca, _LAST_READ_ERROR={"primary": "GET /v2/account: HTTP 401: old failure"}):
+        try:
+            asyncio.run(capital.read_capital_snapshot(a.account_key))
+        except capital.CapitalUnavailable as exc:
+            assert exc.diagnostic == {"endpoint": "/v2/account", "category": "unclassified_failure"}
+        else:
+            raise AssertionError("missing account must block")
+    assert len(calls) == 1 and alpaca._READ_FAILURE_CAPTURE.get() is None
+
+
+def test_outer_read_deadline_is_explicit_and_cancellation_is_not_swallowed():
+    a = _book()
+    calls = []
+
+    async def expired(awaitable, *, timeout):
+        assert timeout == 10
+        awaitable.close()
+        raise asyncio.TimeoutError("private details")
+
+    async def cancelled(awaitable, *, timeout):
+        awaitable.close()
+        raise asyncio.CancelledError()
+
+    with _transport([a], {}, calls), \
+            _patched(capital, asyncio=SimpleNamespace(wait_for=expired, TimeoutError=asyncio.TimeoutError)):
+        try:
+            asyncio.run(capital.read_capital_snapshot(a.account_key))
+        except capital.CapitalUnavailable as exc:
+            assert exc.diagnostic == {"endpoint": "/v2/account", "category": "deadline_exceeded"}
+        else:
+            raise AssertionError("deadline must block")
+    with _transport([a], {}, calls), \
+            _patched(capital, asyncio=SimpleNamespace(wait_for=cancelled, TimeoutError=asyncio.TimeoutError)):
+        try:
+            asyncio.run(capital.read_capital_snapshot(a.account_key))
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("shutdown cancellation must propagate")
+    assert calls == [] and alpaca._READ_FAILURE_CAPTURE.get() is None
 
 
 def test_discovery_freezes_daily_evidence_and_retests_growing_and_shrinking_books():

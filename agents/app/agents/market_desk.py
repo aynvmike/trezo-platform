@@ -1,4 +1,9 @@
-"""Market Desk -- turns Nova's market reports into one view every lane reads.
+"""Market Desk -- fresh reports or qualified internal benchmark context.
+
+When no fresh relay report is available, a single Alpaca SPY/QQQ snapshot
+request supplies a source-timed price-versus-provider-daily-VWAP proxy.
+It expires after five minutes and carries no invented news, VIX or breadth.
+Fresh relay reports take precedence; all existing consumers remain tighten-only.
 
 WHY THIS EXISTS (2026-08-25, Mike: "I want to have an agent that can go
 through the reports and can process for each agent so that we can stay
@@ -19,8 +24,8 @@ in THIS module. Writer and readers share a file on purpose: the ex-date
 guard taught us what happens when a format's producer and consumer are
 allowed to drift apart in silence.
 
-WHAT IT NEVER DOES. The desk holds no opinions of its own and moves no
-levers. It cannot change scope, posture, sizing, or orders, and every
+WHAT IT NEVER DOES. The desk moves no levers. It cannot change scope,
+posture, sizing, or orders, and every
 consumer is required to treat a missing or stale view as "no opinion"
 -- an absent report leaves every lane exactly as it was before this
 agent existed. Consumers may only TIGHTEN on what the desk serves
@@ -30,8 +35,11 @@ take risk off the table; it can never put risk on.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -58,6 +66,9 @@ class MarketView:
     movers_down: list = field(default_factory=list)
     catalysts: list = field(default_factory=list)
     summary: str = ""
+    context_kind: str = "relay_report"
+    max_age_seconds: float = VIEW_MAX_AGE_H * 3600
+    provenance: dict = field(default_factory=dict)
 
     def age_hours(self, now: Optional[datetime] = None) -> Optional[float]:
         try:
@@ -68,12 +79,18 @@ class MarketView:
         except Exception:  # noqa: BLE001
             return None
 
-    def fresh(self) -> bool:
-        age = self.age_hours()
-        return age is not None and 0 <= age <= VIEW_MAX_AGE_H
+    def fresh(self, now: Optional[datetime] = None) -> bool:
+        age = self.age_hours(now)
+        # Report TTL stays unchanged. Short-lived internal views carry their
+        # own smaller bound, always measured from the source timestamp.
+        maximum = self.max_age_seconds
+        return (not isinstance(maximum, bool) and isinstance(maximum, (int, float))
+                and math.isfinite(maximum) and 0 < maximum <= VIEW_MAX_AGE_H * 3600
+                and age is not None and 0 <= age * 3600 <= maximum)
 
 
-def build_view(payload: dict, source: str = "") -> Optional[MarketView]:
+def build_view(payload: dict, source: str = "", *, context_kind="relay_report",
+               max_age_seconds=VIEW_MAX_AGE_H * 3600, provenance=None) -> Optional[MarketView]:
     """A validated MarketView from a raw market_context payload, or None.
 
     Tolerant of missing optional fields, strict about the ones that
@@ -100,15 +117,22 @@ def build_view(payload: dict, source: str = "") -> Optional[MarketView]:
         return out[:12]
 
     indices = {}
-    for k, v in (payload.get("indices") or {}).items():
+    raw_indices = payload.get("indices") or {}
+    if not isinstance(raw_indices, dict):
+        return None
+    for k, v in raw_indices.items():
         try:
-            indices[str(k).upper()] = float(v)
+            number = float(v)
+            if math.isfinite(number):
+                indices[str(k).upper()] = number
         except (TypeError, ValueError):
             continue
     vix = None
     try:
         if payload.get("vix") is not None:
             vix = float(payload["vix"])
+            if not math.isfinite(vix) or vix <= 0:
+                vix = None
     except (TypeError, ValueError):
         vix = None
     return MarketView(
@@ -123,6 +147,9 @@ def build_view(payload: dict, source: str = "") -> Optional[MarketView]:
         movers_down=_syms("movers_down"),
         catalysts=[str(c)[:120] for c in (payload.get("catalysts") or [])][:8],
         summary=str(payload.get("summary") or "")[:600],
+        context_kind=context_kind,
+        max_age_seconds=max_age_seconds,
+        provenance=dict(provenance or {}),
     )
 
 
@@ -144,24 +171,51 @@ def current_market_view() -> Optional[MarketView]:
 
 class MarketDeskAgent(Agent):
     name = "market_desk"
-    tick_interval_seconds = 300
+    # Completed minute bars lose one minute of a five-minute TTL already.
+    # Two-minute polling keeps useful context available between observations.
+    tick_interval_seconds = 120
 
     _last_seen_as_of: str = ""
+    _last_seen_key: str = ""
 
     async def tick(self) -> list[AgentMessage]:
         global _current, _current_at
         row = await self._newest_briefing()
-        if not row:
-            return []
-        view = build_view(row.get("payload") or {},
-                          source=str(row.get("source") or ""))
+        view = None
+        try:
+            if isinstance(row, dict):
+                view = build_view(row.get("payload") or {},
+                                  source=str(row.get("source") or ""))
+        except (TypeError, ValueError, AttributeError):
+            view = None
         if view is None or not view.fresh():
-            return []
-        if view.as_of == self._last_seen_as_of:
-            return []                     # same report; nothing new to say
+            # A transient relay read failure does not displace an already
+            # valid report. An expired report cannot lock out the fallback.
+            retained = current_market_view()
+            if retained is not None and retained.context_kind == "relay_report":
+                return []
+            from app.knowledge.internal_market_context import (
+                MAX_SOURCE_AGE_SECONDS, fetch_context)
+            result = await fetch_context(now=datetime.now(timezone.utc))
+            if result.status != "ready":
+                return [AgentMessage(agent=self.name, kind="info", payload=result.receipt())]
+            view = build_view(result.payload, context_kind="internal_benchmark_proxy",
+                              max_age_seconds=MAX_SOURCE_AGE_SECONDS,
+                              provenance=result.payload["provenance"])
+            if view is None or not view.fresh():
+                return [AgentMessage(agent=self.name, kind="info", payload={
+                    **result.receipt(), "status": "invalid", "reason": "context_expired_before_publication"})]
+        key = hashlib.sha256(json.dumps(asdict(view), sort_keys=True,
+                                       allow_nan=False).encode()).hexdigest()
+        # Restore the current pointer BEFORE suppressing duplicate receipts.
+        # A replaced/cleared pointer must not strand an otherwise valid source.
+        duplicate = key == self._last_seen_key
         self._last_seen_as_of = view.as_of
+        self._last_seen_key = key
         _current = view
         _current_at = time.time()
+        if duplicate:
+            return []
 
         # Say what was read, once per report, in the feed -- so "are the
         # agents reviewing the reports?" has a visible receipt.
@@ -179,6 +233,10 @@ class MarketDeskAgent(Agent):
             payload={
                 "ticker": "MARKET", "event": "market_view",
                 "slot": view.slot, "regime": view.regime,
+                "as_of": view.as_of, "source": view.source,
+                "context_kind": view.context_kind,
+                "max_age_seconds": view.max_age_seconds,
+                "provenance": view.provenance,
                 "vix": view.vix, "movers_up": view.movers_up,
                 "movers_down": view.movers_down,
                 "note": f"market view updated from {view.source or 'report'}"

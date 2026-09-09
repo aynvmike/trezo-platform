@@ -112,7 +112,8 @@ async def research_for_book(book_id: str, *, settings=None,
             capitals = [capital_snapshot["equity_usd"]]
         except CapitalUnavailable as exc:
             return {**base, "status": "blocked", "reason": str(exc),
-                    "capital_basis": capital_mode}
+                    "capital_basis": capital_mode,
+                    **({"capital_read_diagnostic": exc.diagnostic} if exc.diagnostic else {})}
         except Exception as exc:
             return {**base, "status": "failed", "reason": "research_equity_read_failed",
                     "capital_basis": capital_mode, "error_type": type(exc).__name__}
