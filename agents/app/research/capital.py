@@ -16,6 +16,10 @@ import math
 class CapitalUnavailable(ValueError):
     """A stable, non-secret reason why dynamic research cannot proceed."""
 
+    def __init__(self, reason: str, *, diagnostic: dict | None = None):
+        super().__init__(reason)
+        self.diagnostic = diagnostic
+
 
 async def read_capital_snapshot(book_id: str) -> dict:
     from app.brokers.accounts import bind_for_user
@@ -43,12 +47,21 @@ async def read_capital_snapshot(book_id: str) -> dict:
             correct_route = False
         if not correct_route:
             raise CapitalUnavailable("research_broker_route_mismatch")
-        try:
-            account = await asyncio.wait_for(alpaca.get_account(), timeout=10)
-        except Exception as exc:
-            raise CapitalUnavailable("research_equity_read_failed") from exc
-    if account is None:
-        raise CapitalUnavailable("research_equity_read_failed")
+        # Keep the diagnostic attached to THIS read. last_read_error() is a
+        # per-book historical slot and can describe another concurrent read.
+        with alpaca.capture_read_failure("/v2/account") as capture:
+            try:
+                account = await asyncio.wait_for(alpaca.get_account(), timeout=10)
+            except asyncio.TimeoutError as exc:
+                raise CapitalUnavailable("research_equity_read_failed", diagnostic={
+                    "endpoint": "/v2/account", "category": "deadline_exceeded"}) from exc
+            except Exception as exc:
+                raise CapitalUnavailable("research_equity_read_failed", diagnostic={
+                    "endpoint": "/v2/account",
+                    **alpaca._safe_read_failure(type(exc).__name__ + ":")}) from exc
+            if account is None:
+                raise CapitalUnavailable("research_equity_read_failed", diagnostic=(
+                    capture.failure or {"endpoint": "/v2/account", "category": "unclassified_failure"}))
     try:
         if isinstance(account.equity, bool) or isinstance(account.cash, bool):
             raise ValueError("invalid account amounts")

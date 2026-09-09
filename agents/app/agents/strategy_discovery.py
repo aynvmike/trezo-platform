@@ -87,6 +87,19 @@ class StrategyDiscoveryAgent(Agent):
                              "note": f"{rep.total_trades} closed records logged - review the recorded outcomes"},
                 ))
 
+            # Review completed accounting days directly inside the engine.
+            # The journal retains evidence and hypotheses; no trading rules
+            # are changed by a daily report or its telemetry receipt.
+            try:
+                from app.learning.daily_review import daily_review_for_book
+                day_review = await daily_review_for_book(client, uid)
+            except Exception as exc:
+                day_review = {"event": "daily_trade_review", "user_id": uid,
+                              "status": "failed", "reason": "daily_review_binding_failed",
+                              "error_type": type(exc).__name__, "execution_enabled": False,
+                              "strategy_promotion_eligible": False}
+            out.append(AgentMessage(agent=self.name, kind="info", payload=day_review))
+
             # Direct internal research path: the durable cycle owns daily
             # idempotence and trial evidence. Discord/telemetry is never a queue.
             # Research freezes current broker equity or an explicit scenario;

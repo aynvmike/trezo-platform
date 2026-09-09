@@ -16,6 +16,8 @@ import os
 import re
 import time
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -171,6 +173,59 @@ _READ_ERROR_LOGGED_AT: dict[tuple[str, str], float] = {}
 _READ_ERROR_LOG_EVERY_S = 60.0
 
 
+@dataclass
+class ReadFailureCapture:
+    """Diagnostic for one caller's read, including its awaited child task."""
+
+    endpoint: str
+    failure: Optional[dict] = None
+
+
+_READ_FAILURE_CAPTURE: ContextVar[Optional[ReadFailureCapture]] = ContextVar(
+    "alpaca_read_failure_capture", default=None)
+
+
+@contextmanager
+def capture_read_failure(endpoint: str):
+    """Capture sanitized failures for one read without consulting old errors.
+
+    A fresh mutable holder is inherited by asyncio.wait_for's child task.
+    Concurrent callers each create their own holder; resetting restores any
+    enclosing scope. No response body, request headers or exception text is
+    retained in this diagnostic.
+    """
+    capture = ReadFailureCapture(endpoint=endpoint)
+    token = _READ_FAILURE_CAPTURE.set(capture)
+    try:
+        yield capture
+    finally:
+        _READ_FAILURE_CAPTURE.reset(token)
+
+
+def _safe_read_failure(detail: str) -> dict:
+    """Reduce the existing transport note to an allowlisted diagnostic."""
+    match = re.match(r"^HTTP ([45][0-9]{2})(?::|$)", detail)
+    if match:
+        status = int(match.group(1))
+        category = ("authentication_failed" if status in {401, 403} else
+                    "rate_limited" if status == 429 else
+                    "broker_unavailable" if status >= 500 else "http_error")
+        return {"category": category, "http_status": status}
+    category = {
+        "ConnectTimeout": "connect_timeout", "ReadTimeout": "read_timeout",
+        "WriteTimeout": "write_timeout", "PoolTimeout": "pool_timeout",
+        "TimeoutError": "timeout", "TimeoutException": "timeout",
+        "ConnectError": "connection_failed", "ReadError": "read_failed",
+        "RemoteProtocolError": "protocol_error", "JSONDecodeError": "invalid_response",
+    }.get(detail.split(":", 1)[0])
+    if category is None and detail.startswith(("2xx payload without parseable cash/equity",
+                                                "unexpected payload shape:")):
+        category = "invalid_response"
+    if category is None and detail == "Alpaca not configured for this book":
+        category = "not_configured"
+    return {"category": category or "unclassified_failure"}
+
+
 def _read_book() -> str:
     """The key a read failure is filed under: the bound env-slot account
     id ('primary' / 'acct2' / 'acct3'); unbound, the same 'live' /
@@ -206,6 +261,9 @@ def _note_read_error(path: str, detail: str, *, log: bool = True) -> None:
         book = _read_book()
         endpoint = str(path).split("?", 1)[0]
         detail = str(detail)
+        capture = _READ_FAILURE_CAPTURE.get()
+        if capture is not None and capture.endpoint == endpoint:
+            capture.failure = {"endpoint": endpoint, **_safe_read_failure(detail)}
         _LAST_READ_ERROR[book] = f"GET {endpoint}: {detail}"
         if not log:
             return

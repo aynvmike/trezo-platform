@@ -341,6 +341,45 @@ def test_fixed_scenario_identity_and_legacy_completed_evidence_remain_compatible
         assert second["continuation"]["source_job_id"] == first["job_id"]
 
 
+def test_sqlite_inspections_close_handles_before_temporary_directory_cleanup():
+    """Exercise the actual read/update tests with Windows handle semantics."""
+    original_connect = sqlite3.connect
+    original_tempdir = tempfile.TemporaryDirectory
+    opened = {}
+    counts = {"connections": 0, "cleanups": 0}
+
+    class TrackedConnection(sqlite3.Connection):
+        def __init__(self, path, *args, **kwargs):
+            super().__init__(path, *args, **kwargs)
+            counts["connections"] += 1
+            self.handle_id = counts["connections"]
+            opened[self.handle_id] = str(path)
+
+        def close(self):
+            super().close()
+            opened.pop(self.handle_id, None)
+
+    def connect(path, *args, **kwargs):
+        return original_connect(path, *args, factory=TrackedConnection, **kwargs)
+
+    class CheckedTemporaryDirectory(original_tempdir):
+        def __exit__(self, *args):
+            counts["cleanups"] += 1
+            outstanding = [path for path in opened.values()
+                           if Path(self.name) in Path(path).parents]
+            try:
+                assert not outstanding, "SQLite handles must close before directory cleanup"
+            finally:
+                super().__exit__(*args)
+
+    with _patched(sqlite3, connect=connect), _patched(
+            tempfile, TemporaryDirectory=CheckedTemporaryDirectory):
+        test_actual_cycle_records_all_variants_and_repeated_cycle_is_idempotent()
+        test_fixed_scenario_identity_and_legacy_completed_evidence_remain_compatible()
+    assert counts["connections"] > 0 and counts["cleanups"] == 2
+    assert not opened
+
+
 def test_dynamic_same_key_freezes_equity_observation_and_all_completed_evidence():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "research.sqlite3"

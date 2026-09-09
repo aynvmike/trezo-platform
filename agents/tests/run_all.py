@@ -9,6 +9,7 @@ Run: python -m agents.tests.run_all
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 import importlib
 import os
 import shutil
@@ -55,7 +56,7 @@ SUITES = sorted(p.stem for p in HERE.glob("test_*.py"))
 # vf:gate-harness -- which is precisely the drift GATE-04 exists to catch,
 # so RAISE THIS NUMBER in the same commit that adds a suite). `>=` because
 # suites are added over time -- nothing should ever lower it.
-EXPECTED_MIN_SUITES = 71
+EXPECTED_MIN_SUITES = 73
 
 # The env vars the leak net depends on. A suite that changes either and
 # does not put it back would blind the net for every suite after it
@@ -63,6 +64,35 @@ EXPECTED_MIN_SUITES = 71
 # net is not measuring), so drift is a failure of THAT suite.
 _NET_ENV = ("TREZO_ACTIVITY_LOG_DIR", "TREZO_ACTIVITY_LOG")
 LEAK_HINT = "stub app.agents.activity_log.record"
+
+
+class _FailureTee:
+    """Stream normal progress while retaining bounded runner failure lines."""
+
+    def __init__(self, stream, suite, diagnostics):
+        self.stream = stream
+        self.suite = suite
+        self.diagnostics = diagnostics
+        self.pending = ""
+
+    def write(self, value):
+        result = self.stream.write(value)
+        lines = (self.pending + value).split("\n")
+        self.pending = lines.pop()[:512]
+        for line in lines:
+            line = line.strip()
+            if line.startswith(("FAIL  ", "ERROR ")):
+                self.diagnostics.append(f"{self.suite}: {line[:300]}")
+                # Retain a small tail, rather than replaying full suite output
+                # or tracebacks into the deployment operation's result row.
+                del self.diagnostics[:-6]
+        return result
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 def _activity_lines() -> list[str]:
@@ -99,6 +129,7 @@ def main() -> int:
     stub_config()
 
     failed = []
+    diagnostics: list[str] = []
     leaks: list[tuple[str, int]] = []
     for name in SUITES:
         print(f"\n=== {name} " + "=" * max(0, 50 - len(name)))
@@ -110,15 +141,16 @@ def main() -> int:
         # Each suite runs in its own process-shared namespace but stubs
         # module attributes; importing them all in one process is fine
         # because every suite resets what it stubs (see _REAL/_reset).
-        try:
-            mod = importlib.import_module(f"tests.{name}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  ERROR importing: {type(e).__name__}: {e}")
-            failed.append(name)
-        else:
-            # GATE-05: run_tests fails a suite that collects zero tests.
-            if run_tests(dict(vars(mod))):
+        with redirect_stdout(_FailureTee(sys.stdout, name, diagnostics)):
+            try:
+                mod = importlib.import_module(f"tests.{name}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  ERROR importing: {type(e).__name__}: {e}")
                 failed.append(name)
+            else:
+                # GATE-05: run_tests fails a suite that collects zero tests.
+                if run_tests(dict(vars(mod))):
+                    failed.append(name)
         for k, v in env_before.items():
             if os.environ.get(k) != v:
                 print(f"  FAIL  {name} left {k}={os.environ.get(k)!r} "
@@ -148,6 +180,12 @@ def main() -> int:
         for name, n in leaks:
             print("  " + _leak_line(name, n))
     if failed:
+        if diagnostics:
+            # ops_relay retains only the last 4000 characters. A failing
+            # function from an early suite must survive later PASS output.
+            print("FAILURE DETAILS (last 6 runner errors, truncated per line):")
+            for detail in diagnostics:
+                print("  " + detail)
         print(f"FAILED suites: {', '.join(failed)}")
         return 1
     # Final re-measure (review 2026-09-02): a row that lands AFTER the last
