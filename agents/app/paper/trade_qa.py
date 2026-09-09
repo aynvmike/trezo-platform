@@ -884,6 +884,65 @@ def _entry_fill_at(opening_fills: list, order_id: str) -> str:
     return best_raw
 
 
+def _row_entry_reference(row: dict, side: str, positions: list, fills: list,
+                         asset_type: str, window_start: datetime,
+                         now: datetime) -> tuple[Optional[datetime], str]:
+    """Resolve this row's entry receipt from this book's existing reads.
+
+    A symbol can have several trade cycles in the lookback. Its oldest
+    activity is therefore not evidence for this row's entry. Prefer the
+    row's exact opening order; without that link, require the same strict
+    one-order arithmetic proof used by the entry-receipt resolver. No
+    new broker reads and no changes to trading timestamps occur here.
+    """
+    if side not in ("long", "short"):
+        return None, "row direction is unknown"
+    entered = _parse_ts(row.get("entry_at"))
+    if entered is None or entered < window_start:
+        return None, "row entry predates the readable fill window"
+    opening_side = "buy" if side == "long" else "sell"
+    order_id = str(row.get("broker_order_id") or "").strip()
+    if order_id:
+        opening = [f for f in fills
+                   if str(f.get("order_id") or "") == order_id
+                   and str(f.get("side") or "").lower().startswith(opening_side)]
+        if not opening:
+            return None, "no opening fill for this row's broker order in the window"
+    else:
+        if len(positions) != 1:
+            return None, "no unique broker position to establish the entry order"
+        position = positions[0]
+        if (not _qty_matches(abs(_f(row.get("quantity"))),
+                             abs(_f(position.get("qty"))), asset_type)
+                or not _price_matches(abs(_f(row.get("entry_price"))),
+                                      abs(_f(position.get("avg_entry_price"))),
+                                      asset_type)[0]):
+            return None, "row and broker position disagree; entry order is unresolved"
+        ok, reason, _qty, _price, opening = _arith_gate(position, fills, asset_type)
+        if not ok:
+            return None, f"entry order is unresolved: {reason}"
+        order_ids = {str(f.get("order_id") or "").strip() for f in opening}
+        if "" in order_ids or len(order_ids) != 1:
+            return None, "opening fills do not establish one identified entry order"
+        order_id = next(iter(order_ids))
+
+    # A date-only, missing, future or out-of-window timestamp cannot settle
+    # the earliest fill. Do not silently pick another partial that has a
+    # usable clock and declare it the start of the trade.
+    for fill in opening:
+        raw = str(fill.get("transaction_time") or fill.get("date") or "").strip()
+        try:
+            timestamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            timestamp = None
+        if (("T" not in raw and " " not in raw) or ":" not in raw
+                or timestamp is None or timestamp.tzinfo is None
+                or timestamp < window_start or timestamp > now):
+            return None, "entry-order fills do not provide complete bounded timestamps"
+    reference = _parse_ts(_entry_fill_at(opening, order_id))
+    return reference, "" if reference is not None else "entry fill time is unresolved"
+
+
 # ---------------------------------------------------------------------------
 # Ticketing. Edge-triggered: the activity row, the alert and the
 # source_payload.qa block are written on TRANSITION only.
@@ -1168,10 +1227,15 @@ async def _inspect(client, uid: str, positions: list, orders: list,
 
     # ---- I2 / I4 / I5 / I5b, per open row ----------------------------
     for (key, side), rlist in sorted(open_rows.items()):
+        # Drift tickets are keyed by book/symbol/code, not row or side.
+        # A healthy duplicate must not clear another row's discrepancy.
+        sole_open_row = sum(1 for row in rows_by_sym.get(key, [])
+                            if str(row.get("status") or "") == "open") == 1
         for r in rlist:
             await _check_row(client, uid, key, side, r, pos_by_key,
                              fills_by_sym, window_start, rep, budget,
-                             dry_run=dry_run, open_orders=open_orders)
+                             dry_run=dry_run, open_orders=open_orders,
+                             entry_drift_clear_allowed=sole_open_row)
 
     # ---- I6: ledger singularity --------------------------------------
     await _check_singularity(client, uid, rows, opt_rows, positions,
@@ -1530,7 +1594,8 @@ async def _check_row(client, uid: str, key: str, side: str, r: dict,
                      pos_by_key: dict, fills_by_sym: dict,
                      window_start: datetime, rep: dict, budget: dict,
                      *, dry_run: bool,
-                     open_orders: Optional[list] = None) -> None:
+                     open_orders: Optional[list] = None,
+                     entry_drift_clear_allowed: bool = False) -> None:
     """I2, I4, I5 and I5b for one open row. All read-only at the ledger."""
     at = str(r.get("asset_type") or "stock").lower()
     rid = str(r.get("id") or "")
@@ -1656,25 +1721,35 @@ async def _check_row(client, uid: str, key: str, side: str, r: dict,
                          f"price. Its entry price may not be what actually "
                          f"happened."), row_id=rid), rep)
 
-    # entry_at drift: RECORDED, never corrected -- entry_at drives time
-    # stops, so "fixing" it moves an exit.
+    # entry_at drift: compare the entry ORDER, never the oldest activity
+    # for this symbol (which may belong to an earlier trade or an exit).
+    # RECORDED, never corrected -- entry_at drives time stops.
     if entry_at is not None:
-        best = None
-        for f in fills_by_sym.get(key, []):
-            ts = _parse_ts(f.get("transaction_time") or f.get("date"))
-            if ts and (best is None or ts < best):
-                best = ts
+        best, unresolved = _row_entry_reference(
+            r, side, pos_by_key.get((key, side), []),
+            fills_by_sym.get(key, []), at, window_start,
+            datetime.now(timezone.utc))
         if best is not None:
             drift = abs((entry_at - best).total_seconds()) / 60.0
             if drift > entry_drift_min():
                 await _raise_ticket(client, uid, Finding(
                     "qa_entry_time_drift", key, severity="info",
                     message=(f"Row {rid} records an entry time {drift:.0f} "
-                             f"minutes away from the broker's fill time "
+                             f"minutes away from the earliest observed opening "
+                             f"fill for this order within the lookback "
                              f"({best.isoformat()}). NOT corrected: entry_at "
                              f"drives time stops, so changing it would move an "
                              f"exit. Recorded for a human."),
-                    row_id=rid, extra={"qa_true_entry_at": best.isoformat()}), rep)
+                    row_id=rid, extra={
+                        "qa_reference_fill_at": best.isoformat(),
+                        "qa_reference_scope": "opening_order_fills_in_lookback",
+                    }), rep)
+            elif entry_drift_clear_allowed:
+                _clear_ticket(uid, key, "qa_entry_time_drift")
+        else:
+            _log("qa_read_deferred", key,
+                 reason=f"entry-time comparison deferred: {unresolved}",
+                 extra={"user_id": uid, "row_id": rid})
 
     # ---- I5: ROW => ENFORCEABLE PROTECTION ---------------------------
     await _check_enforceable_stop(client, uid, key, r, rid, at, open_orders, rep)
