@@ -11,6 +11,8 @@ export type FeedMessage = {
   confidence?: number | null;
   payload: Record<string, unknown>;
   created_at: string;
+  user_id?: string | null;
+  book_label?: string;
 };
 
 const AGENT_NAMES: Record<string, string> = {
@@ -31,6 +33,7 @@ const AGENT_NAMES: Record<string, string> = {
   adaptive_scope: "Adaptive Scope",
   strategy_discovery: "Strategy Discovery",
   dividend_manager: "Dividend Manager",
+  dividend_wheel: "Dividend Wheel",
   market_horizon: "Market Horizon"
 };
 
@@ -109,6 +112,10 @@ export function describeAgentMessage(m: FeedMessage): string {
   const event = typeof p.event === "string" ? p.event : "";
   if (event) {
     switch (event) {
+      case "market_opportunity_library":
+        return `Market report saved ${numv("opportunity_count")} trade possibilities, including ${numv("bearish_count")} bearish ideas. Availability and blocked requirements are recorded for this book.`;
+      case "option_lane_status":
+        return `${str("lane") || str("strategy") || "Options"}: ${str("status") || "availability update"}${str("reason") ? ` — ${str("reason")}` : ""}.`;
       case "options_idea":
         return `Options idea — ${str("strategy").replace(/_/g, " ")} on ${ticker}.`;
       case "kindrip_contribution":

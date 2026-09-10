@@ -182,8 +182,8 @@ def _reeval_env(settings_read):
     reev._hb_at.clear()
     reev._last_action.clear()
     try:
-        with _patched(reev, reeval_is_enabled=lambda: True,
-                      _regime=lambda: "neutral",
+        with _patched(reev, reeval_is_enabled=lambda user_id=None: True,
+                      _regime=lambda user_id=None: "neutral",
                       _low_edge=lambda *a: False,
                       _log=_quiet), \
                 _patched(candles_mod, fetch_candles_for=_bars), \
@@ -206,6 +206,27 @@ def test_a_collapsed_thesis_still_rotates_when_the_bar_is_known():
             _row(), price=95.0, side="long", at="stock", strat="stms",
             stop=None, target=None, emit=emit))
     assert out == {"close": "reeval_tcs_collapse"}, out
+
+
+def test_reevaluation_reads_only_the_positions_own_book_regime():
+    from types import SimpleNamespace
+    scope = load_module("app.runtime.scope")
+    real_regime = reev._regime
+    seen = []
+
+    def own_scope(user_id=None):
+        seen.append(user_id)
+        assert user_id in ("book-a", "book-b"), "an unbound scope read leaks policy"
+        return SimpleNamespace(regime="risk_off" if user_id == "book-a" else "risk_on")
+
+    with _reeval_env(lambda user_id=None: settings.BotSettings(tcs_threshold=70)), \
+            _patched(reev, _regime=real_regime), _patched(scope, get_scope=own_scope):
+        for uid in ("book-a", "book-b"):
+            row = {**_row(f"regime-{uid}"), "user_id": uid}
+            out = _run(reev.reevaluate_position(row, price=95.0, side="long",
+                at="stock", strat="stms", stop=None, target=None, emit=[]))
+            assert out == {"close": "reeval_tcs_collapse"}, out
+    assert seen == ["book-a", "book-b"]
 
 
 def test_a_failed_settings_read_never_closes_a_position():

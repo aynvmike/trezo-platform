@@ -92,6 +92,7 @@ class ScopeAdjustment:
     stop_multiplier: float = 1.0
     tcs_bump: int = 0
     paused_strategies: tuple[str, ...] = ()
+    user_id: str = ""  # book owner of this control decision; never inherited
 
     def to_dict(self) -> dict:
         return asdict(self)

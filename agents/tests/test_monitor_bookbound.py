@@ -164,7 +164,8 @@ def _registry(books):
     functions by the time this suite runs). Patch every name that reads
     the registry: the accounts module AND route_guard, which bound the
     names at import -- the same pattern test_manual_trade_bookbound
-    uses. [] means single-account; two books means multi-account."""
+    uses. A one-item registry models a sole configured account; an empty
+    registry means there is no registered book and cannot authorize a route."""
     by_key = {b.account_key: b for b in books}
     multi = len(books) > 1
 
@@ -325,7 +326,7 @@ def test_resync_refuses_a_row_that_names_no_book():
         calls.append("cancel")
         return 1, None
 
-    with _registry([]), _patched(alp, alpaca_configured=lambda: True,
+    with _registry(_two_books()[:1]), _patched(alp, alpaca_configured=lambda: True,
                                  cancel_open_orders_for=_cancel), \
             _patched(alog, record=_norec):
         ok, note = _run(leg_sync.resync_alpaca_legs(
@@ -385,7 +386,7 @@ def test_resync_takes_no_action_when_the_positions_read_fails():
     def _rec(event, ticker, **kw):
         logged.append(event)
 
-    with _registry([]), _patched(
+    with _registry(_two_books()[:1]), _patched(
             alp, alpaca_configured=lambda: True, get_positions_strict=_none,
             cancel_open_orders_for=_cancel, submit_oco_sell=_oco), \
             _patched(alog, record=_rec):
@@ -408,7 +409,7 @@ def test_resync_tells_a_failed_read_from_a_flat_answer():
         calls.append("cancel")
         return 1, None
 
-    with _registry([]), _patched(
+    with _registry(_two_books()[:1]), _patched(
             alp, alpaca_configured=lambda: True, get_positions_strict=_flat,
             cancel_open_orders_for=_cancel), _patched(alog, record=_norec):
         ok, note = _run(leg_sync.resync_alpaca_legs(
@@ -427,7 +428,7 @@ def test_resync_uses_the_strict_read_not_the_collapsing_one():
     async def _none(token=None):
         return None
 
-    with _registry([]), _patched(
+    with _registry(_two_books()[:1]), _patched(
             alp, alpaca_configured=lambda: True, get_positions=_boom,
             get_positions_strict=_none), _patched(alog, record=_norec):
         ok, note = _run(leg_sync.resync_alpaca_legs(
@@ -727,7 +728,7 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
     pm.PositionMonitorAgent._did_initial_reconcile = True
     try:
         # Shield swept, nothing working -> False -> the close proceeds.
-        with _registry([]), _qa_shield({"book-a": set()}), \
+        with _registry(_two_books()[:1]), _qa_shield({"book-a": set()}), \
                 _patched(pm, _supabase=lambda: client, _latest_price=_price,
                          _manage_day_options=_noop, _gap_check_open_bell=_noop,
                          _pre_break_review=_noop, check_and_lock_profit=_nolock), \
@@ -858,8 +859,8 @@ def test_a_flagged_modeled_row_far_below_a_stale_stop_is_not_closed():
         return None
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _real_tick(client, 10.0, close_position=_close,
-                                   reeval_is_enabled=lambda: True,
+    with _registry(_two_books()[:1]), _real_tick(client, 10.0, close_position=_close,
+                                   reeval_is_enabled=lambda user_id=None: True,
                                    reevaluate_position=_reeval,
                                    _maybe_trail_stock_profit=_trail):
         out = _run(agent.tick())
@@ -897,7 +898,7 @@ def test_a_flagged_alpaca_row_gets_no_broker_stop_and_no_naked_check():
         return {"id": "liq"}, None
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _clean_liq(), _clean_naked(), _real_tick(client, 10.0), \
+    with _registry(_two_books()[:1]), _clean_liq(), _clean_naked(), _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(alp, ensure_stock_protection=_ensure,
                      get_open_orders_for=_open, liquidate_position=_liq), \
@@ -923,8 +924,8 @@ def test_a_manual_close_still_closes_a_flagged_row():
                                  realized_pnl_usd=0.0)
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _real_tick(client, 10.0, close_position=_close,
-                                   reeval_is_enabled=lambda: False):
+    with _registry(_two_books()[:1]), _real_tick(client, 10.0, close_position=_close,
+                                   reeval_is_enabled=lambda user_id=None: False):
         _run(agent.tick())
     assert closed == [("pos-PG", "manual")], closed
 
@@ -948,7 +949,7 @@ def test_external_fill_detection_still_applies_to_a_flagged_row():
 
     agent = pm.PositionMonitorAgent()
     # Shield swept, nothing working -> False -> the close proceeds.
-    with _registry([]), _qa_shield({"book-a": set()}), \
+    with _registry(_two_books()[:1]), _qa_shield({"book-a": set()}), \
             _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(engine, record_external_close=_rec_close):
@@ -1039,7 +1040,7 @@ def test_the_flag_is_selected_and_consulted_where_it_is_read():
                    '"asset_type, broker, source_payload"',             # gap check
                    'close_requested, source_payload")',                # the tick
                    "_nps = _is_no_price_stop(r)",
-                   "if reeval_is_enabled() and not _nps:",
+                   'if reeval_is_enabled(r.get("user_id")) and not _nps:',
                    "if close_reason is None and not _nps:",
                    'if at == "stock" and not _nps:',
                    "elif _nps:",
@@ -1066,7 +1067,7 @@ def test_the_tick_clears_its_inline_binding_when_the_loop_is_done():
     client = _Client({"paper_positions": rows})
     agent = pm.PositionMonitorAgent()
     with _registry(_two_books()), \
-            _real_tick(client, 55.0, reeval_is_enabled=lambda: False):
+            _real_tick(client, 55.0, reeval_is_enabled=lambda user_id=None: False):
         _run(agent.tick())
         left = accounts._active.get()
     assert left is None, f"the last row's book stayed bound: {left}"
@@ -1122,7 +1123,7 @@ def test_a_flagged_extended_row_is_neither_laddered_nor_trail_locked():
         return [{"id": "leg"}]           # exit legs resting: not naked
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _clean_liq(), _clean_naked(), \
+    with _registry(_two_books()[:1]), _clean_liq(), _clean_naked(), \
             _real_tick(client, 52.0, _push_stop_to_broker=_push), \
             _patched(book_scope, held_symbols=_held), \
             _patched(alp, liquidate_position=_liq, ensure_stock_protection=_ensure,
@@ -1167,7 +1168,7 @@ def test_a_flagged_extended_row_is_not_time_stopped_either():
         return [{"id": "leg"}]
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _clean_liq(), _clean_naked(), _real_tick(client, 50.0), \
+    with _registry(_two_books()[:1]), _clean_liq(), _clean_naked(), _real_tick(client, 50.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(alp, liquidate_position=_liq, ensure_stock_protection=_ensure,
                      get_open_orders_for=_open), \
@@ -1254,7 +1255,7 @@ def _no_close_tick(rows, held, shield):
                                  fill_price=exit_price, realized_pnl_usd=1.0)
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _qa_shield(shield), _real_tick(client, 10.0), \
+    with _registry(_two_books()[:1]), _qa_shield(shield), _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(engine, record_external_close=_rec_close):
         out = _run(agent.tick())

@@ -33,30 +33,36 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 from app.brokers.accounts import (
-    account_for_user, current_account, multi_account_active, load_accounts,
+    account_for_user, bound_account, multi_account_active, load_accounts,
 )
 from app.brokers.endpoints import paper_base_url
 
 
 def check_route(user_id: str) -> Tuple[bool, str]:
-    """Is the currently BOUND account the one that owns this book?
+    """Require a registered book and its explicit binding in every config.
 
-    Single-account mode returns ok -- there is nothing to cross. Unknown
-    books are refused outright: acting on a book we cannot resolve is how
-    a stranger's order lands on the default account.
+    Even a sole account can be the wrong account for an unresolved book.
+    current_account()'s market-data default is never proof of ownership.
     """
-    if not multi_account_active():
-        return True, "single-account"
-    uid = str(user_id or "")
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False, "missing book -- refusing an order without account ownership"
     expected = account_for_user(uid)
-    bound = current_account()
+    bound = bound_account()
     if expected is None:
         return False, (f"unknown book {uid[:8]} -- refusing rather than "
-                       f"falling back to "
-                       f"{bound.account_id if bound else 'none'}")
-    if bound is None or bound.key_id != expected.key_id:
-        return False, (f"bound {bound.account_id if bound else 'NONE'} but "
-                       f"book {uid[:8]} belongs to {expected.account_id}")
+                       "falling back to a default account")
+    if bound is None:
+        return False, f"book {uid[:8]} has no explicit broker binding -- refusing"
+    if (bound.account_key != expected.account_key
+            or bound.key_id != expected.key_id):
+        return False, (f"bound {bound.account_id} but book {uid[:8]} "
+                       f"belongs to {expected.account_id}")
+    try:
+        if paper_base_url(bound.base_url) != paper_base_url(expected.base_url):
+            return False, "bound broker endpoint does not match the requested book"
+    except ValueError:
+        return False, "book has an invalid paper broker endpoint -- refusing"
     return True, f"ok:{expected.account_id}"
 
 

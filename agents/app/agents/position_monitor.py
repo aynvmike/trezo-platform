@@ -723,16 +723,20 @@ def _crypto_mae_adopted_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-def _crypto_reeval_enabled() -> bool:
-    """May the reevaluator see a broker-routed coin? OFF BY DEFAULT.
-    reevaluator.py has no crypto-safe overrides yet: on a losing coin it
-    would close at >=1d when the fresh TCS is under HALF the book's STOCK
-    bar, tighten the stop to price*0.98 at 3d (a 2% band under most coins'
-    own stop_pct), and close outright at 7d. Set TREZO_CRYPTO_REEVAL=1 to
-    turn it on. The crypto call passes target=None so lower_target can
-    never touch a coin, and only ratchets a returned stop UP."""
-    return os.getenv("TREZO_CRYPTO_REEVAL", "0").strip().lower() in (
-        "1", "true", "yes", "on")
+def _crypto_reeval_enabled(user_id: str | None = None) -> bool:
+    """This book's verified permission to re-evaluate broker-routed coins.
+
+    Crypto still passes target=None and only ratchets a returned stop up.
+    Unknown settings are not permission to alter a held position.
+    """
+    if not user_id:
+        return False
+    try:
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        cfg = get_bot_settings(user_id)
+        return not is_fallback_settings(cfg) and bool(cfg.crypto_reevaluation_enabled)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _is_adopted_row(r: dict) -> bool:
@@ -2146,7 +2150,7 @@ class PositionMonitorAgent(Agent):
                                 and "hodl" not in _strat_a):
                             _uid_c = str(r.get("user_id") or "")
                             _now_c = _utc_now().timestamp()
-                            if _crypto_reeval_enabled() and reeval_is_enabled():
+                            if _crypto_reeval_enabled(_uid_c) and reeval_is_enabled(_uid_c):
                                 try:
                                     # target=None ON PURPOSE (2026-09-02):
                                     # lower_target would persist target =
@@ -2197,9 +2201,9 @@ class PositionMonitorAgent(Agent):
                                     _arec("crypto_reeval_off", tk,
                                           strategy=str(r.get("strategy") or ""),
                                           reason=("losing coin not re-scored: "
-                                                  + ("TREZO_CRYPTO_REEVAL is off"
-                                                     if not _crypto_reeval_enabled()
-                                                     else "TREZO_REEVAL_ENABLED is off")
+                                                  + ("crypto reevaluation disabled or unverified for this book"
+                                                     if not _crypto_reeval_enabled(_uid_c)
+                                                     else "reevaluation disabled or unverified for this book")
                                                   + " -- MAE ceiling / time limit still apply"),
                                           extra={"user_id": _uid_c, "broker": "alpaca"})
                                 except Exception:  # noqa: BLE001
@@ -2717,11 +2721,10 @@ class PositionMonitorAgent(Agent):
                 # was dead platform-wide -- zero reeval_check lines in the
                 # live log -- while the 2026-08-22 note here said the
                 # reevaluator was "actively managing open positions". The
-                # flag IS on in production (TREZO_REEVAL_ENABLED=true), so
-                # where this line is reached it is live; it simply was not
-                # being reached. Alpaca CRYPTO rows now get their own,
+                # historical global flag could not help a call that was not
+                # reached. Alpaca CRYPTO rows now get their own,
                 # narrower call inside the crypto branch (behind
-                # TREZO_CRYPTO_REEVAL, target=None, stop ratchet-up only).
+                # this book's verified permission, target=None, stop ratchet-up only).
                 # Alpaca STOCK rows still never reach the reevaluator; that
                 # branch belongs to the stock track.
                 # NEQ-05: the reevaluator tightens stops, lowers targets and
@@ -2729,7 +2732,7 @@ class PositionMonitorAgent(Agent):
                 # not see a no_price_stop row at all (belt to its own
                 # strategy-prefix exemption's braces).
                 reeval_close: str | None = None
-                if reeval_is_enabled() and not _nps:
+                if reeval_is_enabled(r.get("user_id")) and not _nps:
                     try:
                         _rv = await reevaluate_position(
                             r, price, side, at, strat, stop, target,

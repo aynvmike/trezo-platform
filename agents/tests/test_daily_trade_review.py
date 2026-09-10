@@ -269,7 +269,7 @@ def test_real_discovery_binds_two_books_to_durable_review_before_research():
         cfg = _settings(tmp)
         bridge = ModuleType("app.research.bridge")
 
-        async def research(book):
+        async def research(book, **kwargs):
             with closing(sqlite3.connect(Path(tmp) / "daily_trade_reviews.sqlite3")) as db:
                 assert db.execute("SELECT COUNT(*) FROM daily_trade_reviews WHERE book_id=?", (book,)).fetchone()[0] == 7
             research_calls.append(book)

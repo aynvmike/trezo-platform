@@ -4,24 +4,15 @@ Subscribes to `signal` messages. For each one, applies position-sizing and
 exposure rules and emits either an `approve` or `veto`. Veto wins -
 Trade Execution only ever listens for `approve`.
 
-Rules:
-  - Veto if direction is "neutral" (no actionable bias)
-  - Veto if the signal's strategy is paused by Adaptive Scope
-  - Veto if the signal's ticker is flagged by Adaptive Scope
-  - Veto if TCS below the user's threshold (raised by the regime posture).
-    A scanner signal (no user_id) is judged at the LOWEST enabled book's
-    floor (BI-03) -- each book's own floor binds again at the fan-out
-  - Veto if too many open signals already (configurable cap)
-  - Kill-switches: a scanner signal is vetoed only when NO book can take
-    it (per-book halts, the user-set daily $ brake and the per-coin bench
-    are judged book by book here and enforced again at the fan-out); a
-    PINNED signal (payload.user_id AND book_scoped=True) is judged for
-    ITS book alone. A bare user_id is PROVENANCE -- which book's scan
-    raised it -- and the fan-out sends that approval to every book, so
-    it takes the all-books rule as well (vf:single-book-gates)
-  - Otherwise approve, forwarding strategy + stop/target geometry, with
-    stops tightened by the current Adaptive Scope posture. A signal that
-    says no_price_stop=True gets NO stop geometry filled in (NEQ-05)
+Every shared scanner observation is assessed separately for each registered
+book. A book_scoped input names exactly one account. The risk gate uses only
+that book's settings, adaptive posture, overrides, realized outcomes, daily
+goal, concentration and loss limits. Missing routing never falls back to the
+primary book. Every approval stays pinned through execution, which rechecks
+its book's broker state and limits immediately before placing an order.
+
+Stops may be tightened within the book's posture; no_price_stop=True keeps
+its explicit exit-policy contract without manufactured price geometry.
 """
 
 from __future__ import annotations
@@ -33,8 +24,8 @@ from collections import deque
 
 _log = logging.getLogger(__name__)
 
-_LAST_KS_LOG = 0.0   # kill-switch veto log throttle (2026-07-07)
-_LAST_KS_UNKNOWN_LOG = 0.0   # KS-11: "could not evaluate" log throttle
+_LAST_KS_LOG: dict[str, float] = {}   # kill-switch veto log throttle (2026-07-07)
+_LAST_KS_UNKNOWN_LOG: dict[str, float] = {}   # KS-11: "could not evaluate" log throttle
 
 from app.config import get_settings
 from app.memory import get_memory, AgentDecision
@@ -132,7 +123,7 @@ async def _find_rotation_candidate(
         return None
 
 
-def _note_kill_switch_unknown(ticker: str) -> None:
+def _note_kill_switch_unknown(ticker: str, user_id: str | None = None) -> None:
     """KS-11: check_states() came back None -- no client, or the
     paper_accounts read failed. That is "could not evaluate", NOT "no
     halts anywhere". The risk gate does not veto on it (the execution
@@ -140,12 +131,12 @@ def _note_kill_switch_unknown(ticker: str) -> None:
     enforcement point), but it must never pass silently either: one
     log line + one activity row per 10 minutes, so a dead database can
     never look like a quiet tape."""
-    global _LAST_KS_UNKNOWN_LOG
     import time as _t
     now = _t.time()
-    if (now - _LAST_KS_UNKNOWN_LOG) < 600.0:
+    key = str(user_id or "unattributed")
+    if (now - _LAST_KS_UNKNOWN_LOG.get(key, 0.0)) < 600.0:
         return
-    _LAST_KS_UNKNOWN_LOG = now
+    _LAST_KS_UNKNOWN_LOG[key] = now
     # Wording (review 2026-09-01, rv:risk_manager :126): None has three
     # causes -- no Supabase client, a killswitch import failure, or the
     # paper_accounts read raising -- so say "unavailable", not "failed".
@@ -160,7 +151,7 @@ def _note_kill_switch_unknown(ticker: str) -> None:
              reason=("check_states returned None (kill-switch state "
                      "unavailable) - per-book halts not evaluated at the "
                      "risk gate; the fan-out fails closed"),
-             extra={"user_id": "global"})
+             extra={"user_id": user_id or "unattributed"})
     except Exception:  # noqa: BLE001
         pass
 
@@ -333,18 +324,13 @@ class RiskManagerAgent(Agent):
         except Exception:  # noqa: BLE001
             pass
 
-    def forget_ticker(self, ticker: str) -> None:
-        """Position Monitor calls this when a position closes, allowing
-        a fresh approval on the same ticker. If the ticker was never in
-        the set, the discard is a silent no-op.
+    def forget_ticker(self, ticker: str, user_id: str | None = None) -> None:
+        """Release only the book named by the close/refusal receipt.
 
-        2026-09-02: keys are per book now, and the close message this
-        follows does not always name one, so every book's entry for the
-        ticker is released. The next seed/prune re-adds any book that
-        still holds it, so a stale release cannot enable stacking."""
-        suffix = f":{str(ticker or '').strip().upper()}"
-        for k in [k for k in self._recent_approvals if k.endswith(suffix)]:
-            self._recent_approvals.pop(k, None)
+        Legacy receipts without ownership may release a legacy empty-book
+        key, never a sibling book's pending approval.
+        """
+        self._recent_approvals.pop(self._ak(user_id, ticker), None)
 
     async def _account_equity(self, user_id) -> float:
         """Best-effort account equity (cash + vault) for per-coin cap
@@ -457,6 +443,40 @@ class RiskManagerAgent(Agent):
         return 300
 
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
+        # A market observation is shared. Its risk verdict is never shared:
+        # evaluate a pinned copy for each routable book before any settings,
+        # scope, goal, loss, crowding or approval state can influence it.
+        if message.kind == "signal":
+            from dataclasses import replace
+            books = self._registered_books()
+            uid = str(message.payload.get("user_id") or "")
+            if message.payload.get("book_scoped"):
+                if not uid or uid not in books:
+                    return [self._veto(
+                        message.payload.get("ticker", "?"),
+                        int(message.payload.get("tcs", 0)),
+                        "Book unavailable: signal requires a registered account; no primary fallback",
+                        strategy=message.payload.get("strategy"), user_id=uid or None)]
+            else:
+                if not books:
+                    return [self._veto(
+                        message.payload.get("ticker", "?"),
+                        int(message.payload.get("tcs", 0)),
+                        "Book unavailable: no registered accounts; no primary fallback",
+                        strategy=message.payload.get("strategy"), user_id=message.payload.get("user_id"))]
+                out = []
+                for book_id in sorted(books):
+                    payload = dict(message.payload, user_id=book_id, book_scoped=True)
+                    if uid:
+                        payload["origin_book"] = uid
+                    try:
+                        out.extend(await self.on_message(replace(message, payload=payload)))
+                    except Exception as exc:  # a failed book must not silence siblings
+                        out.append(AgentMessage(agent=self.name, kind="error", payload={
+                            "event": "book_risk_evaluation_failed", "user_id": book_id,
+                            "ticker": payload.get("ticker"),
+                            "note": f"Book risk evaluation failed: {type(exc).__name__}: {exc}"}))
+                return out
         # Patched 2026-06-10 (Mike's WMT 52-share incident): seed open
         # positions into the dedup set on first message so a restart
         # while positions are already open doesn't re-stack the ticker
@@ -480,7 +500,7 @@ class RiskManagerAgent(Agent):
             _p = message.payload if isinstance(message.payload, dict) else {}
             _tk = str(_p.get("ticker") or "").upper().strip()
             if _tk:
-                self.forget_ticker(_tk)
+                self.forget_ticker(_tk, _p.get("user_id"))
             return []
 
         # Tiered staleness veto (Task #89, 2026-06-05). Mike: signals
@@ -516,7 +536,7 @@ class RiskManagerAgent(Agent):
         if message.kind == "close":
             tk = (message.payload or {}).get("ticker")
             if tk:
-                self.forget_ticker(str(tk))
+                self.forget_ticker(str(tk), message.payload.get("user_id"))
             return []
 
         if message.kind != "signal":
@@ -530,29 +550,20 @@ class RiskManagerAgent(Agent):
         target_pct = message.payload.get("target_pct")
 
         # User-tunable thresholds from the Bot Tuning settings page.
-        from app.runtime.settings import get_bot_settings
-        # Per-user settings when the signal is user-scoped (#119);
-        # the global row otherwise.
-        _sig_uid = message.payload.get("user_id")
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        _sig_uid = str(message.payload["user_id"])
         cfg = get_bot_settings(_sig_uid)
+        if is_fallback_settings(cfg):
+            return [self._veto(ticker, tcs,
+                               "Book settings unavailable: no entries on guessed settings",
+                               strategy=strategy, user_id=_sig_uid)]
+        from app.runtime.book_gate import admits
+        admission = admits(cfg, asset_type=str(message.payload.get("asset_type") or ""),
+                           strategy=str(strategy or ""))
+        if not admission:
+            return [self._veto(ticker, tcs, admission.reason,
+                               strategy=strategy, user_id=_sig_uid)]
         min_tcs = cfg.tcs_threshold
-        # BI-03 (review 2026-09-01, rv:scanners-scale :462): a scanner
-        # signal has no user_id, so `cfg` above is the PRIMARY row and
-        # this floor was the primary's slider -- a secondary book with a
-        # lower slider was starved between its floor and the primary's,
-        # because this veto fired before the fan-out's per-book
-        # book_gate.admits ever ran. The scanners now emit at the LOWEST
-        # enabled book's floor; the risk gate must judge at the same
-        # floor or the scanner change never binds. Each book's own floor
-        # (plus its recovery / margin bumps) is re-applied per book at
-        # the fan-out. A user-scoped signal keeps its own book's row.
-        # Fails OPEN to the bare read on any failure.
-        if not _sig_uid:
-            try:
-                from app.runtime.settings import min_tcs_floor_across_books
-                min_tcs = int(min_tcs_floor_across_books())
-            except Exception:  # noqa: BLE001
-                min_tcs = cfg.tcs_threshold
         # NEQ-05 / G3: the producer says this lane has NO price stop (the
         # dividend ladder: exits are the spec's -- cut, payout breach,
         # recycling -- not a price). Nothing below may fill a default
@@ -588,10 +599,10 @@ class RiskManagerAgent(Agent):
         # Manager is the single enforcement point: every signal flows
         # through here, so consulting scope here covers every strategy.
         from app.runtime.scope import get_scope
-        scope = get_scope()
+        scope = get_scope(_sig_uid)
 
         if direction == "neutral":
-            return [self._veto(ticker, tcs, "Neutral direction - no actionable bias")]
+            return [self._veto(ticker, tcs, "Neutral direction - no actionable bias", user_id=message.payload.get("user_id"))]
 
         # Paused strategy - a base name in the paused set pauses its
         # variants too (e.g. 'crypto' pauses crypto_scalp/swing/dca).
@@ -599,7 +610,7 @@ class RiskManagerAgent(Agent):
                 or strategy.split("_")[0] in scope.paused_strategies):
             return [self._veto(
                 ticker, tcs,
-                f"Strategy '{strategy}' paused by Adaptive Scope [{scope.regime}]")]
+                f"Strategy '{strategy}' paused by Adaptive Scope [{scope.regime}]", user_id=message.payload.get("user_id"))]
 
         # Breakout PROBATION (Mike 2026-07-14: "I would like for it to be
         # active -- it helps with the opening of the market"). Probation
@@ -625,7 +636,7 @@ class RiskManagerAgent(Agent):
         if ticker in scope.flagged_tickers:
             return [self._veto(
                 ticker, tcs,
-                f"{ticker} flagged by Adaptive Scope - recent material event")]
+                f"{ticker} flagged by Adaptive Scope - recent material event", user_id=message.payload.get("user_id"))]
 
         # Expert override: per-stock disable list. When the user has
         # turned off a ticker (e.g. "skip NVDA until earnings"),
@@ -639,7 +650,7 @@ class RiskManagerAgent(Agent):
             if disabled_reason:
                 return [self._veto(
                     ticker, tcs,
-                    f"{ticker} disabled in Expert overrides: {disabled_reason}")]
+                    f"{ticker} disabled in Expert overrides: {disabled_reason}", user_id=message.payload.get("user_id"))]
         except Exception:  # noqa: BLE001
             pass
 
@@ -771,7 +782,7 @@ class RiskManagerAgent(Agent):
                         "Broker-only mode: Alpaca has no forex venue, so a "
                         "forex position could only ever be modeled - it "
                         "would never appear on the broker screen. Set "
-                        "TREZO_FOREX_MODELED_OK=true to trade it anyway.")]
+                        "TREZO_FOREX_MODELED_OK=true to trade it anyway.", user_id=message.payload.get("user_id"))]
         except Exception:  # noqa: BLE001
             pass
 
@@ -788,10 +799,8 @@ class RiskManagerAgent(Agent):
         # total"). The old query pooled every book's open rows into one
         # read, so the 25k was penalized for what the 75k held -- the
         # veto lines said "17 positions" when no single book held 17.
-        # A veto here kills the signal for ALL books, so the honest
-        # per-book judgement is the MINIMUM bump across active books:
-        # if any book still has room in this basket, the signal stays
-        # alive and the per-book gates downstream decide who takes it.
+        # The market is shared; positions and crowding belong to the
+        # explicit book being assessed, including a book with no positions.
         crowding_bump_v = 0
         crowding_note = ""
         try:
@@ -805,26 +814,13 @@ class RiskManagerAgent(Agent):
                 def _q_book():
                     return (_pr_cl.table("paper_positions")
                             .select("user_id, ticker, asset_type, strategy")
-                            .eq("status", "open").limit(120).execute())
+                            .eq("status", "open").eq("user_id", _sig_uid).limit(120).execute())
                 _bk = (await _aio_pr.to_thread(_q_book)).data or []
-                _by_book: dict[str, list] = {}
-                for _row in _bk:
-                    _u = str(_row.get("user_id") or "")
-                    if _u:
-                        _by_book.setdefault(_u, []).append(_row)
+                _own_rows = [r for r in _bk if str(r.get("user_id") or "") == _sig_uid]
                 _bask = basket_of(
-                    ticker, str(message.payload.get("asset_type") or ""),
-                    strategy)
-                if _by_book:
-                    _best: tuple[int, str] | None = None
-                    for _rows in _by_book.values():
-                        _bv, _bn = crowding_bump(
-                            _bask, concentration_read(_rows))
-                        if _best is None or _bv < _best[0]:
-                            _best = (_bv, _bn)
-                        if _best[0] == 0:
-                            break  # some book has room - no bump
-                    crowding_bump_v, crowding_note = _best
+                    ticker, str(message.payload.get("asset_type") or ""), strategy)
+                crowding_bump_v, crowding_note = crowding_bump(
+                    _bask, concentration_read(_own_rows))
         except Exception:  # noqa: BLE001
             crowding_bump_v = 0
 
@@ -836,19 +832,8 @@ class RiskManagerAgent(Agent):
         # nothing at all from 8/27 12:36 ET until this fix. Only vetoes
         # from checks ABOVE the sum (neutral direction, flagged ticker)
         # were still visible, which is why the log looked merely quiet.
-        # PER-BOOK kill-switches + weekly RECOVERY (Mike 2026-08-27:
-        # "the agents are not treating each book as their own book").
-        # The old shape here was two platform-wide vetoes — ANY user in
-        # daily drawdown paused all signals, and check_all's single
-        # verdict let one book's tripped weekly limit freeze all three
-        # (2026-08-27: primary at -8.0% vetoed 1,162 signals while the
-        # 25k/-1.6% and 75k/-2.7% books were healthy). Now: a signal is
-        # vetoed only when NO book can take it. Hard halts (daily /
-        # streak / session) block their book; a weekly trip puts its
-        # book in RECOVERY (speculative lanes suspended, half size,
-        # tighter stops — enforced per book at the execution fan-out).
-        # When every eligible book is recovering, the conviction bar
-        # rises by RECOVERY_TCS_BUMP here as well.
+        # Each signal is already pinned above. Hard halts affect only
+        # its book; recovery adds this book's own bar and lane restrictions.
         recovery_bump = 0
         recovery_reason = ""
         try:
@@ -865,36 +850,16 @@ class RiskManagerAgent(Agent):
             # which is what the old {} fallback read as. No veto from
             # here (the fan-out fails closed for every book on the same
             # None and is the enforcement point), but never silent.
-            _note_kill_switch_unknown(ticker)
+            _note_kill_switch_unknown(ticker, _sig_uid)
         elif _sig_uid and message.payload.get("book_scoped"):
-            # PINNED signal (review 2026-09-01, rv:killswitch-contracts):
-            # judge ONLY this signal's own book. The all-books branch
-            # below asks "can ANY book act?", which is the right question
-            # for a signal every book will see and the wrong one for a
-            # signal raised FOR one book -- a dividend-ladder buy for
-            # book B while B is hard-halted and A is open used to be
-            # approved (and, book_scoped, executed on B). The execution
-            # single-book path re-applies the same gate; this is the
-            # first line of defence, not the only one.
-            # vf:single-book-gates (2026-09-01): the test is user_id AND
-            # book_scoped -- the SAME contract as trade_execution.
-            # on_message. A bare user_id is PROVENANCE: pattern_detection
-            # stamps its origin book on every watchlist signal and the
-            # fan-out sends that approval to EVERY book (origin_book set,
-            # user_id popped). Judging such a signal here by its origin
-            # book alone re-froze the siblings -- the primary halted or
-            # over its $ limit vetoed the 25k/75k books' copies too (the
-            # 2026-08-27 failure class), and a primary in weekly recovery
-            # raised every book's bar. A provenance-only user_id falls
-            # through to the all-books rule below; its cfg / TCS-floor
-            # read above keeps the origin book's row, as before.
+            # The broker executor independently repeats this same book gate.
             _st_own = _states.get(str(_sig_uid))
             try:
                 _daily_over_own = await daily_dollar_over(_ks_client)
             except Exception:  # noqa: BLE001
                 _daily_over_own = None
             if _daily_over_own is None:
-                # unknown: fail-open here (same as the all-books branch);
+                # Unknown dollar brake is logged again at execution;
                 # nothing in this branch logs -- _read_book_brakes records
                 # daily_dollar_limit_unknown at execution (vf:single-book-
                 # gates :820).
@@ -920,46 +885,6 @@ class RiskManagerAgent(Agent):
                 recovery_bump = int(RECOVERY_TCS_BUMP)
                 recovery_reason = (f", weekly recovery +{recovery_bump} "
                                    f"({_who} working back)")
-        elif _states:
-            # KS-12: the user-set daily $ brake, judged PER BOOK like the
-            # percent one (killswitch.daily_dollar_over, which the fan-out
-            # re-checks). None = the read failed = unknown: no veto here.
-            # RV-RM-2 (review 2026-09-01), so nobody reads this as
-            # fail-closed: the fan-out re-reads it per book and, on None
-            # there too, records daily_dollar_limit_unknown and proceeds
-            # on the percent brake alone -- fail-OPEN, never silent.
-            try:
-                _daily_over = await daily_dollar_over(_ks_client)
-            except Exception:  # noqa: BLE001
-                _daily_over = None
-            if _daily_over is None:
-                _daily_over = set()
-            _blocked_notes: list[str] = []
-            _n_recovering = 0
-            _n_open = 0
-            for _uid_b, _st in _states.items():
-                if _st.halted and _st.mode != "recovery":
-                    _blocked_notes.append(f"[{_st.scope}] {_st.reason}")
-                    continue
-                if _uid_b in _daily_over:
-                    _blocked_notes.append("daily $ loss limit (user setting)")
-                    continue
-                if _st.mode == "recovery":
-                    if recovery_policy(strategy) == "suspend":
-                        _blocked_notes.append(
-                            f"recovery suspends {strategy or 'this lane'}")
-                        continue
-                    _n_recovering += 1
-                    continue
-                _n_open += 1
-            if _n_open == 0 and _n_recovering == 0:
-                _why = "; ".join(sorted(set(_blocked_notes))[:3]) or "all books halted"
-                return [self._veto(
-                    ticker, tcs, f"Kill-switch [all books] - {_why}")]
-            if _n_open == 0 and _n_recovering > 0:
-                recovery_bump = int(RECOVERY_TCS_BUMP)
-                recovery_reason = (f", weekly recovery +{recovery_bump} "
-                                   f"({_n_recovering} book(s) working back)")
 
 
         # The confidence bar can be raised by the current regime posture,
@@ -981,7 +906,7 @@ class RiskManagerAgent(Agent):
             )
             return [self._veto(
                 ticker, tcs,
-                f"TCS {tcs} below threshold {effective_min_tcs}{extra}")]
+                f"TCS {tcs} below threshold {effective_min_tcs}{extra}", user_id=message.payload.get("user_id"))]
 
         # --- Crypto accumulation + per-coin cap (Mike 2026-06-13, Part 2) ---
         # Crypto HODL/DCA may SCALE IN on dips across days, unlike one-shot
@@ -1052,22 +977,11 @@ class RiskManagerAgent(Agent):
         # already has a recent approval (and Position Monitor hasn't told
         # us the position closed yet), veto rather than re-buy -- EXCEPT
         # crypto HODL/DCA, which may add once the cooldown clears.
-        # PER BOOK (2026-09-02, the APPROVAL STARVATION alerts): a pinned
-        # signal is judged against ITS OWN book; an unscoped scanner signal
-        # is refused here only when EVERY registered book already holds the
-        # name -- otherwise it goes to the fan-out, which skips the books
-        # that hold it and executes on the ones that do not. That fan-out
-        # check reads each book's OPEN rows live, so it is a stricter
-        # anti-stacking guard than this in-memory cache ever was.
-        _uid_sig = str(message.payload.get("user_id") or "")
+        # Approval reservations and actual positions are keyed by book.
+        _uid_sig = _sig_uid
         _holding = self._books_holding(_coin_u)
-        if _uid_sig:
-            _dedup_blocked = _uid_sig in _holding
-            _dedup_who = "this book"
-        else:
-            _books_all = self._registered_books()
-            _dedup_blocked = bool(_books_all) and _books_all.issubset(_holding)
-            _dedup_who = f"all {len(_books_all)} books" if _books_all else ""
+        _dedup_blocked = _uid_sig in _holding
+        _dedup_who = "this book"
         if _dedup_blocked:
             if _is_crypto and _accumulate_mode:
                 _cool = float(getattr(cfg, "crypto_accumulate_cooldown_hours", 18.0) or 18.0)
@@ -1092,20 +1006,11 @@ class RiskManagerAgent(Agent):
                     user_id=message.payload.get("user_id"),
                 )]
 
-        # Book-first (Mike 2026-08-20): "make the agents look at the
-        # books as a default and not the account. no matter what."
-        # This counter spans EVERY book - it seeds from paper_positions
-        # with no user filter - so with three books holding ~10
-        # positions each it sat permanently at 14/14 and vetoed the
-        # whole platform's entries: 516 "Open-signal cap reached (14)"
-        # vetoes on 08-20 alone, while no single book was near ITS cap.
-        # A platform-wide count judged against one book's setting is a
-        # category error. The cap now lives at the fan-out, where each
-        # book is counted by name (trade_execution._book_open_tickers)
-        # against its own max_open_positions. Here the crossing is only
-        # NOTED - with the rotation hint kept, since "which weakest
-        # position frees a slot" is still useful on the dashboard.
-        if not _holding and len(self._recent_approvals) >= max_open:
+        # Capacity is enforced from fresh positions at execution. Record
+        # this book's pressure only, so sibling positions do not trigger
+        # another book's rotation research or a misleading global count.
+        _own_open = sum(k.startswith(f"{_sig_uid}:") for k in self._recent_approvals)
+        if not _dedup_blocked and _own_open >= max_open:
             try:
                 rotation_hint = await _find_rotation_candidate(
                     message.payload.get("user_id"), tcs,
@@ -1114,10 +1019,10 @@ class RiskManagerAgent(Agent):
                     agent=self.name, kind="info", confidence=0.3,
                     payload={
                         "ticker": ticker,
-                        "event": "platform_signal_pressure",
-                        "note": (f"{len(self._recent_approvals)} tickers "
-                                 f"approved-and-open across all books - "
-                                 f"per-book caps decide at the fan-out"),
+                        "user_id": _sig_uid,
+                        "event": "book_signal_pressure",
+                        "note": (f"{_own_open} tickers approved-and-open "
+                                 f"on this book; execution rechecks its capacity"),
                         **({"rotation_candidate": rotation_hint}
                            if rotation_hint else {}),
                     })
@@ -1133,11 +1038,6 @@ class RiskManagerAgent(Agent):
         # Read the crypto set from COIN_MAP so the ISO 20022-aligned
         # coin expansion (Mike 2026-05-31) is picked up automatically.
         from app.data.candles import COIN_MAP as _COIN_MAP
-        # BI-04: books whose per-coin loss halt is tripped for THIS coin
-        # (scanner signals only -- a user-scoped signal is judged for its
-        # own book above). Travels on the approve payload so the fan-out
-        # skips them instead of the whole platform losing the coin.
-        benched_books: list[str] = []
         if ticker.upper() not in _COIN_MAP and not _is_forex:
             from app.strategies.market_filter import (
                 get_market_bias, direction_blocked, liquidity_check,
@@ -1148,11 +1048,13 @@ class RiskManagerAgent(Agent):
             # scanner emits "long"; the dividend_lt lane is long-only).
             # Only 'bullish' mapped to long, so a "long" signal was judged
             # as a SHORT here and blocked by an UP tape.
-            _dir = str(direction or "").lower()
+            _underlying_direction = str(message.payload.get("underlying_direction") or "").lower()
+            _dir = (_underlying_direction if _underlying_direction in
+                    ("bullish", "bearish", "long", "short") else str(direction or "").lower())
             side = "long" if _dir in ("bullish", "long") else "short"
             blocked = direction_blocked(await get_market_bias(), side)
             if blocked:
-                return [self._veto(ticker, tcs, blocked)]
+                return [self._veto(ticker, tcs, blocked, user_id=message.payload.get("user_id"))]
             stock_candles = await fetch_candles_for(ticker, "stock")
             liq = liquidity_check(stock_candles, strategy=strategy)
             if liq:
@@ -1217,63 +1119,21 @@ class RiskManagerAgent(Agent):
                 return [v]
             ext = overextension_check(stock_candles)
             if ext:
-                return [self._veto(ticker, tcs, ext)]
+                return [self._veto(ticker, tcs, ext, user_id=message.payload.get("user_id"))]
             spread = await spread_quality_check(ticker)
             if spread:
-                return [self._veto(ticker, tcs, spread)]
+                return [self._veto(ticker, tcs, spread, user_id=message.payload.get("user_id"))]
         else:
-            # Per-coin daily loss limit (QW6) - crypto only. Benches a
-            # single coin without halting the rest of the book.
-            # BI-04: PER BOOK. A PINNED signal (user_id + book_scoped) is
-            # judged for its own book (coin_loss_halt filters by user_id).
-            # A shared signal used to be judged on every book's losses
-            # summed against one book's budget and vetoed for ALL of them
-            # -- the primary's bad morning benched the 75k's coin. Now each
-            # book gets its own verdict: veto only when EVERY book is
-            # benched; otherwise carry the benched ones on the approval
-            # and let the fan-out skip just those.
-            from app.paper.killswitch import (
-                coin_loss_halt, coin_loss_halt_by_book)
-            # vf:single-book-gates (2026-09-01): "own book" means PINNED
-            # -- user_id AND book_scoped -- the same contract as the
-            # kill-switch branch above and trade_execution.on_message.
-            # pattern_detection emits crypto signals (COIN_MAP watchlist
-            # symbols) stamped with a bare origin-book user_id that the
-            # fan-out sends to EVERY book. Reading that stamp as a pin
-            # vetoed every book's copy when the origin book's coin was
-            # benched, and carried NO benched_books when it was not, so
-            # the fan-out (which trusts benched_books) let a benched
-            # sibling trade the coin. A provenance stamp walks every book.
-            _coin_uid = (message.payload.get("user_id")
-                         if message.payload.get("book_scoped") else None)
-            if _coin_uid:
-                coin_veto = await coin_loss_halt(
-                    _supabase(), ticker, _coin_uid)
-                if coin_veto:
-                    return [self._veto(ticker, tcs, coin_veto,
-                                       strategy=strategy,
-                                       user_id=_coin_uid)]
-            else:
-                _verdicts = await coin_loss_halt_by_book(_supabase(), ticker)
-                benched_books = sorted(
-                    u for u, (_h, _r) in _verdicts.items() if _h)
-                if _verdicts and len(benched_books) == len(_verdicts):
-                    _why = next(r for _h, r in _verdicts.values() if _h)
-                    return [self._veto(
-                        ticker, tcs,
-                        f"{_why} [all {len(_verdicts)} books benched]",
-                        strategy=strategy)]
+            # A coin loss limit belongs to this book and this symbol.
+            from app.paper.killswitch import coin_loss_halt
+            coin_veto = await coin_loss_halt(_supabase(), ticker, _sig_uid)
+            if coin_veto:
+                return [self._veto(ticker, tcs, coin_veto,
+                                   strategy=strategy, user_id=_sig_uid)]
 
         import time as _apt
-        # PER BOOK (2026-09-02). A PINNED approval marks only its own book.
-        # An UNSCOPED scanner approval marks nothing here on purpose: which
-        # books actually open a position is decided at the fan-out, and the
-        # seed/prune passes re-read paper_positions, so the books that do
-        # open one get their key within the prune window while the books
-        # that were skipped stay free. Writing a platform-wide key here is
-        # exactly what starved the lanes.
-        if _uid_sig:
-            self._recent_approvals[self._ak(_uid_sig, ticker)] = _apt.time()
+        # Reserve only this book's pending approval until its receipt.
+        self._recent_approvals[self._ak(_uid_sig, ticker)] = _apt.time()
         # Patched 2026-06-05 (Task #47): propagate user_id into the
         # approve payload so persistence + trace panel can attribute
         # per-user instead of falling through to NULL.
@@ -1293,9 +1153,10 @@ class RiskManagerAgent(Agent):
         if message.payload.get("book_scoped") is not None:
             approve_payload["book_scoped"] = bool(
                 message.payload.get("book_scoped"))
-        # BI-04: per-coin bench, per book (see the crypto gate above).
-        if benched_books:
-            approve_payload["benched_books"] = list(benched_books)
+        if message.payload.get("underlying_direction"):
+            approve_payload["underlying_direction"] = message.payload["underlying_direction"]
+        if message.payload.get("origin_book"):
+            approve_payload["origin_book"] = message.payload["origin_book"]
         # Lane caps travel WITH the approval (re-audit 2026-08-28: the
         # execution-side min() was dead because this whitelist never
         # carried the key — the U3 per-name cap could not bind).
@@ -1747,11 +1608,11 @@ class RiskManagerAgent(Agent):
             _log_it = True
             if reason.startswith("Kill-switch"):
                 import time as _t
-                global _LAST_KS_LOG
-                if (_t.time() - _LAST_KS_LOG) < 600.0:
+                _log_book = str(user_id or "unattributed")
+                if (_t.time() - _LAST_KS_LOG.get(_log_book, 0.0)) < 600.0:
                     _log_it = False
                 else:
-                    _LAST_KS_LOG = _t.time()
+                    _LAST_KS_LOG[_log_book] = _t.time()
             if _log_it:
                 from app.agents.activity_log import record as _arec
                 _arec("veto", ticker, tcs=int(tcs), strategy=strategy,

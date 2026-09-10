@@ -17,7 +17,7 @@ type Resp = {
  * closed_manual. Use after wiping a paper account, switching brokers,
  * or whenever the modeled book and Alpaca disagree.
  */
-export function WheelReconcileButton() {
+export function WheelReconcileButton({ accountKey }: { accountKey: string }) {
   const router = useRouter();
   const [stage, setStage] = useState<"idle" | "running" | "done" | "error">("idle");
   const [resp, setResp] = useState<Resp | null>(null);
@@ -25,7 +25,7 @@ export function WheelReconcileButton() {
   async function run() {
     setStage("running");
     try {
-      const r = await fetch("/api/wheel/reconcile", { method: "POST" });
+      const r = await fetch("/api/wheel/reconcile", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account_key: accountKey }) });
       const j = (await r.json()) as Resp;
       setResp(j);
       setStage(j.ok ? "done" : "error");
@@ -43,7 +43,7 @@ export function WheelReconcileButton() {
       ? `✓ Reconciled — ${resp?.rows_closed ?? 0} stale leg(s) closed`
       : stage === "error"
       ? `✗ Failed — ${resp?.error ?? "unknown error"}`
-      : "Reconcile modeled book with broker";
+      : "Reconcile this book with broker";
 
   return (
     <div className="rounded-xl border border-weave-100 bg-white p-4 flex items-center justify-between gap-3 flex-wrap">

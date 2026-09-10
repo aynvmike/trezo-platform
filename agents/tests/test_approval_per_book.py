@@ -95,12 +95,14 @@ def test_the_wmt_restart_case_still_cannot_stack_on_the_holding_book():
     assert PRIMARY not in a._books_holding("WMT")  # others free
 
 
-def test_forget_ticker_releases_every_books_entry():
+def test_forget_ticker_releases_only_the_receipt_book():
     a = _agent()
     a._recent_approvals = {a._ak(ACCT2, "ETH"): 1.0, a._ak(ACCT3, "ETH"): 1.0,
                            a._ak(ACCT2, "BTC"): 1.0}
+    a.forget_ticker("eth", ACCT2)
+    assert a._books_holding("ETH") == {ACCT3}
     a.forget_ticker("eth")
-    assert a._books_holding("ETH") == set()
+    assert a._books_holding("ETH") == {ACCT3}, "unowned receipt cleared another book"
     assert a._books_holding("BTC") == {ACCT2}
 
 

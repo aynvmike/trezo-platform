@@ -275,8 +275,8 @@ def _real_tick(client, price, seen: _Seen, **extra):
         _maybe_trail_hodl=_noop,
         # defaults for the switches: reeval gated OFF, time rule OFF,
         # adopted MAE OFF -- exactly what ships; tests flip per case.
-        reeval_is_enabled=lambda: True, reevaluate_position=_no_reeval,
-        _crypto_reeval_enabled=lambda: False,
+        reeval_is_enabled=lambda user_id=None: True, reevaluate_position=_no_reeval,
+        _crypto_reeval_enabled=lambda user_id=None: False,
         _crypto_time_exit_enabled=lambda: False,
         _crypto_mae_adopted_enabled=lambda: False,
     )
@@ -339,7 +339,7 @@ def test_crypto_path_has_no_session_gate_source_pins():
     # position_monitor: the crypto branch calls the reevaluator (anchored
     # on reeval_close_c) AND the internal line other suites pin is intact
     assert "reeval_close_c" in PM_SRC
-    assert PM_SRC.count("if reeval_is_enabled() and not _nps:") == 1
+    assert PM_SRC.count('if reeval_is_enabled(r.get("user_id")) and not _nps:') == 1
     assert PM_SRC.count("await reevaluate_position(") == 2, \
         "expected the internal call plus the crypto-branch call"
     # target=None on the crypto call: lower_target must never touch a coin
@@ -450,11 +450,10 @@ def test_decide_crypto_stale_exit_pure_function():
         assert reason == "stop" and "[adopted row, TREZO_CRYPTO_MAE_ADOPTED=1]" in detail
 
 
-def test_the_switches_default_off_and_read_the_env_per_call():
+def test_optional_time_and_adopted_mae_switches_still_default_off():
     import os
     for env, fn in (("TREZO_CRYPTO_TIME_EXIT", pm._crypto_time_exit_enabled),
-                    ("TREZO_CRYPTO_MAE_ADOPTED", pm._crypto_mae_adopted_enabled),
-                    ("TREZO_CRYPTO_REEVAL", pm._crypto_reeval_enabled)):
+                    ("TREZO_CRYPTO_MAE_ADOPTED", pm._crypto_mae_adopted_enabled)):
         had = os.environ.pop(env, None)
         try:
             assert fn() is False, f"{env} must default OFF"
@@ -467,6 +466,60 @@ def test_the_switches_default_off_and_read_the_env_per_call():
                 os.environ.pop(env, None)
             else:
                 os.environ[env] = had
+
+
+def test_reevaluation_flags_use_only_the_named_books_verified_settings():
+    from types import SimpleNamespace
+    fallback = SimpleNamespace(reevaluation_enabled=True, crypto_reevaluation_enabled=True)
+    configs = {
+        "book-a": SimpleNamespace(reevaluation_enabled=False, crypto_reevaluation_enabled=False),
+        "book-b": SimpleNamespace(reevaluation_enabled=True, crypto_reevaluation_enabled=True),
+        "book-unknown": fallback,
+    }
+    seen = []
+
+    def own_cfg(uid=None):
+        seen.append(uid)
+        return configs.get(uid, fallback)
+
+    with _patched(rsettings, get_bot_settings=own_cfg,
+                  is_fallback_settings=lambda cfg: cfg is fallback):
+        for fn in (reeval.reeval_is_enabled, pm._crypto_reeval_enabled):
+            assert fn("book-a") is False
+            assert fn("book-b") is True
+            assert fn("book-unknown") is False
+            assert fn() is False
+    assert seen == ["book-a", "book-b", "book-unknown"] * 2
+
+
+def test_real_crypto_monitor_applies_reevaluation_enablement_per_book():
+    from types import SimpleNamespace
+    rows = [_crypto_row(uid, entry_at=_ago(days=1, hours=12))
+            for uid in ("book-a", "book-b")]
+    client = _Client({"paper_positions": rows})
+    seen = _Seen()
+
+    async def decide(row, *args, **kwargs):
+        seen.reeval.append(row["user_id"])
+        return None
+
+    def cfg(uid=None):
+        return SimpleNamespace(reevaluation_enabled=uid == "book-b",
+                               crypto_reevaluation_enabled=uid == "book-b")
+
+    # Preserve the actual gates while stubbing the monitor's remaining I/O.
+    own_crypto_gate = pm._crypto_reeval_enabled
+    own_reeval_gate = reeval.reeval_is_enabled
+    with _registry(_two_books()), \
+            _real_tick(client, 0.97, seen, reevaluate_position=decide,
+                       _crypto_reeval_enabled=own_crypto_gate,
+                       reeval_is_enabled=own_reeval_gate), \
+            _patched(rsettings, get_bot_settings=cfg,
+                     is_fallback_settings=lambda config: False):
+        _run(pm.PositionMonitorAgent().tick())
+    assert seen.reeval == ["book-b"], seen.reeval
+    assert seen.liq == [] and seen.closes == []
+    assert [row[2]["extra"]["user_id"] for row in seen.events("crypto_reeval_off")] == ["book-a"]
 
 
 # =======================================================================
@@ -515,7 +568,7 @@ def test_the_time_rule_is_off_by_default_and_the_row_rides():
     # ...and the gated reevaluator says it is gated, once, for this book
     off = seen.events("crypto_reeval_off")
     assert len(off) == 1 and off[0][2]["extra"]["user_id"] == "book-b", seen.said
-    assert "TREZO_CRYPTO_REEVAL is off" in off[0][2]["reason"]
+    assert "crypto reevaluation disabled or unverified for this book" in off[0][2]["reason"]
 
 
 def test_rescore_collapse_closes_through_the_crypto_exit_path():
@@ -533,7 +586,7 @@ def test_rescore_collapse_closes_through_the_crypto_exit_path():
     agent = pm.PositionMonitorAgent()
     with _registry(_two_books()), \
             _real_tick(client, 0.97, seen, reevaluate_position=_rv,
-                       _crypto_reeval_enabled=lambda: True):
+                       _crypto_reeval_enabled=lambda user_id=None: True):
         out = _run(agent.tick())
     assert len(seen.reeval) == 1, seen.reeval
     call = seen.reeval[0]
@@ -554,20 +607,19 @@ def test_rescore_collapse_closes_through_the_crypto_exit_path():
     assert seen.events("crypto_reeval_off") == []
 
 
-def test_reeval_is_not_reached_when_the_master_flag_is_off():
-    """TREZO_CRYPTO_REEVAL=1 but TREZO_REEVAL_ENABLED off on the server:
-    the coin is not re-scored and the row names the master flag."""
+def test_reeval_is_not_reached_when_the_books_general_permission_is_off():
+    """A crypto-specific permission cannot override its own book's general one."""
     row = _crypto_row("book-b", entry_at=_ago(days=1, hours=12))
     client = _Client({"paper_positions": [row]})
     seen = _Seen()
     agent = pm.PositionMonitorAgent()
     with _registry(_two_books()), \
-            _real_tick(client, 0.97, seen, _crypto_reeval_enabled=lambda: True,
-                       reeval_is_enabled=lambda: False):
+            _real_tick(client, 0.97, seen, _crypto_reeval_enabled=lambda user_id=None: True,
+                       reeval_is_enabled=lambda user_id=None: False):
         _run(agent.tick())
     assert seen.liq == [] and seen.closes == []
     off = seen.events("crypto_reeval_off")
-    assert len(off) == 1 and "TREZO_REEVAL_ENABLED is off" in off[0][2]["reason"]
+    assert len(off) == 1 and "reevaluation disabled or unverified for this book" in off[0][2]["reason"]
 
 
 def test_mae_ceiling_catches_the_dot_geometry():
@@ -701,7 +753,7 @@ def test_reeval_stop_only_ratchets_up_and_target_reaches_tp_push():
     agent = pm.PositionMonitorAgent()
     with _registry(_two_books()), \
             _real_tick(client, 0.97, seen, reevaluate_position=_rv_lower,
-                       _crypto_reeval_enabled=lambda: True, _arm_broker_stop=_arm):
+                       _crypto_reeval_enabled=lambda user_id=None: True, _arm_broker_stop=_arm):
         out = _run(agent.tick())
     assert seen.liq == [] and seen.closes == []
     assert armed == [0.85], armed              # the row's stop, not 0.80
@@ -718,7 +770,7 @@ def test_reeval_stop_only_ratchets_up_and_target_reaches_tp_push():
 
     with _registry(_two_books()), \
             _real_tick(client, 0.97, seen, reevaluate_position=_rv_higher,
-                       _crypto_reeval_enabled=lambda: True):
+                       _crypto_reeval_enabled=lambda user_id=None: True):
         _run(agent.tick())
     assert seen.liq == [] and seen.closes == []
     assert seen.tp == [1.05], seen.tp
@@ -735,7 +787,7 @@ def test_a_row_that_is_already_closing_on_its_stop_is_not_rescored():
     seen = _Seen()
     agent = pm.PositionMonitorAgent()
     with _registry(_two_books()), \
-            _real_tick(client, 0.84, seen, _crypto_reeval_enabled=lambda: True,
+            _real_tick(client, 0.84, seen, _crypto_reeval_enabled=lambda user_id=None: True,
                        _crypto_time_exit_enabled=lambda: True):
         _run(agent.tick())                # reevaluate_position stub RAISES if reached
     assert seen.liq == [("DOT", "crypto", "book-b", "acct2")]

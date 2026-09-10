@@ -1,9 +1,9 @@
 """Bot tuning settings - read tunable parameters from `bot_settings`.
 
 Per-user capable (Phase 5b / #119): get_bot_settings(user_id) reads that
-user's row; get_bot_settings() with no argument resolves to the anchor
-(primary) row in single-row mode, else the bound account's row under
-multi-account. Cached per user_id for 30 seconds.
+user's row; a call without a book uses only an explicitly bound account.
+An unbound read returns identifiable defaults, never another book's row.
+Cached per user_id for 30 seconds.
 
 Shared scanners must NOT gate on the bare read -- it is one book's
 opinion. Use lane_enabled_any() / min_tcs_floor_across_books() (BI-03).
@@ -30,6 +30,9 @@ class BotSettings:
     stms_enabled: bool = True
     extended_enabled: bool = True
     crypto_enabled: bool = True
+    dividend_lt_enabled: bool = True
+    reevaluation_enabled: bool = True
+    crypto_reevaluation_enabled: bool = True
     autonomy_mode: str = "guarded"
     account_posture: str = "auto"
     allocation_overrides: dict | None = None
@@ -57,9 +60,13 @@ class BotSettings:
     # approval >= 1, the Options Scanner's _run_wheel() pass auto-fires
     # CSP / CC orders instead of emitting only suggestions. Routes through
     # the same primitives as the /wheel/place-leg manual button. Honors
-    # kill-switches + consecutive-loss limit. Default off; flip on once
-    # paper trading has proven the chain end-to-end.
-    wheel_auto_execute: bool = False
+    # kill-switches + consecutive-loss limit. Runtime reads require each
+    # book's persisted opt-in; ops/enable_books.py applies Mike's requested
+    # paper activation without enabling unrelated owners through defaults.
+    wheel_auto_execute: bool = True
+    day_options_enabled: bool = True
+    spreads_enabled: bool = True
+    long_options_enabled: bool = True
     # Expert mode - Mike Phase 13a follow-up (2026-05-30). When True
     # the Bot Tuning UI surfaces the Expert Overrides section
     # (per-stock strategy pin + disable list). The underlying
@@ -180,6 +187,9 @@ def _from_row(r: dict) -> BotSettings:
         stms_enabled=bool(r.get("stms_enabled", True)),
         extended_enabled=bool(r.get("extended_enabled", True)),
         crypto_enabled=bool(r.get("crypto_enabled", True)),
+        dividend_lt_enabled=bool(r.get("dividend_lt_enabled", False)),
+        reevaluation_enabled=bool(r.get("reevaluation_enabled", False)),
+        crypto_reevaluation_enabled=bool(r.get("crypto_reevaluation_enabled", False)),
         autonomy_mode=str(r.get("autonomy_mode", "guarded") or "guarded"),
         account_posture=str(r.get("account_posture", "auto") or "auto"),
         allocation_overrides=(r.get("allocation_overrides") or None),
@@ -189,6 +199,9 @@ def _from_row(r: dict) -> BotSettings:
         switching_mode=str(r.get("switching_mode", "adaptive") or "adaptive"),
         switching_advantage_pct=int(r.get("switching_advantage_pct", 10) or 10),
         wheel_auto_execute=bool(r.get("wheel_auto_execute", False)),
+        day_options_enabled=bool(r.get("day_options_enabled", False)),
+        spreads_enabled=bool(r.get("spreads_enabled", False)),
+        long_options_enabled=bool(r.get("long_options_enabled", False)),
         expert_mode_enabled=bool(r.get("expert_mode_enabled", False)),
         auto_trade_enabled=bool(r.get("auto_trade_enabled", True)),
         options_min_dte=(int(r["options_min_dte"]) if r.get("options_min_dte") is not None else None),
@@ -260,46 +273,20 @@ def required_switch_advantage(
 
 
 def get_bot_settings(user_id: Optional[str] = None) -> BotSettings:
-    """Active bot settings, cached 30s per user.
+    """Read only this book's settings; an absent binding is not a book.
 
-    With a user_id, reads that user's `bot_settings` row. With no
-    argument, reads the most-recently-updated row (the global,
-    single-user default). Falls back to defaults on any miss.
+    Explicit IDs are always honored, even with a single broker account.
+    TREZO_SETTINGS_SINGLE_ROW is obsolete and cannot override a book ID.
     """
-    # Single-row mode (2026-07-06): one operator, ONE settings row. The
-    # web app saves the signed-in user's row while engine signals carry
-    # the paper-engine's user id -- two rows drifted apart and Bot Tuning
-    # edits stopped reaching the trades. With TREZO_PRIMARY_USER_ID set,
-    # EVERY consumer (global or per-user) resolves to that row.
-    # Single-row mode exists (2026-07-06) because the web app saved the
-    # signed-in user's row while engine signals carried the paper engine's
-    # id -- two rows drifted and Bot Tuning edits stopped reaching trades.
-    # Collapsing EVERY lookup to one row is the right fix for one operator
-    # with one book. It is the WRONG fix once a person holds several: it
-    # would tie every account to the main account's settings, which is
-    # precisely what multi-account has to avoid (Mike, 2026-08-09). So the
-    # anchor generalises -- to THIS account when there is more than one.
-    _multi = False
-    _acct_key = None
-    try:
-        from app.brokers.accounts import (
-            multi_account_active as _maa, current_user_id as _cuid,
-        )
-        _multi = _maa()
-        if _multi:
-            _acct_key = _cuid()
-    except Exception:  # noqa: BLE001
-        _multi = False
-
-    if _multi:
-        # Each book keeps its own row. An explicit user_id IS an account
-        # key and is honoured; a bare call resolves to the bound account.
-        if not user_id:
-            user_id = _acct_key or _primary_user_id()
-    else:
-        _prim = _primary_user_id()
-        if _prim and _single_row_mode():
-            user_id = _prim
+    if not user_id:
+        try:
+            from app.brokers.accounts import bound_account
+            account = bound_account()
+            user_id = account.account_key if account else None
+        except Exception:
+            user_id = None
+    if not user_id:
+        return _DEFAULTS
     now = time.time()
     hit = _cache.get(user_id)
     if hit is not None and (now - hit[1]) < _TTL:
@@ -312,8 +299,7 @@ def get_bot_settings(user_id: Optional[str] = None) -> BotSettings:
 
     try:
         q = client.table("bot_settings").select("*")
-        if user_id:
-            q = q.eq("user_id", user_id)
+        q = q.eq("user_id", user_id)
         res = q.order("updated_at", desc=True).limit(1).execute()
         rows = res.data or []
         bs = _from_row(rows[0]) if rows else _DEFAULTS
@@ -344,11 +330,9 @@ _log = _logging.getLogger("trezo.settings")
 
 
 def _enabled_book_ids() -> list:
-    """Book keys of every enabled, valid broker account, or [] while
-    single-account. The seam the guard tests stub; may raise."""
-    from app.brokers.accounts import load_accounts, multi_account_active
-    if not multi_account_active():
-        return []
+    """Book keys of every enabled, valid broker account, including a sole book.
+    The seam the guard tests stub; may raise."""
+    from app.brokers.accounts import load_accounts
     return [a.account_key for a in load_accounts() if a.account_key]
 
 

@@ -1,5 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
+import { getOwnerBookKeys } from "@/lib/books";
+import { LoadError } from "@/components/dashboard/load-error";
 
 /**
  * WheelAcquisitionQueue — replaces the "Modeled wheel planner —
@@ -69,23 +71,28 @@ function dteFromExp(exp: string | null | undefined): number | null {
   }
 }
 
-export async function WheelAcquisitionQueue() {
+export async function WheelAcquisitionQueue({ accountKey }: { accountKey: string }) {
   const supabase = createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return null;
+  const books = await getOwnerBookKeys(supabase, user.id);
+  if (books.failure) return <LoadError {...books.failure} />;
+  if (!books.data?.includes(accountKey)) return <LoadError table="trading_accounts" message="Selected account is unavailable." />;
 
   // Last 24h of wheel_suggestion events, this user only.
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("agent_messages")
     .select("id, payload, created_at")
     .eq("agent_name", "options_scanner")
     .eq("kind", "info")
+    .or(`user_id.eq.${accountKey},user_id.is.null`)
     .gte("created_at", since)
     .order("created_at", { ascending: false })
     .limit(200);
+  if (error) return <LoadError table="agent_messages" message={error.message} />;
 
   const rows = (data ?? []) as Row[];
 
@@ -94,7 +101,7 @@ export async function WheelAcquisitionQueue() {
   for (const r of rows) {
     const p = r.payload || ({} as WheelSuggestion & { event?: string });
     if (p.event !== "wheel_suggestion") continue;
-    if (p.user_id && p.user_id !== user.id) continue;
+    if (p.user_id !== accountKey) continue;
     const key = (p.underlying || "").toUpperCase();
     if (!key) continue;
     if (!byTicker.has(key)) byTicker.set(key, r);

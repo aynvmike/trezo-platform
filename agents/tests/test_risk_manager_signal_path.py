@@ -80,7 +80,8 @@ def test_the_kill_switch_gate_still_exists_above_the_bar():
     """Moving the block must not have dropped it: the per-book veto and
     the bump both have to be inside on_message, above the sum."""
     node = _on_message_node()
-    assert "Kill-switch [all books]" in SRC, "the per-book veto vanished"
+    assert "Kill-switch [{_who}]" in SRC, "the own-book veto vanished"
+    assert "Kill-switch [all books]" not in SRC, "a shared all-books verdict has returned"
     bar = min(n.lineno for n in ast.walk(node)
               if isinstance(n, ast.Name) and n.id == "effective_min_tcs"
               and isinstance(n.ctx, ast.Store))

@@ -1,5 +1,8 @@
 import { createClient } from "@/lib/supabase/server";
 import { cn } from "@/lib/utils";
+import { getOwnerBookKeys } from "@/lib/books";
+import { messageBelongsToBooks } from "@/lib/agent-book-scope";
+import { LoadError } from "@/components/dashboard/load-error";
 
 type Row = {
   id: string;
@@ -7,6 +10,7 @@ type Row = {
   kind: string;
   payload: Record<string, unknown>;
   created_at: string;
+  user_id: string | null;
 };
 
 /**
@@ -16,17 +20,22 @@ type Row = {
  * user sees what was proposed, why, and when. Replaces the "did
  * anything actually change?" guesswork.
  */
-export async function StrategyProposalsFeed({ userId }: { userId: string }) {
+export async function StrategyProposalsFeed({ userId, accountKey }: { userId: string; accountKey?: string }) {
   const supabase = createClient();
-  const { data } = await supabase
+  const booksLoad = await getOwnerBookKeys(supabase, userId);
+  if (booksLoad.failure) return <LoadError {...booksLoad.failure} />;
+  const keys = booksLoad.data ?? [];
+  if (accountKey && !keys.includes(accountKey)) return <LoadError table="trading_accounts" message="Selected account is unavailable." />;
+  const { data, error } = await supabase
     .from("agent_messages")
-    .select("id, agent_name, kind, payload, created_at")
+    .select("id, user_id, agent_name, kind, payload, created_at")
     .in("agent_name", ["strategy_discovery", "adaptive_scope"])
     .in("kind", ["alert", "metrics", "info"])
-    .or(`user_id.eq.${userId},user_id.is.null`)
+    .or(`user_id.in.(${[...new Set([...keys, userId])].join(",")}),user_id.is.null`)
     .order("created_at", { ascending: false })
-    .limit(15);
-  const rows = (data ?? []) as Row[];
+    .limit(75);
+  if (error) return <LoadError table="agent_messages" message={error.message} />;
+  const rows = ((data ?? []) as Row[]).filter((row) => messageBelongsToBooks(row, keys, userId, accountKey)).slice(0, 15);
 
   if (rows.length === 0) {
     return (

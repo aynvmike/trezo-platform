@@ -43,7 +43,7 @@ CRYPTO_SYMBOLS = _all_crypto_symbols()
 
 # Priority-rotation throttle (2026-07-02): at most N weakest-hold
 # rotations per day, process-local; the activity log carries each one.
-_ROTATIONS_TODAY: dict = {"day": "", "n": 0}
+_ROTATIONS_TODAY: dict[str, dict] = {}  # book -> its daily rotation counter
 
 
 def _lane_cap_f(source_payload) -> float | None:
@@ -127,6 +127,12 @@ class TradeExecutionAgent(Agent):
                          "event": "execute_error", "lane": _lane,
                          "error": _why})]
 
+        if message.payload.get("book_scoped") and not user_id:
+            return [AgentMessage(agent=self.name, kind="error", payload={
+                "ticker": ticker, "event": "execute_error",
+                "lane": _lane_of(ticker, message.payload),
+                "error": "Book-scoped approval has no account; no primary fallback"})]
+
         # Platform-default routing (Mike 2026-08-20): "by default all
         # accounts and books have access to the platform - we adjust in
         # the settings." A user_id on an approve payload is PROVENANCE -
@@ -189,57 +195,11 @@ class TradeExecutionAgent(Agent):
         if not user_id:
             return await self._execute_for_all_users(ticker, side, message.payload)
 
-        # SINGLE-BOOK path (user_id + book_scoped). Review 2026-09-01
-        # (rv:killswitch-contracts, rv:bound-hunter :168): this branch
-        # went straight to _execute_for_user with NONE of the fan-out's
-        # per-book gates -- no kill-switch, no daily $ brake, no bench,
-        # no R:R re-harmonization, no recovery / margin bump -- so the
-        # first producer to pin a signal (the dividend ladder) would
-        # have executed on a hard-halted book. Both paths now run the
-        # SAME reads (_read_book_brakes) and the SAME gate (_gate_book),
-        # so they cannot drift. Capacity (max_open_positions per pocket)
-        # stays a fan-out concern: a pinned signal is one book's own
-        # decision about its own ladder.
-        from app.runtime.persistence import _client as _pclient
-        _lane = _lane_of(ticker, message.payload)
-        _book_ks, _dollar_over, _closed = await self._read_book_brakes(
-            _pclient(), ticker, side, message.payload, 1, user_id=user_id)
-        if _closed is not None:
-            return [_closed]
-        _benched = {str(b) for b in
-                    (message.payload.get("benched_books") or []) if b}
-
-        # Bind THIS book's broker credentials before placing its order.
-        # trade_execution already fans out across paper_accounts rows, but
-        # nothing bound the account -- so every book's orders would have
-        # gone to the primary Alpaca account (2026-08-09).
-        from app.brokers.accounts import bind_for_user as _bind_acct
-        from app.brokers.route_guard import check_route, record_mismatch
-        from app.runtime.settings import get_bot_settings as _bot_settings
-        with _bind_acct(user_id):
-            _ok, _note = check_route(user_id)
-            if not _ok:
-                # Refuse rather than mis-route: 7 orders landed on the
-                # wrong broker account on 8/10-11 with no error anywhere.
-                record_mismatch(ticker, user_id, _note, "execute.single")
-                return [AgentMessage(
-                    agent=self.name, kind="error", confidence=1.0,
-                    payload={"user_id": user_id, "ticker": ticker,
-                             "event": "execute_error",
-                             "lane": _lane,
-                             "error": f"route check failed: {_note}"})]
-            _g = await self._gate_book(
-                user_id, ticker, side, message.payload,
-                cfg=_bot_settings(user_id),
-                ks_state=_book_ks.get(str(user_id)),
-                dollar_over=_dollar_over, benched=_benched, lane=_lane)
-            if _g.rr_note:
-                self._log_rr_notes(ticker, message.payload, _lane,
-                                   [_g.rr_note])
-            if _g.skip is not None:
-                return [_g.skip]
-            return await self._execute_for_user(user_id, ticker, side,
-                                                _g.payload)
+        # Pinned approvals use exactly the same book, pocket, stacking,
+        # loss and sizing gates as shared observations. Restrict the loop
+        # to this book; a pin is never an exemption from account capacity.
+        return await self._execute_for_all_users(
+            ticker, side, message.payload, only_user_id=str(user_id))
 
     async def _book_open_tickers(self) -> dict | None:
         """{user_id: {TICKER, ...}} of OPEN positions - one query serving
@@ -306,10 +266,10 @@ class TradeExecutionAgent(Agent):
             return book_cap
         total = sum(float(v or 0) for v in pockets.values())
         alloc = float(pockets.get(_key, 0) or 0)
+        if alloc <= 0:
+            return 0  # explicit zero stays unfunded even when every pin is zero
         if total <= 0:
             return book_cap
-        if alloc <= 0:
-            return 0  # pocket not funded on this book
         return max(1, round(book_cap * alloc / total))
 
     @staticmethod
@@ -502,6 +462,11 @@ class TradeExecutionAgent(Agent):
                          "lane": lane, "event": event, "note": note,
                          **extra}))
 
+        from app.runtime.settings import is_fallback_settings
+        if is_fallback_settings(cfg):
+            return _skip("book_settings_unavailable",
+                         "Skipped: this book's settings are unavailable; no guessed risk or auto-trade")
+
         # THIS book's own kill-switch verdict (2026-08-27). Hard halt
         # (daily / streak / session) -> this book sits out; the others
         # keep working. Weekly recovery -> speculative lanes sit out and
@@ -636,24 +601,13 @@ class TradeExecutionAgent(Agent):
         ticker: str,
         side: str,
         source_payload: dict,
+        *, only_user_id: str | None = None,
     ) -> list[AgentMessage]:
-        """Approve message did not carry a user_id (Risk Manager does not
-        currently propagate it through approve/veto payloads). Fan the
-        approval out to every active paper account so per-user execution,
-        budgets, and cost-basis all stay correct.
+        """Execute against each named book with every guard in one place.
 
-        Aggregates messages from every per-user call. If no paper_accounts
-        exist (fresh install) we emit a single info row so the trace panel
-        records what happened instead of silently dropping the approve.
-
-        Every per-book gate runs here, under bind_for_user(uid), because
-        this is the first line where a book has a name: route check, then
-        _gate_book (its own kill-switch verdict with the KS-5 bump, its
-        daily $ brake KS-12, its per-coin bench, its R:R geometry against
-        ITS floor RR-2/RR-3, its margin-territory bump TE-19, then
-        book_gate.admits) -- shared with the single-book path -- and
-        finally capacity. A kill-switch state that cannot be read fails
-        CLOSED for every book (KS-11, _read_book_brakes).
+        only_user_id restricts a pinned approval to its single owner. Both
+        paths run identical route, halt, lane, capacity, stacking and risk
+        checks, then the ordinary per-book budget and broker sizing path.
         """
         import asyncio
         from app.runtime.persistence import _client
@@ -663,6 +617,7 @@ class TradeExecutionAgent(Agent):
             return [AgentMessage(
                 agent=self.name, kind="info", confidence=1.0,
                 payload={
+                    "user_id": only_user_id,
                     "ticker": ticker,
                     "side": side,
                     "note": "Skipped: Supabase client unavailable, cannot enumerate paper accounts",
@@ -670,7 +625,10 @@ class TradeExecutionAgent(Agent):
             )]
 
         def _fetch():
-            return client.table("paper_accounts").select("user_id").execute()
+            q = client.table("paper_accounts").select("user_id")
+            if only_user_id:
+                q = q.eq("user_id", only_user_id)
+            return q.execute()
 
         try:
             accts = await asyncio.to_thread(_fetch)
@@ -678,6 +636,7 @@ class TradeExecutionAgent(Agent):
             return [AgentMessage(
                 agent=self.name, kind="error", confidence=1.0,
                 payload={
+                    "user_id": only_user_id,
                     "ticker": ticker,
                     "side": side,
                     "event": "execute_error",
@@ -686,14 +645,19 @@ class TradeExecutionAgent(Agent):
                 },
             )]
 
-        users = [a.get("user_id") for a in (accts.data or []) if a.get("user_id")]
+        users = list(dict.fromkeys(str(a["user_id"]) for a in (accts.data or [])
+                                   if a.get("user_id") and (not only_user_id
+                                   or str(a["user_id"]) == only_user_id)))
         if not users:
             return [AgentMessage(
                 agent=self.name, kind="info", confidence=1.0,
                 payload={
+                    "user_id": only_user_id,
                     "ticker": ticker,
                     "side": side,
-                    "note": "Skipped: no paper accounts exist yet",
+                    "event": "book_unavailable",
+                    "note": "Skipped: requested paper account unavailable" if only_user_id
+                            else "Skipped: no paper accounts exist yet",
                 },
             )]
 
@@ -710,6 +674,12 @@ class TradeExecutionAgent(Agent):
         # 14/14 and 516 entries died in a day with every book holding
         # spare slots. Count each book by name, once per signal.
         open_by_book = await self._book_open_tickers()
+        if open_by_book is None:
+            return [AgentMessage(agent=self.name, kind="info", payload={
+                "user_id": uid, "ticker": ticker, "side": side,
+                "event": "book_capacity_unknown",
+                "note": "Skipped: open positions could not be read; book capacity unknown"})
+                    for uid in users]
         # PER-BOOK kill-switch states (Mike 2026-08-27: "the agents are
         # not treating each book as their own book"). Fetched once per
         # signal (row sums are 30s-cached inside); each book is then
@@ -720,7 +690,8 @@ class TradeExecutionAgent(Agent):
         # shared with the single-book path.
         _lane = _lane_of(ticker, source_payload)
         _book_ks, _dollar_over, _closed = await self._read_book_brakes(
-            client, ticker, side, source_payload, len(users))
+            client, ticker, side, source_payload, len(users),
+            user_id=only_user_id)
         if _closed is not None:
             return [_closed]
         # Per-coin loss halt, measured PER BOOK by Risk Manager
@@ -741,6 +712,9 @@ class TradeExecutionAgent(Agent):
                     _ok, _note = _check_route(uid)
                     if not _ok:
                         _rec_mm(ticker, uid, _note, "execute.fanout")
+                        out.append(AgentMessage(agent=self.name, kind="error", payload={
+                            "user_id": uid, "ticker": ticker, "event": "execute_error",
+                            "lane": _lane, "error": f"route check failed: {_note}"}))
                         continue
                     # Per-book appetite (2026-08-18). A scanner signal
                     # carries no user_id, so every settings read upstream
@@ -1090,10 +1064,12 @@ class TradeExecutionAgent(Agent):
                 equity = _true_eq
         except Exception:  # noqa: BLE001
             pass
-        from app.runtime.settings import get_bot_settings
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
         # Per book. Posture and allocation overrides are exactly the kind
         # of setting that must not leak between accounts (2026-08-18).
         cfg = get_bot_settings(user_id)
+        if is_fallback_settings(cfg):
+            raise ValueError("Book settings unavailable: allocation cannot use guessed budgets")
         mt = market_type_for(strategy, asset_type)
         alloc = build_allocation(
             equity,
@@ -1172,17 +1148,18 @@ class TradeExecutionAgent(Agent):
         # Income lanes are never rotated for fast lanes; max N/day.
         try:
             import os as _os3
-            if (_os3.getenv("TREZO_PRIORITY_ROTATION", "1") != "0"
+            if (user_id and _os3.getenv("TREZO_PRIORITY_ROTATION", "1") != "0"
                     and mt in ("stocks", "crypto", "forex")):
                 from datetime import date as _date
                 from datetime import datetime, timezone
-                global _ROTATIONS_TODAY
                 _today = _date.today().isoformat()
-                if _ROTATIONS_TODAY.get("day") != _today:
-                    _ROTATIONS_TODAY = {"day": _today, "n": 0}
+                _rotation_book = str(user_id)
+                _book_rot = _ROTATIONS_TODAY.setdefault(_rotation_book, {"day": _today, "n": 0})
+                if _book_rot.get("day") != _today:
+                    _book_rot = _ROTATIONS_TODAY[_rotation_book] = {"day": _today, "n": 0}
                 _max_rot = int(float(_os3.getenv(
                     "TREZO_PRIORITY_ROTATION_MAX_PER_DAY", "2")))
-                if _ROTATIONS_TODAY["n"] < _max_rot:
+                if _book_rot["n"] < _max_rot:
                     from app.runtime.settings import _supabase
                     client = _supabase()
                     if client is not None:
@@ -1215,16 +1192,21 @@ class TradeExecutionAgent(Agent):
                                          .get("tcs")) or 0)
                             if held_h >= 36 and _tcs0 < 55:
                                 cands.append((held_h, _tcs0, r))
-                        if cands:
+                        if cands and _book_rot["n"] < _max_rot:
                             cands.sort(key=lambda x: (x[1], -x[0]))
                             _held_h, _tcs0, victim = cands[0]
 
                             def _flag(rid=victim["id"]):
                                 return (client.table("paper_positions")
                                         .update({"close_requested": True})
-                                        .eq("id", rid).execute())
-                            await _aio.to_thread(_flag)
-                            _ROTATIONS_TODAY["n"] += 1
+                                        .eq("user_id", user_id).eq("id", rid)
+                                        .eq("close_requested", False).execute())
+                            _book_rot["n"] += 1  # reserve before the await, per book
+                            try:
+                                await _aio.to_thread(_flag)
+                            except Exception:
+                                _book_rot["n"] -= 1
+                                raise
                             try:
                                 from app.agents.activity_log import record as _arec
                                 _arec("priority_rotation",

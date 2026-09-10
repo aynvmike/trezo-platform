@@ -53,7 +53,7 @@ function fmtUsd(n: number | null | undefined): string {
  *
  * Renders an EmptyCard when no open positions.
  */
-export async function OpenOptionsTable() {
+export async function OpenOptionsTable({ accountKey }: { accountKey?: string } = {}) {
   const supabase = createClient();
   const {
     data: { user },
@@ -64,15 +64,16 @@ export async function OpenOptionsTable() {
   // every book the person owns. A failed read (books or rows) renders as
   // a failure, not as the EmptyCard.
   const books = await getOwnerBookKeys(supabase, user.id);
+  if (books.failure) return <LoadError {...books.failure} />;
+  if (accountKey && !books.data?.includes(accountKey)) return <LoadError table="trading_accounts" message="Selected account is unavailable." />;
   const { data: rowsRaw, error } = await supabase
     .from("options_positions")
     .select(
       "id, underlying, strategy, option_type, strike, expiration, contracts, net_premium_usd, status, opened_at"
     )
-    .in("user_id", bookQueryKeys(books.data))
+    .in("user_id", bookQueryKeys(accountKey ? [accountKey] : books.data))
     .eq("status", "open")
     .order("opened_at", { ascending: false });
-  if (books.failure) return <LoadError {...books.failure} />;
   if (error) {
     console.error(`[load] options_positions: ${error.message}`);
     return <LoadError table="options_positions" message={error.message} />;

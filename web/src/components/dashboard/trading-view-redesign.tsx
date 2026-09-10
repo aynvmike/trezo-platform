@@ -42,6 +42,7 @@ export type TVPosition = {
   id: string | number;
   ticker: string;
   side: string;
+  exposure?: string;
   layer: string;
   chip: number;
   entry: number;
@@ -333,7 +334,7 @@ export function TradingViewRedesign({ data, closeAction }: { data?: TradingData;
                     </span>
                   </td>
                   <td className="px-5 py-3"><span className={"rounded-md px-2 py-0.5 font-mono text-[11px] " + (LAYER_CHIP[p.chip] || "text-[rgb(var(--muted-foreground))] bg-[rgb(var(--muted))]")}>{p.chip} &middot; {p.layer}</span></td>
-                  <td className="px-5 py-3"><span className={"rounded px-1.5 py-0.5 font-mono text-[11px] " + (p.side === "LONG" ? "text-emerald-500 bg-emerald-500/10" : "text-red-500 bg-red-500/10")}>{p.side}</span></td>
+                  <td className="px-5 py-3"><span className={"rounded px-1.5 py-0.5 font-mono text-[11px] " + (p.side === "LONG" ? "text-emerald-500 bg-emerald-500/10" : "text-red-500 bg-red-500/10")}>{p.side}{p.assetKind === "Option" ? " CONTRACT" : ""}</span>{p.exposure && <span className="block mt-1 text-[10px] text-[rgb(var(--muted-foreground))]">{p.exposure}</span>}</td>
                   <td className="px-5 py-3 font-mono text-[rgb(var(--muted-foreground))]">{price(p.entry)}</td>
                   <td className="px-5 py-3 font-mono text-[rgb(var(--foreground))]">{p.current == null ? "—" : price(p.current)}</td>
                   <td className="px-5 py-3 font-mono text-[rgb(var(--muted-foreground))]">{p.qty}</td>

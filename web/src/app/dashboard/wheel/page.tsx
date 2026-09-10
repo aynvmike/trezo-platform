@@ -11,10 +11,11 @@ import { WheelReconcileButton } from "@/components/dashboard/wheel-reconcile-but
 import { WheelUniversePanel } from "@/components/dashboard/wheel-universe-panel";
 import { OpenOptionsTable } from "@/components/dashboard/open-options-table";
 import { WheelAcquisitionQueue } from "@/components/dashboard/wheel-acquisition-queue";
-import { OptionsApprovalBadge } from "@/components/dashboard/options-approval-badge";
 import { LoadError, loadResult } from "@/components/dashboard/load-error";
 import { getOwnerBookKeys, bookQueryKeys, withBooks } from "@/lib/books";
-import { fetchAlpacaSnapshot } from "@/lib/alpaca-snapshot";
+import { fetchBookBrokerSnapshot } from "@/lib/book-broker-snapshot";
+import { BookCapabilitiesPanel } from "@/components/dashboard/book-capabilities-panel";
+import Link from "next/link";
 import {
   fetchWheelLiveSnapshot,
   summariseLiveWheel
@@ -173,8 +174,8 @@ function describeIdle(reason: IdleReason): {
   if (!reason.optionsScannerEnabled) {
     return {
       description:
-        "Wheel scanner is paused — turn it back on in Bot Tuning to resume.",
-      next: "Next: enable the Options Scanner under Bot Tuning → Strategies."
+        "Wheel execution is switched off for this book.",
+      next: "Next: enable Auto-trade and Wheel auto-execute in this account's Bot Tuning."
     };
   }
   if (!reason.marketOpen) {
@@ -284,7 +285,7 @@ function computeCycle(
   };
 }
 
-export default async function WheelPage() {
+export default async function WheelPage({ searchParams }: { searchParams?: { account?: string } }) {
   const supabase = createClient();
   const {
     data: { user }
@@ -295,7 +296,15 @@ export default async function WheelPage() {
   // every book the person owns. (bot_settings below stays keyed by the
   // caller's own key: it is one book's dial, chosen on the settings page.)
   const booksLoad = await getOwnerBookKeys(supabase, user.id);
-  const keys = bookQueryKeys(booksLoad.data);
+  const { data: books, error: booksError } = await supabase.from("trading_accounts")
+    .select("account_key, label").eq("owner_id", user.id).eq("is_active", true).order("label");
+  if (booksError || booksLoad.failure) return <div className="p-6"><LoadError table="trading_accounts" message={booksError?.message ?? booksLoad.failure?.message ?? "Accounts unavailable."} /></div>;
+  const selected = searchParams?.account ?? books?.[0]?.account_key;
+  const activeBook = books?.find((book) => book.account_key === selected);
+  const bookNav = <nav className="flex flex-wrap gap-2" aria-label="Trading account">{(books ?? []).map((book) => <Link key={book.account_key} href={`/dashboard/wheel?account=${encodeURIComponent(book.account_key)}`} aria-current={book.account_key === selected ? "page" : undefined} className={cn("rounded-lg border px-3 py-2 text-sm", book.account_key === selected ? "border-emerald-400 bg-emerald-50 text-emerald-900" : "border-weave-200 text-weave-700")}>{book.label ?? "Account"}</Link>)}</nav>;
+  if (!activeBook) return <div className="p-6 space-y-3"><p role="alert">Select an available account to see its Wheel.</p>{bookNav}</div>;
+  const accountKey = String(activeBook.account_key);
+  const keys = bookQueryKeys([accountKey]);
 
   const [rowsRes, botRes, lastTickRes, alpacaSnap, wheelLive] = await Promise.all([
     supabase
@@ -308,18 +317,19 @@ export default async function WheelPage() {
       .order("opened_at", { ascending: false }),
     supabase
       .from("bot_settings")
-      .select("pattern_enabled")
-      .eq("user_id", user.id)
+      .select("wheel_auto_execute, auto_trade_enabled")
+      .eq("user_id", accountKey)
       .maybeSingle(),
     supabase
       .from("agent_messages")
       .select("created_at")
       .eq("agent_name", "options_scanner")
+      .or(`user_id.eq.${accountKey},payload->>user_id.eq.${accountKey}`)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle(),
-    fetchAlpacaSnapshot(),
-    fetchWheelLiveSnapshot(user.id)
+    fetchBookBrokerSnapshot(accountKey),
+    fetchWheelLiveSnapshot(accountKey)
   ]);
   // Live broker totals — when present, these override the modeled
   // numbers from `options_positions` on the headline tiles. Falls
@@ -343,12 +353,12 @@ export default async function WheelPage() {
   const lastTickMinutesAgo = lastTickIso
     ? Math.round((Date.now() - new Date(lastTickIso).getTime()) / 60_000)
     : null;
-  const optionsApprovalLevel = alpacaSnap?.configured && alpacaSnap.account
-    ? Number(alpacaSnap.account.options_approved_level ?? 0)
+  const optionsApprovalLevel = alpacaSnap
+    ? Number(alpacaSnap.options_approved_level ?? 0)
     : null;
   const idleReason = {
     marketOpen,
-    optionsScannerEnabled: Boolean(botRes.data?.pattern_enabled ?? true),
+    optionsScannerEnabled: Boolean(botRes.data?.wheel_auto_execute && botRes.data?.auto_trade_enabled),
     lastTickMinutesAgo,
     optionsApprovalLevel
   };
@@ -402,8 +412,12 @@ export default async function WheelPage() {
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
       <LayerHero id={5} openCount={heroOpenCount} />
+      {bookNav}
+      <p className="text-sm text-weave-600">Showing {activeBook.label ?? "this account"}. Positions, cash requirements and order buttons belong to this book.</p>
 
       {rowsLoad.failure ? <LoadError {...rowsLoad.failure} /> : null}
+      {botRes.error ? <LoadError table="bot_settings" message={botRes.error.message} /> : null}
+      {lastTickRes.error ? <LoadError table="agent_messages" message={lastTickRes.error.message} /> : null}
 
       {/* Headline tiles — when Alpaca is connected and reports open
           option legs, these read from the broker (LIVE). Otherwise
@@ -447,27 +461,27 @@ export default async function WheelPage() {
         only. Reconciled / settled legs roll into Realized P&L.
       </p>
 
-      <OptionsApprovalBadge />
+      <BookCapabilitiesPanel accountKey={accountKey} />
 
-      <WheelReconcileButton />
+      <WheelReconcileButton key={accountKey} accountKey={accountKey} />
 
-      <WheelUniversePanel userId={user.id} />
+      <WheelUniversePanel userId={accountKey} />
 
-      <WheelLivePositions userId={user.id} />
+      <WheelLivePositions userId={accountKey} />
 
       {/* Task #28: complete options book with bucket badges (wheel /
           income / hopeful) and DTE color-coding. Bucket-aware view -
           shows hopeful holds and other non-Wheel options alongside the
           Wheel. */}
-      <OpenOptionsTable />
+      <OpenOptionsTable accountKey={accountKey} />
 
-      <WheelLiveQuotes underlyings={WHEEL_WATCHLIST} />
+      <WheelLiveQuotes key={accountKey} accountKey={accountKey} underlyings={WHEEL_WATCHLIST} />
 
       {/* Task #35: Acquisition Queue replaces the example-grid as the
           primary signal of what the bot is actually queueing. The full
           17-name example planner moves into a collapsed disclosure
           below for those who still want the reference. */}
-      <WheelAcquisitionQueue />
+      <WheelAcquisitionQueue accountKey={accountKey} />
 
       <Disclosure title="Show full example planner (all watchlist names)">
         <section className="space-y-3">

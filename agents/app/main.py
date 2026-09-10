@@ -444,7 +444,16 @@ async def paper_alpaca_snapshot():
 
 
 @app.get("/wheel/live-quotes", tags=["options"])
-async def wheel_live_quotes(underlyings: str):
+async def wheel_live_quotes(underlyings: str, user_id: str = ""):
+    from app.brokers.book_routes import paper_book_route, BookRouteUnavailable
+    try:
+        with paper_book_route(user_id):
+            return {**await _wheel_live_quotes_for(underlyings, user_id), "user_id": user_id}
+    except BookRouteUnavailable as exc:
+        return {"configured": False, "user_id": user_id, "error": str(exc)}
+
+
+async def _wheel_live_quotes_for(underlyings: str, user_id: str):
     """Live cash-secured-put + covered-call premiums for a wheel
     watchlist. `underlyings` is a comma-separated list. For each
     symbol: pull the current quote, compute the 5%-below-spot and
@@ -462,7 +471,7 @@ async def wheel_live_quotes(underlyings: str):
     # but the response shape and the gate check are provider-neutral
     # so future brokers (Webull, Robinhood, IBKR) plug in without the
     # Wheel page needing changes.
-    broker = await active_broker_name()
+    broker = await active_broker_name(user_id)
     if broker == "modeled" or not alpaca_configured():
         return {
             "configured": False,
@@ -570,6 +579,15 @@ async def wheel_universe(user_id: str = ""):
 
 @app.get("/wheel/positions", tags=["options"])
 async def wheel_positions(user_id: str = ""):
+    from app.brokers.book_routes import paper_book_route, BookRouteUnavailable
+    try:
+        with paper_book_route(user_id):
+            return {**await _wheel_positions_for(user_id), "user_id": user_id}
+    except BookRouteUnavailable as exc:
+        return {"configured": False, "user_id": user_id, "error": str(exc)}
+
+
+async def _wheel_positions_for(user_id: str):
     """Real options positions on the user's connected Alpaca account.
 
     Classifies each leg using OCC parsing:
@@ -588,7 +606,7 @@ async def wheel_positions(user_id: str = ""):
     routed = "env-keys"
     if user_id:
         bt = await get_user_broker_token(user_id, "alpaca")
-        if bt:
+        if bt and bt.access_token:
             token = UserToken(
                 access_token=bt.access_token,
                 refresh_token=bt.refresh_token,
@@ -689,72 +707,82 @@ async def wheel_place_leg(
     contracts: int = 1,
     limit_price: float | None = None,
 ):
-    """Place a single-leg wheel order on Alpaca paper (sell-to-open).
-
-    leg = "csp" picks a put ~5% below spot; "cc" picks a call ~5%
-    above. The bot uses live_option_pick to land on the real listed
-    contract closest to the target strike + expiration. The order
-    routes through the user's Alpaca OAuth connection when available,
-    falling back to the env keys for legacy / single-tenant setups."""
-    from app.brokers.alpaca import (
-        alpaca_configured, UserToken, submit_option_order,
-    )
-    from app.brokers.alpaca_data import live_option_pick
-    from app.integrations.web_tokens import get_user_broker_token
-
+    """An explicitly requested book runs the shared checked paper Wheel path."""
+    import math
+    import re
+    from datetime import date
+    from types import SimpleNamespace
+    from app.brokers.book_routes import paper_book_route, BookRouteUnavailable
+    from app.agents.options_scanner import (
+        OptionsScannerAgent, _supabase, _book_kill_states, _fire_block_reason)
+    from app.paper.killswitch import daily_dollar_over
     if leg not in ("csp", "cc"):
         return {"ok": False, "error": "leg must be 'csp' or 'cc'."}
-    if not underlying or not target_strike or not target_exp:
-        return {"ok": False, "error": "Missing required params."}
-
-    # Per-user token first; env keys as fallback.
-    token: UserToken | None = None
-    routed = "env-keys"
-    if user_id:
-        bt = await get_user_broker_token(user_id, "alpaca")
-        if bt:
-            token = UserToken(
-                access_token=bt.access_token,
-                refresh_token=bt.refresh_token,
-                expires_at=bt.expires_at,
-            )
-            routed = "user-oauth"
-    if token is None and not alpaca_configured():
-        return {"ok": False, "error": "Alpaca not configured + user has no OAuth connection.",
-                "routed": routed}
-
-    opt_type = "put" if leg == "csp" else "call"
-    pick = await live_option_pick(underlying, opt_type, float(target_strike),
-                                   str(target_exp))
-    if not pick:
-        return {"ok": False, "error": f"No listed {opt_type} contract near ${target_strike} for {target_exp}.",
-                "routed": routed}
-
-    # Sell-to-open: short the put (CSP) or short the call (CC).
-    order, err = await submit_option_order(
-        occ_symbol=pick.occ,
-        contracts=int(contracts),
-        side="sell",
-        time_in_force="day",
-        limit_price=limit_price,
-        token=token,
-    )
-    if err or not order:
-        return {"ok": False, "error": f"Alpaca rejected the order: {err}",
-                "routed": routed, "occ": pick.occ}
-
-    return {
-        "ok": True,
-        "routed": routed,
-        "leg": "wheel_csp" if leg == "csp" else "wheel_cc",
-        "occ": pick.occ,
-        "underlying": underlying.upper(),
-        "strike": pick.strike,
-        "expiration": pick.expiration,
-        "premium": pick.premium,
-        "alpaca_order_id": order.get("id"),
-        "alpaca_order_status": order.get("status"),
-    }
+    underlying = str(underlying or "").upper().strip()
+    try:
+        if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", underlying):
+            raise ValueError("Invalid underlying ticker.")
+        if not math.isfinite(float(target_strike)) or float(target_strike) <= 0:
+            raise ValueError("Strike must be a finite positive number.")
+        if isinstance(contracts, bool) or not isinstance(contracts, int) or not 1 <= contracts <= 50:
+            raise ValueError("Contracts must be an integer between 1 and 50.")
+        if date.fromisoformat(target_exp) < date.today():
+            raise ValueError("Expiration cannot be in the past.")
+        if limit_price is not None and (not math.isfinite(float(limit_price)) or float(limit_price) <= 0):
+            raise ValueError("Limit price must be a finite positive number.")
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "user_id": user_id, "error": str(exc)}
+    try:
+        with paper_book_route(user_id):
+            client = _supabase()
+            if client is None:
+                return {"ok": False, "error": "Trading state is unavailable for this book."}
+            strategy = "wheel_csp" if leg == "csp" else "wheel_cc"
+            states = await _book_kill_states(client)
+            if states is None or user_id not in states:
+                return {"ok": False, "error": "This book's risk state could not be verified."}
+            blocked = _fire_block_reason(states, user_id, strategy)
+            if blocked:
+                return {"ok": False, "user_id": user_id, "error": blocked}
+            limits = await daily_dollar_over(client)
+            if limits is None:
+                return {"ok": False, "error": "This book's daily loss limit could not be verified."}
+            if user_id in limits:
+                return {"ok": False, "user_id": user_id, "error": "This book has reached its daily loss limit."}
+            proposal = SimpleNamespace(underlying=underlying, strike=float(target_strike),
+                        expiration=target_exp, contracts=contracts, credit_usd=0,
+                        modeled_iv=None, premium_per_share=0)
+            result = await OptionsScannerAgent()._wheel_auto_fire(
+                user_id, underlying, proposal, strategy, "manual request", client=client,
+                limit_price=limit_price, manual=True)
+            if result is None:
+                return {"ok": False, "user_id": user_id,
+                        "error": "No order submitted; market or Wheel entry checks did not permit this request."}
+            payload = result.payload
+            event = payload.get("event")
+            accepted = event in {"wheel_auto_placed", "wheel_auto_tracking_failed"}
+            response = {"ok": accepted, "user_id": user_id,
+                        "routed": payload.get("routed_via"), "leg": strategy,
+                        "underlying": underlying, "occ": payload.get("occ"),
+                        "contracts": payload.get("contracts", proposal.contracts),
+                        "strike": payload.get("strike"), "expiration": payload.get("expiration"),
+                        "premium": payload.get("premium_per_share"),
+                        "alpaca_order_id": payload.get("alpaca_order_id"),
+                        "alpaca_order_status": payload.get("alpaca_order_status"),
+                        "recorded": event == "wheel_auto_placed"}
+            if not accepted:
+                response["error"] = payload.get("reason") or payload.get("note") or "Wheel entry blocked."
+            elif event == "wheel_auto_tracking_failed":
+                response["record_error"] = payload.get("reason") or "Broker accepted the order, but tracking failed."
+                # The accepted OCC, not the target proposal, identifies what
+                # the frontend may retry recording without submitting again.
+                from app.data.occ import parse_occ
+                actual = parse_occ(str(payload.get("occ") or ""))
+                if actual:
+                    response.update(strike=actual.strike, expiration=actual.expiration)
+            return response
+    except BookRouteUnavailable as exc:
+        return {"ok": False, "user_id": user_id, "error": str(exc)}
 
 
 @app.post("/agents/run-now/{name}", tags=["agents"])
@@ -799,7 +827,16 @@ async def agent_run_now(name: str):
 
 
 @app.post("/wheel/reconcile", tags=["options"])
-async def wheel_reconcile():
+async def wheel_reconcile(user_id: str = ""):
+    from app.brokers.book_routes import paper_book_route, BookRouteUnavailable
+    try:
+        with paper_book_route(user_id):
+            return await _wheel_reconcile_for(user_id)
+    except BookRouteUnavailable as exc:
+        return {"ok": False, "user_id": user_id, "error": str(exc)}
+
+
+async def _wheel_reconcile_for(user_id: str):
     """Force a reconciliation pass: any open modeled wheel_csp / wheel_cc
     row on Supabase that has NO matching option contract on the user's
     Alpaca account is closed_manual with a 'Reconciled' note.
@@ -819,13 +856,17 @@ async def wheel_reconcile():
         return {"ok": False, "error": f"Supabase client error: {e}"}
 
     scanner = OptionsScannerAgent()
-    msgs = await scanner._reconcile_with_broker(client)
+    msgs = await scanner._reconcile_with_broker(client, user_id=user_id)
     total = sum(int(m.payload.get("closed_count", 0)) for m in msgs)
+    failures = [m.payload for m in msgs if m.kind == "error" or m.payload.get("status") == "failed"]
     return {
-        "ok": True,
-        "users_touched": len(msgs),
+        "ok": not failures,
+        "user_id": user_id,
+        "users_touched": 1,
         "rows_closed": total,
         "details": [m.payload for m in msgs],
+        **({"error": failures[0].get("reason") or "This book's reconciliation could not be verified."}
+           if failures else {}),
     }
 
 
