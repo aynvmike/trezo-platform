@@ -219,10 +219,20 @@ class BookHealthAgent(Agent):
         have = {(str(r.get("ticker") or "").upper(),
                  str(r.get("side") or "long")) for r in rows}
 
+        # Wheel contracts already have a manager in options_positions.
+        # If that read fails, still inspect stocks/crypto but do not claim
+        # an option is unmanaged from an incomplete ledger view.
+        from app.paper.option_ownership import managed_option_keys
+        option_owners = await managed_option_keys(client, uid)
+        if option_owners is not None:
+            have.update(option_owners)
+
         # ---- INVARIANT 1: unmanaged notional should be zero ----------
         unmanaged, unmanaged_usd = [], 0.0
         for bp in broker:
             key = _ledger_key(bp)
+            if option_owners is None and str(bp.get("asset_class")) == "us_option":
+                continue
             if key in have:
                 continue
             # DU-01: skip a row ONLY when market_value is present, parses
@@ -247,9 +257,9 @@ class BookHealthAgent(Agent):
             body = (
                 f"The broker holds **{len(unmanaged)}** position(s) worth "
                 f"**${unmanaged_usd:,.0f}** that this book has no open row "
-                f"for. Nothing is managing them: no stop, no target, no "
-                f"profit ladder. Crypto has no broker bracket either, so "
-                f"those are unprotected outright.\n\n"
+                f"for. Trezo cannot manage their exits through a ledger "
+                f"row. Broker-side protection has not been verified by "
+                f"this check.\n\n"
                 + ", ".join(unmanaged[:12]))
             await notify(f"{label}: ${unmanaged_usd:,.0f} unmanaged",
                          body, severity=sev, key=fkey,
@@ -260,7 +270,7 @@ class BookHealthAgent(Agent):
             findings.append({"finding": "unmanaged_positions",
                              "count": len(unmanaged),
                              "notional_usd": round(unmanaged_usd, 2)})
-        elif self._open_findings.pop(fkey, None):
+        elif option_owners is not None and self._open_findings.pop(fkey, None):
             await notify(f"{label}: every position is managed again",
                          f"All {len(broker)} broker position(s) now have a "
                          f"matching open row.", severity="good", key="")

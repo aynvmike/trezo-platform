@@ -285,6 +285,50 @@ def _h_web_rebuild(args: dict) -> str:
     return out
 
 
+
+def _read_diagnostics() -> str:
+    """Read-only incident probe, run in the existing relay worker thread.
+
+    Stack locations omit locals and source text. Broker reads run on an
+    isolated event loop so a blocked engine loop can be distinguished
+    from a failing connection from this server.
+    """
+    import threading
+    import traceback
+    import time
+    frames = sys._current_frames()
+    lines = []
+    for thread in threading.enumerate():
+        frame = frames.get(thread.ident)
+        if frame is None or thread.name != "MainThread":
+            continue
+        locations = traceback.extract_stack(frame)[-12:]
+        lines.append("main_thread: " + " -> ".join(
+            f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in locations))
+
+    async def probe():
+        from app.brokers.accounts import load_accounts, bind_for_user
+        from app.brokers.alpaca import (
+            get_positions_strict, get_open_orders_all_strict, last_read_error)
+        result = []
+        for account in load_accounts():
+            with bind_for_user(account.account_key):
+                for label, reader in (("positions", get_positions_strict),
+                                      ("open_orders", get_open_orders_all_strict)):
+                    start = time.monotonic()
+                    rows = await reader()
+                    detail = (f"rows={len(rows)}" if rows is not None
+                              else f"unreadable: {last_read_error()}")
+                    result.append(f"isolated_read {account.account_id} {label}: "
+                                  f"{detail} elapsed={time.monotonic()-start:.2f}s")
+        return result
+    try:
+        lines.extend(asyncio.run(probe()))
+    except Exception as exc:
+        lines.append(f"isolated_read: {type(exc).__name__}")
+    return "\n".join(lines)
+
+
 def _h_report_status(args: dict) -> str:
     lines = []
     # 2026-08-28: queue report_status with {"send_test": true} to prove
@@ -344,6 +388,8 @@ def _h_report_status(args: dict) -> str:
                 f"last_tick={_lt} err={_err or '-'}")
     except Exception as e:  # noqa: BLE001
         lines.append(f"agent states: error {str(e)[:160]}")
+    if args.get("diagnostics"):
+        lines.append(_read_diagnostics())
     return "\n".join(lines)
 
 

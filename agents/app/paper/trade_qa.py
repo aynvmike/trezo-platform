@@ -1053,11 +1053,10 @@ async def _maybe_shield_liveness_alert(client, uid: str, rep: dict) -> None:
                 message=(f"Trezo has not been able to read this book's orders "
                          f"{since}. While that is true the QA shield answers "
                          f"'cannot check', and BOTH reconcilers skip closing "
-                         f"rows rather than guess. Nothing is being closed on "
-                         f"this book until the broker read recovers. Nothing is "
-                         f"at risk from this by itself -- closing a row is "
-                         f"bookkeeping, not an exit -- but the ledger will drift "
-                         f"until it clears."))
+                         f"rows based only on absence. This does not verify "
+                         f"position protection or stop all exits. Broker-side "
+                         f"orders may still fill while reconciliation is "
+                         f"deferred; restore reads and inspect the receipts."))
     await _raise_ticket(client, uid, f, rep)
 
 
@@ -1078,7 +1077,7 @@ async def _rows_for_book(client, uid: str) -> Optional[list]:
         return None
 
 
-async def _option_rows_for_book(client, uid: str) -> list:
+async def _option_rows_for_book(client, uid: str) -> Optional[list]:
     """options_positions, READ-ONLY. I6 (ledger singularity) cannot be asked
     without looking at both tables, and the wheel lane's laundering -- a
     closed_manual row for a contract the broker still holds -- is only
@@ -1089,9 +1088,10 @@ async def _option_rows_for_book(client, uid: str) -> list:
                         "status, contracts, strategy, notes")
                 .eq("user_id", uid).execute())
     try:
-        return (await asyncio.to_thread(_q)).data or []
+        rows = (await asyncio.to_thread(_q)).data
+        return rows if isinstance(rows, list) else None
     except Exception:  # noqa: BLE001
-        return []
+        return None
 
 
 async def _inspect(client, uid: str, positions: list, orders: list,
@@ -1102,6 +1102,11 @@ async def _inspect(client, uid: str, positions: list, orders: list,
         return _skip(rep, uid, "ledger read failed -- no partial sweep",
                      event="qa_read_deferred")
     opt_rows = await _option_rows_for_book(client, uid)
+    if opt_rows is None:
+        return _skip(rep, uid, "option ownership read failed -- no partial sweep",
+                     event="qa_read_deferred")
+    from app.paper.option_ownership import broker_option_keys
+    option_owners = broker_option_keys(opt_rows)
 
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=lookback_h())
@@ -1143,7 +1148,7 @@ async def _inspect(client, uid: str, positions: list, orders: list,
 
     # ---- I1: FILL => ROW. The NOBL case. -----------------------------
     for (key, side), plist in sorted(pos_by_key.items()):
-        if open_rows.get((key, side)):
+        if open_rows.get((key, side)) or (key, side) in option_owners:
             continue                                # I1 satisfied
         for p in plist:
             await _handle_orphan(client, uid, key, side, p, fills_by_sym,

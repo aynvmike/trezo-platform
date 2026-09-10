@@ -266,6 +266,7 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
     # at all, adoption still happens -- an unmanaged position is worse
     # than a young-looking one -- and the row says which clock it has.
     receipts = _UNLOADED
+    option_owners = _UNLOADED
 
     for bp in rows:
         try:
@@ -285,6 +286,17 @@ async def adopt_for_book(user_id: str, *, dry_run: bool = False) -> dict:
             continue
         if (ticker, side) in have:
             continue
+        # LULG 2026-09-10: adoption must respect the Wheel's existing owner.
+        if at == "option":
+            if option_owners is _UNLOADED:
+                from app.paper.option_ownership import managed_option_keys
+                option_owners = await managed_option_keys(client, str(user_id))
+            if option_owners is None or (ticker, side) in option_owners:
+                out["skipped"].append({
+                    "ticker": ticker,
+                    "why": ("option ownership unreadable - no adoption"
+                            if option_owners is None else "managed by the Wheel ledger")})
+                continue
 
         # What is it worth right now? Both the defaults and anything we
         # inherit are checked against this, so adoption can never hand

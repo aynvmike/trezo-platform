@@ -1,7 +1,7 @@
 """Alpaca paper-trading client.
 
-Phase 8a built the read side — account equity, buying power, positions.
-Phase 8b adds the write side — bracket order placement — plus the market
+Phase 8a built the read side â€” account equity, buying power, positions.
+Phase 8b adds the write side â€” bracket order placement â€” plus the market
 clock. Trezo's trade rules (TREZO_NOVA_BOT_TRADE_RULES.md) target Alpaca's
 paper API as the stock execution venue.
 
@@ -373,7 +373,7 @@ async def _get(path: str, token: Optional["UserToken"] = None,
 async def _post(path: str, body: dict,
                   token: Optional["UserToken"] = None) -> tuple[Optional[dict], Optional[str]]:
     """POST to an Alpaca endpoint. Returns (json, None) on success or
-    (None, error_message) on failure — never raises."""
+    (None, error_message) on failure â€” never raises."""
     if token is None and not alpaca_configured():
         return None, "Alpaca is not configured"
     try:
@@ -447,7 +447,7 @@ async def _delete(path: str,
 
 
 async def get_account(token: Optional["UserToken"] = None) -> Optional[AlpacaAccount]:
-    """Fetch the Alpaca paper account snapshot — equity, buying power,
+    """Fetch the Alpaca paper account snapshot â€” equity, buying power,
     day-trade status. None if Alpaca is unconfigured or unreachable."""
     data = await _get("/v2/account", token=token)
     if not isinstance(data, dict):
@@ -673,7 +673,7 @@ async def get_option_positions(token: Optional["UserToken"] = None) -> list[dict
 
 
 async def get_clock(token: Optional["UserToken"] = None) -> Optional[dict]:
-    """Market clock — {is_open, next_open, next_close}. None on failure."""
+    """Market clock â€” {is_open, next_open, next_close}. None on failure."""
     data = await _get("/v2/clock", token=token)
     return data if isinstance(data, dict) else None
 
@@ -1881,7 +1881,7 @@ def _equity_sell_tif(qty: float) -> str:
 async def submit_stop_sell(
     symbol: str, qty: float, stop_price: float,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Plain stop sell — the protection-first fallback when an OCO is
+    """Plain stop sell â€” the protection-first fallback when an OCO is
     refused (2026-07-15, the PYPL naked-4 incident). GTC for whole
     shares, DAY for fractional (see _equity_sell_tif)."""
     return await _post("/v2/orders", {
@@ -1932,11 +1932,42 @@ def _is_buy_limit(order: dict) -> bool:
     return t == "limit" and str(order.get("side") or "").lower() == "buy"
 
 
+async def _confirmed_short_qty(symbol: str, qty, *, available: bool = False):
+    """A stale ledger must never turn a protective buy into a new long."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        bp = await _get(f"/v2/positions/{str(symbol).upper()}")
+        if not isinstance(bp, dict):
+            return None, "short position unreadable or absent - buy protection deferred"
+        held = Decimal(str(bp.get("qty")))
+        requested = Decimal(str(qty))
+        if not held.is_finite() or held >= 0:
+            return None, "broker no longer holds a short - no protective buy"
+        if not requested.is_finite() or requested <= 0:
+            return None, "invalid protective quantity"
+        cap = -held
+        if available and bp.get("qty_available") is not None:
+            free = abs(Decimal(str(bp["qty_available"])))
+            if not free.is_finite():
+                return None, "available short quantity unreadable"
+            cap = min(cap, free)
+        if cap <= 0:
+            return None, "no unreserved short quantity - buy protection deferred"
+        return format(min(requested, cap).normalize(), "f"), None
+    except (InvalidOperation, TypeError, ValueError):
+        return None, "short quantity unreadable - buy protection deferred"
+    except Exception:
+        return None, "short position read failed - buy protection deferred"
+
+
 async def submit_stop_buy(
     symbol: str, qty, stop_price: float,
 ) -> tuple[Optional[dict], Optional[str]]:
     """Plain buy stop -- protection-first fallback for a SHORT when the
     OCO is refused (same shape as submit_stop_sell)."""
+    qty, refusal = await _confirmed_short_qty(symbol, qty, available=True)
+    if refusal:
+        return None, refusal
     return await _post("/v2/orders", {
         "symbol": symbol.upper(),
         "qty": str(qty),
@@ -1952,6 +1983,9 @@ async def submit_oco_buy(
 ) -> tuple[Optional[dict], Optional[str]]:
     """OCO exit pair for an existing SHORT: take-profit buy limit (below)
     + buy stop (above), one cancels the other."""
+    qty, refusal = await _confirmed_short_qty(symbol, qty, available=True)
+    if refusal:
+        return None, refusal
     return await _post("/v2/orders", {
         "symbol": symbol.upper(),
         "qty": str(qty),
@@ -1987,15 +2021,18 @@ async def ensure_short_protection(
     if any(_is_buy_stop(o) for o in orders):
         return False, "buy stop already resting at the broker"
 
+    # Confirm existence and side BEFORE cancelling any current protection.
+    qty, refusal = await _confirmed_short_qty(sym, qty)
+    if refusal:
+        return False, refusal
     resting_buys = [o for o in orders if _is_buy_limit(o)]
     for o in resting_buys:
         if o.get("id"):
             await _delete(f"/v2/orders/{o.get('id')}")
     lost_target = bool(resting_buys)
 
-    # QP-01: never ask for more than the venue holds (short qty is negative
-    # at the venue; the clamp strips the sign).
-    qty = await _clamp_to_venue_qty(sym, qty)
+    # Each submit rechecks after cancellation and again before fallback:
+    # the target can fill between the earlier snapshot and this point.
 
     if target and target > 0:
         _o, err = await submit_oco_buy(sym, qty, target, stop)
@@ -2020,8 +2057,11 @@ async def ensure_short_protection(
         except (TypeError, ValueError):
             continue
         if _q > 0 and _px > 0:
+            _safe_qty, _refusal = await _confirmed_short_qty(sym, _q, available=True)
+            if _refusal:
+                return False, f"buy protection deferred: {_refusal}"
             _r, _rerr = await _post("/v2/orders", {
-                "symbol": sym, "qty": str(_q), "side": "buy", "type": "limit",
+                "symbol": sym, "qty": _safe_qty, "side": "buy", "type": "limit",
                 "limit_price": str(round(_px, 2)), "time_in_force": "gtc",
             })
             if not _rerr:
