@@ -191,6 +191,43 @@ def test_isolated_diagnostics_preserve_failed_read_as_unknown():
     assert "unreadable: ConnectTimeout" in result
     assert "rows=0" not in result
 
+
+
+def test_broker_tls_setup_is_off_loop_cached_and_still_verified():
+    import httpx
+    import threading
+    calls, contexts = [], []
+    main_thread = threading.get_ident()
+    context = object()
+    def build(**kwargs):
+        assert threading.get_ident() != main_thread, "certificate loading blocked the engine"
+        assert kwargs == {"verify": True, "trust_env": True}
+        calls.append(kwargs)
+        return context
+    class Client:
+        def __init__(self, **kwargs):
+            contexts.append(kwargs["verify"])
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **k):
+            return SimpleNamespace(status_code=200, json=lambda: [])
+    async def reads():
+        return await asyncio.gather(*(alp._get("/v2/positions") for _ in range(5)))
+    with patch(httpx, create_ssl_context=build, AsyncClient=Client), \
+            patch(alp, _TLS_CONTEXT=None, alpaca_configured=lambda: True,
+                  _headers_for=lambda token: {}, _base_url=lambda: "https://paper-api.alpaca.markets"):
+        assert run(reads()) == [[], [], [], [], []]
+    assert len(calls) == 1
+    assert contexts == [context] * 5
+
+def test_tls_setup_failure_is_a_failed_read_not_empty_or_unverified():
+    import httpx
+    def build(**kwargs): raise RuntimeError("certificate configuration unavailable")
+    def client(**kwargs): raise AssertionError("must not connect without verified TLS")
+    with patch(httpx, create_ssl_context=build, AsyncClient=client), \
+            patch(alp, _TLS_CONTEXT=None, alpaca_configured=lambda: True), quiet_activity_log():
+        assert run(alp._get("/v2/positions")) is None
+
 if __name__ == "__main__":
     from tests._bootstrap import run_tests
     raise SystemExit(run_tests(globals()))

@@ -246,7 +246,12 @@ def _diagnostic_transport(book, outcome, calls):
 
     class Client:
         def __init__(self, **kwargs):
-            assert kwargs == {"timeout": 10.0}
+            import ssl
+            assert set(kwargs) == {"timeout", "verify"}
+            assert kwargs["timeout"] == 10.0
+            assert isinstance(kwargs["verify"], ssl.SSLContext)
+            assert kwargs["verify"].verify_mode == ssl.CERT_REQUIRED
+            assert kwargs["verify"].check_hostname is True
 
         async def __aenter__(self):
             return self

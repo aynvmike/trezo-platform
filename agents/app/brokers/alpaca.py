@@ -326,6 +326,31 @@ def _q(value) -> str:
     return quote(str(value if value is not None else ""), safe="")
 
 
+
+# Certificate loading is synchronous in httpx. Rebuilding it on every
+# broker request blocked the engine loop (server stack, 2026-09-10).
+# This cache contains ONLY trust configuration, never account credentials.
+_TLS_CONTEXT = None
+from threading import Lock as _TLSLock
+_TLS_LOCK = _TLSLock()
+
+
+def _build_verified_tls_context():
+    global _TLS_CONTEXT
+    with _TLS_LOCK:
+        if _TLS_CONTEXT is None:
+            import httpx
+            _TLS_CONTEXT = httpx.create_ssl_context(verify=True, trust_env=True)
+        return _TLS_CONTEXT
+
+
+async def _verified_tls_context():
+    if _TLS_CONTEXT is not None:
+        return _TLS_CONTEXT
+    import asyncio
+    return await asyncio.to_thread(_build_verified_tls_context)
+
+
 async def _get(path: str, token: Optional["UserToken"] = None,
                *, quiet_404: bool = False):
     """GET an Alpaca endpoint. Returns parsed JSON, or None on any failure.
@@ -345,7 +370,7 @@ async def _get(path: str, token: Optional["UserToken"] = None,
         return None
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=await _verified_tls_context()) as client:
             resp = await client.get(_base_url() + path, headers=_headers_for(token))
             status = int(getattr(resp, "status_code", 0) or 0)
             if status >= 400:
@@ -378,7 +403,7 @@ async def _post(path: str, body: dict,
         return None, "Alpaca is not configured"
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, verify=await _verified_tls_context()) as client:
             resp = await client.post(
                 _base_url() + path,
                 headers={**_headers_for(token), "Content-Type": "application/json"},
@@ -412,7 +437,7 @@ async def _patch(path: str, body: dict,
         return None, "Alpaca is not configured"
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, verify=await _verified_tls_context()) as client:
             resp = await client.patch(_base_url() + path, json=body,
                                       headers={**_headers_for(token),
                                                "Content-Type": "application/json"})
@@ -434,7 +459,7 @@ async def _delete(path: str,
         return None, "Alpaca is not configured"
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, verify=await _verified_tls_context()) as client:
             resp = await client.delete(_base_url() + path, headers=_headers_for(token))
             if resp.status_code >= 400:
                 return None, f"HTTP {resp.status_code}: {resp.text}"
