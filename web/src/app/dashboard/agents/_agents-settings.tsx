@@ -73,20 +73,26 @@ export function AgentsSettings() {
   async function toggle(name: string, enabled: boolean) {
     setAgents((cur) => cur.map((a) => (a.name === name ? { ...a, enabled } : a)));
     try {
-      await fetch(`/api/agents/${name}/toggle`, {
+      const response = await fetch(`/api/agents/${name}/toggle`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled })
       });
-    } catch {
+      const result = await response.json();
+      if (!response.ok || result.error) throw new Error(result.error || `Agent toggle failed (${response.status}).`);
+      setError(null);
+    } catch (error) {
       setAgents((cur) => cur.map((a) => (a.name === name ? { ...a, enabled: !enabled } : a)));
+      setError(error instanceof Error ? error.message : "Agent toggle failed.");
     }
   }
 
   async function trigger(name: string) {
     setBusyName(name);
     try {
-      await fetch(`/api/agents/${name}/trigger`, { method: "POST" });
+      const response = await fetch(`/api/agents/${name}/trigger`, { method: "POST" });
+      const result = await response.json();
+      if (!response.ok || result.error) throw new Error(result.error || "Trigger failed.");
     } catch {
       setError("Trigger failed");
     } finally {

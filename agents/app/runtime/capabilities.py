@@ -181,7 +181,118 @@ CAPABILITIES: list[dict] = [
 
 def capabilities_text() -> str:
     """One line per capability -- for prompts / logs / agent context."""
-    return "\n".join("- " + c["name"] + ": " + c["summary"] for c in CAPABILITIES)
+    protections = "\n".join("- " + c["name"] + ": " + c["summary"] for c in CAPABILITIES)
+    trading = "\n".join("- " + c["label"] + ": " + c["reason"] for c in capability_catalog())
+    return protections + "\nTrading capabilities (availability is per book):\n" + trading
+
+
+def capability_catalog() -> list[dict]:
+    """Known execution adapters, separate from ideas and broker permission.
+
+    This pure catalog is safe for market-report ingestion; only the async
+    per-book read below may assert that a configured lane is available.
+    """
+    specs = [
+        ("stock_long", "Stock longs", True, ["bullish"], "pattern_enabled", 0,
+         "Pattern, opening-range and momentum entries; each book's signal and risk gates apply."),
+        ("stock_short", "Stock shorts", True, ["bearish"], "pattern_enabled", 0,
+         "Requires this account's shorting permission and a borrowable symbol at order time."),
+        ("stms", "Small-cap momentum", True, ["bullish"], "stms_enabled", 0,
+         "Implemented long momentum setups; market window and liquidity gates apply."),
+        ("orb", "Opening-range breakouts", True, ["bullish", "bearish"], "stms_enabled", 0,
+         "Both directions are implemented; one qualifying breakout per symbol during the configured opening window."),
+        ("extended", "Multi-day stock swings", True, ["bullish"], "extended_enabled", 0,
+         "Implemented long continuation setups; overnight holding follows this lane's existing rules."),
+        ("crypto_long", "Spot crypto", True, ["bullish"], "crypto_enabled", 0,
+         "Long-only spot execution; cash, fees and coin limits apply per book."),
+        ("crypto_short", "Crypto shorts", False, ["bearish"], None, 0,
+         "Unavailable: no crypto borrowing or derivatives execution adapter is implemented."),
+        ("wheel_csp", "Cash-secured puts", True, ["bullish", "neutral"], "wheel_auto_execute", 1,
+         "Requires own options permission, verified cash collateral and a qualifying contract."),
+        ("wheel_cc", "Covered calls", True, ["neutral"], "wheel_auto_execute", 1,
+         "Requires own options permission and unpledged 100-share lots; duplicate calls are refused."),
+        ("day_options", "Intraday calls and puts", True, ["bullish", "bearish"], "day_options_enabled", 2,
+         "Purchased contracts; direction of the contract is distinct from underlying exposure."),
+        ("spreads", "Defined-risk option spreads", True, ["bullish", "bearish"], "spreads_enabled", 3,
+         "Bull-put and bear-call credit spreads and iron condors; requires own spread permission, buying power and tradable paired contracts."),
+        ("bull_call_spread", "Bull-call debit spreads", False, ["bullish"], None, 3,
+         "Research only: an idea builder exists, but no autonomous selection branch is connected."),
+        ("butterfly", "Option butterflies", False, ["neutral"], None, 3,
+         "Research only: an idea builder exists, but no autonomous selection branch is connected."),
+        ("long_options", "Directional calls and puts", True, ["bullish", "bearish"], "long_options_enabled", 2,
+         "Purchased calls or puts, selected from both market leaders and laggards."),
+        ("dividend_lt", "Long-term dividends", True, ["bullish"], "dividend_lt_enabled", 0,
+         "Quality-screened stock or fund entries; own score, income budget and screen-managed exits apply."),
+        ("forex", "Foreign exchange", False, ["bullish", "bearish"], None, 0,
+         "Unavailable: market-data research exists but no FX execution venue is connected."),
+        ("reevaluation", "Broker stock reevaluation", False, ["bullish", "bearish"], "reevaluation_enabled", 0,
+         "Unavailable: stock leg resynchronization rejects shorts and does not safely roll back failed broker changes. Existing protective exits remain active."),
+        ("crypto_reevaluation", "Crypto thesis reevaluation", True, ["bullish"], "crypto_reevaluation_enabled", 0,
+         "Rechecks this book's losing coins around the clock; existing exemptions and exit limits apply."),
+        ("research", "New strategy research", False, ["bullish", "bearish"], None, 0,
+         "Research only: stored opportunities can generate tests; unvalidated rules cannot place orders."),
+    ]
+    rows = [{"id": i, "label": label, "implemented": implemented,
+             "directions": directions, "flag": flag, "options_level": level,
+             "reason": reason} for i, label, implemented, directions, flag, level, reason in specs]
+    from app.strategies.library import LIBRARY
+    rows.extend({"id": "library:" + c.id, "label": c.name, "implemented": False,
+                 "directions": [], "flag": None, "options_level": 0,
+                 "reason": "Research reference: no execution-module mapping. Retained for future implementation."}
+                for c in LIBRARY if not c.maps_to)
+    return rows
+
+
+def _book_capability_rows(cfg, account, *, settings_verified: bool) -> list[dict]:
+    """Pure status evaluation. Enabled means eligible, never an order/fill."""
+    rows = []
+    for item in capability_catalog():
+        row = {k: item[k] for k in ("id", "label", "directions", "reason")}
+        row["status"] = "unavailable"
+        if item["implemented"]:
+            if not settings_verified:
+                row.update(status="unverified", reason="This book's settings could not be verified.")
+            elif not getattr(cfg, "auto_trade_enabled", False) or not getattr(cfg, item["flag"], False):
+                row.update(status="disabled", reason="Disabled by this book's own settings.")
+            elif account is None:
+                row.update(status="unverified", reason="Broker permissions could not be read for this book.")
+            elif account.trading_blocked or str(account.status).upper() != "ACTIVE":
+                row.update(status="unavailable", reason="This broker account currently blocks trading.")
+            elif item["options_level"] and min(account.options_approved_level, account.options_trading_level) < item["options_level"]:
+                row.update(status="unavailable", reason=f"This book needs options trading level {item['options_level']}.")
+            elif item["id"] == "stock_short" and getattr(account, "shorting_enabled", None) is not True:
+                known = getattr(account, "shorting_enabled", None)
+                row.update(status="unverified" if known is None else "unavailable",
+                           reason="Shorting permission is unverified." if known is None else "This broker account does not permit stock shorts.")
+            else:
+                row["status"] = "enabled"
+                if item["id"] == "orb" and getattr(account, "shorting_enabled", None) is not True:
+                    row["directions"] = ["bullish"]
+                    row["reason"] += (" Bearish entries are unavailable: shorting is disabled for this book."
+                                      if getattr(account, "shorting_enabled", None) is False else
+                                      " Bearish entries remain unverified until this book's shorting permission is confirmed.")
+        rows.append(row)
+    return rows
+
+
+async def capabilities_for_book(book_id: str) -> dict:
+    """Read only one bound paper account; never substitute a default book."""
+    from app.brokers.accounts import account_for_user, bind_for_user, PAPER_BASE_URL
+    from app.runtime.settings import get_bot_settings, is_fallback_settings
+    from app.brokers import alpaca
+    account = account_for_user(book_id)
+    cfg = get_bot_settings(book_id)
+    snapshot = None
+    if account is not None and account.base_url.rstrip("/") == PAPER_BASE_URL:
+        try:
+            with bind_for_user(book_id):
+                snapshot = await asyncio.wait_for(alpaca.get_account(), timeout=12)
+        except Exception:
+            snapshot = None
+    return {"book_id": book_id, "label": account.label if account else book_id,
+            "capabilities": _book_capability_rows(cfg, snapshot,
+                settings_verified=not is_fallback_settings(cfg)),
+            "note": "Availability is checked independently. Every entry still checks this book's risk, collateral, capacity and current symbol eligibility."}
 
 
 async def seed_shared_capabilities() -> int:
@@ -198,7 +309,10 @@ async def seed_shared_capabilities() -> int:
         client = create_client(s.supabase_url, s.supabase_service_role_key)
         now = datetime.now(timezone.utc).isoformat()
         inserted = 0
-        for cap in CAPABILITIES:
+        trading_caps = [{"id": c["id"], "name": c["label"],
+                         "summary": c["reason"], "applies_to": "per-book trading eligibility"}
+                        for c in capability_catalog()]
+        for cap in CAPABILITIES + trading_caps:
             topic = "capability:" + cap["id"]
             content = cap["name"] + " - " + cap["summary"] + " (applies to: " + cap["applies_to"] + ")"
 

@@ -11,6 +11,9 @@ import { resolveSuggestion } from "./_actions";
 
 import { Disclosure } from "@/components/ui/disclosure";
 import { StrategyProposalsFeed } from "@/components/dashboard/strategy-proposals";
+import Link from "next/link";
+import { BookCapabilitiesPanel } from "@/components/dashboard/book-capabilities-panel";
+import { LoadError } from "@/components/dashboard/load-error";
 
 export const dynamic = "force-dynamic";
 
@@ -62,37 +65,53 @@ function timeAgo(iso: string): string {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
-export default async function StrategyPage() {
+export default async function StrategyPage({ searchParams }: { searchParams?: { account?: string } }) {
   const supabase = createClient();
   const {
     data: { user }
   } = await supabase.auth.getUser();
   if (!user) redirect("/sign-in?redirect=/dashboard/strategy");
 
+  const { data: books, error: booksError } = await supabase.from("trading_accounts")
+    .select("account_key, label").eq("owner_id", user.id).eq("is_active", true).order("label");
+  if (booksError) return <div className="p-6"><LoadError table="trading_accounts" message={booksError.message} /></div>;
+  const selected = searchParams?.account ?? books?.[0]?.account_key;
+  const activeBook = books?.find((book) => book.account_key === selected);
+  const bookNav = <nav className="flex flex-wrap gap-2" aria-label="Trading account">{(books ?? []).map((book) => <Link key={book.account_key} href={`/dashboard/strategy?account=${encodeURIComponent(book.account_key)}`} aria-current={book.account_key === selected ? "page" : undefined} className={cn("rounded-lg border px-3 py-2 text-sm", book.account_key === selected ? "border-emerald-400 bg-emerald-50 text-emerald-900" : "border-weave-200 text-weave-700")}>{book.label ?? "Account"}</Link>)}</nav>;
+  if (!activeBook) return <div className="p-6 space-y-3"><p role="alert">Select an available account to see its strategy scope.</p>{bookNav}</div>;
+  const accountKey = String(activeBook.account_key);
+
   const [postureRes, logRes, eventRes, settingsRes] = await Promise.all([
     supabase
       .from("strategy_scope_adjustments")
       .select("*")
+      .eq("user_id", accountKey)
       .eq("action", "set_posture")
+      .eq("status", "applied")
       .order("created_at", { ascending: false })
       .limit(1),
     supabase
       .from("strategy_scope_adjustments")
       .select("*")
+      .eq("user_id", accountKey)
       .order("created_at", { ascending: false })
       .limit(25),
     supabase
       .from("agent_messages")
       .select("id, created_at, payload")
       .eq("kind", "event")
+      .eq("user_id", accountKey)
       .order("created_at", { ascending: false })
       .limit(20),
     supabase
       .from("bot_settings")
       .select("autonomy_mode")
-      .eq("user_id", user.id)
+      .eq("user_id", accountKey)
       .maybeSingle()
   ]);
+
+  const loadError = postureRes.error || logRes.error || eventRes.error || settingsRes.error;
+  if (loadError) return <div className="p-6 space-y-3">{bookNav}<LoadError table="strategy scope" message={loadError.message} /></div>;
 
   const posture = (postureRes.data ?? [])[0] ?? null;
   const log = logRes.data ?? [];
@@ -120,6 +139,9 @@ export default async function StrategyPage() {
         subtitle="Where the bot tells you which strategies it wants to favour, trim, or pause — and when it wants to change its mind."
         explainer="Trezo carries a library of proven strategies the agents reason over, plus an Adaptive Scope engine that reads the market regime and breaking news, then adjusts how the bot trades — tightening stops, raising the confidence bar, pausing a strategy, or flagging a ticker — without you tracking any of it by hand."
       />
+      {bookNav}
+      <p className="text-sm text-weave-600">Scope and autonomy below apply to {activeBook.label ?? "this account"}.</p>
+      <BookCapabilitiesPanel accountKey={accountKey} />
 
       {/* Current posture */}
       <section>
@@ -165,7 +187,7 @@ export default async function StrategyPage() {
         </div>
       </section>
 
-      <StrategyProposalsFeed userId={user.id} />
+      <StrategyProposalsFeed userId={user.id} accountKey={accountKey} />
 
       {/* Regime playbook */}
       {play && (
@@ -242,6 +264,7 @@ export default async function StrategyPage() {
                         <div className="flex justify-end gap-2">
                           <form action={resolveSuggestion}>
                             <input type="hidden" name="row_id" value={r.id} />
+                            <input type="hidden" name="account_key" value={accountKey} />
                             <input type="hidden" name="decision" value="apply" />
                             <button
                               type="submit"
@@ -252,6 +275,7 @@ export default async function StrategyPage() {
                           </form>
                           <form action={resolveSuggestion}>
                             <input type="hidden" name="row_id" value={r.id} />
+                            <input type="hidden" name="account_key" value={accountKey} />
                             <input type="hidden" name="decision" value="dismiss" />
                             <button
                               type="submit"

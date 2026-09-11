@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwnedBook } from "@/lib/book-access";
 
 export const dynamic = "force-dynamic";
 
@@ -19,7 +20,7 @@ const ALLOWED_STRATEGIES = [
   "iv_crush_short", "dividend_capture_long",
 ];
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const supabase = createClient();
   const {
     data: { user }
@@ -27,10 +28,12 @@ export async function GET() {
   if (!user) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
+  const book = await requireOwnedBook(supabase, user.id, req.nextUrl.searchParams.get("account_key"));
+  if (!book.ok) return book.response;
   const { data, error } = await supabase
     .from("stock_strategy_overrides")
     .select("id, ticker, strategy, reason, expires_at, created_at")
-    .eq("user_id", user.id)
+    .eq("user_id", book.key)
     .order("created_at", { ascending: false });
   if (error) {
     return NextResponse.json({ ok: false, error: error.message }, { status: 200 });
@@ -47,6 +50,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
   const body = await req.json().catch(() => ({}));
+  const book = await requireOwnedBook(supabase, user.id, body.account_key);
+  if (!book.ok) return book.response;
   const ticker = String(body.ticker ?? "").trim().toUpperCase();
   const strategy = String(body.strategy ?? "").trim();
   const reason = body.reason ? String(body.reason).trim() : null;
@@ -72,7 +77,7 @@ export async function POST(req: NextRequest) {
     .from("stock_strategy_overrides")
     .upsert(
       {
-        user_id: user.id,
+        user_id: book.key,
         ticker,
         strategy,
         reason,
@@ -95,13 +100,15 @@ export async function DELETE(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
   const ticker = (req.nextUrl.searchParams.get("ticker") ?? "").trim().toUpperCase();
+  const book = await requireOwnedBook(supabase, user.id, req.nextUrl.searchParams.get("account_key"));
+  if (!book.ok) return book.response;
   if (!ticker) {
     return NextResponse.json({ ok: false, error: "ticker is required." }, { status: 200 });
   }
   const { error } = await supabase
     .from("stock_strategy_overrides")
     .delete()
-    .eq("user_id", user.id)
+    .eq("user_id", book.key)
     .eq("ticker", ticker);
   if (error) {
     return NextResponse.json({ ok: false, error: error.message }, { status: 200 });

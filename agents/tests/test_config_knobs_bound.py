@@ -190,13 +190,13 @@ def test_lane_switches_are_declared_bool_and_default_off():
         assert default is False, f"{name} must default OFF (was {default!r})"
 
 
-def test_dividend_lane_switch_is_declared_optional_and_dark():
+def test_dividend_legacy_score_override_is_declared_optional():
     f = _declared_fields()
     assert "trezo_dividend_lt_tcs" in f, "config.py does not declare trezo_dividend_lt_tcs"
     ann, default = f["trezo_dividend_lt_tcs"]
     assert ann == "int | None", ann
     assert default is None, (
-        "trezo_dividend_lt_tcs must default None (unset -> _lane_tcs reads 0 -> dark)")
+        "trezo_dividend_lt_tcs must default None (unset -> measured candidate score)")
 
 
 def test_every_reevaluator_tunable_is_declared_optional():
@@ -383,9 +383,9 @@ def test_env_example_documents_every_new_key_commented_out_with_its_default():
         assert shown and "#" not in shown, f"{env}: '{shown}' -- value on the line, notes on their own"
         assert float(shown) == float(default) if shown not in ("true", "false") \
             else shown == str(default).lower(), (env, shown, default)
-    assert "TREZO_DIVIDEND_LT_TCS" in text and "ON-SWITCH" in text.upper()
+    assert "TREZO_DIVIDEND_LT_TCS" in text and "measured bullish chart" in text
     assert "blank = dark" not in text.lower() and "blank = the lane" not in text.lower()
-    assert "tcs_threshold" in text, "the dividend switch must say it has to exceed the book's tcs_threshold"
+    assert "tcs_threshold" in text, "the dividend score policy must document the book's tcs_threshold gate"
 
 
 def test_env_example_swallows_no_comment_as_a_value():

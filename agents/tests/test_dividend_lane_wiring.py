@@ -14,11 +14,10 @@ constant, and check what actually leaves the agent on the bus.
   MIG-02 the KINDRIP bridge selected profiles.full_name/email, neither
          of which exists; the error was swallowed and every draft
          instruction was stamped 'Trezo Parent'.
-  TE-06  the lane's activation switch: the signal carries `tcs` if and
-         only if Settings.trezo_dividend_lt_tcs is > 0 (TREZO_DIVIDEND_LT_TCS
-         in agents/.env). At 0 / unset the lane stays dark exactly as
-         before; no_price_stop and max_notional ride on every signal
-         either way.
+  TE-06  legacy configured scores stay labelled; unset values now use
+         measured entry confidence after the quality screen. Missing
+         holdings/data fail closed; no_price_stop and max_notional ride
+         on every signal either way.
   vf:no-price-stop-exec (skeptic 2026-09-01): every ladder signal is
          pinned to ITS book (book_scoped True). Trade Execution treats a
          bare user_id as provenance and fans the approval out to every
@@ -35,6 +34,7 @@ import asyncio
 import contextlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -45,6 +45,8 @@ agent_mod = load_module("app.agents.dividend_lt_agent")
 screen_mod = load_module("app.strategies.dividend_screen")
 universe_mod = load_module("app.data.market_universe")
 kb = load_module("app.payments.kindrip_bridge")
+allocation = load_module("app.paper.allocation")
+settings = load_module("app.runtime.settings")
 
 
 def _run(coro):
@@ -141,11 +143,22 @@ _ROW = {"allocation_overrides": {"income": 3000, "stocks": 0, "options": 0},
         "dividend_lane_mode": "ACCUMULATE"}
 
 
+async def _zero_equity(uid):
+    return 0.0  # explicit overrides fund the fixture, never a broker read
+
+
+async def _measured73(ticker, cfg):
+    return SimpleNamespace(tcs=73, direction="bullish", breakdown={"trend": 12})
+
+
 def _tick(positions, pool, verdicts, screen=_no_screen):
     client = _Client({"paper_positions": _Res(positions)})
     agent = agent_mod.DividendLTAgent()
     agent._last_states = {}
-    with _patched(agent_mod, screen_many=_screen_many(verdicts)), \
+    with _patched(agent_mod, screen_many=_screen_many(verdicts),
+                  _measured_entry_score=_measured73), \
+            _patched(allocation, effective_equity=_zero_equity), \
+            _patched(settings, get_bot_settings=lambda uid: settings.BotSettings()), \
             _patched(universe_mod, market_wide_candidates=_pool(*pool)), \
             _patched(screen_mod, screen=screen):
         return _run(agent._tick_book(client, "book-1", dict(_ROW)))
@@ -180,11 +193,8 @@ class _Cfg:
         self.__dict__.update(kw)
 
 
-def test_ladder_signal_carries_tcs_iff_the_switch_is_on():
-    """tcs present <=> Settings.trezo_dividend_lt_tcs > 0. The dark cases
-    (0, absent, junk, negative) must leave NO tcs key -- Risk Manager
-    reads payload.get('tcs', 0), so the lane stays dark exactly as it
-    did before the switch existed."""
+def test_ladder_uses_measured_tcs_when_legacy_override_is_unset():
+    """Unset/junk legacy values must reach measured scoring, not TCS 0."""
     verdicts = {"PG": _verdict("PG", "Staples")}
     cases = [
         (_Cfg(trezo_dividend_lt_tcs=0), None),
@@ -202,9 +212,12 @@ def test_ladder_signal_carries_tcs_iff_the_switch_is_on():
         assert sigs, f"no signal left the agent for {cfg.__dict__}"
         for m in sigs:
             if want is None:
-                assert "tcs" not in m.payload, (cfg.__dict__, m.payload)
+                assert m.payload["tcs"] == 73, (cfg.__dict__, m.payload)
+                assert m.payload["tcs_source"] == "measured_pattern_score"
             else:
                 assert m.payload["tcs"] == want, (cfg.__dict__, m.payload)
+                assert m.payload["tcs_source"] == "legacy_configured_score"
+            assert m.confidence == m.payload["tcs"] / 100.0
             # The contract rides on every signal, switch or no switch.
             assert m.payload["no_price_stop"] is True, m.payload
             assert m.payload["max_notional"] > 0, m.payload
@@ -316,11 +329,124 @@ def test_ladder_count_reads_strategy_column():
     client = _Client({"paper_positions": _Res([])})
     agent = agent_mod.DividendLTAgent()
     with _patched(agent_mod, screen_many=_screen_many({})), \
+            _patched(allocation, effective_equity=_zero_equity), \
+            _patched(settings, get_bot_settings=lambda uid: settings.BotSettings()), \
             _patched(universe_mod, market_wide_candidates=_pool()), \
             _patched(screen_mod, screen=_no_screen):
         _run(agent._tick_book(client, "book-1", dict(_ROW)))
     cols = [c for t, c in client.selects if t == "paper_positions"]
     assert cols and "strategy" in cols[0], cols
+
+
+def test_default_income_budget_comes_from_the_books_existing_allocation():
+    for equity, posture in ((10000, "auto"), (75000, "balanced"), (150000, "income")):
+        inp = agent_mod._lane_inputs_for({"account_posture": posture}, equity)
+        expected = allocation.build_allocation(equity, posture_setting=posture)
+        assert inp is not None and inp.capital == expected.budgets["income"]
+    assert agent_mod._lane_inputs_for({"allocation_overrides": {"income": 0}}, 150000) is None
+
+
+def test_real_ladder_tick_uses_measured_score_and_independent_default_budgets():
+    # Actual chart scorer, confluence and signal generation; only I/O is fake.
+    from tests.test_directional_scoring import _fixture, _mirror
+    candles_mod = load_module("app.data.candles")
+    verdicts = {"PG": _verdict("PG", "Staples")}
+    up = _fixture()
+    equity_reads = []
+    selected = {"bars": up}
+
+    async def equity(uid):
+        equity_reads.append(uid)
+        return 10000 if uid == "book-large" else 4000
+
+    async def candles(ticker, asset_type):
+        assert (ticker, asset_type) == ("PG", "stock")
+        return selected["bars"]
+
+    def cfg(uid):
+        return settings.BotSettings(dividend_lt_enabled=(uid != "book-disabled"),
+                                    tcs_threshold=80)
+
+    client = _Client({"paper_positions": _Res([])})
+    agent = agent_mod.DividendLTAgent()
+    agent._last_states = {}
+    with _patched(agent_mod, screen_many=_screen_many(verdicts), get_settings=lambda: _Cfg()), \
+            _patched(allocation, effective_equity=equity), \
+            _patched(settings, get_bot_settings=cfg), \
+            _patched(universe_mod, market_wide_candidates=_pool("PG")), \
+            _patched(candles_mod, fetch_candles_for=candles):
+        large = _run(agent._tick_book(client, "book-large", {}))
+        small = _run(agent._tick_book(client, "book-small", {}))
+        disabled = _run(agent._tick_book(client, "book-disabled", {}))
+        selected["bars"] = _mirror(up)
+        bearish = _run(agent._tick_book(client, "book-large", {}))
+    signal = _signals(large)[0]
+    # Measured 70 remains 70 even when the book's risk threshold is 80.
+    assert signal.payload["tcs"] == 70 and signal.confidence == 0.7
+    assert signal.payload["tcs_source"] == "measured_pattern_score"
+    assert signal.payload["dividend_lt"]["quality_screen_passed"] is True
+    assert signal.payload["no_price_stop"] is signal.payload["book_scoped"] is True
+    assert signal.payload["user_id"] == "book-large"
+    assert not _signals(small) and small[0].payload["reason"] == "income_budget_or_lane_inputs"
+    assert not _signals(disabled) and disabled[0].payload["reason"] == "disabled_for_book"
+    assert not _signals(bearish) and bearish[0].payload["reason"] == "no_bullish_setup"
+    assert equity_reads == ["book-large", "book-small", "book-large"]
+
+
+def test_failed_or_missing_position_read_never_proposes_a_ladder_buy():
+    class BoomClient(_Client):
+        def table(self, name):
+            raise RuntimeError("position service unavailable")
+
+    clients = [BoomClient({}), _Client({"paper_positions": _Res(None)}),
+               _Client({"paper_positions": _Res([], error="read failed")})]
+    for client in clients:
+        with _patched(allocation, effective_equity=_zero_equity), \
+                _patched(settings, get_bot_settings=lambda uid: settings.BotSettings()):
+            result = _run(agent_mod.DividendLTAgent()._tick_book(client, "book-1", dict(_ROW)))
+        assert not _signals(result)
+        assert result[0].payload["reason"] == "position_read_failed"
+        assert result[0].payload["user_id"] == "book-1"
+
+
+def test_unverified_book_settings_block_before_equity_or_holdings_are_read():
+    async def forbidden_equity(uid):
+        raise AssertionError("fallback settings must stop before reading equity")
+
+    class NoReadsClient(_Client):
+        def table(self, name):
+            raise AssertionError("fallback settings must stop before reading holdings")
+
+    # Use the real fallback identity check, not a fake disabled book. Its
+    # permissive default flags must never become permission to buy.
+    fallback = settings._DEFAULTS
+    assert settings.is_fallback_settings(fallback)
+    with _patched(settings, get_bot_settings=lambda uid: fallback), \
+            _patched(allocation, effective_equity=forbidden_equity):
+        result = _run(agent_mod.DividendLTAgent()._tick_book(
+            NoReadsClient({}), "book-unknown", dict(_ROW)))
+    assert not _signals(result)
+    assert result[0].payload["reason"] == "settings_unverified"
+    assert result[0].payload["user_id"] == "book-unknown"
+
+
+def test_missing_chart_data_is_an_explicit_block_without_a_score():
+    candles_mod = load_module("app.data.candles")
+    verdicts = {"PG": _verdict("PG", "Staples")}
+
+    async def missing(*args):
+        return []
+
+    with _patched(agent_mod, screen_many=_screen_many(verdicts), get_settings=lambda: _Cfg()), \
+            _patched(allocation, effective_equity=_zero_equity), \
+            _patched(settings, get_bot_settings=lambda uid: settings.BotSettings()), \
+            _patched(universe_mod, market_wide_candidates=_pool("PG")), \
+            _patched(candles_mod, fetch_candles_for=missing):
+        out = _run(agent_mod.DividendLTAgent()._tick_book(
+            _Client({"paper_positions": _Res([])}), "book-1", dict(_ROW)))
+    assert not _signals(out)
+    assert out[0].payload["reason"] == "scoring_unavailable"
+    assert "tcs" not in out[0].payload
 
 
 # --- MIG-02: KINDRIP parent name --------------------------------------------

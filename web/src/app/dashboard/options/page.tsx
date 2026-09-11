@@ -6,6 +6,9 @@ import { Disclosure } from "@/components/ui/disclosure";
 import { WheelReconcileButton } from "@/components/dashboard/wheel-reconcile-button";
 import { LoadError, loadResult } from "@/components/dashboard/load-error";
 import { getOwnerBookKeys, bookQueryKeys, withBooks } from "@/lib/books";
+import { optionExposure } from "@/lib/trade-exposure";
+import Link from "next/link";
+import { messageBelongsToBooks } from "@/lib/agent-book-scope";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +19,9 @@ function usd(n: number | null | undefined): string {
 
 const STRATEGY_LABEL: Record<string, string> = {
   long_call: "Long Call",
+  long_put: "Long Put",
+  bear_call_spread: "Bear Call Spread",
+  bear_put_spread: "Bear Put Spread",
   bull_call_spread: "Bull Call Spread",
   cash_secured_put: "Cash-Secured Put",
   bull_put_spread: "Bull Put Spread",
@@ -40,6 +46,8 @@ type BookRow = {
   id: string;
   underlying: string;
   strategy: string;
+  option_type: string | null;
+  direction: string | null;
   strike: number | null;
   expiration: string | null;
   contracts: number;
@@ -52,6 +60,9 @@ type Greeks = { delta?: number; gamma?: number; theta?: number; vega?: number };
 
 type IdeaMessage = {
   id: string;
+  user_id: string | null;
+  agent_name: string;
+  kind: string;
   created_at: string;
   payload: {
     event?: string;
@@ -75,7 +86,7 @@ function num(n: number | null | undefined, digits = 1, sign = false): string {
   return (sign && v >= 0 ? "+" : "") + v.toFixed(digits);
 }
 
-export default async function OptionsPage() {
+export default async function OptionsPage({ searchParams }: { searchParams?: { account?: string } }) {
   const supabase = createClient();
   const {
     data: { user }
@@ -85,19 +96,27 @@ export default async function OptionsPage() {
   // rv:web-pages sweep: options_positions is keyed by BOOK (0047); read
   // every book the person owns.
   const booksLoad = await getOwnerBookKeys(supabase, user.id);
-  const keys = bookQueryKeys(booksLoad.data);
+  const { data: books, error: booksError } = await supabase.from("trading_accounts")
+    .select("account_key, label").eq("owner_id", user.id).eq("is_active", true).order("label");
+  if (booksError || booksLoad.failure) return <div className="p-6"><LoadError table="trading_accounts" message={booksError?.message ?? booksLoad.failure?.message ?? "Accounts unavailable."} /></div>;
+  const selected = searchParams?.account ?? books?.[0]?.account_key;
+  const activeBook = books?.find((book) => book.account_key === selected);
+  const bookNav = <nav className="flex flex-wrap gap-2" aria-label="Trading account">{(books ?? []).map((book) => <Link key={book.account_key} href={`/dashboard/options?account=${encodeURIComponent(book.account_key)}`} aria-current={book.account_key === selected ? "page" : undefined} className={cn("rounded-lg border px-3 py-2 text-sm", book.account_key === selected ? "border-emerald-400 bg-emerald-50 text-emerald-900" : "border-weave-200 text-weave-700")}>{book.label ?? "Account"}</Link>)}</nav>;
+  if (!activeBook) return <div className="p-6 space-y-3"><p role="alert">Select an available account to see its option positions.</p>{bookNav}</div>;
+  const keys = bookQueryKeys([String(activeBook.account_key)]);
 
   const [bookRes, ideaRes] = await Promise.all([
     supabase
       .from("options_positions")
-      .select("id, underlying, strategy, strike, expiration, contracts, net_premium_usd, status, realized_pnl_usd")
+      .select("id, underlying, strategy, option_type, direction, strike, expiration, contracts, net_premium_usd, status, realized_pnl_usd")
       .in("user_id", keys)
       .order("opened_at", { ascending: false }),
     supabase
       .from("agent_messages")
-      .select("id, created_at, payload")
+      .select("id, user_id, agent_name, kind, created_at, payload")
       .eq("agent_name", "options_scanner")
       .eq("kind", "info")
+      .or(`user_id.in.(${[...new Set([...(booksLoad.data ?? []), user.id])].join(",")}),user_id.is.null`)
       .order("created_at", { ascending: false })
       .limit(40)
   ]);
@@ -107,6 +126,7 @@ export default async function OptionsPage() {
   const ideaLoad = loadResult<IdeaMessage[]>("agent_messages", ideaRes, []);
   const allBook = bookLoad.data ?? [];
   const ideas = (ideaLoad.data ?? [])
+    .filter((message) => messageBelongsToBooks(message, booksLoad.data ?? [], user.id, String(activeBook.account_key)))
     .filter((m) => m.payload?.event === "options_idea")
     .slice(0, 12);
 
@@ -140,8 +160,10 @@ export default async function OptionsPage() {
   return (
     <div className="px-4 sm:px-6 py-8 space-y-8 max-w-6xl">
       <LayerHero id={3} openCount={bookLoad.failure ? undefined : openBook.length} />
+      {bookNav}
+      <p className="text-sm text-weave-600">Showing {activeBook.label ?? "this account"}. Buying a put is a long contract position with bearish market exposure.</p>
 
-      <WheelReconcileButton />
+      <WheelReconcileButton key={String(activeBook.account_key)} accountKey={String(activeBook.account_key)} />
 
       {bookLoad.failure ? (
         <LoadError {...bookLoad.failure} />
@@ -279,6 +301,7 @@ export default async function OptionsPage() {
                 <tr className="text-left text-[11px] uppercase tracking-widest text-weave-500 border-b border-weave-100">
                   <th className="px-4 py-3">Underlying</th>
                   <th className="px-4 py-3">Strategy</th>
+                  <th className="px-4 py-3">Market exposure</th>
                   <th className="px-4 py-3 text-right">Strike</th>
                   <th className="px-4 py-3 text-right">Contracts</th>
                   <th className="px-4 py-3 text-right">Premium</th>
@@ -298,6 +321,7 @@ export default async function OptionsPage() {
                       <td className="px-4 py-3 text-weave-600">
                         {prettyStrategy(p.strategy)}
                       </td>
+                      <td className="px-4 py-3 text-xs text-weave-600">{optionExposure(p.strategy === "option_day" && p.option_type ? `long_${p.option_type}` : p.strategy, "", p.direction ?? "long")}</td>
                       <td className="px-4 py-3 text-right font-mono">{usd(p.strike)}</td>
                       <td className="px-4 py-3 text-right font-mono">{p.contracts}</td>
                       <td className="px-4 py-3 text-right font-mono text-emerald-700">

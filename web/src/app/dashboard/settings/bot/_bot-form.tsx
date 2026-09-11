@@ -18,6 +18,12 @@ type Settings = {
   stms_enabled: boolean;
   extended_enabled: boolean;
   crypto_enabled: boolean;
+  day_options_enabled?: boolean;
+  spreads_enabled?: boolean;
+  long_options_enabled?: boolean;
+  dividend_lt_enabled?: boolean;
+  reevaluation_enabled?: boolean;
+  crypto_reevaluation_enabled?: boolean;
   autonomy_mode: string;
   account_posture: string;
   allocation_overrides: Record<string, number> | null;
@@ -580,9 +586,9 @@ export function BotTuningForm({
           </div>
         ) : null}
 
-        {expertVisible ? (
+        {expertVisible && accountKey ? (
           <div className="mt-4">
-            <ExpertOverrides />
+            <ExpertOverrides accountKey={accountKey} />
           </div>
         ) : null}
       </section>
@@ -590,13 +596,19 @@ export function BotTuningForm({
       <section>
         <h2 className="font-medium text-weave-800 mb-1">Strategies</h2>
         <p className="text-sm text-weave-500 mb-2">
-          Turn a whole strategy off and its scanner keeps running but emits no signals.
+          These strategy switches apply only to this book. Enabled strategies still require broker permissions, capital and passing risk checks.
         </p>
         <div className="rounded-xl border border-weave-100 bg-white px-4 divide-y divide-weave-50">
           <Toggle name="pattern_enabled"  label="Pattern Detection"            hint="Candlestick-pattern scanning of your default watchlist." defaultChecked={s.pattern_enabled} />
           <Toggle name="stms_enabled"     label="STMS - Small Trades Momentum" hint="Small-cap momentum scanner, 7-11 AM ET." defaultChecked={s.stms_enabled} />
           <Toggle name="extended_enabled" label="Extended Strategy - Swing layer" hint="Multi-day swing scanner (Layer 4): EMA50 pullbacks, breakout holds, gap continuations, stair-steppers." defaultChecked={s.extended_enabled} />
           <Toggle name="crypto_enabled"   label="Crypto Bot"                   hint="24/7 SCALP / SWING / DCA scanning of XRP, ETH, SOL." defaultChecked={s.crypto_enabled} />
+          <Toggle name="day_options_enabled" label="Intraday options" hint="Buy calls or puts for intraday setups. Purchased puts provide bearish exposure even though the contract position is long." defaultChecked={s.day_options_enabled ?? false} />
+          <Toggle name="long_options_enabled" label="Long calls and puts" hint="Buy directional option contracts for bullish or bearish setups, using this book's own options approval and budget." defaultChecked={s.long_options_enabled ?? false} />
+          <Toggle name="spreads_enabled" label="Defined-risk option spreads" hint="Bullish put credit spreads and bearish call credit spreads. Both legs must pass this account's execution checks." defaultChecked={s.spreads_enabled ?? false} />
+          <Toggle name="dividend_lt_enabled" label="Dividend portfolio" hint="Build and manage long-term dividend holdings in this account, subject to its available capital." defaultChecked={s.dividend_lt_enabled ?? false} />
+          <Toggle name="reevaluation_enabled" label="Review modeled positions" hint="Reevaluate eligible internal paper positions. Broker-held stock switching remains unavailable until reconciliation supports it." defaultChecked={s.reevaluation_enabled ?? false} />
+          <Toggle name="crypto_reevaluation_enabled" label="Review crypto positions" hint="Reevaluate this book's internal crypto positions as market conditions and strategy fit change." defaultChecked={s.crypto_reevaluation_enabled ?? false} />
         </div>
       </section>
 
@@ -659,7 +671,7 @@ export function BotTuningForm({
           options={[
             { value: "suggest", label: "Suggest only", hint: "The bot recommends changes; nothing takes effect until you approve it." },
             { value: "guarded", label: "Guarded auto", hint: "The bot applies risk-reducing changes on its own, within hard limits." },
-            { value: "full",    label: "Full auto",    hint: "The bot also acts on smaller signals and adjusts more freely." }
+            { value: "full",    label: "Full auto",    hint: "The bot adjusts this book's strategy scope within its configured limits. Broker permissions and risk checks still apply." }
           ]}
         />
       </section>

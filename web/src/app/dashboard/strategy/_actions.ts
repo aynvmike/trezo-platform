@@ -17,7 +17,8 @@ import { createClient } from "@/lib/supabase/server";
 export async function resolveSuggestion(formData: FormData): Promise<void> {
   const rowId = String(formData.get("row_id") ?? "").trim();
   const decision = String(formData.get("decision") ?? "").trim();
-  if (!rowId || (decision !== "apply" && decision !== "dismiss")) return;
+  const accountKey = String(formData.get("account_key") ?? "").trim();
+  if (!rowId || !accountKey || (decision !== "apply" && decision !== "dismiss")) return;
 
   const supabase = createClient();
   const {
@@ -25,11 +26,18 @@ export async function resolveSuggestion(formData: FormData): Promise<void> {
   } = await supabase.auth.getUser();
   if (!user) return;
 
-  await supabase
+  const { data: owned, error } = await supabase.from("trading_accounts")
+    .select("account_key").eq("owner_id", user.id).eq("account_key", accountKey).eq("is_active", true).maybeSingle();
+  if (error || !owned) throw new Error("Account ownership could not be verified.");
+
+  const { error: updateError } = await supabase
     .from("strategy_scope_adjustments")
     .update({ status: decision === "apply" ? "applied" : "dismissed" })
     .eq("id", rowId)
+    .eq("user_id", accountKey)
     .eq("status", "suggested");
+
+  if (updateError) throw new Error(`Scope change was not saved: ${updateError.message}`);
 
   revalidatePath("/dashboard/strategy");
 }

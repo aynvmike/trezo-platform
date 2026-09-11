@@ -300,6 +300,11 @@ _active: contextvars.ContextVar = contextvars.ContextVar(
     "trezo_active_account", default=None)
 
 
+def bound_account():
+    """Explicit task binding only; never substitute the default book."""
+    return _active.get()
+
+
 def current_account():
     """The account this task is acting for; falls back to primary."""
     return _active.get() or primary_account()

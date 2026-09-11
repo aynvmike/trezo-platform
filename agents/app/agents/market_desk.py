@@ -185,7 +185,9 @@ class MarketDeskAgent(Agent):
         try:
             if isinstance(row, dict):
                 view = build_view(row.get("payload") or {},
-                                  source=str(row.get("source") or ""))
+                                  source=str(row.get("source") or ""),
+                                  provenance={"relay_briefing_id": row.get("id"),
+                                              "ingested_at": row.get("created_at")})
         except (TypeError, ValueError, AttributeError):
             view = None
         if view is None or not view.fresh():
@@ -214,8 +216,19 @@ class MarketDeskAgent(Agent):
         self._last_seen_key = key
         _current = view
         _current_at = time.time()
+        # Persist before receipt deduplication: a restarted engine or a newly
+        # configured book still needs its own copy of this report's ideas.
+        try:
+            from app.research.opportunities import capture_market_view
+            library_receipts = [AgentMessage(agent=self.name, kind="info", payload=p)
+                                for p in await capture_market_view(view)]
+        except Exception as exc:
+            library_receipts = [AgentMessage(agent=self.name, kind="info", payload={
+                "event": "market_opportunity_library", "status": "failed",
+                "reason": "opportunity_library_binding_failed",
+                "error_type": type(exc).__name__, "execution_enabled": False})]
         if duplicate:
-            return []
+            return library_receipts
 
         # Say what was read, once per report, in the feed -- so "are the
         # agents reviewing the reports?" has a visible receipt.
@@ -228,7 +241,7 @@ class MarketDeskAgent(Agent):
                           f"{view.summary[:160]}"))
         except Exception:  # noqa: BLE001
             pass
-        return [AgentMessage(
+        return [*library_receipts, AgentMessage(
             agent=self.name, kind="info",
             payload={
                 "ticker": "MARKET", "event": "market_view",
@@ -262,7 +275,7 @@ class MarketDeskAgent(Agent):
 
             def _q():
                 return (cl.table("relay_briefings")
-                        .select("payload, source, created_at")
+                        .select("id, payload, source, created_at")
                         .eq("kind", "market_context")
                         .eq("status", "ingested")
                         .order("created_at", desc=True)

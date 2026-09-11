@@ -671,13 +671,156 @@ def test_pinned_approval_gets_the_margin_bump_under_its_own_binding():
 
 
 def test_both_paths_call_the_one_gate_helper():
-    """The point of the refactor: a gate added to _gate_book reaches both
-    paths. Source-shape guard so a re-inlined copy fails loudly."""
-    for fn in (te.TradeExecutionAgent.on_message,
-               te.TradeExecutionAgent._execute_for_all_users):
-        src = inspect.getsource(fn)
-        assert "self._gate_book(" in src, f"{fn.__name__} bypasses _gate_book"
-        assert "self._read_book_brakes(" in src, f"{fn.__name__} bypasses _read_book_brakes"
+    """Pinned and shared approvals enter the SAME full per-book gate loop."""
+    entry = inspect.getsource(te.TradeExecutionAgent.on_message)
+    assert "only_user_id=str(user_id)" in entry
+    assert "self._execute_for_user(" not in entry, "single path bypasses book guards"
+    shared = inspect.getsource(te.TradeExecutionAgent._execute_for_all_users)
+    for call in ("self._gate_book(", "self._read_book_brakes(",
+                 "self._book_open_tickers(", "self._pocket_cap("):
+        assert call in shared, call
+
+
+def test_pinned_approval_cannot_stack_a_held_ticker():
+    h = Harness(_books())
+    async def held():
+        return {BOOK_A: {}, BOOK_B: {"KO": "stock"}}
+    h.agent._book_open_tickers = held
+    out = h.run(_pinned(ticker="KO"), via_on_message=True)
+    assert h.executed == {}
+    assert len(_events(out, "book_already_holds", BOOK_B)) == 1
+
+
+def test_pinned_approval_respects_its_book_capacity_and_ignores_siblings():
+    books = _books()
+    books[BOOK_B].max_open_positions = 1
+    async def held():
+        return {BOOK_A: {}, BOOK_B: {"OTHER": "crypto"}}
+    h = Harness(books)
+    h.agent._book_open_tickers = held
+    out = h.run(_pinned(), via_on_message=True)
+    assert h.executed == {}
+    assert len(_events(out, "book_at_capacity", BOOK_B)) == 1
+    h = Harness(books)
+    async def sibling_full():
+        return {BOOK_A: {"OTHER": "crypto"}, BOOK_B: {}}
+    h.agent._book_open_tickers = sibling_full
+    h.run(_pinned(), via_on_message=True)
+    assert set(h.executed) == {BOOK_B}
+
+
+def test_pinned_approval_respects_its_pocket_slots():
+    books = _books()
+    books[BOOK_B].allocation_overrides = {"stocks": 0}
+    h = Harness(books)
+    out = h.run(_pinned(), via_on_message=True)
+    assert h.executed == {}
+    assert len(_events(out, "pocket_at_capacity", BOOK_B)) == 1
+
+
+def test_pinned_approval_refuses_unknown_capacity_and_never_fans_out():
+    h = Harness(_books())
+    async def unknown():
+        return None
+    h.agent._book_open_tickers = unknown
+    out = h.run(_pinned(), via_on_message=True)
+    assert h.executed == {}
+    assert len(_events(out, "book_capacity_unknown", BOOK_B)) == 1
+    h = Harness(_books())
+    payload = _pinned()
+    payload["user_id"] = "missing-book"
+    out = h.run(payload, via_on_message=True)
+    assert h.executed == {}, "missing pinned account fanned out to healthy books"
+    assert len(_events(out, "book_unavailable", "missing-book")) == 1
+
+
+def test_pinned_approval_without_an_owner_is_never_shared():
+    h = Harness(_books())
+    payload = _pinned()
+    payload.pop("user_id")
+    out = h.run(payload, via_on_message=True)
+    assert h.executed == {}
+    assert len(_events(out, "execute_error")) == 1
+
+
+def test_unknown_settings_skip_only_the_affected_book_before_sizing():
+    books = _books()
+    books[BOOK_A] = settings_mod._DEFAULTS
+    h = Harness(books)
+    out = h.run(_payload(tcs=95))
+    assert set(h.executed) == {BOOK_B}
+    assert len(_events(out, "book_settings_unavailable", BOOK_A)) == 1
+    assert BOOK_A not in h.account_reads, "missing settings reached margin sizing"
+    h = Harness(books)
+    payload = _pinned(tcs=95)
+    payload["user_id"] = BOOK_A
+    out = h.run(payload, via_on_message=True)
+    assert h.executed == {}, "pinned entry ignored unknown book settings"
+    assert len(_events(out, "book_settings_unavailable", BOOK_A)) == 1
+
+
+def test_allocation_cannot_reconstruct_a_budget_from_fallback_settings():
+    alloc = load_module("app.paper.allocation")
+    async def equity(uid):
+        return 10000.0
+    with _patched(settings_mod, get_bot_settings=lambda uid: settings_mod._DEFAULTS), \
+         _patched(alloc, effective_equity=equity):
+        try:
+            _run(te.TradeExecutionAgent()._allocation_gate(BOOK_A, 10000, "swing", "stock"))
+        except ValueError as exc:
+            assert "settings unavailable" in str(exc)
+        else:
+            raise AssertionError("allocation sized with an unreadable book settings row")
+
+
+def test_rotation_quota_and_close_requests_belong_to_each_book():
+    import types
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+    import os
+    alloc = load_module("app.paper.allocation")
+    rows = [dict(id=f"{uid}-{i}", user_id=uid, ticker=f"OLD{i}",
+                 entry_at=(datetime.now(timezone.utc)-timedelta(days=3)).isoformat(),
+                 source_payload={"tcs": 20}, strategy="swing", close_requested=False)
+            for uid in (BOOK_A, BOOK_B) for i in range(3)]
+    writes = []
+    class Query:
+        def __init__(self):
+            self.filters = {}
+            self.change = None
+        def select(self, *args):
+            return self
+        def eq(self, key, value):
+            if key != "status":
+                self.filters[key] = value
+            return self
+        def update(self, change):
+            self.change = change
+            return self
+        def execute(self):
+            selected = [r for r in rows if all(r.get(k) == v for k, v in self.filters.items())]
+            if self.change:
+                assert self.filters.get("user_id") in (BOOK_A, BOOK_B)
+                for row in selected:
+                    writes.append((row["user_id"], row["id"]))
+                    row.update(self.change)
+            return types.SimpleNamespace(data=[dict(r) for r in selected])
+    class Client:
+        def table(self, name):
+            assert name == "paper_positions"
+            return Query()
+    agent = te.TradeExecutionAgent()
+    with patch.dict(os.environ, {"TREZO_PRIORITY_ROTATION": "1", "TREZO_PRIORITY_ROTATION_MAX_PER_DAY": "2"}), \
+         _patched(te, _ROTATIONS_TODAY={}), \
+         _patched(settings_mod, _supabase=lambda: Client()), \
+         _patched(alloc, market_type_for=lambda strategy, asset: "stocks"), \
+         _quiet_activity_log():
+        for uid in (BOOK_A, BOOK_A, BOOK_A, BOOK_B, BOOK_B, BOOK_B):
+            _run(agent._budget_skip(uid, "NEW", "stocks", 1000, 1000, "balanced"))
+        assert te._ROTATIONS_TODAY[BOOK_A]["n"] == 2
+        assert te._ROTATIONS_TODAY[BOOK_B]["n"] == 2
+    assert [uid for uid, rid in writes] == [BOOK_A, BOOK_A, BOOK_B, BOOK_B]
+    assert len({rid for uid, rid in writes}) == 4
 
 
 # --- NEQ-05 / G3: no_price_stop through the fan-out and the single path ----

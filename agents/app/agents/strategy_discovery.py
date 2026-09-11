@@ -10,6 +10,7 @@ feedback loop (TREZO_NOVA_BOT_TRADE_RULES.md Section 11).
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from app.config import get_settings
 from app.paper.performance import performance_for_user
@@ -26,6 +27,26 @@ def _supabase():
         return create_client(s.supabase_url, s.supabase_service_role_key)
     except Exception:  # noqa: BLE001
         return None
+
+
+async def _book_risk_evidence(client, book_id):
+    """Observe this book's persisted flags; never run a mutating halt check."""
+    base = {"book_id": book_id, "observed_at": datetime.now(timezone.utc).isoformat(),
+            "source": "own_book_persisted_risk_flags", "execution_authorization": False}
+    try:
+        def query():
+            return (client.table("paper_accounts")
+                    .select("user_id,trading_halted,halt_scope,halt_reason,consecutive_losses")
+                    .eq("user_id", book_id).limit(1).execute())
+        rows = (await asyncio.to_thread(query)).data
+        if not rows or rows[0].get("user_id") != book_id:
+            return {**base, "status": "unavailable", "reason": "own_book_risk_row_missing"}
+        return {**base, "status": "observed", **{key: rows[0].get(key) for key in
+                ("trading_halted", "halt_scope", "halt_reason", "consecutive_losses")},
+                "limitation": "Persisted flags only; fresh execution gates remain authoritative."}
+    except Exception as exc:
+        return {**base, "status": "unavailable", "reason": "own_book_risk_read_failed",
+                "error_type": type(exc).__name__}
 
 
 class StrategyDiscoveryAgent(Agent):
@@ -48,6 +69,12 @@ class StrategyDiscoveryAgent(Agent):
             users = [u["user_id"] for u in ((await asyncio.to_thread(_users)).data or [])]
         except Exception as e:  # noqa: BLE001
             return [AgentMessage(agent=self.name, kind="error", payload={"error": str(e)})]
+
+        from app.brokers.accounts import load_accounts
+        configured = [account.account_key for account in load_accounts()]
+        if configured:
+            users = configured
+        users = list(dict.fromkeys(users))
 
         out: list[AgentMessage] = []
         for uid in users:
@@ -106,7 +133,10 @@ class StrategyDiscoveryAgent(Agent):
             # unreconciled P&L counters never supply its capital.
             try:
                 from app.research.bridge import research_for_book
-                research = await research_for_book(uid)
+                evidence = {"book_id": uid,
+                            "performance": {"book_id": uid, **rep.to_dict()},
+                            "risk_state": await _book_risk_evidence(client, uid)}
+                research = await research_for_book(uid, book_evidence=evidence)
             except Exception as exc:
                 research = {"event": "internal_research", "user_id": uid,
                             "status": "failed", "reason": "research_binding_failed",
@@ -117,12 +147,8 @@ class StrategyDiscoveryAgent(Agent):
             out.append(AgentMessage(agent=self.name, kind="info",
                                     payload={"note": "No paper accounts to analyze."}))
 
-        # Phase 13 — turn this run into durable shared memory other agents
-        # can read, and learn from the backtest log (the Phase 12d substrate).
-        try:
-            prior = await self.recall(shared=True, limit=10)
-        except Exception:  # noqa: BLE001
-            prior = []
+        # Account outcomes must never become another book's shared policy.
+        # Public market context is shareable; performance hints are scoped.
         for msg in list(out):
             payload = msg.payload if isinstance(msg.payload, dict) else {}
             weak = payload.get("weakest_strategy")
@@ -132,21 +158,22 @@ class StrategyDiscoveryAgent(Agent):
                     content=(f"The {weak} strategy has negative recorded closed-row "
                              "P&L. Fees and execution evidence remain unverified; "
                              "this is a review hint, not promotion evidence."),
+                    scope=f"book:{payload['user_id']}",
                     category="warning")
-        insight = await self._backtest_insight(client)
-        if insight:
-            await self.remember(topic="backtest_leader", content=insight)
         out.append(AgentMessage(
             agent=self.name, kind="info",
-            payload={"note": "Shared agent memory updated",
-                     "prior_memory_recalled": len(prior)}))
+            payload={"note": "Per-book performance and research evidence updated",
+                     "books_reviewed": len(users)}))
         return out
 
-    async def _backtest_insight(self, client) -> str:
+    async def _backtest_insight(self, client, book_id=None) -> str:
         """Read the backtest_runs log and summarise the standout strategy."""
+        if not book_id:
+            return ""
         def _q():
             return (client.table("backtest_runs")
                     .select("strategy, total_return_pct, trades")
+                    .eq("user_id", book_id)
                     .order("created_at", desc=True).limit(200).execute()).data or []
         try:
             rows = await asyncio.to_thread(_q)

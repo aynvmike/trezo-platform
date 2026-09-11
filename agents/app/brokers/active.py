@@ -65,6 +65,18 @@ async def active_broker_name(user_id: Optional[str] = None) -> str:
                     return b
         except Exception:  # noqa: BLE001
             pass
+        # An explicit book never inherits the primary account's presence.
+        # A lone secondary account must resolve even with no primary keys.
+        from app.brokers.accounts import account_for_user
+        from app.brokers.endpoints import paper_base_url
+        account = account_for_user(user_id)
+        if account is None or not account.key_id or not account.secret:
+            return "modeled"
+        try:
+            paper_base_url(account.base_url)
+        except ValueError:
+            return "modeled"
+        return "alpaca"
     try:
         from app.brokers.alpaca import alpaca_configured
         if alpaca_configured():
@@ -107,6 +119,7 @@ async def active_broker_option_chain(
 
 async def _alpaca_snapshot(user_id: Optional[str]) -> Optional[BrokerSnapshot]:
     from app.brokers.alpaca import get_account, broker_venue, UserToken
+    from app.brokers.accounts import account_for_user, bind_for_user
     token = None
     if user_id:
         try:
@@ -120,7 +133,13 @@ async def _alpaca_snapshot(user_id: Optional[str]) -> Optional[BrokerSnapshot]:
                 )
         except Exception:  # noqa: BLE001
             pass
-    acct = await get_account(token=token)
+    if user_id and token is None:
+        if account_for_user(user_id) is None:
+            return None
+        with bind_for_user(user_id):
+            acct = await get_account(token=None)
+    else:
+        acct = await get_account(token=token)
     if not acct:
         return None
     return BrokerSnapshot(

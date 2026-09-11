@@ -32,22 +32,16 @@ MODE: ladder entries only fire in ACCUMULATE and PARTIAL. In INCOME mode
 the lane is drawing down, not building, so new ladder buys would work
 against the owner's stated intent.
 
-ACTIVATION SWITCH (TE-06, audit 2026-09-01). Risk Manager forwards only
-signals that carry a `tcs`, and vetoes one without it at TCS 0. This lane
-emits `tcs` ONLY when Settings.trezo_dividend_lt_tcs is > 0 -- i.e. when
-TREZO_DIVIDEND_LT_TCS is set in agents/.env (e.g. TREZO_DIVIDEND_LT_TCS=75).
-The value must EXCEED the book's tcs_threshold (bot_settings, default 70,
-plus any recovery/cycle bump): Risk Manager judges the stamped tcs against
-that floor, so a switch set below it (vf:no-price-stop-exec: this example
-used to say 60) lets the lane emit and then vetoes every ladder signal --
-on, yet still dark.
-At the default 0 the signal carries no `tcs` and the lane stays dark, on
-purpose: every ladder signal is `no_price_stop: True`, and that contract
-has to be honoured live by the executor (no default price stop planted)
-and the monitor (no stop/target close, no trail, no broker stop -- NEQ-05)
-before a single ladder name is bought. Verify that end to end on paper,
-then flip the switch. `no_price_stop` and `max_notional` ride on every
-signal regardless of the switch.
+ENTRY CONFIDENCE (2026-09-10). Each book's dividend_lt_enabled flag controls
+its own ladder. Quality-screened candidates receive a measured bullish
+pattern score when TREZO_DIVIDEND_LT_TCS is unset/0. The former global
+score override (e.g. TREZO_DIVIDEND_LT_TCS=75) is retained for compatibility
+and labelled as configured, never presented as measured evidence. Risk
+Manager applies the book's unchanged tcs_threshold and other gates. Missing
+market data or a non-bullish setup produces a visible skip, never a score
+copied from the entry threshold. The no-price-stop execution and monitoring
+contract remains required on every signal, together with book_scoped and
+the independently sized max_notional.
 """
 
 from __future__ import annotations
@@ -82,15 +76,10 @@ def _supabase():
 
 
 def _lane_tcs() -> int:
-    """TE-06: the lane's activation switch, read through Settings so
-    agents/.env controls it (os.getenv never sees that file). Returns
-    Settings.trezo_dividend_lt_tcs as an int, or 0 -- meaning "dark" --
-    when the field is absent (older config), unset, unparseable or
-    negative. Never raises: a broken read leaves the lane dark, which is
-    the side that cannot buy anything."""
+    """Legacy configured score, or 0 to require measured candidate scoring."""
     try:
         v = getattr(get_settings(), "trezo_dividend_lt_tcs", 0)
-        return max(0, int(float(v or 0)))
+        return max(0, min(100, int(float(v or 0))))
     except Exception:  # noqa: BLE001
         return 0
 
@@ -103,7 +92,11 @@ def _lane_inputs_for(row: dict, equity: float) -> Optional[LaneInputs]:
     against rather than inventing a parallel truth. Falls back to spec
     defaults (70/25/5) when a book has no overrides.
     """
-    pockets = row.get("allocation_overrides") or {}
+    from app.paper.allocation import build_allocation
+    pockets = build_allocation(
+        equity, posture_setting=str(row.get("account_posture") or "auto"),
+        overrides=row.get("allocation_overrides"),
+    ).budgets
     income = float(pockets.get("income", 0) or 0)
     stocks = float(pockets.get("stocks", 0) or 0)
     options = float(pockets.get("options", 0) or 0)
@@ -139,6 +132,22 @@ def _lane_inputs_for(row: dict, equity: float) -> Optional[LaneInputs]:
         # A book configured outside the guardrails does not get a
         # silently-corrected lane — it gets no lane, and says so.
         return None
+
+
+async def _measured_entry_score(ticker: str, cfg):
+    """Use the existing chart scorer after the independent dividend screen."""
+    from app.data.candles import fetch_candles_for
+    from app.patterns.confluence import confluence_bonus
+    from app.patterns.scoring import MarketContext, calculate_score
+    candles = await fetch_candles_for(ticker, "stock")
+    if not candles or len(candles) < 15:
+        return None
+    conf = confluence_bonus({"recent_15": candles[-15:],
+                             "recent_30": candles[-30:], "full": candles})
+    return calculate_score(candles, MarketContext(
+        confluence_bonus=float(conf["bonus"]),
+        pattern_weights=getattr(cfg, "pattern_weights", None),
+    ), strategy="dividend_lt")
 
 
 class DividendLTAgent(Agent):
@@ -197,9 +206,31 @@ class DividendLTAgent(Agent):
                          ) -> list[AgentMessage]:
         out: list[AgentMessage] = []
 
-        inp = _lane_inputs_for(row, 0.0)
+        def blocked(reason, note, ticker="LANE"):
+            return AgentMessage(agent=self.name, kind="info", payload={
+                "event": "dividend_lt_blocked", "user_id": uid,
+                "ticker": ticker, "reason": reason, "note": note,
+            })
+
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        from app.paper.allocation import effective_equity
+        try:
+            cfg = get_bot_settings(uid)
+            if not uid or is_fallback_settings(cfg):
+                return [blocked("settings_unverified",
+                    "Cannot verify this book's dividend settings; no ladder entries proposed.")]
+            if not getattr(cfg, "dividend_lt_enabled", True):
+                return [blocked("disabled_for_book", "Dividend ladder disabled for this book.")]
+            equity = await effective_equity(uid)
+            lane_row = dict(row)
+            lane_row.setdefault("account_posture", cfg.account_posture)
+            lane_row.setdefault("allocation_overrides", cfg.allocation_overrides)
+            inp = _lane_inputs_for(lane_row, equity)
+        except Exception as exc:  # noqa: BLE001
+            return [blocked("allocation_unavailable", f"Could not resolve this book's lane budget: {exc}")]
         if inp is None:
-            return out           # this book does not run the lane
+            return [blocked("income_budget_or_lane_inputs",
+                "Income pocket is below $500 or the lane inputs violate its guardrails.")]
 
         sizing = size_lane(inp)
 
@@ -209,9 +240,13 @@ class DividendLTAgent(Agent):
                     .select("ticker, quantity, asset_type, strategy")
                     .eq("user_id", uid).eq("status", "open").execute())
         try:
-            positions = (await asyncio.to_thread(_positions)).data or []
-        except Exception:  # noqa: BLE001
-            positions = []
+            result = await asyncio.to_thread(_positions)
+            if getattr(result, "error", None) or not isinstance(result.data, list):
+                raise RuntimeError("Open-position read did not return a verified list")
+            positions = result.data
+        except Exception as exc:  # noqa: BLE001
+            return [blocked("position_read_failed",
+                f"Cannot verify this book's holdings; no ladder entries proposed: {exc}")]
 
         # `held` is EVERY open holding in the book, whatever strategy
         # opened it: the fresh filter below must not propose a name the
@@ -264,9 +299,9 @@ class DividendLTAgent(Agent):
                     }))
 
         if inp.mode == "INCOME":
-            return out           # drawing down, not building
+            return out + [blocked("income_draw_mode", "INCOME mode draws cash rather than adding ladder names.")]
         if room <= 0:
-            return out
+            return out + [blocked("ladder_full", "This book has reached its configured ladder name count.")]
 
         # --- candidates: market-wide, screened, sector-capped
         try:
@@ -275,7 +310,7 @@ class DividendLTAgent(Agent):
         except Exception:  # noqa: BLE001
             pool = []
         if not pool:
-            return out
+            return out + [blocked("market_candidates_unavailable", "No market-wide candidates available this tick.")]
 
         fresh = [s for s in pool if s.upper() not in held]
         try:
@@ -298,13 +333,25 @@ class DividendLTAgent(Agent):
 
         cap_pct = per_name_cap_pct(sizing)
         per_name_dollars = sizing.ladder_capital * cap_pct
-        # TE-06: the activation switch, read once per book per tick.
-        # > 0 -> the signal carries that tcs and Risk Manager judges it;
-        # 0 -> no `tcs` key at all and the lane stays dark (see the
-        # module docstring for why that is the default).
         _tcs = _lane_tcs()
 
         for v in chosen:
+            score = None
+            tcs = _tcs
+            if tcs <= 0:
+                try:
+                    score = await _measured_entry_score(v.ticker, cfg)
+                except Exception as exc:  # noqa: BLE001
+                    out.append(blocked("scoring_unavailable", str(exc)[:180], v.ticker))
+                    continue
+                if score is None:
+                    out.append(blocked("scoring_unavailable", "Insufficient candles for measured entry confidence.", v.ticker))
+                    continue
+                if score.direction != "bullish":
+                    out.append(blocked("no_bullish_setup",
+                        f"Dividend quality screen passed, but chart direction is {score.direction}; no ladder buy proposed.", v.ticker))
+                    continue
+                tcs = int(score.tcs)
             _payload = {
                 "user_id": uid,
                 "ticker": v.ticker,
@@ -315,6 +362,9 @@ class DividendLTAgent(Agent):
                 "direction": "bullish",
                 "strategy": "dividend_lt",
                 "asset_type": "stock",
+                "tcs": tcs,
+                "tcs_source": "measured_pattern_score" if score is not None else "legacy_configured_score",
+                "breakdown": dict(score.breakdown) if score is not None else {},
                 # The ladder has no stop: a dividend grower is held
                 # through drawdowns, and the exits are the spec's
                 # (dividend cut, payout breach, recycling ratio), not
@@ -329,6 +379,7 @@ class DividendLTAgent(Agent):
                 "book_scoped": True,
                 "max_notional": round(per_name_dollars, 2),
                 "dividend_lt": {
+                    "quality_screen_passed": True,
                     "tier": v.tier,
                     "yield_pct": v.yield_pct,
                     "payout_ratio": v.payout_ratio,
@@ -340,13 +391,8 @@ class DividendLTAgent(Agent):
                     "unlocks": sizing.unlocks,
                 },
                 }
-            if _tcs > 0:
-                # TE-06: the switch is on -- Risk Manager gets a score to
-                # judge instead of vetoing at TCS 0. Absent at 0 so the
-                # dark behaviour is byte-identical to before the switch.
-                _payload["tcs"] = _tcs
             out.append(AgentMessage(
-                agent=self.name, kind="signal", confidence=0.60,
+                agent=self.name, kind="signal", confidence=tcs / 100.0,
                 payload=_payload))
 
         if chosen:
@@ -357,7 +403,7 @@ class DividendLTAgent(Agent):
                     "event": "dividend_lt_scan",
                     "note": (f"screened {len(verdicts)} names, "
                              f"{len(eligible)} eligible, proposing "
-                             f"{len(chosen)}; ladder {len(ladder_held)}/"
+                             f"{sum(m.kind == 'signal' for m in out)}; ladder {len(ladder_held)}/"
                              f"{sizing.ladder_names} names, "
                              f"cap {cap_pct*100:.0f}%/name"),
                 }))

@@ -51,6 +51,7 @@ class _ScopeState:
                 self._posture.status = "expired"
                 expired.append(self._posture)
                 self._posture = None
+                self._regime = "choppy"
         for ticker, adj in list(self._flags.items()):
             end = _parse(adj.created_at) + timedelta(minutes=adj.ttl_minutes)
             if now >= end:
@@ -103,9 +104,40 @@ class _ScopeState:
         )
 
 
-scope_state = _ScopeState()
+class _BookScopeState:
+    """Independent control state per account; market data may still be shared."""
+
+    def __init__(self) -> None:
+        self._books: dict[str, _ScopeState] = {}
+        self._expired: dict[str, list[ScopeAdjustment]] = {}
+
+    def for_book(self, user_id: str) -> _ScopeState:
+        key = str(user_id or "").strip()
+        if not key:
+            raise ValueError("Adaptive scope requires an explicit book user_id")
+        return self._books.setdefault(key, _ScopeState())
+
+    def expire_stale(self, user_id: str) -> list[ScopeAdjustment]:
+        """Drain expiry receipts, including controls expired during risk reads."""
+        expired = self._expired.pop(user_id, [])
+        expired.extend(self.for_book(user_id).expire_stale())
+        return expired
+
+    def view(self, user_id: str | None = None) -> ScopeView:
+        # Unattributed legacy observers see baseline, never the primary's
+        # flags / pauses. They must supply a book to inspect its decisions.
+        state = self._books.get(str(user_id or ""))
+        if state is None:
+            return _ScopeState().view()
+        expired = state.expire_stale()
+        if expired:
+            self._expired.setdefault(str(user_id), []).extend(expired)
+        return state.view()
 
 
-def get_scope() -> ScopeView:
-    """The effective scope right now — call this from the Risk Manager."""
-    return scope_state.view()
+scope_state = _BookScopeState()
+
+
+def get_scope(user_id: str | None = None) -> ScopeView:
+    """Effective scope for THIS book; a missing book has no inherited controls."""
+    return scope_state.view(user_id)

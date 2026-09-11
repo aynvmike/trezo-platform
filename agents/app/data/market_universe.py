@@ -319,11 +319,17 @@ async def sector_compass() -> dict:
         SECTOR_BIAS["leaders"] = [s for s, _ in windows["3d"][:3]]
         SECTOR_BIAS["laggards"] = [s for s, _ in windows["3d"][-3:]]
         SECTOR_BIAS["windows"] = windows
-        # Generals of the LEADING sectors: 1-day and 3-day moves, so the
-        # agents know what the industry leaders are doing right now.
+        # Read both ends of the sector tape. A put/short scan cannot find
+        # downside leaders in a universe built only from winning sectors.
         gens: list[dict] = []
-        for etf in SECTOR_BIAS["leaders"][:3]:
+        seen_generals: set[str] = set()
+        sectors = dict.fromkeys(SECTOR_BIAS["leaders"][:3]
+                                + SECTOR_BIAS["laggards"][-3:])
+        for etf in sectors:
             for sym in SECTOR_GENERALS.get(etf, [])[:10]:
+                if sym in seen_generals:
+                    continue
+                seen_generals.add(sym)
                 try:
                     cs = await fetch_stock_candles(sym)
                     cl = [float(c.close) for c in cs] if cs else []
@@ -342,4 +348,3 @@ async def sector_compass() -> dict:
         SECTOR_BIAS["generals"] = gens
         windows["generals"] = gens
     return windows
-

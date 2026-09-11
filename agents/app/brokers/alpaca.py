@@ -56,6 +56,7 @@ class AlpacaAccount:
     # account it is bound to and never silently trade the wrong one.
     account_number: str = ""
     account_id: str = ""
+    shorting_enabled: bool | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -70,9 +71,9 @@ def _account_ctx():
       must never be allowed to redirect a live call. Live keeps its
       existing single-account path until live multi-account is a
       deliberate, separately-reviewed decision.
-    * SINGLE ACCOUNT. When only the primary account is enabled there is
-      nothing to route, so every call takes the original code path and
-      this whole mechanism is inert.
+    * UNBOUND SINGLE ACCOUNT. Legacy unbound market-data reads keep their
+      original configuration. An explicit binding is always honored,
+      including when the only registered account is a secondary book.
 
     Set by app.brokers.accounts.use_account(), which is a ContextVar --
     so concurrent per-account cycles cannot leak into each other's calls.
@@ -80,7 +81,10 @@ def _account_ctx():
     if _live_active():
         return None
     try:
-        from app.brokers.accounts import current_account, multi_account_active
+        from app.brokers.accounts import bound_account, current_account, multi_account_active
+        explicit = bound_account()
+        if explicit is not None:
+            return explicit
         if not multi_account_active():
             return None
         return current_account()
@@ -523,6 +527,8 @@ async def get_account(token: Optional["UserToken"] = None) -> Optional[AlpacaAcc
         options_trading_level=int(data.get("options_trading_level") or 0),
         account_number=str(data.get("account_number") or ""),
         account_id=str(data.get("id") or ""),
+        shorting_enabled=(data["shorting_enabled"]
+                          if isinstance(data.get("shorting_enabled"), bool) else None),
     )
 
 
