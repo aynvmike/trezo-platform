@@ -276,16 +276,74 @@ async def open_position(
 # ---- Close position -------------------------------------------------------
 
 
+async def _apply_close_to_account(client, user_id: str, *, pnl: float,
+                                  cash_delta: float) -> None:
+    """The ONE place a realized close moves the account counters.
+
+    EXIT TRUTH (2026-09-18). close_position moved cash, today/ytd/week
+    realized P/L and the loss streak; record_external_close moved the
+    ROW and nothing else. So every Alpaca-routed exit -- brackets,
+    crypto stops resting at the venue, positions the broker closed --
+    changed a position's realized_pnl_usd while the account's weekly
+    counter never heard about it. By 09-18 the stored week counters and
+    the sum of the closed rows disagreed on every book (primary -73.59
+    vs +133.78; 75k -126.99 vs +39.58). Two close paths, one ledger.
+    """
+    account = await get_account(user_id)
+    if not account:
+        return
+    new_cash = float(account["current_cash_usd"]) + cash_delta
+    new_today = float(account["today_realized_pnl_usd"]) + pnl
+    new_ytd = float(account["ytd_realized_pnl_usd"]) + pnl
+    # Kill-switch counters (Phase 8c): a losing trade extends the
+    # streak, a winning trade resets it; weekly realized P&L accrues.
+    prev_consec = int(account.get("consecutive_losses") or 0)
+    new_consec = (prev_consec + 1) if pnl < 0 else 0
+    new_week_pnl = float(account.get("week_realized_pnl_usd") or 0) + pnl
+
+    def _sync_update_account():
+        return (
+            client.table("paper_accounts")
+            .update({
+                "current_cash_usd": new_cash,
+                "today_realized_pnl_usd": new_today,
+                "ytd_realized_pnl_usd": new_ytd,
+                "consecutive_losses": new_consec,
+                "week_realized_pnl_usd": round(new_week_pnl, 2),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+    await asyncio.to_thread(_sync_update_account)
+
+
 async def close_position(
     user_id: str,
     position_id: str,
     market_price: float,
     reason: str = "manual",
+    *,
+    actual_fill: bool = False,
+    exit_order_id: Optional[str] = None,
 ) -> FillResult:
     """Close an open paper position.
 
     Updates the row with exit_price, realized P&L, status. Adds proceeds
     back to current_cash. Updates today_realized_pnl_usd + ytd_realized_pnl_usd.
+
+    EXIT TRUTH (2026-09-18). `market_price` used to be a candle close and
+    this function shaved modelled slippage off it and called the result
+    a fill -- for rows the BROKER was closing. On 09-18 three SOL stops
+    were booked at exactly 96.821565 (= 96.87 candle x (1 - 5bps)) while
+    the venue filled them at 105.40-105.51: -$355 booked, ~-$30 real, on
+    a stop that fired because the candle was days stale. With
+    `actual_fill=True` the price IS the venue's filled_avg_price: no
+    slippage is applied (the fill already contains it), the activity row
+    says fill_close_broker, and the row records where its exit price
+    came from. Modelled closes remain for the internal paper engine,
+    which is the only place a model is the truth.
     """
     client = _supabase()
     if not client:
@@ -311,9 +369,16 @@ async def close_position(
     entry = float(pos["entry_price"])
     asset_type = pos["asset_type"]
 
-    # Exit with slippage
-    fill_price = apply_slippage(market_price, side, "close")
+    # Exit with slippage -- unless the price IS the venue's fill, which
+    # already contains whatever slippage the market charged.
+    if actual_fill:
+        fill_price = float(market_price)
+    else:
+        fill_price = apply_slippage(market_price, side, "close")
     notional = qty * fill_price
+    # The fee stays the commission model on both paths: Alpaca posts fee
+    # activities later than the fill, so at close time the model is the
+    # best available estimate. It is labelled as such below.
     fee = commission(asset_type, notional)
 
     if side == "long":
@@ -324,13 +389,32 @@ async def close_position(
     # Visibility pack (2026-07-01): closes show slippage + fee + net P/L.
     try:
         from app.agents.activity_log import record as _arec
-        _arec("fill_close_modeled", str(pos.get("ticker") or "?"),
-              strategy=str(pos.get("strategy") or "") or None,
-              reason=(f"{reason}: fill {fill_price:.6g} vs mkt {market_price:.6g} "
-                      f"({SLIPPAGE_BPS}bps slip + ${fee:.2f} fee), pnl {pnl:+.2f}"),
-              extra={"user_id": str(user_id), "asset_type": asset_type})
+        if actual_fill:
+            _arec("fill_close_broker", str(pos.get("ticker") or "?"),
+                  strategy=str(pos.get("strategy") or "") or None,
+                  reason=(f"{reason}: venue fill {fill_price:.6g} "
+                          f"(order {str(exit_order_id or '-')[:8]}; "
+                          f"fee ${fee:.2f} modelled, provisional), "
+                          f"pnl {pnl:+.2f}"),
+                  extra={"user_id": str(user_id), "asset_type": asset_type,
+                         "exit_order_id": exit_order_id})
+        else:
+            _arec("fill_close_modeled", str(pos.get("ticker") or "?"),
+                  strategy=str(pos.get("strategy") or "") or None,
+                  reason=(f"{reason}: fill {fill_price:.6g} vs mkt {market_price:.6g} "
+                          f"({SLIPPAGE_BPS}bps slip + ${fee:.2f} fee), pnl {pnl:+.2f}"),
+                  extra={"user_id": str(user_id), "asset_type": asset_type})
     except Exception:  # noqa: BLE001
         pass
+    # Where the exit price came from travels with the row, so a later
+    # receipt reconciliation knows which closes are already broker truth
+    # and which are still a model waiting for one.
+    _sp = dict(pos.get("source_payload") or {}) if isinstance(
+        pos.get("source_payload"), dict) else {}
+    _sp["exit_price_source"] = "broker_fill" if actual_fill else "modeled"
+    if exit_order_id:
+        _sp["exit_order_id"] = str(exit_order_id)
+    _sp.pop("exit_pending", None)
 
     # Map reason → status
     status_map = {
@@ -351,6 +435,7 @@ async def close_position(
                 "exit_at": datetime.now(timezone.utc).isoformat(),
                 "realized_pnl_usd": pnl,
                 "fees_usd": float(pos.get("fees_usd", 0)) + fee,
+                "source_payload": _sp,
             })
             .eq("id", position_id)
             .execute()
@@ -358,34 +443,9 @@ async def close_position(
 
     await asyncio.to_thread(_sync_close)
 
-    # Update account cash + P&L
-    account = await get_account(user_id)
-    if account:
-        new_cash = float(account["current_cash_usd"]) + notional - fee
-        new_today = float(account["today_realized_pnl_usd"]) + pnl
-        new_ytd   = float(account["ytd_realized_pnl_usd"])   + pnl
-        # Kill-switch counters (Phase 8c): a losing trade extends the
-        # streak, a winning trade resets it; weekly realized P&L accrues.
-        prev_consec = int(account.get("consecutive_losses") or 0)
-        new_consec = (prev_consec + 1) if pnl < 0 else 0
-        new_week_pnl = float(account.get("week_realized_pnl_usd") or 0) + pnl
-
-        def _sync_update_account():
-            return (
-                client.table("paper_accounts")
-                .update({
-                    "current_cash_usd": new_cash,
-                    "today_realized_pnl_usd": new_today,
-                    "ytd_realized_pnl_usd": new_ytd,
-                    "consecutive_losses": new_consec,
-                    "week_realized_pnl_usd": round(new_week_pnl, 2),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                })
-                .eq("user_id", user_id)
-                .execute()
-            )
-
-        await asyncio.to_thread(_sync_update_account)
+    # Update account cash + P&L -- through the one shared path.
+    await _apply_close_to_account(client, user_id, pnl=pnl,
+                                  cash_delta=notional - fee)
 
     # Phase 13/14 — learning-loop recorder. Writes one trade_outcomes
     # row capturing entry context + outcome. Never blocks the close.
@@ -992,8 +1052,23 @@ async def record_external_close(
     position_id: str,
     exit_price: float,
     reason: str = "alpaca_bracket",
+    *,
+    price_source: str = "candle_provisional",
+    exit_order_id: Optional[str] = None,
 ) -> FillResult:
-    """Mark an external-broker tracking position closed."""
+    """Mark an external-broker tracking position closed.
+
+    EXIT TRUTH (2026-09-18). This path booked the ROW and nothing else:
+    no exit fee, and the account's cash / today / week / ytd / streak
+    counters were never told -- so every broker-side exit (bracket,
+    resting crypto stop, position gone at the venue) left the weekly
+    counter disagreeing with the closed rows it was supposed to sum.
+    Now: same fee model as close_position (subtracted, labelled
+    provisional), the same shared account update, and `price_source`
+    travels with the row -- "broker_fill" when the caller resolved the
+    venue's own fill from its receipts, "candle_provisional" when the
+    best it had was a candle, so the reconciler knows which is which.
+    """
     client = _supabase()
     if not client:
         return FillResult(ok=False, error="Supabase not configured")
@@ -1018,17 +1093,42 @@ async def record_external_close(
     side = pos.get("side")
     tgt = float(pos.get("target_price") or 0)
     stp = float(pos.get("stop_price") or 0)
+    asset_type = str(pos.get("asset_type") or "stock")
 
+    exit_price = float(exit_price)
+    notional = qty * exit_price
+    fee = commission(asset_type, notional)
     if side == "long":
-        pnl = qty * (exit_price - entry)
+        gross = qty * (exit_price - entry)
         status = ("closed_target" if (tgt and exit_price >= tgt)
                   else "closed_stop" if (stp and exit_price <= stp)
                   else "closed_manual")
     else:
-        pnl = qty * (entry - exit_price)
+        gross = qty * (entry - exit_price)
         status = ("closed_target" if (tgt and exit_price <= tgt)
                   else "closed_stop" if (stp and exit_price >= stp)
                   else "closed_manual")
+    pnl = gross - fee - float(pos.get("fees_usd", 0) or 0)
+
+    _sp = dict(pos.get("source_payload") or {}) if isinstance(
+        pos.get("source_payload"), dict) else {}
+    _sp["exit_price_source"] = str(price_source or "candle_provisional")
+    if exit_order_id:
+        _sp["exit_order_id"] = str(exit_order_id)
+    _sp.pop("exit_pending", None)
+
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("fill_close_broker" if price_source == "broker_fill"
+              else "fill_close_provisional",
+              str(pos.get("ticker") or "?"),
+              strategy=str(pos.get("strategy") or "") or None,
+              reason=(f"{reason}: exit {exit_price:.6g} ({price_source}; "
+                      f"fee ${fee:.2f} modelled), pnl {pnl:+.2f}"),
+              extra={"user_id": str(user_id), "asset_type": asset_type,
+                     "exit_order_id": exit_order_id})
+    except Exception:  # noqa: BLE001
+        pass
 
     def _sync_close():
         return (
@@ -1038,6 +1138,8 @@ async def record_external_close(
                 "exit_price": exit_price,
                 "exit_at": datetime.now(timezone.utc).isoformat(),
                 "realized_pnl_usd": round(pnl, 2),
+                "fees_usd": float(pos.get("fees_usd", 0) or 0) + fee,
+                "source_payload": _sp,
             })
             .eq("id", position_id)
             .execute()
@@ -1045,6 +1147,10 @@ async def record_external_close(
 
     try:
         await asyncio.to_thread(_sync_close)
+        # The account hears about this close exactly as it hears about
+        # an internal one -- the defect this function carried since day 1.
+        await _apply_close_to_account(client, user_id, pnl=pnl,
+                                      cash_delta=notional - fee)
 
         # Phase 13/14 - learning-loop recorder.
         try:

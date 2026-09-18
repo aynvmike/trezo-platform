@@ -264,8 +264,18 @@ def _real_tick(client, price, seen: _Seen, **extra):
     throttles = (dict(pm._crypto_reeval_off_at), dict(pm._adopted_underwater_at))
     pm._crypto_reeval_off_at.clear()
     pm._adopted_underwater_at.clear()
+    async def _no_quote(_tk):
+        return None                       # no venue quote in the gate shell
+
+    async def _fresh(_tk):
+        return True, "stub"               # the stubbed candle is current
+
     defaults = dict(
         _supabase=lambda: client, _latest_price=_price,
+        # EXIT TRUTH (2026-09-18): the crypto price path now asks the
+        # venue first and checks candle freshness; both are seams. Held
+        # here so `price` still flows through _latest_price as before.
+        _crypto_quote=_no_quote, _candle_fresh=_fresh,
         _manage_day_options=_noop, _gap_check_open_bell=_noop,
         _pre_break_review=_noop, check_and_lock_profit=_nolock,
         _step_check=_nostep,

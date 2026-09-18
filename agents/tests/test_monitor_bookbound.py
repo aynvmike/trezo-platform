@@ -75,6 +75,20 @@ alog = load_module("app.agents.activity_log")
 engine = load_module("app.paper.engine")
 leg_sync = load_module("app.paper.leg_sync")
 pm = load_module("app.agents.position_monitor")
+
+
+# EXIT TRUTH (2026-09-18) seams: no venue quote, no receipts, and a candle
+# the harness vouches for -- so `price` still flows through _latest_price.
+async def _no_receipts(_after_iso, *a, **k):
+    return None
+
+
+async def _no_quote(_tk):
+    return None
+
+
+async def _fresh_stub(_tk):
+    return True, "stub"
 # Seams the NEQ-05 real-tick tests pin: the equity session gate the
 # broker-stop arm consults, and the holiday calendar the pre-break
 # review consults. Both are lazy imports inside the monitor, so they
@@ -702,7 +716,9 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
     seen = {}
 
     async def _rec_close(user_id, position_id, exit_price,
-                         reason="alpaca_bracket"):
+                         reason="alpaca_bracket", **_exit_truth_kw):
+        # EXIT TRUTH (2026-09-18): the monitor now passes price_source /
+        # exit_order_id; the stub accepts and ignores them.
         seen.update(user_id=user_id, pid=position_id, reason=reason)
         return engine.FillResult(ok=True, position_id=position_id,
                                  fill_price=exit_price, realized_pnl_usd=10.0)
@@ -729,6 +745,8 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
         # Shield swept, nothing working -> False -> the close proceeds.
         with _registry([]), _qa_shield({"book-a": set()}), \
                 _patched(pm, _supabase=lambda: client, _latest_price=_price,
+                         _fill_activities=_no_receipts,
+                         _crypto_quote=_no_quote, _candle_fresh=_fresh_stub,
                          _manage_day_options=_noop, _gap_check_open_bell=_noop,
                          _pre_break_review=_noop, check_and_lock_profit=_nolock), \
                 _patched(book_scope, held_symbols=_held), \
@@ -791,6 +809,8 @@ def _real_tick(client, price, **extra):
     pm.PositionMonitorAgent._did_initial_reconcile = True
     try:
         with _patched(pm, _supabase=lambda: client, _latest_price=_price,
+                      _fill_activities=_no_receipts,
+                      _crypto_quote=_no_quote, _candle_fresh=_fresh_stub,
                       _manage_day_options=_noop, _gap_check_open_bell=_noop,
                       _pre_break_review=_noop, check_and_lock_profit=_nolock,
                       _step_check=_nostep, **extra), \
@@ -941,7 +961,9 @@ def test_external_fill_detection_still_applies_to_a_flagged_row():
         return {"KO"}                    # PG is gone at the broker
 
     async def _rec_close(user_id, position_id, exit_price,
-                         reason="alpaca_bracket"):
+                         reason="alpaca_bracket", **_exit_truth_kw):
+        # EXIT TRUTH (2026-09-18): the monitor now passes price_source /
+        # exit_order_id; the stub accepts and ignores them.
         seen.update(pid=position_id, reason=reason)
         return engine.FillResult(ok=True, position_id=position_id,
                                  fill_price=exit_price, realized_pnl_usd=1.0)
@@ -1248,7 +1270,9 @@ def _no_close_tick(rows, held, shield):
         return set(held)
 
     async def _rec_close(user_id, position_id, exit_price,
-                         reason="alpaca_bracket"):
+                         reason="alpaca_bracket", **_exit_truth_kw):
+        # EXIT TRUTH (2026-09-18): the monitor now passes price_source /
+        # exit_order_id; the stub accepts and ignores them.
         seen.update(pid=position_id, reason=reason)
         return engine.FillResult(ok=True, position_id=position_id,
                                  fill_price=exit_price, realized_pnl_usd=1.0)

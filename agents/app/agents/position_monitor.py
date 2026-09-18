@@ -1224,6 +1224,395 @@ async def _latest_price(ticker: str, asset_type: str) -> float | None:
     return float(candles[-1].close)
 
 
+# ---------------------------------------------------------------------------
+# EXIT TRUTH (2026-09-18) -- a price that can fire a stop must be fresh, and a
+# close the broker made must be booked at the broker's fill.
+#
+# THE CASE. 09-18 13:07Z: SOL was quoted 105.40 / 105.50 at the venue. The
+# monitor priced it off a candle at 96.87 -- CoinGecko's fallback OHLC comes
+# in four-day bars past 30 days, so the "latest close" was days old -- decided
+# the stop was hit on three books, liquidated all three at the venue (real
+# fills 105.40-105.51: a whisker under entry), then booked every row at
+# 96.87 x (1 - 5bps) = 96.821565 with modelled fees: -$355 in the ledger for
+# ~-$30 of real loss, and a coin sold for no reason. The primary re-bought
+# 36 seconds later, paying the round trip again.
+#
+# Two rules follow, and each has a seam a test can hold:
+#   1. A crypto stop is judged on the VENUE'S quote (bid/ask, timestamped),
+#      never on a candle older than a session. No fresh price -> no
+#      price-based exit this tick; the stop RESTING at the venue is the
+#      protection, and it does not need this process to be right.
+#   2. A liquidation is booked at the venue's filled_avg_price, read back by
+#      order id. Not filled yet -> the row waits (exit_pending) and is
+#      settled next tick from the same order; failed -> the row stays open
+#      and says why. A candle never prices a broker close again; when no
+#      receipt can be found, the close is labelled candle_provisional so a
+#      reconciler knows it is still owed a fill.
+
+PRICE_MAX_AGE_S = float(os.getenv("TREZO_PRICE_MAX_AGE_S", "180") or 180)
+CANDLE_MAX_AGE_S = float(os.getenv("TREZO_CANDLE_MAX_AGE_S", str(26 * 3600)) or 26 * 3600)
+_EXIT_POLL_TRIES = int(os.getenv("TREZO_EXIT_POLL_TRIES", "4") or 4)
+_EXIT_POLL_WAIT_S = float(os.getenv("TREZO_EXIT_POLL_WAIT_S", "0.75") or 0.75)
+_price_unavailable_at: dict[str, float] = {}     # (uid:sym) -> monotonic
+_PRICE_UNAVAILABLE_SAY_EVERY_S = 1800.0
+
+# Seams (module attributes so the guard suites can hold them without a
+# broker): the venue quote, the order reader, the receipts reader, the sleep.
+_crypto_quote = None        # async (symbol) -> Quote|None; None -> alpaca_data
+_get_order = None           # async (order_id) -> dict|None; None -> alpaca
+_fill_activities = None     # async (after_iso) -> list|None; None -> alpaca
+_sleep = None               # async (seconds); None -> asyncio.sleep
+
+
+def _age_s(iso_or_dt) -> float | None:
+    """Seconds since a timestamp (ISO string or datetime). None if unreadable."""
+    try:
+        if isinstance(iso_or_dt, datetime):
+            t = iso_or_dt
+        else:
+            s = str(iso_or_dt or "").strip()
+            if not s:
+                return None
+            t = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - t).total_seconds())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _venue_price_crypto(ticker: str) -> tuple[float | None, str]:
+    """The venue's own mid for a coin, only if the quote is fresh.
+    Returns (price, source) or (None, why)."""
+    try:
+        fn = _crypto_quote
+        if fn is None:
+            from app.brokers.alpaca_data import get_crypto_quote as fn
+        q = await fn(ticker)
+    except Exception as e:  # noqa: BLE001
+        return None, f"venue quote error ({type(e).__name__})"
+    if q is None:
+        return None, "venue quote unavailable"
+    bid = float(getattr(q, "bid", 0) or 0)
+    ask = float(getattr(q, "ask", 0) or 0)
+    if bid <= 0 or ask <= 0:
+        return None, "venue quote has no bid/ask"
+    age = _age_s(getattr(q, "ts", ""))
+    if age is None:
+        return None, "venue quote carries no timestamp"
+    if age > PRICE_MAX_AGE_S:
+        return None, f"venue quote stale ({age:.0f}s > {PRICE_MAX_AGE_S:.0f}s)"
+    return (bid + ask) / 2.0, "venue"
+
+
+_candle_fresh = None        # async (ticker) -> (bool, why); None -> default
+
+
+async def _candle_is_fresh(ticker: str) -> tuple[bool, str]:
+    """Is the newest candle for this coin younger than CANDLE_MAX_AGE_S?
+    A live daily bar (timestamped at its open) qualifies; a four-day
+    fallback bar from last week does not. Unknown counts as NOT fresh."""
+    fn = _candle_fresh
+    if fn is not None:
+        return await fn(ticker)
+    try:
+        candles = await fetch_candles_for(ticker, "crypto")
+    except Exception as e:  # noqa: BLE001
+        return False, f"candles error ({type(e).__name__})"
+    if not candles:
+        return False, "no candles"
+    age = _age_s(getattr(candles[-1], "timestamp", None))
+    if age is None:
+        return False, "candle carries no timestamp"
+    if age > CANDLE_MAX_AGE_S:
+        return False, f"last candle is {age / 3600:.0f}h old"
+    return True, "fresh"
+
+
+async def _price_crypto(ticker: str) -> tuple[float | None, str]:
+    """Fresh price for a coin: venue quote first; else the candle close
+    (through _latest_price, the seam every guard suite holds) only if
+    the bar is fresh; else nothing -- and nothing means not judged."""
+    px, src = await _venue_price_crypto(ticker)
+    if px is not None:
+        return px, src
+    why = src
+    p = await _latest_price(ticker, "crypto")
+    if p is None:
+        return None, f"{why}; no candles"
+    fresh, cwhy = await _candle_is_fresh(ticker)
+    if not fresh:
+        return None, f"{why}; {cwhy}"
+    return float(p), "candle"
+
+
+def _say_price_unavailable(uid: str, sym: str, why: str) -> None:
+    """Once per half hour per (book, coin): the row was NOT judged."""
+    import time as _t
+    key = f"{uid}:{sym}"
+    now = _t.monotonic()
+    if now - _price_unavailable_at.get(key, -1e9) < _PRICE_UNAVAILABLE_SAY_EVERY_S:
+        return
+    _price_unavailable_at[key] = now
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("price_unavailable", sym,
+              reason=(f"no fresh price -- stop/target NOT judged this tick "
+                      f"({why}); the stop resting at the venue is the "
+                      f"protection"),
+              extra={"user_id": uid})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _order_fill(order) -> tuple[str, float | None, float | None]:
+    """(status, filled_avg_price, filled_qty) from an order dict."""
+    if not isinstance(order, dict):
+        return "", None, None
+    st = str(order.get("status") or "").lower()
+    try:
+        px = float(order.get("filled_avg_price") or 0) or None
+    except (TypeError, ValueError):
+        px = None
+    try:
+        fq = float(order.get("filled_qty") or 0) or None
+    except (TypeError, ValueError):
+        fq = None
+    return st, px, fq
+
+
+_ORDER_TERMINAL_FAIL = ("canceled", "cancelled", "expired", "rejected",
+                        "stopped", "suspended")
+
+
+async def _poll_exit_order(order_id: str, *, tries: int | None = None
+                           ) -> tuple[str, float | None, float | None]:
+    """Read an exit order back until it fills, fails, or we stop waiting.
+    Returns (status, filled_avg_price, filled_qty); status '' = unreadable."""
+    get = _get_order
+    if get is None:
+        from app.brokers.alpaca import get_order as get
+    sl = _sleep or asyncio.sleep
+    n = int(tries if tries is not None else _EXIT_POLL_TRIES)
+    st, px, fq = "", None, None
+    for i in range(max(1, n)):
+        try:
+            order = await get(order_id)
+        except Exception:  # noqa: BLE001
+            order = None
+        st, px, fq = _order_fill(order)
+        if st == "filled" and px:
+            return st, px, fq
+        if st in _ORDER_TERMINAL_FAIL:
+            return st, px, fq
+        if i < n - 1:
+            await sl(_EXIT_POLL_WAIT_S)
+    return st, px, fq
+
+
+async def _mark_exit_pending(r: dict, order_id: str | None, reason: str) -> None:
+    """Park the row: an exit is working at the venue; do not decide again."""
+    client = _supabase()
+    sp = dict(r.get("source_payload") or {}) if isinstance(
+        r.get("source_payload"), dict) else {}
+    sp["exit_pending"] = {"order_id": order_id, "reason": reason,
+                          "submitted_at": datetime.now(timezone.utc).isoformat()}
+    r["source_payload"] = sp
+    if client is None:
+        return
+    try:
+        await asyncio.to_thread(
+            lambda: client.table("paper_positions")
+            .update({"source_payload": sp}).eq("id", r["id"]).execute())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("exit_pending", str(r.get("ticker") or "?"),
+              reason=(f"{reason}: liquidation accepted, not yet filled "
+                      f"(order {str(order_id or '-')[:8]}); the row waits "
+                      f"for the venue's fill -- nothing booked"),
+              extra={"user_id": str(r.get("user_id") or "")})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _clear_exit_pending(r: dict) -> None:
+    client = _supabase()
+    sp = dict(r.get("source_payload") or {}) if isinstance(
+        r.get("source_payload"), dict) else {}
+    sp.pop("exit_pending", None)
+    r["source_payload"] = sp
+    if client is None:
+        return
+    try:
+        await asyncio.to_thread(
+            lambda: client.table("paper_positions")
+            .update({"source_payload": sp}).eq("id", r["id"]).execute())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _book_liquidation(r: dict, liq, candle_price: float | None,
+                            reason: str):
+    """After the venue ACCEPTED a liquidation: book it at the fill, or wait.
+
+    Returns the FillResult when the row was closed, else None (pending or
+    failed -- the row stays open and the activity log says which).
+    """
+    order_id = str(liq.get("id") or "") if isinstance(liq, dict) else ""
+    uid = str(r.get("user_id") or "")
+    tk = str(r.get("ticker") or "?")
+    if order_id:
+        st, px, fq = await _poll_exit_order(order_id)
+        if st == "filled" and px:
+            row_qty = float(r.get("quantity") or 0)
+            if fq and row_qty and abs(fq - row_qty) / row_qty > 0.01:
+                try:
+                    from app.agents.activity_log import record as _arec
+                    _arec("exit_qty_mismatch", tk,
+                          reason=(f"venue filled {fq:.8g} vs row {row_qty:.8g}; "
+                                  f"booked at the fill price, quantity per the "
+                                  f"row -- reconcile owns the remainder"),
+                          extra={"user_id": uid, "exit_order_id": order_id})
+                except Exception:  # noqa: BLE001
+                    pass
+            return await close_position(uid, r["id"], px, reason=reason,
+                                        actual_fill=True,
+                                        exit_order_id=order_id)
+        if st in _ORDER_TERMINAL_FAIL:
+            try:
+                from app.agents.activity_log import record as _arec
+                _arec("exit_error", tk,
+                      reason=(f"{reason}: liquidation order {order_id[:8]} "
+                              f"ended {st} -- row left open, nothing booked"),
+                      extra={"user_id": uid, "asset_type": "crypto"})
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        await _mark_exit_pending(r, order_id, reason)
+        return None
+    # No order handle came back with the acceptance. The coins are gone or
+    # going at the venue and there is no id to read a fill from: book the
+    # row so it cannot be liquidated twice, but say plainly that this
+    # exit price is a model owed a receipt.
+    if candle_price is None:
+        await _mark_exit_pending(r, None, reason)
+        return None
+    fill = await close_position(uid, r["id"], candle_price, reason=reason)
+    try:
+        from app.agents.activity_log import record as _arec
+        _arec("exit_provisional", tk,
+              reason=(f"{reason}: venue returned no order id; closed at "
+                      f"candle {candle_price:.6g} PROVISIONALLY -- reconcile "
+                      f"against receipts"),
+              extra={"user_id": uid})
+    except Exception:  # noqa: BLE001
+        pass
+    return fill
+
+
+async def _settle_pending_exit(r: dict) -> bool:
+    """A row whose exit is already working at the venue is settled here and
+    NOT judged again. True = handled this tick (closed, or still waiting);
+    False = nothing pending (or the pending exit failed and was cleared, so
+    the row is judged normally)."""
+    sp = r.get("source_payload") if isinstance(r.get("source_payload"), dict) else {}
+    pend = (sp or {}).get("exit_pending")
+    if not isinstance(pend, dict):
+        return False
+    uid = str(r.get("user_id") or "")
+    tk = str(r.get("ticker") or "?")
+    order_id = str(pend.get("order_id") or "")
+    reason = str(pend.get("reason") or "stop")
+    if not order_id:
+        # Parked without a handle: only a receipt can settle it.
+        px, src, oid = await _exit_receipt_price(r)
+        if px is not None and src == "broker_fill":
+            from app.paper.engine import record_external_close
+            await record_external_close(uid, r["id"], px, reason=reason,
+                                        price_source=src, exit_order_id=oid)
+        return True
+    st, px, fq = await _poll_exit_order(order_id, tries=1)
+    if st == "filled" and px:
+        await close_position(uid, r["id"], px, reason=reason,
+                             actual_fill=True, exit_order_id=order_id)
+        return True
+    if st in _ORDER_TERMINAL_FAIL:
+        await _clear_exit_pending(r)
+        try:
+            from app.agents.activity_log import record as _arec
+            _arec("exit_error", tk,
+                  reason=(f"{reason}: pending liquidation {order_id[:8]} "
+                          f"ended {st}; row back in play"),
+                  extra={"user_id": uid, "asset_type": "crypto"})
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    age = _age_s(pend.get("submitted_at"))
+    if age is not None and age > 900:
+        # A quarter hour with no verdict: stop waiting on the id, let the
+        # receipts decide next tick (a market liquidation does not take
+        # fifteen minutes; the order read is what is failing).
+        pend["order_id"] = ""
+        await _mark_exit_pending(r, "", reason)
+    return True
+
+
+def _closing_side(row_side: str) -> str:
+    return "sell" if str(row_side or "long").lower() == "long" else "buy"
+
+
+def _symbol_matches(activity_symbol: str, ticker: str) -> bool:
+    a = str(activity_symbol or "").upper().replace("/", "")
+    t = str(ticker or "").upper().replace("/", "")
+    return bool(a) and (a == t or a == t + "USD" or a + "USD" == t)
+
+
+async def _exit_receipt_price(r: dict) -> tuple[float | None, str, str | None]:
+    """The venue's own closing fill(s) for this row, from its receipts.
+
+    Returns (price, 'broker_fill', order_id) when the closing-side fills
+    after the row's entry add up to the row's quantity (2% tolerance);
+    else (None, why, None). Never guesses."""
+    reader = _fill_activities
+    if reader is None:
+        from app.brokers.alpaca import get_fill_activities_strict as reader
+    after = str(r.get("entry_at") or "")
+    if not after:
+        return None, "row carries no entry_at", None
+    try:
+        acts = await reader(after)
+    except Exception as e:  # noqa: BLE001
+        return None, f"receipts read raised ({type(e).__name__})", None
+    if acts is None:
+        return None, "receipts read failed", None
+    want = _closing_side(r.get("side"))
+    tk = str(r.get("ticker") or "")
+    fills = [a for a in acts if isinstance(a, dict)
+             and _symbol_matches(a.get("symbol"), tk)
+             and str(a.get("side") or "").lower() == want]
+    if not fills:
+        return None, "no closing fill in the receipts since entry", None
+    fills.sort(key=lambda a: str(a.get("transaction_time") or ""), reverse=True)
+    row_qty = float(r.get("quantity") or 0)
+    got, val, order_id = 0.0, 0.0, None
+    for a in fills:                       # newest first: the exit is the tail
+        try:
+            q = float(a.get("qty") or 0); p = float(a.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if q <= 0 or p <= 0:
+            continue
+        got += q; val += q * p
+        order_id = order_id or str(a.get("order_id") or "") or None
+        if row_qty and got >= row_qty * 0.98:
+            break
+    if not got or (row_qty and abs(got - row_qty) / row_qty > 0.02):
+        return None, (f"closing fills sum {got:.8g} vs row {row_qty:.8g}"), None
+    return val / got, "broker_fill", order_id
+
+
 def _minutes_since(iso_ts) -> float:
     """Minutes elapsed since an ISO timestamp. 0 if missing or unparseable."""
     if not iso_ts:
@@ -1897,10 +2286,20 @@ class PositionMonitorAgent(Agent):
         book_scope.new_cycle()
         alpaca_held = None
 
+        price_why: dict[str, str] = {}
+
         async def _price(tk: str, at: str) -> float | None:
             key = f"{tk}:{at}"
             if key not in price_cache:
-                p = await _latest_price(tk, at)
+                if at == "crypto":
+                    # EXIT TRUTH: a coin is priced off the venue's fresh
+                    # quote, or a candle younger than a session, or not
+                    # at all -- never off a days-old fallback bar.
+                    p, why = await _price_crypto(tk)
+                    if p is None:
+                        price_why[key] = why
+                else:
+                    p = await _latest_price(tk, at)
                 if p is not None:
                     price_cache[key] = p
             return price_cache.get(key)
@@ -1984,7 +2383,14 @@ class PositionMonitorAgent(Agent):
                             if _qa_shield_blocks_close(r.get("user_id"), tk, r.get("side")):
                                 continue
                             # Genuinely gone at the broker -> reconcile books.
-                            price_c = await _price(tk, at)
+                            # EXIT TRUTH: the venue's own closing fill from
+                            # its receipts prices this close; the candle is
+                            # only a labelled stand-in when no receipt can.
+                            _rx_px, _rx_src, _rx_oid = await _exit_receipt_price(r)
+                            if _rx_px is None:
+                                _rx_px, _rx_src, _rx_oid = (
+                                    await _price(tk, at), "candle_provisional", None)
+                            price_c = _rx_px
                             if price_c is not None:
                                 from app.paper.engine import record_external_close
                                 # PH-3: name the reason. Left to the default
@@ -1993,7 +2399,8 @@ class PositionMonitorAgent(Agent):
                                 # while the bus message said alpaca_external.
                                 fill = await record_external_close(
                                     r["user_id"], r["id"], price_c,
-                                    reason="alpaca_external")
+                                    reason="alpaca_external",
+                                    price_source=_rx_src, exit_order_id=_rx_oid)
                                 if fill.ok:
                                     alpaca_reconciled += 1
                                     affected_users.add(r["user_id"])
@@ -2011,8 +2418,23 @@ class PositionMonitorAgent(Agent):
                                             "broker": "alpaca",
                                         }))
                             continue
+                        # EXIT TRUTH: an exit already working at the venue
+                        # is settled from its order, never re-decided.
+                        if await _settle_pending_exit(r):
+                            alpaca_managed += 1
+                            continue
                         price_c = await _price(tk, at)
                         if price_c is None:
+                            # No fresh price: the row is NOT judged. Say so
+                            # (throttled) and keep the venue's stop armed.
+                            _say_price_unavailable(
+                                str(r.get("user_id") or ""), tk,
+                                price_why.get(f"{tk}:{at}", "no price"))
+                            try:
+                                if not _is_no_price_stop(r):
+                                    await _arm_broker_stop(r)
+                            except Exception:  # noqa: BLE001
+                                pass
                             alpaca_managed += 1
                             continue
                         stop_c = (float(r["stop_price"])
@@ -2357,8 +2779,15 @@ class PositionMonitorAgent(Agent):
                                     "broker": "alpaca",
                                 }))
                             continue
-                        fill = await close_position(
-                            r["user_id"], r["id"], price_c, reason=reason_c)
+                        # EXIT TRUTH: booked at the venue's fill, read back
+                        # by order id -- or parked until it fills. The
+                        # candle price is never the exit price of a
+                        # broker close (09-18: 96.82 booked, 105.4 filled).
+                        fill = await _book_liquidation(
+                            r, _liq, price_c, reason_c)
+                        if fill is None:
+                            alpaca_managed += 1
+                            continue
                         if fill.ok:
                             affected_users.add(r["user_id"])
                             if _cexit_event:
@@ -2427,10 +2856,18 @@ class PositionMonitorAgent(Agent):
                         if _qa_shield_blocks_close(r.get("user_id"), tk, r.get("side")):
                             continue
                         # Alpaca's bracket order closed it - reconcile our books.
-                        price = await _price(tk, at)
+                        # EXIT TRUTH: priced from the bracket's own fill in
+                        # the receipts; a candle only as a labelled stand-in.
+                        _rx_px, _rx_src, _rx_oid = await _exit_receipt_price(r)
+                        if _rx_px is None:
+                            _rx_px, _rx_src, _rx_oid = (
+                                await _price(tk, at), "candle_provisional", None)
+                        price = _rx_px
                         if price is not None:
                             from app.paper.engine import record_external_close
-                            fill = await record_external_close(r["user_id"], r["id"], price)
+                            fill = await record_external_close(
+                                r["user_id"], r["id"], price,
+                                price_source=_rx_src, exit_order_id=_rx_oid)
                             if fill.ok:
                                 alpaca_reconciled += 1
                                 affected_users.add(r["user_id"])
