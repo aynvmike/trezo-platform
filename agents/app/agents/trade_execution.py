@@ -325,6 +325,9 @@ class TradeExecutionAgent(Agent):
                     return 0, ""
                 snap = {"cash": float(getattr(acct, "cash", 0) or 0),
                         "equity": float(getattr(acct, "equity", 0) or 0),
+                        "daytrade_count": getattr(acct, "daytrade_count", None),
+                        "pattern_day_trader": getattr(acct, "pattern_day_trader", None),
+                        "pdt_state_known": getattr(acct, "pdt_state_known", False),
                         "ts": _t.time()}
                 snaps[str(user_id)] = snap
             cash, equity = snap.get("cash"), snap.get("equity")
@@ -795,6 +798,12 @@ class TradeExecutionAgent(Agent):
                                                   f"already holds it - no "
                                                   f"stacking")}))
                             continue
+                        refusal = await self._entry_discipline(
+                            client, uid, ticker, side, _sp_uid, _cfg, _atype,
+                            held=ticker.upper() in _held)
+                        if refusal is not None:
+                            out.append(refusal)
+                            continue
                         _pcap = self._pocket_cap(_cfg, _atype, _cap)
                         _popen = self._pocket_open(_held, _atype)
                         if (ticker.upper() not in _held
@@ -881,6 +890,43 @@ class TradeExecutionAgent(Agent):
         # geometry was re-harmonized to ITS floor (before -> after).
         self._log_rr_notes(ticker, source_payload, _lane, _rr_notes)
         return out
+
+    async def _entry_discipline(self, client, uid, ticker, side, payload, cfg, lane, *, held):
+        """Called inside THIS book's route binding, including pinned signals."""
+        from app.paper.entry_discipline import (
+            check_reentry, pdt_verdict, goal_lock, is_intraday, knob, emit)
+        strategy = (payload.get("strategy") or
+                    (payload.get("strategy_selection") or {}).get("chosen") or
+                    payload.get("dominant_pattern") or payload.get("source_agent") or "system")
+        details = await check_reentry(client, uid, ticker, lane, side, held=held)
+        event = "reentry_refused"
+        if details is None and lane == "stock" and is_intraday(strategy):
+            import time
+            snapshots = getattr(self, "_margin_snaps", {})
+            snapshot = snapshots.get(str(uid), {})
+            if (time.time()-snapshot.get("ts", 0) > 60
+                    or "daytrade_count" not in snapshot):
+                from app.brokers.alpaca import get_account
+                account = await get_account()
+                snapshot = {key: getattr(account, key, None) for key in (
+                    "cash", "equity", "daytrade_count", "pattern_day_trader", "pdt_state_known")}
+                if account is not None:
+                    snapshot["ts"] = time.time()
+                    snapshots[str(uid)] = snapshot
+                    self._margin_snaps = snapshots
+            details = pdt_verdict(snapshot, strategy, lane,
+                                  buffer=knob("TREZO_PDT_BUFFER_USD", 2500),
+                                  minimum=knob("TREZO_PDT_MIN_EQUITY", 2000))
+            event = "pdt_guard"
+        if details is None:
+            details = await goal_lock(uid, cfg, strategy, client=client)
+            event = "goal_lock_refused"
+        if details is None:
+            return None
+        emit(event, uid, ticker, strategy, details)
+        return AgentMessage(agent=self.name, kind="info", payload={
+            "event": event, "user_id": str(uid), "ticker": ticker,
+            "strategy": strategy, "lane": lane, **details})
 
     async def _execute_for_user(
         self,
@@ -1409,6 +1455,18 @@ class TradeExecutionAgent(Agent):
         if acct.trading_blocked:
             return _err("Alpaca account has trading blocked")
 
+        # Recheck the freshly read account immediately on the stock submission
+        # path: the fan-out's cached PDT count may have changed since its read.
+        from app.paper.entry_discipline import pdt_verdict, knob, emit
+        pdt = pdt_verdict(vars(acct), strategy, "stock",
+                          buffer=knob("TREZO_PDT_BUFFER_USD", 2500),
+                          minimum=knob("TREZO_PDT_MIN_EQUITY", 2000))
+        if pdt is not None:
+            emit("pdt_guard", user_id, ticker, strategy, pdt)
+            return [AgentMessage(agent=self.name, kind="info", payload={
+                "event": "pdt_guard", "user_id": str(user_id), "ticker": ticker,
+                "strategy": strategy, "lane": "stock", **pdt})]
+
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "stock")
         if remaining <= 0:
@@ -1580,10 +1638,10 @@ class TradeExecutionAgent(Agent):
         )
         if err or not order:
             from app.paper.killswitch import record_broker_reject
-            record_broker_reject(str(user_id))  # THIS book's reject, not the platform's
+            record_broker_reject(str(user_id), error=err)
             try:
                 from app.agents.activity_log import record as _arec
-                _arec("broker_reject", ticker, strategy=strategy,
+                _arec("pdt_reject" if "day trad" in str(err).lower() else "broker_reject", ticker, strategy=strategy,
                       reason=str(err)[:200],
                       extra={"user_id": str(user_id), "asset_type": "stock"})
             except Exception:  # noqa: BLE001
@@ -1705,10 +1763,10 @@ class TradeExecutionAgent(Agent):
                                               token=token)
         if oerr or not order:
             from app.paper.killswitch import record_broker_reject
-            record_broker_reject(str(user_id))  # THIS book's reject
+            record_broker_reject(str(user_id), error=oerr)
             try:
                 from app.agents.activity_log import record as _arec
-                _arec("broker_reject", ticker, strategy=strategy,
+                _arec("pdt_reject" if "day trad" in str(oerr).lower() else "broker_reject", ticker, strategy=strategy,
                       reason=str(oerr)[:200],
                       extra={"user_id": str(user_id), "asset_type": "stock"})
             except Exception:  # noqa: BLE001
@@ -1982,10 +2040,10 @@ class TradeExecutionAgent(Agent):
         )
         if err or not order:
             from app.paper.killswitch import record_broker_reject
-            record_broker_reject(str(user_id))  # THIS book's reject, not the platform's
+            record_broker_reject(str(user_id), error=err)
             try:
                 from app.agents.activity_log import record as _arec
-                _arec("broker_reject", ticker, strategy=strategy,
+                _arec("pdt_reject" if "day trad" in str(err).lower() else "broker_reject", ticker, strategy=strategy,
                       reason=str(err)[:200],
                       extra={"user_id": str(user_id), "asset_type": "crypto"})
             except Exception:  # noqa: BLE001

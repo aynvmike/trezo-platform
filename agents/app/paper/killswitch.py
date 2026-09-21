@@ -88,7 +88,10 @@ def _prune_rejects() -> None:
             _broker_reject_ts.pop(_b, None)
 
 
-def record_broker_reject(user_id: str | None = None) -> int:
+def record_broker_reject(user_id: str | None = None, *, error=None) -> int:
+    # A policy rejection is observable but not a broker malfunction storm.
+    if "day trad" in str(error or "").lower():
+        return broker_reject_count(user_id)
     _prune_rejects()
     _b = str(user_id or "")
     _broker_reject_ts.setdefault(_b, []).append(_time_ks.time())

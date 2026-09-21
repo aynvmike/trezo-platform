@@ -17,6 +17,10 @@ It only ever
       afternoon when the day is still behind.
 No revenge trading, no pressure sizing, no chasing.
 
+The executor additionally locks new intraday entries after a banked goal when
+the book's goal_lock_enabled setting is on (approved 2026-09-21). Persistent
+lock state follows the account's UTC counter rollover; open exits continue.
+
 Env: TREZO_DAILY_GOAL forces a $ amount; TREZO_GOAL_MAX_PCT is the
 rung-selection safety ceiling as a fraction of equity (default 0.015).
 """
@@ -25,7 +29,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 
 # (daily $, label) -- Mike's ladder of working-life pay, in trading days.
 GOAL_RUNGS: list[tuple[float, str]] = [
@@ -75,44 +79,38 @@ def daily_goal_for(equity: float) -> tuple[float, str]:
     return (amount, label)
 
 
-async def today_realized(user_id) -> float:
-    """Today's realized P&L from row truth. Prefers the kill-switch's 30s
-    row-sum cache (refreshed on every signal while the desk is live);
-    falls back to one direct query cached 60s. Fail-open 0.0."""
+async def today_realized(user_id) -> float | None:
+    """Counter shared by engine._apply_close_to_account's two close paths.
+
+    The existing account reset uses UTC. Never combine that counter with an
+    ET/local-calendar cache, and never replace a failed read with zero.
+    """
     uid = _resolve_uid(user_id)
     if not uid:
-        return 0.0
-    try:
-        from app.paper.killswitch import _ROWSUM_CACHE
-        hit = _ROWSUM_CACHE.get(uid)
-        if hit and (time.time() - hit[0]) < 30.0:
-            return float(hit[2])
-    except Exception:  # noqa: BLE001
-        pass
-    hit2 = _DY_CACHE.get(uid)
-    if hit2 and (time.time() - hit2[0]) < 60.0:
-        return float(hit2[1])
+        return None
     try:
         import asyncio
         from app.runtime.settings import _supabase as _sb
         client = _sb()
         if client is None:
-            return 0.0
-        today_s = date.today().isoformat()
+            return None
+        today_s = datetime.now(timezone.utc).date().isoformat()
 
         def _rows():
-            return (client.table("paper_positions")
-                    .select("realized_pnl_usd")
+            return (client.table("paper_accounts")
+                    .select("today_realized_pnl_usd,last_reset_date")
                     .eq("user_id", uid)
-                    .gte("exit_at", today_s)
-                    .like("status", "closed%")
-                    .limit(500).execute())
-        rr = (await asyncio.to_thread(_rows)).data or []
-        dy = round(sum(float(x.get("realized_pnl_usd") or 0) for x in rr), 2)
-        _DY_CACHE[uid] = (time.time(), dy)
-        return dy
+                    .limit(2).execute())
+        rr = (await asyncio.to_thread(_rows)).data
+        if not isinstance(rr, list) or len(rr) != 1:
+            return None
+        reset = str(rr[0].get("last_reset_date") or "")
+        if reset != today_s:
+            return None
+        from app.paper.entry_discipline import number
+        return number(rr[0]["today_realized_pnl_usd"])
     except Exception:  # noqa: BLE001
-        return 0.0
+        return None
 
 
 async def goal_state(user_id) -> dict:
@@ -138,9 +136,10 @@ async def goal_state(user_id) -> dict:
     return {
         "goal": goal, "label": label,
         "equity": round(float(eq or 0.0), 2),
-        "realized": dy, "hit": bool(goal and dy >= goal),
+        "realized": dy, "hit": bool(goal and dy is not None and dy >= goal),
+        "known": dy is not None and eq is not None and eq > 0,
         "pct": (round(min(100.0, max(0.0, (dy / goal) * 100.0)), 1)
-                if goal else 0.0),
+                if goal and dy is not None else 0.0),
         "week_goal": round(goal * 5, 2),
         "week_realized": wk,
     }

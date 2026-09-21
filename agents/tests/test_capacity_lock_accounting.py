@@ -224,8 +224,17 @@ def test_the_refusal_spellings_match_the_executors_own():
     te = load_module("app.agents.trade_execution")
     src = inspect.getsource(te)
     for ev in wd._DELIBERATE_REFUSALS:
-        assert f'"event": "{ev}"' in src, (
+        assert (f'"event": "{ev}"' in src or
+                (f'event = "{ev}"' in src and '"event": event' in src)), (
             f"watchdog counts '{ev}' but trade_execution never emits it")
+
+
+def test_income_refusals_are_counted_by_the_real_watchdog():
+    for event in ('reentry_refused', 'pdt_guard', 'goal_lock_refused'):
+        assert event in wd._DELIBERATE_REFUSALS
+        agent = _agent()
+        _refuse(agent, 1, event=event)
+        assert agent._flow['lanes']['crypto']['refusals'] == 1
 
 
 if __name__ == "__main__":
