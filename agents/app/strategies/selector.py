@@ -34,6 +34,20 @@ CRYPTO_STRATEGIES = ["default", "pattern", "crypto", "extended"]
 CYCLE_STRATEGIES = ["iv_crush_short", "dividend_capture_long"]
 
 
+def _direction_supported(strategy: str, direction: str, asset_type: str) -> bool:
+    """Respect lane mandates while comparing stock longs and shorts equally."""
+    if direction not in ("bullish", "bearish"):
+        return False
+    if direction == "bullish":
+        return True
+    # These scanners implement long continuation/accumulation or spot
+    # crypto. A general selector must not invent a short version of them.
+    base = str(strategy).lower().split("_")[0]
+    return asset_type != "crypto" and base not in (
+        "stms", "extended", "crypto", "dividend",
+    )
+
+
 @dataclass
 class StrategyPick:
     strategy: str
@@ -94,7 +108,8 @@ def eligible_strategies(asset_type: str, *, in_stms_window: bool = True,
 def select_strategy(candles, *, ctx: Optional[MarketContext] = None,
                     history: Optional[dict] = None,
                     strategies: Optional[list] = None,
-                    outcome_edge: Optional[dict] = None) -> StrategyPick:
+                    outcome_edge: Optional[dict] = None,
+                    asset_type: str = "stock") -> StrategyPick:
     """Score `candles` under each strategy and pick the best for this
     stock right now.
 
@@ -113,21 +128,23 @@ def select_strategy(candles, *, ctx: Optional[MarketContext] = None,
         e = edge.get(strat) or {}
         rows.append({"strategy": strat, "score": sc, "tcs": int(sc.tcs),
                      "direction": sc.direction,
+                     "direction_supported": _direction_supported(
+                         strat, sc.direction, asset_type),
                      "hist": history.get(strat),
                      "verdict": e.get("verdict", "insufficient_data"),
                      "expectancy": float(e.get("expectancy_usd") or 0.0)})
 
-    # Long-only bot: prefer bullish reads. Drop strategies with a
-    # net-loss backtest history on this stock from the running.
-    bull = [r for r in rows if r["direction"] == "bullish"]
-    healthy = [r for r in bull if (r["hist"] is None or r["hist"] >= 0)]
+    # Apply the same history/experience rules to either actionable side.
+    # Side is not a ranking preference; supported lane mandates still are.
+    actionable = [r for r in rows if r["direction_supported"]]
+    healthy = [r for r in actionable if (r["hist"] is None or r["hist"] >= 0)]
     # Outcome-weighted (2026-06-16): when alternatives exist, drop the
     # strategies the user's LIVE record says to avoid (negative realized
     # expectancy over a meaningful sample). Falls back to `healthy` when
     # that would empty the pool, so a thin / all-avoid record never
     # strands the selector.
     not_avoid = [r for r in healthy if r["verdict"] != "avoid"]
-    pool = not_avoid or healthy or bull or rows
+    pool = not_avoid or healthy or actionable or rows
 
     # Highest live TCS wins; then a proven live edge ("favor"); then
     # realized expectancy; then backtest history as the final tiebreak.
@@ -143,17 +160,21 @@ def select_strategy(candles, *, ctx: Optional[MarketContext] = None,
     considered = sorted(
         [{"strategy": r["strategy"], "tcs": r["tcs"],
           "direction": r["direction"], "backtest_return_pct": r["hist"],
+          "direction_supported": r["direction_supported"],
           "live_verdict": r["verdict"]}
          for r in rows],
         key=lambda d: d["tcs"], reverse=True)
 
     return StrategyPick(
         strategy=win["strategy"], tcs=int(sc.tcs), score=int(sc.score),
-        direction=sc.direction, dominant_pattern=sc.dominant_pattern,
+        direction=sc.direction if actionable else "neutral",
+        dominant_pattern=sc.dominant_pattern,
         detected_patterns=list(sc.detected_patterns or []),
         breakdown=dict(sc.breakdown or {}),
         considered=considered,
-        reason=_reason(win, len(strategies)))
+        reason=(_reason(win, len(strategies)) if actionable else
+                "No supported directional setup in the eligible strategy pool; "
+                "no entry signal."))
 
 
 def _reason(win: dict, n_tested: int) -> str:

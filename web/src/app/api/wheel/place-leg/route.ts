@@ -18,6 +18,9 @@ type AgentsResp = {
   premium?: number;
   alpaca_order_id?: string;
   alpaca_order_status?: string;
+  contracts?: number;
+  recorded?: boolean;
+  record_error?: string;
 };
 
 /**
@@ -43,6 +46,7 @@ export async function POST(request: Request) {
   const user = guard.user;
 
   let body: {
+    account_key?: string;
     leg?: string;
     underlying?: string;
     target_strike?: number;
@@ -58,6 +62,13 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
+
+  const accountKey = typeof body.account_key === "string" ? body.account_key.trim() : "";
+  if (!accountKey) return NextResponse.json({ ok: false, error: "Select the account to trade." }, { status: 400 });
+  const { data: owned, error: ownershipError } = await supabase.from("trading_accounts")
+    .select("account_key").eq("owner_id", user.id).eq("account_key", accountKey).eq("is_active", true).maybeSingle();
+  if (ownershipError) return NextResponse.json({ ok: false, error: "Account ownership could not be verified." }, { status: 503 });
+  if (!owned) return NextResponse.json({ ok: false, error: "Account not found." }, { status: 404 });
 
   const leg = (body.leg ?? "").trim().toLowerCase();
   if (leg !== "csp" && leg !== "cc") {
@@ -96,7 +107,7 @@ export async function POST(request: Request) {
   let agentsResp: AgentsResp;
   try {
     const qs = new URLSearchParams({
-      user_id: user.id,
+      user_id: accountKey,
       leg,
       underlying,
       target_strike: String(target_strike),
@@ -119,16 +130,18 @@ export async function POST(request: Request) {
   }
 
   // Auto-record into options_positions on a successful placement.
-  let recorded = false;
-  let record_error: string | undefined;
-  if (agentsResp.ok && agentsResp.strike && agentsResp.expiration) {
+  let recorded = agentsResp.recorded === true;
+  let record_error: string | undefined = agentsResp.record_error;
+  if (agentsResp.ok && !recorded && agentsResp.strike && agentsResp.expiration) {
     try {
       const optionType = leg === "csp" ? "put" : "call";
       const strategy = leg === "csp" ? "wheel_csp" : "wheel_cc";
+      const placedContracts = Number(agentsResp.contracts ?? contracts);
+      if (!Number.isInteger(placedContracts) || placedContracts <= 0) throw new Error("Placed contract count could not be verified.");
       // Premium per share × 100 shares per contract × contracts.
       // Positive because sell-to-open is a credit received.
       const premiumPerShare = Number(agentsResp.premium ?? limit_price ?? 0);
-      const netPremium = Math.round(premiumPerShare * 100 * contracts * 100) / 100;
+      const netPremium = Math.round(premiumPerShare * 100 * placedContracts * 100) / 100;
       const noteBits = [
         `Placed via Alpaca (${agentsResp.routed ?? "?"})`,
         agentsResp.alpaca_order_id ? `order ${agentsResp.alpaca_order_id}` : null,
@@ -139,14 +152,14 @@ export async function POST(request: Request) {
         .join(" · ");
 
       const { error } = await supabase.from("options_positions").insert({
-        user_id: user.id,
+        user_id: accountKey,
         underlying: agentsResp.underlying ?? underlying,
         strategy,
         direction: "income",
         option_type: optionType,
         strike: agentsResp.strike,
         expiration: agentsResp.expiration,
-        contracts,
+        contracts: placedContracts,
         net_premium_usd: netPremium,
         legs: [],
         status: "open",
@@ -156,6 +169,7 @@ export async function POST(request: Request) {
         record_error = error.message;
       } else {
         recorded = true;
+        record_error = undefined;
       }
     } catch (e) {
       record_error = e instanceof Error ? e.message : "insert failed";

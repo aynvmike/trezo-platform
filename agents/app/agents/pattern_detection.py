@@ -267,6 +267,10 @@ class PatternDetectionAgent(Agent):
                 "max_tcs_direction": "neutral",
                 "threshold": threshold,
                 "bullish_count": 0,
+                "bearish_count": 0,
+                "neutral_count": 0,
+                "signals_by_direction": {"bullish": 0, "bearish": 0},
+                "below_threshold_by_direction": {"bullish": 0, "bearish": 0},
                 "from_watchlist": breakdown["watchlist"],
                 "from_market_wide": breakdown["market_wide"],
                 "strategy_changes": [],
@@ -337,6 +341,7 @@ class PatternDetectionAgent(Agent):
                         history=history.get(sym, {}),
                         strategies=pool_strats,
                         outcome_edge=outcome_edge,
+                        asset_type=asset_type,
                     )
 
                     # Strategy-change detection + switching friction.
@@ -362,7 +367,16 @@ class PatternDetectionAgent(Agent):
                                 new_tcs,
                             )
                             min_to_flip = float(prev_tcs) * (1.0 + adv)
-                            if new_tcs > min_to_flip:
+                            incumbent_eligible = any(
+                                candidate["strategy"] == prev_strategy
+                                and candidate.get("direction_supported", False)
+                                for candidate in pick.considered
+                            )
+                            if new_tcs > min_to_flip or not incumbent_eligible:
+                                if not incumbent_eligible:
+                                    pick.reason = (
+                                        f"Previous strategy '{prev_strategy}' is no longer "
+                                        f"eligible for this setup. {pick.reason}")
                                 # Flip allowed - record and emit.
                                 self._prev_strategy[prev_key] = (pick.strategy, new_tcs)
                                 summary["strategy_change_count"] += 1
@@ -389,14 +403,35 @@ class PatternDetectionAgent(Agent):
                                     confidence=pick.tcs / 100.0, payload=ev,
                                 ))
                             else:
-                                # Suppressed - keep prev pick, emit a 'held' info
-                                # message so Mike can see the friction working.
+                                # The held event must describe the strategy
+                                # that actually leaves on the bus. Re-score
+                                # the incumbent now: reusing its historical
+                                # TCS could admit an entry that no longer
+                                # clears this book's floor.
+                                challenger = pick
+                                pick = select_strategy(
+                                    candles, ctx=ctx,
+                                    history=history.get(sym, {}),
+                                    strategies=[prev_strategy],
+                                    outcome_edge=outcome_edge,
+                                    asset_type=asset_type,
+                                )
+                                pick.considered = challenger.considered
+                                pick.reason = (
+                                    f"Retained '{prev_strategy}': challenger "
+                                    f"'{challenger.strategy}' at TCS {new_tcs} did "
+                                    f"not exceed the {adv * 100:.1f}% switching "
+                                    f"advantage over prior TCS {prev_tcs}. "
+                                    f"Current retained TCS is {pick.tcs}.")
+                                self._prev_strategy[prev_key] = (prev_strategy, int(pick.tcs))
                                 summary["strategy_holds"] += 1
                                 held_ev = {
                                     "ticker": sym,
                                     "held": prev_strategy,
-                                    "challenger": pick.strategy,
+                                    "challenger": challenger.strategy,
                                     "prev_tcs": int(prev_tcs),
+                                    "held_tcs": int(pick.tcs),
+                                    "direction": pick.direction,
                                     "challenger_tcs": new_tcs,
                                     "required_advantage_pct": round(adv * 100, 1),
                                     "mode": cfg.switching_mode,
@@ -405,7 +440,7 @@ class PatternDetectionAgent(Agent):
                                     held_ev["user_id"] = user_id
                                 out.append(AgentMessage(
                                     agent=self.name, kind="strategy_held",
-                                    confidence=prev_tcs / 100.0, payload=held_ev,
+                                    confidence=pick.tcs / 100.0, payload=held_ev,
                                 ))
 
                     if pick.tcs > summary["max_tcs"]:
@@ -414,9 +449,17 @@ class PatternDetectionAgent(Agent):
                         summary["max_tcs_direction"] = pick.direction
                     if pick.direction == "bullish":
                         summary["bullish_count"] += 1
+                    elif pick.direction == "bearish":
+                        summary["bearish_count"] += 1
+                    else:
+                        summary["neutral_count"] += 1
 
-                    if pick.tcs >= threshold:
+                    actionable = pick.direction in ("bullish", "bearish")
+                    if actionable and pick.tcs < threshold:
+                        summary["below_threshold_by_direction"][pick.direction] += 1
+                    if actionable and pick.tcs >= threshold:
                         summary["signals_emitted"] += 1
+                        summary["signals_by_direction"][pick.direction] += 1
                         # Cycle context (Phase 13a). Pull the symbol's
                         # cycle position - it's cached 24h so this is
                         # essentially free. Downstream agents (Risk
@@ -485,16 +528,23 @@ class PatternDetectionAgent(Agent):
                 pool_desc += f" ({wl_n} watchlist + {mw_n} market-wide)"
             note_bits = [
                 f"Scanned {pool_desc} at TCS threshold {summary['threshold']}.",
+                f"Reads: {summary['bullish_count']} bullish, "
+                f"{summary['bearish_count']} bearish, "
+                f"{summary['neutral_count']} without a supported directional setup.",
             ]
             if summary["signals_emitted"] > 0:
                 note_bits.append(
-                    f"{summary['signals_emitted']} signal(s) fired.")
+                    f"{summary['signals_emitted']} signal(s) fired "
+                    f"({summary['signals_by_direction']['bullish']} bullish, "
+                    f"{summary['signals_by_direction']['bearish']} bearish).")
             else:
                 if summary["max_tcs_ticker"]:
                     note_bits.append(
                         f"Strongest read: {summary['max_tcs_ticker']} at TCS "
                         f"{summary['max_tcs']} ({summary['max_tcs_direction']}) - "
-                        f"below threshold, nothing fired.")
+                        + ("below threshold, nothing fired."
+                           if summary["max_tcs"] < summary["threshold"] else
+                           "no supported directional setup, nothing fired."))
                 else:
                     note_bits.append("No tickers produced a scoring read this tick.")
             sc_count = int(summary.get("strategy_change_count") or 0)
@@ -514,6 +564,10 @@ class PatternDetectionAgent(Agent):
                 "max_tcs_direction": summary["max_tcs_direction"],
                 "threshold": summary["threshold"],
                 "bullish_count": summary["bullish_count"],
+                "bearish_count": summary["bearish_count"],
+                "neutral_count": summary["neutral_count"],
+                "signals_by_direction": summary["signals_by_direction"],
+                "below_threshold_by_direction": summary["below_threshold_by_direction"],
                 "from_watchlist": wl_n,
                 "from_market_wide": mw_n,
                 "strategy_changes": summary["strategy_changes"],
@@ -539,9 +593,13 @@ class PatternDetectionAgent(Agent):
                         _tcss.append(int(t))
                 _top_tcs = max(_tcss) if _tcss else 0
                 _by_strategy = {}
+                _by_direction = {"bullish": 0, "bearish": 0}
                 for s in _signals:
                     st = (s.payload or {}).get("strategy") or "default"
                     _by_strategy[st] = _by_strategy.get(st, 0) + 1
+                    direction = (s.payload or {}).get("direction")
+                    if direction in _by_direction:
+                        _by_direction[direction] += 1
                 out.append(AgentMessage(
                     agent=self.name,
                     kind="scanner_pulse",
@@ -554,6 +612,7 @@ class PatternDetectionAgent(Agent):
                         "fired": len(_signals),
                         "top_tcs": _top_tcs,
                         "by_strategy": _by_strategy,
+                        "by_direction": _by_direction,
                     },
                 ))
         except Exception:

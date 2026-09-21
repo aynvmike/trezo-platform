@@ -42,14 +42,16 @@ function usd(n: number): string {
  * view.
  */
 export async function WheelLiveQuotes({
-  underlyings
+  underlyings,
+  accountKey,
 }: {
   underlyings: string[];
+  accountKey: string;
 }) {
   const qs = encodeURIComponent(underlyings.join(","));
   let snap: Snap | null = null;
   try {
-    const r = await fetch(`${AGENTS_BASE}/wheel/live-quotes?underlyings=${qs}`, {
+    const r = await fetch(`${AGENTS_BASE}/wheel/live-quotes?underlyings=${qs}&user_id=${encodeURIComponent(accountKey)}`, {
       cache: "no-store",
       signal: AbortSignal.timeout(15_000)
     });
@@ -135,6 +137,7 @@ export async function WheelLiveQuotes({
                       <div>{usd(r.csp.premium * 100)}</div>
                       <div className="mt-1">
                         <WheelPlaceButton
+                          accountKey={accountKey}
                           leg="csp"
                           underlying={r.symbol}
                           targetStrike={r.csp.strike}
@@ -172,6 +175,7 @@ export async function WheelLiveQuotes({
                       <div>{usd(r.cc.premium * 100)}</div>
                       <div className="mt-1">
                         <WheelPlaceButton
+                          accountKey={accountKey}
                           leg="cc"
                           underlying={r.symbol}
                           targetStrike={r.cc.strike}

@@ -173,7 +173,7 @@ def test_discovery_tick_binds_metadata_and_suppresses_failed_book_hints():
     async def no_backtests(_client):
         return ""
 
-    async def no_research(user_id):
+    async def no_research(user_id, **kwargs):
         return {"event": "internal_research", "user_id": user_id, "status": "disabled"}
 
     agent.recall, agent.remember = recall, remember

@@ -97,16 +97,16 @@ def test_accumulation_passes_even_at_capacity():
         "a held name may be added to even when the book is full"
 
 
-def test_a_failed_holdings_read_fails_open():
-    assert _cap_decision(None, "book-5k", "XLE", None) is True, \
-        "no data must mean historical behavior (trade), not a frozen book"
+def test_a_failed_holdings_read_refuses_an_entry_until_capacity_is_known():
+    assert _cap_decision(None, "book-5k", "XLE", None) is False, \
+        "unknown holdings must not masquerade as a book with room"
 
 
 def _cap_decision(_agent, uid: str, ticker: str,
                   holdings: dict | None) -> bool:
     """The exact gate expression from _execute_for_all_users."""
     if holdings is None:
-        return True
+        return False
     held = holdings.get(uid, set())
     cap = 14
     if ticker.upper() not in held and len(held) >= cap:
@@ -132,8 +132,8 @@ def test_the_global_cap_no_longer_vetoes_anyone():
     import inspect
     rm = load_module("app.agents.risk_manager")
     src = inspect.getsource(rm)
-    assert "platform_signal_pressure" in src, \
-        "the advisory pressure note should exist"
+    assert "book_signal_pressure" in src, \
+        "the advisory pressure note should name only the book it measured"
     assert 'f"Open-signal cap reached ({max_open})"' not in src, \
         "the platform-wide cap veto must stay dead"
 

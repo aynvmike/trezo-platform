@@ -32,13 +32,15 @@ export function WheelPlaceButton({
   underlying,
   targetStrike,
   targetExp,
-  premium
+  premium,
+  accountKey,
 }: {
   leg: Leg;
   underlying: string;
   targetStrike: number;
   targetExp: string;
   premium?: number;
+  accountKey: string;
 }) {
   const router = useRouter();
   const [stage, setStage] = useState<"idle" | "confirm" | "sending" | "done" | "error">("idle");
@@ -52,6 +54,7 @@ export function WheelPlaceButton({
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          account_key: accountKey,
           leg,
           underlying,
           target_strike: targetStrike,

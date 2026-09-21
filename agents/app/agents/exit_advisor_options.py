@@ -212,7 +212,7 @@ class ExitAdvisorOptionsAgent(Agent):
                 kind, severity, message = alert
                 # Catalyst-aware bump: severity goes up one notch when
                 # ctx is hot. Read cycle position best-effort.
-                severity = await self._catalyst_bump(ticker, severity)
+                severity = await self._catalyst_bump(ticker, severity, user_id=user_id)
 
                 await self._raise_alert(
                     client, user_id=user_id, position_id=pid,
@@ -379,7 +379,8 @@ class ExitAdvisorOptionsAgent(Agent):
     # Catalyst-aware severity bump (Rule 8)
     # ------------------------------------------------------------------
 
-    async def _catalyst_bump(self, ticker: str, severity: str) -> str:
+    async def _catalyst_bump(self, ticker: str, severity: str,
+                             user_id: str | None = None) -> str:
         """Bump severity up one notch when the ticker is in a hot
         cycle window (earnings_day) or when adaptive scope is risk_off.
         Best-effort: any failure returns the original severity."""
@@ -392,7 +393,7 @@ class ExitAdvisorOptionsAgent(Agent):
             pass
         try:
             from app.runtime.scope import get_scope
-            scope = get_scope()
+            scope = get_scope(user_id)
             if getattr(scope, "regime", "neutral") == "risk_off":
                 return self._bump(severity)
         except Exception:  # noqa: BLE001

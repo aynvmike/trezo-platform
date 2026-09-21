@@ -88,12 +88,14 @@ def _for_user(uid):
 
 
 @contextlib.contextmanager
-def _registry(multi=True):
-    """Two known books, one unknown. route_guard imports the registry
-    helpers BY NAME, so both modules are patched together."""
-    with _patched(accounts, account_for_user=_for_user,
+def _registry(multi=True, books=None):
+    """Explicit fixture registry; patch imported helpers together."""
+    registry = dict(_BOOKS if books is None else books)
+    resolve = lambda uid: registry.get(uid)
+    with _patched(accounts, account_for_user=resolve,
+                  load_accounts=lambda: list(registry.values()),
                   multi_account_active=lambda: multi), \
-         _patched(route_guard, account_for_user=_for_user,
+         _patched(route_guard, account_for_user=resolve,
                   multi_account_active=lambda: multi):
         yield
 
@@ -154,7 +156,7 @@ def _exec_seam(result_kind="execute"):
 
     async def _fake(self, user_id, ticker, side, payload):
         calls.append({"user_id": user_id, "ticker": ticker, "side": side,
-                      "bound": accounts.current_account()})
+                      "bound": accounts.bound_account()})
         return [_Msg(result_kind, {"ticker": ticker, "user_id": user_id,
                                    "venue": "paper", "quantity": 1,
                                    "fill_price": 10.0})]
@@ -212,16 +214,34 @@ def test_manual_trade_for_an_unresolvable_book_places_nothing():
     assert logged and logged[0][0][0] == "admin.manual_trade.route_refused", logged
 
 
-def test_manual_trade_single_account_mode_is_unchanged():
-    """With one account there is nothing to cross; the existing
-    behaviour (place it) stands. bind_for_user yields None here and
-    check_route answers 'single-account'."""
+def test_manual_trade_single_account_mode_refuses_an_unknown_book():
+    """One registered account still cannot execute another book's order."""
     handler, _ = _load_manual_trade()
-    with _registry(multi=False), _mismatch_log() as mm, _exec_seam() as (calls, _):
+    with _registry(multi=False, books={BOOK_75K: ACCT_75K}), \
+            _mismatch_log() as mm, _exec_seam() as (calls, published):
         res = _run(handler(UNKNOWN, "AMZN", "long"))
+    assert res.get("ok") is False, res
+    assert "refusing" in res.get("error", ""), res
+    assert calls == [], "an unknown book must never execute on the sole account"
+    assert published == [], "refused orders must not reach the bus"
+    assert len(mm) == 1 and mm[0]["user_id"] == UNKNOWN, mm
+    assert mm[0]["where"] == "manual_trade", mm
+    assert accounts.bound_account() is None
+
+
+def test_manual_trade_registered_sole_secondary_book_executes_bound():
+    """A sole acct3 book is valid; its binding must still be explicit."""
+    handler, _ = _load_manual_trade()
+    with _registry(multi=False, books={BOOK_75K: ACCT_75K}), \
+            _mismatch_log() as mm, _exec_seam() as (calls, published):
+        res = _run(handler(BOOK_75K, "AMZN", "short"))
     assert res.get("ok") is True, res
-    assert len(calls) == 1
-    assert not mm
+    assert len(calls) == 1, calls
+    assert calls[0]["user_id"] == BOOK_75K and calls[0]["bound"] is ACCT_75K, calls
+    assert calls[0]["side"] == "short", calls
+    assert len(published) == 1 and published[0].kind == "execute", published
+    assert not mm, mm
+    assert accounts.bound_account() is None
 
 
 @contextlib.contextmanager

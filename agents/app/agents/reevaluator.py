@@ -6,9 +6,9 @@ profit: tighten the stop, lower an unrealistic target so it can still exit
 green, rotate dead capital into a better setup, or (staged) average down.
 
 Design principles:
-  * SAFE BY DEFAULT. The master switch TREZO_REEVAL_ENABLED defaults OFF, so
-    importing/calling this module is a no-op until it is turned on. Every
-    sub-action has its own flag and every threshold is tunable through
+  * BOOK-OWNED PERMISSION. Only a named book's verified reevaluation_enabled
+    setting permits changes; a missing/failed settings read takes no action.
+    Every sub-action has its own flag and every threshold is tunable through
     pydantic Settings (agents/.env) with a process-env fallback (G19).
   * PROTECTIVE DIRECTION ONLY for stops: a tightened stop always moves CLOSER
     to price (cuts risk); it never widens.
@@ -44,10 +44,10 @@ def _num(name: str, default: float) -> float:
         return default
 
 
-# --- master + per-action switches -----------------------------------------
+# --- per-action switches and book-owned enablement ------------------------
 # Read through pydantic Settings so agents/.env reliably controls them: this
 # app loads .env via Settings, NOT os.environ, so a bare os.getenv would miss
-# .env. Falls back to a real env var, then the default. Master OFF until set.
+# .env. Sub-action parameters fall back to a real env var, then the default.
 def _settings_flag(attr: str, env: str, default: bool) -> bool:
     try:
         from app.config import get_settings
@@ -59,10 +59,16 @@ def _settings_flag(attr: str, env: str, default: bool) -> bool:
     return _flag(env, "1" if default else "0")
 
 
-def reeval_is_enabled() -> bool:
-    """Master switch -- True only when TREZO_REEVAL_ENABLED is set in
-    agents/.env (or the environment). Default OFF."""
-    return _settings_flag("trezo_reeval_enabled", "TREZO_REEVAL_ENABLED", False)
+def reeval_is_enabled(user_id: str | None = None) -> bool:
+    """Only this book's verified settings may authorize position changes."""
+    if not user_id:
+        return False
+    try:
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        cfg = get_bot_settings(user_id)
+        return not is_fallback_settings(cfg) and bool(cfg.reevaluation_enabled)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _settings_num(attr: str, env: str, default: float) -> float:
@@ -136,10 +142,10 @@ def _held_days(entry_at) -> float:
         return 0.0
 
 
-def _regime() -> str:
+def _regime(user_id: str | None = None) -> str:
     try:
         from app.runtime.scope import get_scope
-        return str(getattr(get_scope(), "regime", "neutral") or "neutral")
+        return str(getattr(get_scope(user_id), "regime", "neutral") or "neutral")
     except Exception:  # noqa: BLE001
         return "neutral"
 
@@ -233,7 +239,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
     an action is taken, else None. Persists stop/target changes itself and logs
     every action. Fail-open: any error returns None."""
     try:
-        if not reeval_is_enabled():
+        if not reeval_is_enabled(r.get("user_id")):
             return None
         # THE LONG-TERM LANE IS EXEMPT (AUDIT 2026-08-27, priority #2).
         # This function reads price-only gain -- no dividend term -- and
@@ -286,7 +292,7 @@ async def reevaluate_position(r, price, side, at, strat, stop, target,
         user_id = r.get("user_id")
         ticker = str(r.get("ticker") or "?")
         held = _held_days(r.get("entry_at"))
-        regime = _regime()
+        regime = _regime(user_id)
         stale = held >= STALE_DAYS
         very_stale = held >= ROTATE_DAYS
         low_edge = _low_edge(str(strat or ""), str(at or ""))

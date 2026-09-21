@@ -1,29 +1,13 @@
-"""Options Scanner Agent — the Dividend Wheel income engine + options ideas.
+"""Options maintenance and independently enabled paper option strategies.
 
-Ticks every 30 minutes. Three jobs:
+Every registered book chooses its own same-day, directional, spread and Wheel
+availability. Broker permission, route binding, halt/recovery checks, collateral
+and strict exposure reads still gate entries. Wheel writes covered calls and
+cash-secured puts; directional buys include calls AND puts; the spread lane can
+write bullish or bearish defined-risk credit. General ideas remain informational.
 
-  1. SETTLE — close any modeled option position whose expiration has passed.
-     For a cash-secured put: if spot >= strike the put expires worthless and
-     the full credit is kept; if spot < strike it's "assigned" and the loss
-     is credit - (strike - spot) * 100 * contracts.
-
-  2. RECONCILE — when a user has a live Alpaca connection, compare each
-     open options_positions row against the user's actual broker option
-     positions. Any row that has no matching contract at the broker is
-     closed_manual with a "Reconciled — not present at broker" note. This
-     keeps the modeled book honest: Alpaca is the truth, the planner is
-     not allowed to drift.
-
-  3. WHEEL — for each quality name in the Wheel watchlist with no open
-     position, either:
-       a) emit a SUGGESTION (when the user has Alpaca connected) so they
-          can place a real CSP via the Place CSP button, or
-       b) open a modeled cash-secured put (paper-only users with no live
-          broker — the original Phase-6 behaviour).
-
-It also emits `info` messages with Long Call / Bull Call Spread / CSP
-*ideas* for the watchlist — surfaced as suggestions, not auto-executed,
-because directional options carry more risk.
+Scheduled maintenance reviews every book; an explicit user_id pins a requested
+reconciliation to one book. Nothing uses another book's settings to decide entry.
 """
 
 from __future__ import annotations
@@ -46,7 +30,7 @@ from app.strategies.wheel import (
 )
 
 
-def _wheel_dte_pick() -> int:
+def _wheel_dte_pick(user_id: str) -> int:
     """Posture-aware target DTE for new wheel/overlay legs (Mike
     2026-07-20: 'if it is that far out we are missing on valuable
     information'). The auto-fire gate caps growth accounts at 21 DTE,
@@ -59,7 +43,7 @@ def _wheel_dte_pick() -> int:
     cap = 21
     try:
         from app.runtime.settings import get_bot_settings as _g
-        _p = str(getattr(_g(), "account_posture", "auto") or "auto")
+        _p = str(getattr(_g(user_id), "account_posture", "auto") or "auto")
         cap = _caps.get(_p, 21)
     except Exception:  # noqa: BLE001
         cap = 21
@@ -228,6 +212,202 @@ async def _book_token(user_id: str):
     return None, "env-keys"
 
 
+def _option_permission(acct, required: int) -> str | None:
+    """The bound broker's effective permission, never another book's level."""
+    if acct is None:
+        return "broker account unreadable"
+    if getattr(acct, "trading_blocked", False):
+        return "broker has blocked trading on this book"
+    try:
+        approved = int(getattr(acct, "options_approved_level", 0) or 0)
+        # Older adapters may omit trading_level; the current adapter always
+        # supplies it. An explicit zero is a restriction, not missing data.
+        active = int(getattr(acct, "options_trading_level", approved) or 0)
+        if min(approved, active) < required:
+            return (f"this book's effective options level {min(approved, active)} "
+                    f"is below required level {required}")
+    except (TypeError, ValueError):
+        return "broker options permission unreadable"
+    return None
+
+
+def _same_day_entry_open(now=None) -> bool:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    local = (now or datetime.now(ZoneInfo("America/New_York"))).astimezone(
+        ZoneInfo("America/New_York"))
+    minutes = local.hour * 60 + local.minute
+    return local.weekday() < 5 and 9 * 60 + 35 <= minutes <= 11 * 60 + 30
+
+
+async def _option_inventory(client, user_id: str):
+    """Strict snapshot of BOTH ledgers and this bound broker's exposure.
+
+    Used before new exposure. A failed read is never an empty portfolio.
+    Working orders count too: a submitted entry can fill after this scan.
+    """
+    from app.brokers.alpaca import get_positions_strict, get_open_orders_all_strict
+    token, _ = await _book_token(user_id)
+    positions = await get_positions_strict(token=token)
+    orders = await get_open_orders_all_strict(token=token)
+    if positions is None or orders is None:
+        return None
+
+    def _read():
+        tracked = (client.table("options_positions").select("*")
+                   .eq("user_id", user_id).eq("status", "open").execute()).data
+        ledger = (client.table("paper_positions").select("*")
+                  .eq("user_id", user_id).eq("status", "open")
+                  .eq("asset_type", "option").execute()).data
+        if not isinstance(tracked, list) or not isinstance(ledger, list):
+            raise ValueError("option ledger response unreadable")
+        return tracked, ledger
+    try:
+        tracked, ledger = await asyncio.to_thread(_read)
+        import math
+        for rows in (positions, orders, tracked, ledger):
+            for row in rows:
+                if not isinstance(row, dict):
+                    return None
+                for key in ("qty", "quantity", "contracts", "strike", "avg_entry_price",
+                            "entry_price", "net_premium_usd", "filled_qty", "limit_price"):
+                    if row.get(key) is not None and not math.isfinite(float(row[key])):
+                        return None
+    except Exception:
+        return None
+    return {"positions": positions, "orders": orders,
+            "tracked": tracked, "ledger": ledger}
+
+
+def _option_underlying(row: dict) -> str:
+    from app.paper.broker_truth import parse_occ
+    symbol = str(row.get("symbol") or row.get("ticker") or row.get("occ") or "")
+    parsed = parse_occ(symbol)
+    return (parsed["underlying"] if parsed else
+            str(row.get("underlying") or "").upper())
+
+
+def _option_exposure_on(inventory: dict, underlying: str) -> bool:
+    """Any held/tracked/pending option on a name blocks another Wheel leg."""
+    symbol = underlying.upper()
+    return any(_option_underlying(row) == symbol
+               for key in ("positions", "orders", "tracked", "ledger")
+               for row in inventory[key])
+
+
+def _covered_call_reason(inventory: dict, underlying: str, contracts: int) -> str | None:
+    """Never write on already-pledged or insufficient shares, including orders."""
+    if _option_exposure_on(inventory, underlying):
+        return "an option is already held, tracked, or working on this underlying"
+    try:
+        shares = sum(float(row.get("qty") or 0) for row in inventory["positions"]
+                     if str(row.get("symbol") or "").upper() == underlying.upper())
+        # Pending stock sells can remove coverage before this call fills.
+        reserved = sum(max(0.0, float(row.get("qty") or 0)
+                           - float(row.get("filled_qty") or 0))
+                       for row in inventory["orders"]
+                       if str(row.get("symbol") or "").upper() == underlying.upper()
+                       and str(row.get("side") or "").lower() == "sell")
+        if shares - reserved < 100 * contracts:
+            return f"unpledged shares {shares - reserved:g} cannot cover {contracts} call(s)"
+    except (TypeError, ValueError):
+        return "share coverage unreadable"
+    return None
+
+
+def _row_occ(row: dict) -> str:
+    from app.paper.broker_truth import parse_occ
+    for key in ("symbol", "ticker", "occ"):
+        symbol = str(row.get(key) or "").upper()
+        if parse_occ(symbol):
+            return symbol
+    try:
+        exp = date.fromisoformat(str(row.get("expiration") or "")[:10])
+        root = str(row["underlying"]).upper()
+        cp = "C" if str(row["option_type"]).lower().startswith("c") else "P"
+        return f"{root}{exp:%y%m%d}{cp}{int(round(float(row['strike']) * 1000)):08d}"
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
+def _reserved_puts(inventory: dict) -> tuple[int, float]:
+    """Cash obligations across both ledgers and filled/pending broker puts.
+
+    Per-contract maxima avoid counting the same holding in three ledgers;
+    remaining sell-to-open orders are ADDITIONAL to broker-held contracts.
+    """
+    from app.paper.broker_truth import parse_occ
+    snapshots: list[dict[str, float]] = []
+    for key in ("tracked", "ledger", "positions"):
+        quantities: dict[str, float] = {}
+        for row in inventory[key]:
+            occ = _row_occ(row)
+            parsed = parse_occ(occ)
+            if not parsed or parsed["right"] != "P":
+                continue
+            qty = float(row.get("qty") or row.get("quantity") or row.get("contracts") or 0)
+            short = (qty < 0 or str(row.get("side") or "").lower() in ("short", "sell")
+                     or str(row.get("strategy") or "") in ("wheel_csp", "cash_secured_put"))
+            if short:
+                quantities[occ] = quantities.get(occ, 0.0) + abs(qty)
+        snapshots.append(quantities)
+    broker = snapshots[-1]
+    for row in inventory["orders"]:
+        occ = _row_occ(row)
+        parsed = parse_occ(occ)
+        if (not parsed or parsed["right"] != "P" or row.get("side") != "sell"
+                or row.get("position_intent") == "sell_to_close"):
+            continue
+        remaining = max(0.0, float(row.get("qty") or 0) - float(row.get("filled_qty") or 0))
+        broker[occ] = broker.get(occ, 0.0) + remaining
+    merged = {occ: max(snapshot.get(occ, 0.0) for snapshot in snapshots)
+              for snapshot in snapshots for occ in snapshot}
+    return (int(sum(merged.values())),
+            sum(parse_occ(occ)["strike"] * 100.0 * qty for occ, qty in merged.items()))
+
+
+def _long_option_inventory(inventory: dict) -> dict[str, dict]:
+    """Count broker-held and working long contracts, with tracking lane tags."""
+    from app.paper.broker_truth import parse_occ
+    out: dict[str, dict] = {}
+    # Both tracking sources name lanes; broker truth supplies filled risk.
+    tags = {_row_occ(row): str(row.get("strategy") or "")
+            for key in ("ledger", "tracked") for row in inventory[key]
+            if _row_occ(row)}
+    for key in ("ledger", "tracked", "positions", "orders"):
+        for row in inventory[key]:
+            occ = _row_occ(row)
+            parsed = parse_occ(occ)
+            if not parsed:
+                continue
+            strategy = tags.get(occ, "")
+            if key == "orders":
+                if row.get("side") != "buy" or row.get("position_intent") == "buy_to_close":
+                    continue
+                qty = max(0.0, float(row.get("qty") or 0) - float(row.get("filled_qty") or 0))
+            else:
+                qty = float(row.get("qty") or row.get("quantity") or row.get("contracts") or 0)
+                if (qty <= 0 or str(row.get("side") or "").lower() in ("short", "sell")
+                        or (key == "tracked" and strategy != "option_day"
+                            and not strategy.startswith("long_"))):
+                    continue
+            if qty <= 0:
+                continue
+            dte = (parsed["expiry"] - date.today()).days
+            lane = ("option_day" if strategy == "option_day" else
+                    "long" if strategy.startswith("long_") else
+                    "option_day" if dte <= 5 else "long")
+            premium = float(row.get("avg_entry_price") or row.get("entry_price")
+                            or row.get("limit_price") or 0)
+            cost = abs(float(row.get("net_premium_usd") or premium * qty * 100))
+            if key == "orders" and cost <= 0:
+                raise ValueError("working long option has no priced risk")
+            previous = out.get(occ, {}).get("cost", 0.0)
+            out[occ] = {"underlying": parsed["underlying"], "lane": lane,
+                        "cost": previous + cost if key == "orders" else max(previous, cost)}
+    return out
+
+
 async def _book_kill_states(client):
     """KS-6: per-book kill-switch states for the direct-fire lanes. None
     means UNREADABLE, and a lane must not fire on None -- the same
@@ -324,9 +504,9 @@ def _occ_match(occ: str, underlying: str, opt_type: str, strike: float,
 class OptionsScannerAgent(Agent):
     _last_rescore: float = 0.0
     _harvested: set = set()      # option-row ids already sent a harvest order
-    _long_fired: set = set()     # 'L:SYM:date' one-shot guard for long entries
-    _spread_fired: set = set()   # 'S:date' one-new-spread-per-day guard
-    _day_fired: set = set()      # 'D:date:SYM' same-day entry guards
+    _long_fired: set = set()     # 'L:book:SYM:date' one-shot guard
+    _spread_fired: set = set()   # 'S:book:date' one spread/day/book
+    _day_fired: set = set()      # 'D:book:date:SYM' same-day guards
     _short_low: dict = {}        # row id -> lowest premium ratio seen (short legs)
     _short_low_at: dict = {}     # row id -> (low, unix ts when it last improved)
     _short_step: dict = {}       # row id -> ratio at which the last step fired
@@ -572,7 +752,7 @@ class OptionsScannerAgent(Agent):
     # tick wholesale once the market-wide wheel pass outgrew 15 minutes.
     # 45 minutes of headroom; the per-step budgets below sum to 2400s,
     # so every step concludes (works or names itself) well inside it.
-    tick_timeout_seconds = 3600  # raised 08-28: run_wheel legitimately needs >900s live
+    tick_timeout_seconds = 5400  # independent option passes retain each book's own time budget
 
     async def _step(self, name: str, coro, out: list,
                     budget_s: float) -> None:
@@ -612,6 +792,8 @@ class OptionsScannerAgent(Agent):
                                  payload={"note": "Supabase not configured."})]
 
         out: list[AgentMessage] = []
+        from app.brokers.accounts import load_accounts
+        book_count = max(1, len(load_accounts()))
 
         # --- 1. SETTLE expired positions -----------------------------------
         await self._step("settle_expired", self._settle_expired(client),
@@ -633,13 +815,13 @@ class OptionsScannerAgent(Agent):
 
         # --- 5. DIRECTIONAL: long calls/puts on the leading generals -------
         await self._step("directional", self._run_directional(client),
-                         out, 240)
+                         out, 240 * book_count + 30)
 
         # --- 6. SPREADS: defined-risk multi-leg, one ticket at Alpaca ------
-        await self._step("spreads", self._run_spreads(client), out, 180)
+        await self._step("spreads", self._run_spreads(client), out, 180 * book_count + 30)
 
         # --- 7. SAME-DAY options: morning gamma, managed on a 60s leash ----
-        await self._step("same_day", self._run_same_day(client), out, 180)
+        await self._step("same_day", self._run_same_day(client), out, 180 * book_count + 30)
 
         if not out:
             out.append(AgentMessage(agent=self.name, kind="info",
@@ -660,16 +842,47 @@ class OptionsScannerAgent(Agent):
         early or we leave. Strikes lean ITM/ATM so delta stays honest.
         PDT-aware: under $25k equity the 3-day-trades-per-5-sessions
         budget is shared with the stock scalps -- this lane never spends
-        the last slot. Switch TREZO_DAY_OPTIONS (NEQ-09: Settings-first,
-        default OFF -- the lane fires only when it is explicitly true)."""
+        the last slot. Availability comes from each book's day_options_enabled."""
+        return await self._run_lane_books(client, "day_options_enabled",
+                                         "option_same_day", self._run_same_day_for)
+
+    def _lane_receipt(self, uid: str, lane: str, reason: str) -> AgentMessage:
+        from app.agents.activity_log import record
+        record("option_lane_status", "ACCOUNT", strategy=lane, reason=reason,
+               extra={"user_id": uid})
+        return AgentMessage(agent=self.name, kind="info", payload={
+            "event": "option_lane_status", "user_id": uid, "lane": "option",
+            "strategy": lane, "reason": reason})
+
+    async def _run_lane_books(self, client, flag: str, lane: str, fn):
+        """Every registered paper book decides for itself; no anchor toggle."""
+        from app.brokers.accounts import load_accounts
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
         out: list[AgentMessage] = []
-        if not _lane_enabled("TREZO_DAY_OPTIONS"):
-            return out
-        uid = _primary_book()
-        if not uid:
-            return out
-        return await self._run_bound(client, uid, "option_same_day",
-                                     self._run_same_day_for)
+        for book in load_accounts():
+            uid = str(book.user_id)
+            try:
+                cfg = get_bot_settings(uid)
+                if is_fallback_settings(cfg):
+                    out.append(self._lane_receipt(uid, lane, "settings_unavailable for this book"))
+                    continue
+                if not getattr(cfg, "auto_trade_enabled", True):
+                    out.append(self._lane_receipt(uid, lane, "auto-trade is off for this book"))
+                    continue
+                if not getattr(cfg, flag, True):
+                    out.append(self._lane_receipt(uid, lane, f"{flag} is off for this book"))
+                    continue
+                budget = 240 if lane == "option_directional" else 180
+                messages = await asyncio.wait_for(
+                    self._run_bound(client, uid, lane, fn), timeout=budget)
+                out.extend(messages or [])
+                if not messages:
+                    out.append(self._lane_receipt(uid, lane, "scan completed without a new order"))
+            except Exception as exc:
+                # One book's failure cannot cancel evaluation of the rest.
+                out.append(self._lane_receipt(uid, lane,
+                                             f"scan failed: {type(exc).__name__}: {str(exc)[:120]}"))
+        return out
 
     async def _run_bound(self, client, uid: str, where: str, fn):
         """Run one direct-fire lane body with the book's broker account
@@ -691,13 +904,7 @@ class OptionsScannerAgent(Agent):
         out: list[AgentMessage] = []
         today_s = date.today().isoformat()
         try:
-            from datetime import datetime as _dtn
-            from datetime import timezone as _tzn
-            _now = _dtn.now(_tzn.utc)
-            _h = _now.hour + _now.minute / 60.0
-            # ~9:35-11:30 ET: 13.58-15.5 UTC in EDT, 14.58-16.5 in EST --
-            # accept the union (DST-naive, same approach as STMS).
-            if not (13.58 <= _h <= 16.5):
+            if not _same_day_entry_open():
                 return out
             from app.brokers.alpaca import (
                 alpaca_configured, get_account, get_clock,
@@ -710,8 +917,9 @@ class OptionsScannerAgent(Agent):
                 return out
             acct = await get_account()
             _eq = float(getattr(acct, "equity", 0) or 0)
-            if int(getattr(acct, "options_approved_level", 0) or 0) < 2:
-                return out
+            permission = _option_permission(acct, 2)
+            if permission:
+                return [self._lane_receipt(uid, "option_same_day", permission)]
             # PDT: FINRA ELIMINATED the pattern-day-trader rule and the
             # $25k minimum effective 2026-06-04 (SEC approved 2026-04-14);
             # only the standard $2k margin-account floor remains. Brokers
@@ -721,8 +929,8 @@ class OptionsScannerAgent(Agent):
             # the lane down for the rest of the day.
             _pdt_floor = float(_oso.getenv("TREZO_PDT_MIN_EQUITY", "2000"))
             if _eq < _pdt_floor:
-                if f"pdt:{today_s}" not in OptionsScannerAgent._day_fired:
-                    OptionsScannerAgent._day_fired.add(f"pdt:{today_s}")
+                if f"pdt:{uid}:{today_s}" not in OptionsScannerAgent._day_fired:
+                    OptionsScannerAgent._day_fired.add(f"pdt:{uid}:{today_s}")
                     from app.agents.activity_log import record as _arec
                     _arec("option_day_skip", "ACCOUNT",
                           reason=(f"same-day options paused: equity "
@@ -730,7 +938,7 @@ class OptionsScannerAgent(Agent):
                                   f"margin floor"),
                           extra={"user_id": uid})
                 return out
-            if f"pdtstop:{today_s}" in OptionsScannerAgent._day_fired:
+            if f"pdtstop:{uid}:{today_s}" in OptionsScannerAgent._day_fired:
                 return out
             if await _user_halted(client, uid):
                 return out
@@ -804,16 +1012,18 @@ class OptionsScannerAgent(Agent):
             except Exception:  # noqa: BLE001
                 pass
 
-            def _q_open():
-                return (client.table("options_positions")
-                        .select("id").eq("user_id", uid)
-                        .eq("status", "open")
-                        .eq("strategy", "option_day").execute())
-            _openr = (await asyncio.to_thread(_q_open)).data or []
-            if len(_openr) >= _max_open:
-                return out
+            inventory = await _option_inventory(client, uid)
+            if inventory is None:
+                return [self._lane_receipt(uid, "option_same_day", "option exposure unreadable")]
+            day_open = [row for row in _long_option_inventory(inventory).values()
+                        if row["lane"] == "option_day"]
+            if len(day_open) >= _max_open:
+                return [self._lane_receipt(uid, "option_same_day", "open-position cap reached")]
+            _budget = max(0.0, _budget - sum(row["cost"] for row in day_open))
+            if _budget <= 0:
+                return [self._lane_receipt(uid, "option_same_day", "same-day budget already reserved")]
             _fired_today = [k for k in OptionsScannerAgent._day_fired
-                            if k.startswith(f"D:{today_s}:")]
+                            if k.startswith(f"D:{uid}:{today_s}:")]
             if len(_fired_today) >= _max_day:
                 return out
             # Candidates: index ETFs first (true same-day expiries), then
@@ -845,7 +1055,7 @@ class OptionsScannerAgent(Agent):
             scored = []
             for sym in cands:
                 _sym_ct = len([k for k in OptionsScannerAgent._day_fired
-                               if k.startswith(f"D:{today_s}:{sym}#")])
+                               if k.startswith(f"D:{uid}:{today_s}:{sym}#")])
                 if _sym_ct >= _max_sym:
                     continue
                 cnd = await fetch_candles_for(sym, "stock")
@@ -886,7 +1096,8 @@ class OptionsScannerAgent(Agent):
                 return out          # this lane trades SHORT-dated only
             prem = float(getattr(pick, "premium", 0) or 0)
             debit = prem * 100.0
-            if prem <= 0 or debit > _budget:
+            _entry_limit = round(prem * 1.05, 2)
+            if prem <= 0 or _entry_limit * 100 > _budget:
                 return out
             # Profit-probability screen (Mike 2026-07-14: "not cheap or
             # expensive but the profit probability that can be recovered
@@ -897,19 +1108,19 @@ class OptionsScannerAgent(Agent):
                 return out
             # The BUDGET is the cap, not an arbitrary contract count.
             _ctn = max(1, min(int(_oso.getenv("TREZO_DAY_OPT_CT_MAX", "10")),
-                              int(_budget // max(debit, 1.0))))
+                              int(_budget // max(_entry_limit * 100, 1.0))))
             _sym_ct2 = len([k for k in OptionsScannerAgent._day_fired
-                            if k.startswith(f"D:{today_s}:{sym}#")])
+                            if k.startswith(f"D:{uid}:{today_s}:{sym}#")])
             OptionsScannerAgent._day_fired.add(
-                f"D:{today_s}:{sym}#{_sym_ct2 + 1}")
+                f"D:{uid}:{today_s}:{sym}#{_sym_ct2 + 1}")
             order, err = await submit_option_order(
                 str(pick.occ), _ctn, "buy", time_in_force="day",
-                limit_price=round(prem * 1.05, 2))
+                limit_price=_entry_limit)
             from app.agents.activity_log import record as _arec
             if err or not order:
                 _el = str(err or "").lower()
                 if any(t in _el for t in ("pattern day", "day trade", "pdt")):
-                    OptionsScannerAgent._day_fired.add(f"pdtstop:{today_s}")
+                    OptionsScannerAgent._day_fired.add(f"pdtstop:{uid}:{today_s}")
                     _arec("option_day_skip", "ACCOUNT",
                           reason=("broker still enforces day-trade limits "
                                   "(PDT phase-in) -- same-day lane stands "
@@ -959,10 +1170,13 @@ class OptionsScannerAgent(Agent):
                 agent=self.name, kind="execute",
                 payload={"user_id": uid, "event": "option_day_open",
                          "lane": "option", "ticker": sym,
+                         "position_side": "long", "option_type": opt_type,
+                         "underlying_direction": "bullish" if opt_type == "call" else "bearish",
                          "underlying": sym, "occ": str(pick.occ),
                          "debit_usd": round(debit * _ctn, 2)}))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            out.append(self._lane_receipt(uid, "option_same_day",
+                                         f"scan failed: {type(exc).__name__}: {str(exc)[:120]}"))
         return out
 
     async def _run_spreads(self, client) -> list[AgentMessage]:
@@ -977,25 +1191,19 @@ class OptionsScannerAgent(Agent):
         time, one NEW spread per day, the credit must be real DOLLARS
         toward the daily goal (TREZO_SPREAD_MIN_CREDIT, default $20;
         10% pennies-vs-wing floor), and the market must be open. Kill
-        switch TREZO_SPREADS (NEQ-09: Settings-first, default OFF).
+        switch is the book's own spreads_enabled setting.
         Exits v1: spreads are built to be HELD -- expiry settles them and
         the wings cap the loss; the hourly re-score skips multi-leg rows
         so it never prices one leg as the whole position."""
-        out: list[AgentMessage] = []
-        if not _lane_enabled("TREZO_SPREADS"):
-            return out
-        uid = _primary_book()
-        if not uid:
-            return out
-        return await self._run_bound(client, uid, "option_spreads",
-                                     self._run_spreads_for)
+        return await self._run_lane_books(client, "spreads_enabled",
+                                         "option_spreads", self._run_spreads_for)
 
     async def _run_spreads_for(self, client, uid: str) -> list[AgentMessage]:
         """Body of _run_spreads; entered only through _run_bound."""
         import os as _oso
         out: list[AgentMessage] = []
         today_s = date.today().isoformat()
-        if f"S:{today_s}" in OptionsScannerAgent._spread_fired:
+        if f"S:{uid}:{today_s}" in OptionsScannerAgent._spread_fired:
             return out
         try:
             from app.brokers.alpaca import (
@@ -1007,24 +1215,35 @@ class OptionsScannerAgent(Agent):
             if not clock or not clock.get("is_open"):
                 return out
             acct = await get_account()
-            if int(getattr(acct, "options_approved_level", 0) or 0) < 3:
-                return out          # spreads need Level 3
+            permission = _option_permission(acct, 3)
+            if permission:
+                return [self._lane_receipt(uid, "option_spreads", permission)]
             if await _user_halted(client, uid):
                 return out
             _risk_cap = float(_oso.getenv("TREZO_SPREAD_RISK_USD", "150"))
             _max_open = int(_oso.getenv("TREZO_SPREAD_OPEN", "1"))
 
-            def _q_open():
-                return (client.table("options_positions")
-                        .select("id, strategy").eq("user_id", uid)
-                        .eq("status", "open")
-                        .in_("strategy", ["bull_put_spread",
-                                          "bear_call_spread", "iron_condor",
-                                          "butterfly", "bull_call_spread"])
-                        .execute())
-            _open = (await asyncio.to_thread(_q_open)).data or []
+            inventory = await _option_inventory(client, uid)
+            if inventory is None:
+                return [self._lane_receipt(uid, "option_spreads", "option exposure unreadable")]
+            spread_names = {"bull_put_spread", "bear_call_spread", "iron_condor",
+                            "butterfly", "bull_call_spread"}
+            _open = {_option_underlying(row)
+                     for key in ("tracked", "ledger") for row in inventory[key]
+                     if str(row.get("strategy") or "") in spread_names}
+            _open.update(_option_underlying(leg)
+                         for order in inventory["orders"]
+                         if str(order.get("order_class") or "") == "mleg"
+                         for leg in (order.get("legs") or [order]))
+            broker_groups: dict[str, set] = {}
+            for row in inventory["positions"]:
+                root, occ = _option_underlying(row), _row_occ(row)
+                if root and occ:
+                    broker_groups.setdefault(root, set()).add(occ)
+            _open.update(root for root, contracts in broker_groups.items() if len(contracts) >= 2)
+            _open.discard("")
             if len(_open) >= _max_open:
-                return out
+                return [self._lane_receipt(uid, "option_spreads", "open-position cap reached")]
 
             # Pick the play: ride the leading general when it is moving;
             # sell the quiet range on SPY when nothing is.
@@ -1057,6 +1276,9 @@ class OptionsScannerAgent(Agent):
                     play = build_iron_condor("SPY", cnd)
             if not play:
                 return out
+            if _option_exposure_on(inventory, play.underlying):
+                return [self._lane_receipt(uid, "option_spreads",
+                                          "an option is already held or working on the candidate")]
             # KS-6: this book's verdict for the chosen structure
             # (credit spreads / condors tighten in recovery; a debit
             # spread or butterfly is suspended). Unreadable -> no fire.
@@ -1087,6 +1309,8 @@ class OptionsScannerAgent(Agent):
             # Resolve every modeled leg to a REAL listed contract, live-priced.
             from app.brokers.alpaca_data import live_option_pick
             mlegs: list[dict] = []
+            live_legs: list[dict] = []
+            live_expiration = None
             seen_occ: dict[str, int] = {}
             net = 0.0
             for leg in play.legs:
@@ -1095,10 +1319,17 @@ class OptionsScannerAgent(Agent):
                     float(leg.get("strike") or 0), str(play.expiration))
                 if not pk:
                     return out
+                if live_expiration is not None and str(pk.expiration) != live_expiration:
+                    return [self._lane_receipt(uid, "option_spreads", "live legs have different expirations")]
+                live_expiration = str(pk.expiration)
+                live_legs.append({**leg, "strike": float(pk.strike),
+                                  "premium": float(pk.premium), "occ": str(pk.occ)})
                 sgn = 1.0 if str(leg.get("action")) == "sell" else -1.0
                 net += sgn * float(pk.premium)
                 occ = str(pk.occ)
                 if occ in seen_occ:
+                    if mlegs[seen_occ[occ]]["side"] != str(leg.get("action")):
+                        return [self._lane_receipt(uid, "option_spreads", "live legs collapse onto one contract")]
                     mlegs[seen_occ[occ]]["ratio_qty"] += 1
                     continue
                 seen_occ[occ] = len(mlegs)
@@ -1114,9 +1345,26 @@ class OptionsScannerAgent(Agent):
             if net * 100.0 < _min_credit * 0.8:
                 return out          # live quotes must still pay real dollars
 
+            # The listed strikes may differ from the model. Recompute the
+            # maximum expiry liability from the REAL legs and executable
+            # credit, before calling a defined-risk ticket safe to place.
+            points = {0.0, *(float(leg["strike"]) for leg in live_legs)}
+            call_slope = sum((1 if leg["action"] == "sell" else -1)
+                             for leg in live_legs if leg["type"] == "call")
+            if call_slope > 0:
+                return [self._lane_receipt(uid, "option_spreads", "live legs have uncapped call risk")]
+            liability = max(sum((1 if leg["action"] == "sell" else -1)
+                                * max(spot - leg["strike"] if leg["type"] == "call"
+                                      else leg["strike"] - spot, 0.0)
+                                for leg in live_legs) for spot in points) * 100.0
+            live_max_loss = max(0.0, liability - round(net * 0.98, 2) * 100.0)
+            if live_max_loss > _risk_cap:
+                return [self._lane_receipt(uid, "option_spreads",
+                                          f"live maximum loss ${live_max_loss:.2f} exceeds ${_risk_cap:.2f} cap")]
+
             # Limit gives 2% toward the fill; negative = net credit (mleg).
             limit = round(-(net * 0.98), 2)
-            OptionsScannerAgent._spread_fired.add(f"S:{today_s}")
+            OptionsScannerAgent._spread_fired.add(f"S:{uid}:{today_s}")
             order, err = await submit_mleg_order(mlegs, qty=1,
                                                  limit_price=limit)
             from app.agents.activity_log import record as _arec
@@ -1137,10 +1385,10 @@ class OptionsScannerAgent(Agent):
                     "direction": play.direction,
                     "option_type": str(_short_leg.get("type") or "put"),
                     "strike": float(_short_leg.get("strike") or 0),
-                    "expiration": str(play.expiration),
+                    "expiration": live_expiration,
                     "contracts": 1,
                     "net_premium_usd": round(net * 100.0, 2),
-                    "legs": play.legs,
+                    "legs": live_legs,
                     "notes": (f"Placed via Alpaca (mleg): {play.strategy} -- "
                               f"live net credit ${net * 100:.0f}; max loss "
                               f"capped by the wings. "
@@ -1151,7 +1399,7 @@ class OptionsScannerAgent(Agent):
                   strategy=play.strategy,
                   reason=(f"{play.strategy} opened as ONE ticket -- net "
                           f"credit ~${net * 100:.0f}, max loss "
-                          f"${float(play.max_loss_usd):.0f} (the wings are "
+                          f"${live_max_loss:.0f} (the wings are "
                           f"the stop)"),
                   extra={"user_id": uid})
             out.append(AgentMessage(
@@ -1160,9 +1408,14 @@ class OptionsScannerAgent(Agent):
                          "lane": "option", "ticker": play.underlying,
                          "underlying": play.underlying,
                          "strategy": play.strategy,
+                         "underlying_direction": ("bearish" if float(play.net_delta or 0) < 0
+                                                  else "bullish" if float(play.net_delta or 0) > 0
+                                                  else "neutral"),
+                         "max_loss_usd": round(live_max_loss, 2),
                          "net_credit_usd": round(net * 100, 2)}))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            out.append(self._lane_receipt(uid, "option_spreads",
+                                         f"scan failed: {type(exc).__name__}: {str(exc)[:120]}"))
         return out
 
     async def _run_directional(self, client) -> list[AgentMessage]:
@@ -1177,15 +1430,9 @@ class OptionsScannerAgent(Agent):
             one shot per underlying per day, one new entry per tick
           - exits live in the hourly re-score: +40% harvest, -50% cut,
             and always out by DTE <= 3 (no expiry roulette)
-        Switch TREZO_LONG_OPTIONS (NEQ-09: Settings-first, default OFF)."""
-        out: list[AgentMessage] = []
-        if not _lane_enabled("TREZO_LONG_OPTIONS"):
-            return out
-        uid = _primary_book()
-        if not uid:
-            return out
-        return await self._run_bound(client, uid, "option_directional",
-                                     self._run_directional_for)
+        Availability is the book's own long_options_enabled setting."""
+        return await self._run_lane_books(client, "long_options_enabled",
+                                         "option_directional", self._run_directional_for)
 
     async def _run_directional_for(self, client, uid: str) -> list[AgentMessage]:
         """Body of _run_directional; entered only through _run_bound."""
@@ -1200,14 +1447,18 @@ class OptionsScannerAgent(Agent):
             return out
         try:
             from app.brokers.alpaca import (
-                alpaca_configured, get_account, submit_option_order,
+                alpaca_configured, get_account, get_clock, submit_option_order,
             )
             if not alpaca_configured():
                 return out
             acct = await get_account()
             _eq = float(getattr(acct, "equity", 0) or 0)
-            if int(getattr(acct, "options_approved_level", 0) or 0) < 2:
-                return out      # long options need approval level >= 2
+            permission = _option_permission(acct, 2)
+            if permission:
+                return [self._lane_receipt(uid, "option_directional", permission)]
+            clock = await get_clock()
+            if not clock or not clock.get("is_open"):
+                return [self._lane_receipt(uid, "option_directional", "market closed or clock unreadable")]
             if await _user_halted(client, uid):
                 return out
             # KS-6: read once per lane pass; unreadable -> the lane does
@@ -1226,29 +1477,27 @@ class OptionsScannerAgent(Agent):
             _max_open = int(_oso.getenv("TREZO_LONG_OPT_OPEN", "2"))
             _min_d3 = float(_oso.getenv("TREZO_LONG_OPT_MIN_D3", "2.5"))
 
-            def _q_open():
-                return (client.table("options_positions")
-                        .select("id, underlying")
-                        .eq("user_id", uid).eq("status", "open")
-                        .like("strategy", "long_%").execute())
-            _open = (await asyncio.to_thread(_q_open)).data or []
+            inventory = await _option_inventory(client, uid)
+            if inventory is None:
+                return [self._lane_receipt(uid, "option_directional", "option exposure unreadable")]
+            _open = [row for row in _long_option_inventory(inventory).values()
+                     if row["lane"] == "long"]
             if len(_open) >= _max_open:
-                return out
-            _held = {str(x.get("underlying") or "").upper() for x in _open}
+                return [self._lane_receipt(uid, "option_directional", "open-position cap reached")]
+            _held = {row["underlying"] for row in _open}
             today_s = date.today().isoformat()
             # Mike 2026-07-14: he buys on VOLATILITY and VOLUME -- the
             # day-trade lens. Strongest absolute movers first (puts need
             # the down-leaders as much as calls need the up-leaders).
             _gens_ranked = sorted(
-                gens[:10],
-                key=lambda x: -abs(float(x.get("d3") or 0)))
+                gens, key=lambda x: -abs(float(x.get("d3") or 0)))[:10]
             for g in _gens_ranked:
                 sym = str(g.get("sym") or "").upper()
                 try:
                     d3 = float(g.get("d3") or 0)
                 except Exception:  # noqa: BLE001
                     continue
-                _ck = f"L:{sym}:{today_s}"
+                _ck = f"L:{uid}:{sym}:{today_s}"
                 if (not sym or sym in _held or abs(d3) < _min_d3
                         or _ck in OptionsScannerAgent._long_fired):
                     continue
@@ -1292,17 +1541,18 @@ class OptionsScannerAgent(Agent):
                 prem = float(getattr(pick, "premium", 0) or 0)
                 debit = prem * 100.0
                 _budget = min(_cap_usd, 0.03 * max(_eq, 1.0))
-                if prem <= 0 or debit > _budget:
+                _entry_limit = round(prem * 1.05, 2)
+                if prem <= 0 or _entry_limit * 100 > _budget:
                     continue
                 # Multi-contract when the budget covers cheap contracts
                 # (Mike: 3 contracts x $15 profit = the day's 1%) -- the
                 # 15% fast-take in the re-score needs the count.
                 _ctn = max(1, min(int(_oso.getenv("TREZO_LONG_OPT_CT_MAX", "10")),
-                                  int(_budget // max(debit, 1.0))))
+                                  int(_budget // max(_entry_limit * 100, 1.0))))
                 OptionsScannerAgent._long_fired.add(_ck)
                 order, err = await submit_option_order(
                     str(pick.occ), _ctn, "buy", time_in_force="day",
-                    limit_price=round(prem * 1.05, 2))
+                    limit_price=_entry_limit)
                 from app.agents.activity_log import record as _arec
                 if err or not order:
                     _arec("option_long_blocked", sym,
@@ -1340,11 +1590,14 @@ class OptionsScannerAgent(Agent):
                     agent=self.name, kind="execute",
                     payload={"user_id": uid, "event": "long_option_open",
                              "lane": "option", "ticker": sym,
+                             "position_side": "long", "option_type": opt_type,
+                             "underlying_direction": "bullish" if opt_type == "call" else "bearish",
                              "underlying": sym, "occ": str(pick.occ),
-                             "debit_usd": round(debit, 2)}))
+                             "debit_usd": round(debit * _ctn, 2)}))
                 break   # one new long option per tick, by design
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            out.append(self._lane_receipt(uid, "option_directional",
+                                         f"scan failed: {type(exc).__name__}: {str(exc)[:120]}"))
         return out
 
     async def _settle_expired(self, client) -> list[AgentMessage]:
@@ -1882,7 +2135,7 @@ class OptionsScannerAgent(Agent):
             ))
         return out
 
-    async def _reconcile_with_broker(self, client) -> list[AgentMessage]:
+    async def _reconcile_with_broker(self, client, *, user_id: str | None = None) -> list[AgentMessage]:
         """For every user with a live Alpaca connection: any open modeled
         row that has no matching contract at the broker is closed_manual.
 
@@ -1893,12 +2146,13 @@ class OptionsScannerAgent(Agent):
         next step onto the wrong account."""
         from app.brokers.accounts import clear_account
         try:
-            return await self._reconcile_books(client)
+            return await self._reconcile_books(client, user_id=user_id)
         finally:
             clear_account()
 
-    async def _reconcile_books(self, client) -> list[AgentMessage]:
+    async def _reconcile_books(self, client, *, user_id: str | None = None) -> list[AgentMessage]:
         """Body of _reconcile_with_broker; entered only through it."""
+        requested_book = user_id
         from app.brokers.alpaca import (
             UserToken, get_option_positions_strict, alpaca_configured,
         )
@@ -1916,27 +2170,43 @@ class OptionsScannerAgent(Agent):
             # the credit, but this select never fetched it -- every
             # reconciled short booked 0 - buyback (a loss the size of the
             # buy-back) and every long booked raw proceeds. Fetch it.
-            return (
+            query = (
                 client.table("options_positions")
                 .select("id, user_id, underlying, strategy, option_type, "
                         "strike, expiration, contracts, notes, "
                         "net_premium_usd")
                 .eq("status", "open")
-                .execute()
             )
-        rows = (await asyncio.to_thread(_sync_open)).data or []
+            if user_id is not None:
+                query = query.eq("user_id", user_id)
+            return query.execute()
+        try:
+            rows = (await asyncio.to_thread(_sync_open)).data
+            if not isinstance(rows, list):
+                raise ValueError("option tracking response unreadable")
+        except Exception:
+            if requested_book is not None:
+                return [AgentMessage(agent=self.name, kind="error", payload={
+                    "event": "reconcile_skipped_unreadable", "status": "failed",
+                    "user_id": requested_book, "reason": "option tracking ledger unreadable"})]
+            raise
         # 2026-07-15: no early return on empty -- the ADOPT pass below must
         # run even when the books hold nothing (that is exactly the broken
         # state it heals: broker holds an option, books show none).
 
         by_user: dict[str, list[dict]] = {}
         for r in rows:
+            if user_id is not None and str(r.get("user_id")) != user_id:
+                continue
             by_user.setdefault(str(r["user_id"]), []).append(r)
-        # NEQ-09: Settings-first primary id (os.getenv never saw .env, so
-        # the primary's adopt pass never ran when it held no open row).
-        _prim = _primary_book()
-        if _prim and _prim not in by_user:
-            by_user[_prim] = []
+        # The scheduled pass visits every registered book even when empty;
+        # a user-requested reconciliation stays pinned to the selected book.
+        from app.brokers.accounts import load_accounts
+        if user_id is not None:
+            by_user.setdefault(user_id, [])
+        else:
+            for book in load_accounts():
+                by_user.setdefault(str(book.user_id), [])
 
         for user_id, user_rows in by_user.items():
             # TE-15: bind THIS book before any broker read below. Unbound,
@@ -1950,6 +2220,10 @@ class OptionsScannerAgent(Agent):
             _rok, _rnote = _rt_check(str(user_id))
             if not _rok:
                 _rt_mm("ACCOUNT", str(user_id), _rnote, "option_reconcile")
+                if requested_book is not None:
+                    out.append(AgentMessage(agent=self.name, kind="error", payload={
+                        "event": "route_mismatch", "status": "failed", "user_id": user_id,
+                        "reason": _rnote}))
                 continue
             # Skip users with no live Alpaca connection (and no env-key
             # broker either — those stay in pure modeled mode).
@@ -1962,6 +2236,10 @@ class OptionsScannerAgent(Agent):
                     expires_at=bt.expires_at,
                 )
             if token is None and not alpaca_configured():
+                if requested_book is not None:
+                    out.append(AgentMessage(agent=self.name, kind="error", payload={
+                        "event": "reconcile_skipped_unreadable", "status": "failed",
+                        "user_id": user_id, "reason": "broker credentials unavailable"}))
                 continue
 
             try:
@@ -1969,6 +2247,10 @@ class OptionsScannerAgent(Agent):
             except Exception:  # noqa: BLE001
                 broker_options = None
             if broker_options is None:
+                if requested_book is not None:
+                    out.append(AgentMessage(agent=self.name, kind="error", payload={
+                        "event": "reconcile_skipped_unreadable", "status": "failed",
+                        "user_id": user_id, "reason": "broker option positions unreadable"}))
                 # TE-15 (audit 2026-09-01): the 2026-07-15 comment that
                 # stood here claimed a failed fetch was skipped. It was
                 # not: get_option_positions() returned [] on failure, so
@@ -2312,6 +2594,8 @@ class OptionsScannerAgent(Agent):
         strategy: str,
         priced: str,
         client=None,
+        limit_price: float | None = None,
+        manual: bool = False,
     ):
         """Fire a Wheel CSP / CC order on Alpaca, mirroring the same
         primitives /wheel/place-leg uses for the manual button.
@@ -2367,6 +2651,17 @@ class OptionsScannerAgent(Agent):
         if not _rok:
             _rt_mm(underlying, str(user_id or ""), _rnote, "wheel_fire")
             return None
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        cfg = get_bot_settings(user_id)
+        if (is_fallback_settings(cfg) or (not manual and (
+                not getattr(cfg, "auto_trade_enabled", True)
+                or not getattr(cfg, "wheel_auto_execute", False)))):
+            return self._lane_receipt(user_id, strategy,
+                                     "settings_unavailable or automatic Wheel trading is off for this book")
+        if limit_price is not None:
+            import math
+            if not math.isfinite(float(limit_price)) or float(limit_price) <= 0:
+                return self._lane_receipt(user_id, strategy, "limit price must be positive and finite")
         token: "UserToken | None" = None
         routed = "env-keys"
         bt = await get_user_broker_token(user_id, "alpaca")
@@ -2378,11 +2673,11 @@ class OptionsScannerAgent(Agent):
             )
             routed = "user-oauth"
 
-        # Options-approval gate. Mike has Level 3 paper; Level 1 is the
-        # minimum the Wheel needs (covered CSP + CC).
+        # Each book supplies its own permission. Approval alone is not
+        # sufficient if that book has selected a lower active trading level.
         acct = await get_account(token=token)
-        approval = int(getattr(acct, "options_approved_level", 0) or 0)
-        if approval < 1:
+        permission = _option_permission(acct, 1)
+        if permission:
             return AgentMessage(
                 agent=self.name, kind="info",
                 payload={
@@ -2390,14 +2685,25 @@ class OptionsScannerAgent(Agent):
                     "event": "wheel_auto_blocked",
                     "underlying": underlying,
                     "strategy": strategy,
-                    "reason": (
-                        f"Alpaca options approval level {approval} - "
-                        f"need >= 1 to fire CSP / CC. Apply on Alpaca "
-                        f"(Account - Configure - Options trading)."
-                    ),
+                    "reason": permission,
                     "routed_via": routed,
                 },
             )
+
+        # Refresh immediately before writing: both ledgers and working
+        # broker orders can hold exposure that a positions-only read misses.
+        inventory = await _option_inventory(client, user_id)
+        blocked = ("positions, working orders, or option ledger unreadable"
+                   if inventory is None else
+                   _covered_call_reason(inventory, underlying, int(leg.contracts or 1))
+                   if strategy == "wheel_cc" else
+                   "an option is already held, tracked, or working on this underlying"
+                   if _option_exposure_on(inventory, underlying) else None)
+        if blocked:
+            return AgentMessage(agent=self.name, kind="info", payload={
+                "user_id": user_id, "event": "wheel_auto_blocked",
+                "underlying": underlying, "strategy": strategy,
+                "reason": blocked, "routed_via": routed})
 
         # Find the actual listed contract closest to our target.
         opt_type = "put" if strategy == "wheel_csp" else "call"
@@ -2484,8 +2790,8 @@ class OptionsScannerAgent(Agent):
                     # DTE gate: no long lock-ups on small accounts.
                     try:
                         from datetime import date as _dd
-                        _exp = str(getattr(leg, "expiration", None)
-                                   or getattr(pick, "expiration", "") or "")[:10]
+                        _exp = str(getattr(pick, "expiration", None)
+                                   or getattr(leg, "expiration", "") or "")[:10]
                         if len(_exp) == 10:
                             _dte_v = (_dd.fromisoformat(_exp) - _dd.today()).days
                             if _dte_v > _max_dte:
@@ -2505,74 +2811,7 @@ class OptionsScannerAgent(Agent):
                     except Exception:  # noqa: BLE001
                         pass
                     if _eq > 0 and _cap_pct > 0:
-                        from app.runtime.settings import _supabase as _sb
-                        _cl = _sb()
-                        if _cl is None:
-                            raise RuntimeError("no client")
-                        def _q_csp():
-                            return (_cl.table("options_positions")
-                                    .select("strike, contracts")
-                                    .eq("user_id", user_id)
-                                    .eq("status", "open")
-                                    .eq("strategy", "wheel_csp")
-                                    .execute())
-                        import asyncio as _aio
-                        _open_csp = (await _aio.to_thread(_q_csp)).data or []
-                        _held_coll = sum(
-                            float(x.get("strike") or 0) * 100.0
-                            * int(x.get("contracts") or 1)
-                            for x in _open_csp)
-                        # BROKER-TRUTH merge (2026-07-22): Monday's four
-                        # CSPs fired minutes apart -- each gate query ran
-                        # before the prior fire's tracking row landed, so
-                        # every check saw zero open. The broker's own
-                        # short puts are the truth the DB cannot lag:
-                        # count them too and take the stricter view.
-                        _brk_csp_n = 0
-                        _brk_coll = 0.0
-                        # rv:options_scanner :2390 / OG-9: the STRICT
-                        # read, under this book's token. The display read
-                        # collapsed a 429/timeout into [] and this gate
-                        # silently lost its broker-truth half -- the DB
-                        # count still governed (max of the two), so
-                        # nothing fired wrongly, but the 2026-07-22
-                        # DB-lag race quietly reopened on every failed
-                        # read. On None the gate falls back to the DB
-                        # count and SAYS so.
-                        _brk_rows = None
-                        try:
-                            from app.brokers.alpaca import (
-                                get_option_positions_strict as _gops,
-                            )
-                            _brk_rows = await _gops(token=token)
-                        except Exception:  # noqa: BLE001
-                            _brk_rows = None
-                        if _brk_rows is None:
-                            try:
-                                from app.agents.activity_log import (
-                                    record as _arecu)
-                                _arecu("wheel_limit_unreadable", underlying,
-                                       reason=(f"broker option positions "
-                                               f"unreadable -- CSP gate "
-                                               f"judged on the DB count "
-                                               f"alone ({len(_open_csp)} "
-                                               f"open) this tick"),
-                                       extra={"user_id": str(user_id)})
-                            except Exception:  # noqa: BLE001
-                                pass
-                        for _bp in (_brk_rows or []):
-                            try:
-                                _occ = str(_bp.get("symbol") or "")
-                                _bq = float(_bp.get("qty") or 0)
-                                if (len(_occ) > 15 and _occ[-9] == "P"
-                                        and _bq < 0):
-                                    _brk_csp_n += int(abs(_bq))
-                                    _brk_coll += ((int(_occ[-8:]) / 1000.0)
-                                                  * 100.0 * abs(_bq))
-                            except Exception:  # noqa: BLE001
-                                continue
-                        _eff_csp_n = max(len(_open_csp), _brk_csp_n)
-                        _eff_coll = max(_held_coll, _brk_coll)
+                        _eff_csp_n, _eff_coll = _reserved_puts(inventory)
                         # Feed the advisor the SAME ledger the hard cap
                         # uses -- one source, no drift.
                         _adv_lane_cash = _cap_pct * _eq
@@ -2617,8 +2856,9 @@ class OptionsScannerAgent(Agent):
                                     "routed_via": routed,
                                 },
                             )
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:
+                    return self._lane_receipt(user_id, strategy,
+                                             f"collateral check unreadable: {type(exc).__name__}")
                 # 2026-06-16: dropped the "opt_bp and" guard. When buying
                 # power is 0 (small account fully deployed by existing CSPs),
                 # the old guard let the order through to Alpaca, which rejected
@@ -2757,7 +2997,7 @@ class OptionsScannerAgent(Agent):
             contracts=int(leg.contracts or 1),
             side="sell",
             time_in_force="day",
-            limit_price=None,
+            limit_price=limit_price,
             token=token,
         )
         if err or not order:
@@ -2844,6 +3084,8 @@ class OptionsScannerAgent(Agent):
             metadata={
                 "user_id": user_id,
                 "strategy": strategy,
+                "position_side": "short", "option_type": opt_type,
+                "underlying_direction": "bullish" if opt_type == "put" else "bearish",
                 "occ": pick.occ,
                 "strike": pick.strike,
                 "expiration": pick.expiration,
@@ -2859,6 +3101,9 @@ class OptionsScannerAgent(Agent):
             payload={
                 "user_id": user_id,
                 "event": "wheel_auto_placed",
+                "position_side": "short", "option_type": opt_type,
+                "underlying_direction": "bullish" if opt_type == "put" else "bearish",
+                "manual": manual,
                 "lane": "option",           # rv:watchdog-health :949
                 "ticker": underlying,
                 "underlying": underlying,
@@ -2893,8 +3138,8 @@ class OptionsScannerAgent(Agent):
     async def _run_cc_overlay(self, client) -> list[AgentMessage]:
         """CC OVERLAY step. Same binding discipline as _run_wheel: the
         auto-fire binds a book inline, so the step always clears it
-        (rv:options_scanner :2221). The overlay's own broker read
-        (get_positions) rides the book's OAuth token, not the binding."""
+        (rv:options_scanner :2221). Its strict inventory reads use the
+        bound book's env credentials or that same book's OAuth token."""
         from app.brokers.accounts import clear_account
         try:
             return await self._cc_overlay_books(client)
@@ -2926,15 +3171,28 @@ class OptionsScannerAgent(Agent):
                 continue  # one new overlay write per day per user
             if not await _user_has_alpaca(user_id):
                 continue
+            from app.runtime.settings import get_bot_settings, is_fallback_settings
+            cfg = get_bot_settings(user_id)
+            if is_fallback_settings(cfg):
+                out.append(self._lane_receipt(user_id, "wheel_cc", "settings_unavailable for this book"))
+                continue
             try:
-                from app.brokers.alpaca import get_positions, UserToken
-                from app.integrations.web_tokens import get_user_broker_token
-                bt = await get_user_broker_token(user_id, "alpaca")
-                if not bt:
+                from app.brokers.accounts import bind_for_user
+                from app.brokers.route_guard import check_route, record_mismatch
+                with bind_for_user(user_id):
+                    ok, reason = check_route(user_id)
+                    if not ok:
+                        record_mismatch("ACCOUNT", user_id, reason, "cc_overlay")
+                        continue
+                    inventory = await _option_inventory(client, user_id)
+                if inventory is None:
+                    out.append(self._lane_receipt(user_id, "wheel_cc",
+                                                 "positions, working orders, or option ledger unreadable"))
                     continue
-                token = UserToken(bt.access_token)
-                broker = await get_positions(token)
-            except Exception:  # noqa: BLE001
+                broker = inventory["positions"]
+            except Exception as exc:
+                out.append(self._lane_receipt(user_id, "wheel_cc",
+                                             f"coverage check failed: {type(exc).__name__}"))
                 continue
             stocks = []
             for bp in broker or []:
@@ -2957,13 +3215,10 @@ class OptionsScannerAgent(Agent):
 
                 # Never stack premium: any open option row on the name
                 # (wheel, overlay, or directional) blocks a new write.
-                def _sync_open(uid=user_id, sm=sym):
-                    return (
-                        client.table("options_positions").select("id")
-                        .eq("user_id", uid).eq("underlying", sm)
-                        .eq("status", "open").execute()
-                    )
-                if (await asyncio.to_thread(_sync_open)).data:
+                coverage_reason = _covered_call_reason(inventory, sym, lots)
+                if coverage_reason:
+                    out.append(self._lane_receipt(user_id, "wheel_cc",
+                                                 f"{sym}: {coverage_reason}"))
                     continue
                 if _wheel_in_cooldown(user_id, sym, "wheel_cc"):
                     continue
@@ -2995,7 +3250,7 @@ class OptionsScannerAgent(Agent):
                     continue
                 dm = decay_rate_monthly(candles)
                 underwater = spot <= basis * (1.0 - RECOVERY_DISTRESS)
-                _ov_dte = _wheel_dte_pick()
+                _ov_dte = _wheel_dte_pick(user_id)
                 if underwater:
                     leg = evaluate_cc_recovery(
                         sym, candles, basis,
@@ -3062,12 +3317,14 @@ class OptionsScannerAgent(Agent):
                         if ev in ("wheel_auto_blocked",
                                   "wheel_auto_tracking_failed"):
                             _wheel_set_cooldown(user_id, sym, "wheel_cc")
-                        else:
+                        elif fired.kind == "execute":
                             self._overlay_day[user_id] = today
                         fired.payload["overlay"] = True
                         fired.payload["overlay_note"] = note
                         out.append(fired)
-                        break  # one per day - stop scanning this user
+                        if fired.kind == "execute":
+                            break  # one accepted write per day for this book
+                        continue
                     _wheel_set_cooldown(user_id, sym, "wheel_cc")
                     continue
 
@@ -3198,14 +3455,14 @@ class OptionsScannerAgent(Agent):
                         underlying, candles,
                         float(last.get("strike") or 0),
                         days_until_exdiv=cycle_days_to_exdiv,
-                        dte=_wheel_dte_pick(),
+                        dte=_wheel_dte_pick(user_id),
                     )
                     strategy = "wheel_cc"
                 else:
                     leg = evaluate_csp(
                         underlying, candles,
                         decay_monthly=decay_rate_monthly(candles),
-                        dte=_wheel_dte_pick())
+                        dte=_wheel_dte_pick(user_id))
                     if leg:
                         leg = await refine_csp_live(
                             leg, spot=float(candles[-1].close) if candles else None)
@@ -3523,6 +3780,9 @@ class OptionsScannerAgent(Agent):
                     agent=self.name, kind="info",
                     payload={
                         "event": "options_idea",
+                        "underlying_direction": ("bearish" if float(play.net_delta or 0) < 0
+                                                 else "bullish" if float(play.net_delta or 0) > 0
+                                                 else "neutral"),
                         "underlying": play.underlying,
                         "strategy": play.strategy,
                         "direction": play.direction,

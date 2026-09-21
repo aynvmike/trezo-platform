@@ -254,7 +254,10 @@ def test_losing_or_empty_results_never_activate():
         result = _run(Path(directory) / "research.sqlite3", candles=_candles(drift=-0.004))
         assert result["status"] == "completed"
         assert len(result["trials"]) == 4
-        assert all(trial["state"] == "rejected" for trial in result["trials"])
+        assert all(trial["state"] == "rejected" for trial in result["trials"]
+                   if trial["spec"]["direction"] == "long")
+        assert any(trial["train"]["net_pnl_usd"] > 0 for trial in result["trials"]
+                   if trial["spec"]["direction"] == "short")
         assert all(trial["execution_enabled"] is False and trial["forward_evidence_required"]
                    for trial in result["trials"])
 

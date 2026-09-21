@@ -58,7 +58,14 @@ class RoutingProbe:
         self.fanout_calls: list[dict] = []
         self.single_calls: list[str] = []
 
-        async def _fake_fanout(ticker, side, payload):
+        full_book_loop = agent._execute_for_all_users
+
+        async def _fake_fanout(ticker, side, payload, *, only_user_id=None):
+            if only_user_id is not None:
+                # The pin must run the real shared book gates, restricted
+                # to its owner. Only final broker execution is replaced.
+                return await full_book_loop(ticker, side, payload,
+                                            only_user_id=only_user_id)
             self.fanout_calls.append(dict(payload))
             return []
 
@@ -170,7 +177,9 @@ def _single_book_world(states):
     async def _nobody_over(_client):
         return set()
 
-    with _patched(persistence, _client=lambda: None), \
+    from tests.test_fanout_bookkeyed import _FakeClient
+    client = _FakeClient([BOOK])
+    with _patched(persistence, _client=lambda: client), \
          _patched(route_guard, check_route=lambda uid: (True, "ok:test")), \
          _patched(settings_mod,
                   get_bot_settings=lambda uid=None: types.SimpleNamespace(

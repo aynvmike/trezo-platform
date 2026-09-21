@@ -60,11 +60,36 @@ async def list_agents() -> list[AgentInfo]:
 
 # IMPORTANT: register more-specific paths BEFORE the {name} catch-all,
 # otherwise '/agents/feed/recent' would match `{name}` = 'feed'.
+@router.get("/agents/capabilities")
+async def book_capabilities() -> dict[str, Any]:
+    import asyncio
+    from app.brokers.accounts import load_accounts, validation_report
+    from app.runtime.capabilities import capabilities_for_book
+    configured = {a.account_key: a.label for a in load_accounts()}
+    client = _supabase()
+    catalog_error = None
+    if client:
+        try:
+            def _read_books():
+                return client.table("trading_accounts").select("account_key,label").execute()
+            result = await asyncio.to_thread(_read_books)
+            for row in result.data or []:
+                configured[str(row["account_key"])] = row.get("label") or str(row["account_key"])
+        except Exception:
+            catalog_error = "The account directory could not be read; only configured broker accounts are shown."
+    else:
+        catalog_error = "The account directory is unavailable; only configured broker accounts are shown."
+    books = await asyncio.gather(*(capabilities_for_book(key) for key in configured))
+    for book in books:
+        book["label"] = configured[book["book_id"]]
+    return {"books": books, "configuration_notes": validation_report(), "error": catalog_error}
+
+
 @router.get("/agents/feed/recent")
 async def recent_feed(limit: int = 50) -> dict[str, Any]:
     client = _supabase()
     if not client:
-        return {"messages": []}
+        raise HTTPException(status_code=503, detail="Agent activity storage is unavailable")
     try:
         res = (
             client.table("agent_messages")
@@ -86,7 +111,7 @@ async def agent_logs(name: str, limit: int = 50) -> dict[str, Any]:
 
     client = _supabase()
     if not client:
-        return {"agent": name, "messages": []}
+        raise HTTPException(status_code=503, detail="Agent activity storage is unavailable")
 
     try:
         res = (

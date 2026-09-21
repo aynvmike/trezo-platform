@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwnedBook } from "@/lib/book-access";
 
 export const dynamic = "force-dynamic";
 
@@ -11,7 +12,7 @@ export const dynamic = "force-dynamic";
  *   DELETE /api/expert/disabled?ticker=X -> remove one
  */
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const supabase = createClient();
   const {
     data: { user }
@@ -19,10 +20,12 @@ export async function GET() {
   if (!user) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
+  const book = await requireOwnedBook(supabase, user.id, req.nextUrl.searchParams.get("account_key"));
+  if (!book.ok) return book.response;
   const { data, error } = await supabase
     .from("stock_disabled")
     .select("id, ticker, reason, expires_at, created_at")
-    .eq("user_id", user.id)
+    .eq("user_id", book.key)
     .order("created_at", { ascending: false });
   if (error) {
     return NextResponse.json({ ok: false, error: error.message }, { status: 200 });
@@ -39,6 +42,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
   const body = await req.json().catch(() => ({}));
+  const book = await requireOwnedBook(supabase, user.id, body.account_key);
+  if (!book.ok) return book.response;
   const ticker = String(body.ticker ?? "").trim().toUpperCase();
   const reason = body.reason ? String(body.reason).trim() : null;
   const expires_at = body.expires_at ? String(body.expires_at) : null;
@@ -54,7 +59,7 @@ export async function POST(req: NextRequest) {
     .from("stock_disabled")
     .upsert(
       {
-        user_id: user.id,
+        user_id: book.key,
         ticker,
         reason,
         expires_at
@@ -76,13 +81,15 @@ export async function DELETE(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Not signed in." }, { status: 401 });
   }
   const ticker = (req.nextUrl.searchParams.get("ticker") ?? "").trim().toUpperCase();
+  const book = await requireOwnedBook(supabase, user.id, req.nextUrl.searchParams.get("account_key"));
+  if (!book.ok) return book.response;
   if (!ticker) {
     return NextResponse.json({ ok: false, error: "ticker is required." }, { status: 200 });
   }
   const { error } = await supabase
     .from("stock_disabled")
     .delete()
-    .eq("user_id", user.id)
+    .eq("user_id", book.key)
     .eq("ticker", ticker);
   if (error) {
     return NextResponse.json({ ok: false, error: error.message }, { status: 200 });

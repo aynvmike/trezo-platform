@@ -139,12 +139,14 @@ def test_unresolved_book_never_reads_primary_or_parent_binding():
     assert calls == []
 
 
-def test_lone_secondary_book_refuses_legacy_primary_credential_fallback():
+def test_lone_secondary_book_reads_its_bound_credentials_without_primary_fallback():
     b = _book("acct2")
     calls = []
-    with _transport([b], {}, calls):
-        _expect_block(b.account_key, "research_broker_route_mismatch")
-    assert calls == []
+    with _transport([b], {b.key_id: _body(b, 2700)}, calls):
+        snapshot = asyncio.run(capital.read_capital_snapshot(b.account_key))
+    assert snapshot["equity_usd"] == 2700
+    assert snapshot["book_id"] == b.account_key
+    assert calls == [(b.account_key, "/v2/account", b.base_url)]
 
 
 def test_sole_primary_book_reads_its_real_route():

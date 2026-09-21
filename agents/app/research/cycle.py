@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, fields
 from datetime import datetime, timedelta, timezone
 import re
+import json
 
 from .core import (Assumptions, Candidate, MAX_CANDIDATES, POLICY_VERSION, digest, finite,
                    normalize_candles, propose, refine, replay, screen)
@@ -49,7 +50,8 @@ def _capital_snapshot(raw, *, book_id, starting_capital):
 def run_cycle(db_path, *, book_id: str, symbol: str, candles: list,
               starting_capital: float, commission_bps: float, slippage_bps: float,
               fixed_cost_usd: float = 0.0, cycle_key: str | None = None,
-              capital_basis: str = "fixed_scenario", capital_snapshot: dict | None = None) -> dict:
+              capital_basis: str = "fixed_scenario", capital_snapshot: dict | None = None,
+              research_context: dict | None = None) -> dict:
     """Compose two rules, refine from TRAIN, and screen all four on validation.
 
     A supplied cycle key (for example a UTC date) reuses the first persisted
@@ -73,6 +75,11 @@ def run_cycle(db_path, *, book_id: str, symbol: str, candles: list,
         raise ValueError("fixed scenarios cannot carry a broker equity snapshot")
     if capital_basis == "broker_equity" and (cycle_key is None or not cycle_key.strip()):
         raise ValueError("broker equity requires an explicit cycle key")
+    if research_context is not None:
+        if not isinstance(research_context, dict) or research_context.get("book_id") != book_id:
+            raise ValueError("research context must belong to the same book")
+        if len(json.dumps(research_context, allow_nan=False)) > 64_000:
+            raise ValueError("research context exceeds bounded evidence size")
     normalized = normalize_candles(candles)
     assumptions = Assumptions(finite(starting_capital, "starting capital"),
                               finite(commission_bps, "commission bps"),
@@ -96,7 +103,7 @@ def run_cycle(db_path, *, book_id: str, symbol: str, candles: list,
     request = {**scope, "candles": normalized, "dataset_hash": data_hash,
                "split_index": int(len(normalized) * 0.7), "lineage_scope": digest(lineage),
                "assumptions": asdict(assumptions), "capital_basis": capital_basis,
-               "capital_snapshot": capital_snapshot}
+               "capital_snapshot": capital_snapshot, "research_context": research_context}
     store = Store(db_path)
     # Freeze the continuation choice with the job request. A retry must
     # not change its parent because some other cycle finished meanwhile.
@@ -115,7 +122,8 @@ def run_cycle(db_path, *, book_id: str, symbol: str, candles: list,
     # Older fixed-scenario requests have no capital metadata. Their identity,
     # stored assumptions, parent and immutable completed evidence remain valid.
     base.update(capital_basis=frozen.get("capital_basis", "fixed_scenario"),
-                capital_snapshot=frozen.get("capital_snapshot"))
+                capital_snapshot=frozen.get("capital_snapshot"),
+                research_context=frozen.get("research_context"))
     bars = frozen["candles"]
     split = frozen["split_index"]
     assumptions = Assumptions(**frozen["assumptions"])
@@ -126,7 +134,9 @@ def run_cycle(db_path, *, book_id: str, symbol: str, candles: list,
         if continuation:
             spec = continuation["spec"]
             prior = Candidate(**{field.name: spec[field.name] for field in fields(Candidate)})
-            seeds = [prior, next(seed for seed in seeds if seed.candidate_id != prior.candidate_id)]
+            # Always retain the opposite direction, even when the prior is
+            # a refined long. A winner cannot crowd out bearish research.
+            seeds = [prior, next(seed for seed in seeds if seed.direction != prior.direction)]
         # Complete seed training BEFORE producing children. The refinement
         # function has no access to validation data or validation results.
         seed_training = []
@@ -166,7 +176,8 @@ def run_cycle(db_path, *, book_id: str, symbol: str, candles: list,
                   "limitations": ["Historical screening is not verified profitability or deployment eligibility.",
                     "All four trials are retained; this pilot does not correct statistical confidence for repeated searches.",
                     "Validation must not guide additional refinement; locked forward paper evidence is still required.",
-                    "Fractional, long-only, one-position simulation excludes order-book liquidity, partial fills and broker eligibility.",
+                    "Fractional long/short, one-position simulation excludes liquidity, partial fills, borrow fees, locate availability, margin calls and broker eligibility.",
+                    "Market-report hypotheses are observed now; historical tests do not validate the report's timing or demonstrate forward performance.",
                     "Drawdown uses bar-close marked equity, not intrabar extrema.",
                     "Caller must supply completed, consistently spaced bars; no news/social or arbitrary generated code is evaluated."]}
         store.finish(job_id, token, result)

@@ -74,13 +74,14 @@ def _desk(mode="guarded"):
     """The real agent with its three seams swapped and restored:
     autonomy mode pinned, persist recorded, scope_state fresh."""
     persisted = []
-    state = scope._ScopeState()          # the REAL class, a private instance
+    registry = scope._BookScopeState()
+    state = registry.for_book("U")
 
     async def _persist(adj):
         persisted.append(adj)
 
-    with _patched(asa, _autonomy_mode=lambda: mode, _persist=_persist,
-                  scope_state=state):
+    with _patched(asa, _autonomy_mode=lambda user_id: mode, _persist=_persist,
+                  _book_ids=lambda: ["U"], scope_state=registry):
         yield asa.AdaptiveScopeAgent(), state, persisted
 
 
@@ -220,28 +221,30 @@ def test_the_flag_cap_is_reported_not_silently_dropped():
 
 # --- the autonomy-mode read itself -------------------------------------------
 
-def test_autonomy_mode_reads_the_settings_row_and_defaults_to_guarded_on_failure():
+def test_autonomy_mode_reads_the_settings_row_and_only_suggests_on_failure():
     """Drive the REAL _autonomy_mode: it late-imports
     app.runtime.settings.get_bot_settings, so the module attribute is the
     seam. A row that says 'full' is honoured; a failing read (Supabase
-    down at boot) falls back to guarded, never to full."""
+    down at boot) may only suggest, never apply guessed controls."""
     class _Row:
         autonomy_mode = "full"
 
     with _patched(settings_mod, get_bot_settings=lambda *a, **k: _Row()):
-        assert asa._autonomy_mode() == "full"
+        assert asa._autonomy_mode("U") == "full"
 
     class _Blank:
         autonomy_mode = ""
 
     with _patched(settings_mod, get_bot_settings=lambda *a, **k: _Blank()):
-        assert asa._autonomy_mode() == "guarded"
+        assert asa._autonomy_mode("U") == "guarded"
 
     def _boom(*a, **k):
         raise RuntimeError("supabase unreachable")
 
     with _patched(settings_mod, get_bot_settings=_boom):
-        assert asa._autonomy_mode() == "guarded"
+        assert asa._autonomy_mode("U") == "suggest"
+    with _patched(settings_mod, get_bot_settings=lambda uid: settings_mod._DEFAULTS):
+        assert asa._autonomy_mode("U") == "suggest"
 
 
 def test_on_message_uses_the_live_mode_read_end_to_end():
@@ -252,13 +255,14 @@ def test_on_message_uses_the_live_mode_read_end_to_end():
         autonomy_mode = "suggest"
 
     persisted = []
-    state = scope._ScopeState()
+    registry = scope._BookScopeState()
+    state = registry.for_book("U")
 
     async def _persist(adj):
         persisted.append(adj)
 
     with _patched(settings_mod, get_bot_settings=lambda *a, **k: _Row()), \
-            _patched(asa, _persist=_persist, scope_state=state):
+            _patched(asa, _persist=_persist, _book_ids=lambda: ["U"], scope_state=registry):
         out = _run(asa.AdaptiveScopeAgent().on_message(_event()))
     assert out and out[0].kind == "info" and "awaiting approval" in out[0].payload["note"]
     assert state.view().flagged_tickers == frozenset()
@@ -270,7 +274,7 @@ def test_zz_shared_scope_state_was_never_touched():
     must be exactly as it was before this suite -- no flags, no posture."""
     assert asa.scope_state is scope.scope_state, "scope_state seam not restored"
     assert scope.scope_state.view().flagged_tickers == frozenset()
-    assert scope.scope_state.current_posture() is None
+    assert scope.scope_state._books == {}
 
 
 if __name__ == "__main__":

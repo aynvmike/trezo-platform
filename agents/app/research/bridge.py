@@ -62,7 +62,8 @@ def _export(db_path: Path, book_id: str, result: dict) -> str:
 
 
 async def research_for_book(book_id: str, *, settings=None,
-                            now: datetime | None = None) -> dict:
+                            now: datetime | None = None,
+                            book_evidence: dict | None = None) -> dict:
     """One daily equity-based cycle or at most two fixed scenarios per book.
 
     Missing configuration/data/storage produces a visible blocked/failed result.
@@ -105,6 +106,23 @@ async def research_for_book(book_id: str, *, settings=None,
         return {**base, "status": "blocked", "reason": "aware_timestamp_required"}
     current = current.astimezone(timezone.utc)
     day = current.date().isoformat()
+    from app.research.opportunities import daily_context, journal_path
+    db_path = journal_path(cfg)
+    if book_evidence is not None and book_evidence.get("book_id") != book_id:
+        return {**base, "status": "blocked", "reason": "research_evidence_book_mismatch"}
+    try:
+        research_context = await asyncio.to_thread(
+            daily_context, db_path, book_id, now=current,
+            performance=(book_evidence or {}).get("performance"),
+            risk_state=(book_evidence or {}).get("risk_state"))
+    except Exception as exc:
+        return {**base, "status": "failed", "reason": "opportunity_library_read_failed",
+                "error_type": type(exc).__name__}
+    if research_context:
+        symbol, asset_type = research_context["symbol"], research_context["asset_type"]
+    elif book_evidence:
+        research_context = {**book_evidence, "opportunities": [],
+                            "selection_method": "configured_fallback_no_fresh_opportunity"}
     capital_snapshot = None
     if capital_mode == "broker_equity":
         try:
@@ -134,9 +152,6 @@ async def research_for_book(book_id: str, *, settings=None,
         return {**base, "status": "failed", "reason": "market_data_unavailable",
                 "error_type": type(exc).__name__}
 
-    configured_path = str(getattr(cfg, "trezo_research_db_path", "") or "")
-    db_path = (Path(configured_path).expanduser() if configured_path else
-               Path(__file__).resolve().parents[2] / "local_state" / "research.sqlite3")
     # parents[2] is app's parent (agents); independent of service working directory.
     from app.research.cycle import run_cycle
     cases = []
@@ -147,6 +162,7 @@ async def research_for_book(book_id: str, *, settings=None,
                 candles=candles, starting_capital=capital,
                 commission_bps=fee, slippage_bps=slip,
                 capital_basis=capital_mode, capital_snapshot=capital_snapshot,
+                research_context=research_context,
                 cycle_key=f"daily-v1:{asset_type}:{day}")
             artifact = None
             artifact_error = None
@@ -163,6 +179,9 @@ async def research_for_book(book_id: str, *, settings=None,
                           "capital_snapshot": result.get("capital_snapshot"),
                           "job_id": result.get("job_id"), "dataset_hash": result.get("dataset_hash"),
                           "trial_count": len(result.get("trials", [])),
+                          "directions_tested": sorted({t["spec"]["direction"] for t in result.get("trials", [])}),
+                          "opportunity_ids": [o["opportunity_id"] for o in
+                                              (result.get("research_context") or {}).get("opportunities", [])],
                           "artifact_path": artifact, "artifact_export_error": artifact_error,
                           "reason": result.get("reason")})
         except Exception as exc:

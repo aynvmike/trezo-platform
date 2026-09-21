@@ -22,6 +22,12 @@ const schema = z.object({
   stms_enabled: z.coerce.boolean(),
   extended_enabled: z.coerce.boolean(),
   crypto_enabled: z.coerce.boolean(),
+  day_options_enabled: z.coerce.boolean(),
+  spreads_enabled: z.coerce.boolean(),
+  long_options_enabled: z.coerce.boolean(),
+  dividend_lt_enabled: z.coerce.boolean(),
+  reevaluation_enabled: z.coerce.boolean(),
+  crypto_reevaluation_enabled: z.coerce.boolean(),
   autonomy_mode: z.enum(["suggest", "guarded", "full"]),
   account_posture: z.enum(["auto", "growth", "balanced", "income"]),
   risk_profile: z.enum(["conservative", "balanced", "aggressive", "expert"]),
@@ -66,19 +72,17 @@ export async function saveBotSettings(
   // bad request gets a clear message instead of a silent no-op -- and so
   // this does not depend on a policy staying correct forever.
   const requestedKey = String(formData.get("account_key") ?? "").trim();
-  let targetKey = user.id;
-  if (requestedKey && requestedKey !== user.id) {
-    const { data: owned } = await supabase
+  if (!requestedKey) return { ok: false, message: "Select the account to edit before saving." };
+  const { data: owned, error: ownershipError } = await supabase
       .from("trading_accounts")
       .select("account_key")
       .eq("owner_id", user.id)
       .eq("account_key", requestedKey)
+      .eq("is_active", true)
       .maybeSingle();
-    if (!owned) {
-      return { ok: false, message: "That account is not yours to edit." };
-    }
-    targetKey = requestedKey;
-  }
+  if (ownershipError) return { ok: false, message: `Account ownership could not be verified: ${ownershipError.message}` };
+  if (!owned) return { ok: false, message: "That active account is not yours to edit." };
+  const targetKey = requestedKey;
 
   const raw = {
     tcs_threshold: formData.get("tcs_threshold"),
@@ -91,6 +95,12 @@ export async function saveBotSettings(
     stms_enabled: formData.get("stms_enabled") === "on",
     extended_enabled: formData.get("extended_enabled") === "on",
     crypto_enabled: formData.get("crypto_enabled") === "on",
+    day_options_enabled: formData.get("day_options_enabled") === "on",
+    spreads_enabled: formData.get("spreads_enabled") === "on",
+    long_options_enabled: formData.get("long_options_enabled") === "on",
+    dividend_lt_enabled: formData.get("dividend_lt_enabled") === "on",
+    reevaluation_enabled: formData.get("reevaluation_enabled") === "on",
+    crypto_reevaluation_enabled: formData.get("crypto_reevaluation_enabled") === "on",
     autonomy_mode: formData.get("autonomy_mode") ?? "guarded",
     account_posture: formData.get("account_posture") ?? "auto",
     risk_profile: formData.get("risk_profile") ?? "balanced",
@@ -207,5 +217,6 @@ export async function saveBotSettings(
   if (error) return { ok: false, message: error.message };
 
   revalidatePath("/dashboard/settings/bot");
+  revalidatePath("/dashboard/agents");
   return { ok: true, message: "Saved. Agents pick up the new values within 30 seconds." };
 }

@@ -321,17 +321,13 @@ class Settings(BaseSettings):
     trezo_spreads: bool = False
     trezo_long_options: bool = False
 
-    # ---- Dividends-LT lane on-switch (audit 2026-09-01) -----------------
-    # The dividend lane deliberately emits signals WITHOUT a `tcs` today,
-    # and Risk Manager forwards only signals that carry one (TE-06), so
-    # the lane is dark. 0 = keep emitting no tcs (dark, today's state).
-    # A positive value (0-100 scale) is the tcs the lane stamps on its
-    # ladder signals, which lets them through the Risk Manager -- turn it
-    # on only after NEQ-05 (no_price_stop honoured downstream) is fixed;
-    # that is Mike's call. Default None (vf:config-web) = "not set":
-    # dividend_lt_agent._lane_tcs reads None as 0, i.e. dark. A value
-    # must EXCEED the book's tcs_threshold (bot_settings, default 70) or
-    # Risk Manager vetoes every ladder signal the switch lets through.
+    # ---- Dividends-LT legacy score override ---------------------------
+    # None/0 uses measured bullish chart confidence after the dividend
+    # quality screen. A positive value is retained as an explicitly
+    # labelled configured score, not measured evidence. Each book's own
+    # dividend_lt_enabled setting controls its ladder, and Risk Manager
+    # still applies that book's tcs_threshold and other risk gates.
+    # Optional None keeps blank template values safe during config load.
     trezo_dividend_lt_tcs: int | None = None
 
     # ---- Multi-account (2026-08-09, Mike) -------------------------------

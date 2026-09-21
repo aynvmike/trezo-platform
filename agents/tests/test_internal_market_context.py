@@ -259,18 +259,25 @@ def test_real_risk_consumer_tightens_equity_only_and_stale_context_restores_base
     from tests import test_risk_manager_bookkeyed as risk
     with _environment() as env, risk._desk(states=risk.TWO_OPEN,
                                           books=risk._two_floors(), pass_market=True) as (agent, calls):
-        baseline = risk._verdict(asyncio.run(agent.on_message(risk._stock(tcs=42))))
-        assert baseline.kind == "approve", baseline.payload
+        baseline = risk._verdicts(asyncio.run(agent.on_message(risk._stock(tcs=42))),
+                                  {"A": "approve", "B": "veto"})
+        assert "below threshold 70" in baseline["B"].payload["reason"]
+        # There is no execution in this report-consumer test. Release A's
+        # approved-but-unfilled copy before judging the next observation.
+        agent.forget_ticker("KO", "A")
         asyncio.run(env.agent.tick())
-        tightened = risk._verdict(asyncio.run(agent.on_message(risk._stock(tcs=42))))
-        assert tightened.kind == "veto" and "below threshold 45" in tightened.payload["reason"]
-        assert "market report" in tightened.payload["reason"]
-        crypto = risk._verdict(asyncio.run(agent.on_message(risk._signal(tcs=40))))
-        assert crypto.kind == "approve", crypto.payload
+        tightened = risk._verdicts(asyncio.run(agent.on_message(risk._stock(tcs=42))),
+                                   {"A": "veto", "B": "veto"})
+        for uid, floor in (("A", 45), ("B", 75)):
+            assert f"below threshold {floor}" in tightened[uid].payload["reason"]
+            assert "market report" in tightened[uid].payload["reason"]
+        risk._verdicts(asyncio.run(agent.on_message(risk._signal(tcs=40))),
+                       {"A": "approve", "B": "approve"})
         env.clock.value += timedelta(minutes=4)
         assert md.current_market_view() is None
-        restored = risk._verdict(asyncio.run(agent.on_message(risk._stock(tcs=42))))
-        assert restored.kind == "approve", restored.payload
+        restored = risk._verdicts(asyncio.run(agent.on_message(risk._stock(tcs=42))),
+                                  {"A": "approve", "B": "veto"})
+        assert "below threshold 70" in restored["B"].payload["reason"]
         assert calls.alpaca_get_account == 0
 
 
@@ -282,8 +289,10 @@ def test_upward_proxy_does_not_loosen_risk_or_invent_wheel_pressure():
         asyncio.run(env.agent.tick())
         view = md.current_market_view()
         assert view.regime == "risk_on"
-        verdict = risk._verdict(asyncio.run(agent.on_message(risk._stock(tcs=39))))
-        assert verdict.kind == "veto" and "below threshold 40" in verdict.payload["reason"]
+        verdicts = risk._verdicts(asyncio.run(agent.on_message(risk._stock(tcs=39))),
+                                  {"A": "veto", "B": "veto"})
+        for uid, floor in (("A", 40), ("B", 70)):
+            assert f"below threshold {floor}" in verdicts[uid].payload["reason"]
         assert advisor.check_market_pressure("wheel_csp", "SPY", movers_down=view.movers_down).allow
 
 

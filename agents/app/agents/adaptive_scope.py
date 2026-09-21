@@ -31,6 +31,9 @@ configured. See `app/data/macro/base.py` for the licensing story.
 from __future__ import annotations
 
 import asyncio
+import logging
+
+_log = logging.getLogger(__name__)
 
 from app.config import get_settings
 from app.strategies.adaptive import (
@@ -42,18 +45,23 @@ from app.runtime.scope import scope_state
 from .base import Agent, AgentMessage
 
 
-def _autonomy_mode() -> str:
-    # BI-03 (reviewed, deliberately left per-primary): scope adjustments
-    # are ONE engine-wide posture (`scope_state`), not a per-book
-    # decision, so there is no per-book value to read here. The anchor
-    # book's autonomy_mode governs whether the shared scope may act.
-    # Per-book gating of what each book actually TRADES happens in the
-    # fan-out (book_gate), which reads that book's own row.
+def _book_ids() -> list[str]:
+    from app.brokers.accounts import load_accounts
+    return list(dict.fromkeys(str(a.user_id) for a in load_accounts()
+                              if getattr(a, "user_id", None)))
+
+
+def _autonomy_mode(user_id: str) -> str:
+    if not user_id:
+        return "suggest"
     try:
-        from app.runtime.settings import get_bot_settings
-        return getattr(get_bot_settings(), "autonomy_mode", "guarded") or "guarded"
+        from app.runtime.settings import get_bot_settings, is_fallback_settings
+        cfg = get_bot_settings(user_id)
+        if is_fallback_settings(cfg):
+            return "suggest"  # unknown authority can propose, never apply controls
+        return getattr(cfg, "autonomy_mode", "guarded") or "guarded"
     except Exception:  # noqa: BLE001
-        return "guarded"
+        return "suggest"
 
 
 def _supabase():
@@ -73,7 +81,11 @@ async def _persist(adj) -> None:
     client = _supabase()
     if not client:
         return
+    if not adj.user_id:
+        return
     row = {
+        "user_id": adj.user_id,
+        "created_at": adj.created_at,
         "adjustment_id": adj.id,
         "action": adj.action,
         "scope": adj.scope,
@@ -88,20 +100,25 @@ async def _persist(adj) -> None:
     }
 
     def _sync():
-        return client.table("strategy_scope_adjustments").insert(row).execute()
+        table = client.table("strategy_scope_adjustments")
+        if adj.status in ("expired", "dismissed"):
+            return (table.update({"status": adj.status}).eq("user_id", adj.user_id)
+                    .eq("adjustment_id", adj.id).execute())
+        return table.insert(row).execute()
 
     try:
         await asyncio.to_thread(_sync)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Scope audit write failed for book %s: %s", adj.user_id, exc)
 
 
-_CONSUMED_IDS: set[str] = set()
+_CONSUMED_IDS: set[tuple[str, str]] = set()
 
 
 def _adj_from_row(row: dict) -> ScopeAdjustment:
     """Rebuild a ScopeAdjustment from a strategy_scope_adjustments row."""
     return ScopeAdjustment(
+        user_id=str(row.get("user_id") or ""),
         id=str(row.get("adjustment_id") or row.get("id") or ""),
         created_at=str(row.get("created_at") or ""),
         action=str(row.get("action") or "set_posture"),
@@ -117,31 +134,44 @@ def _adj_from_row(row: dict) -> ScopeAdjustment:
     )
 
 
-async def _pull_approved() -> list:
+async def _pull_approved(user_id: str) -> list:
     """User-approved adjustments (status='applied') not yet loaded into the
-    live scope this session. Looks back 12h so a restart rebuilds scope."""
+    live scope this session. Looks back 24h so a restart rebuilds the longest-lived ticker flags."""
+    if not user_id:
+        return []
     client = _supabase()
     if not client:
         return []
     from datetime import datetime, timedelta, timezone
-    since = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
     def _q():
         return (client.table("strategy_scope_adjustments")
-                .select("*").eq("status", "applied")
+                .select("*").eq("status", "applied").eq("user_id", user_id)
                 .gte("created_at", since)
-                .order("created_at", desc=True).limit(50).execute())
+                .order("created_at", desc=True).limit(200).execute())
     try:
         res = await asyncio.to_thread(_q)
     except Exception:  # noqa: BLE001
         return []
     out = []
-    for row in (res.data or []):
+    for row in reversed(res.data or []):
         rid = str(row.get("id") or row.get("adjustment_id") or "")
-        if not rid or rid in _CONSUMED_IDS:
+        if not rid or str(row.get("user_id") or "") != user_id:
             continue
-        _CONSUMED_IDS.add(rid)
-        out.append(_adj_from_row(row))
+        if (user_id, rid) in _CONSUMED_IDS:
+            continue
+        _CONSUMED_IDS.add((user_id, rid))
+        adj = _adj_from_row(row)
+        try:
+            created = datetime.fromisoformat(adj.created_at)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created + timedelta(minutes=adj.ttl_minutes) <= datetime.now(timezone.utc):
+                continue
+        except (TypeError, ValueError):
+            continue  # invalid timestamps cannot acquire fresh control TTLs
+        out.append(adj)
     return out
 
 
@@ -151,28 +181,29 @@ class AdaptiveScopeAgent(Agent):
 
     async def tick(self) -> list[AgentMessage]:
         out: list[AgentMessage] = []
-        mode = _autonomy_mode()
-
-        for adj in scope_state.expire_stale():
-            await _persist(adj)
-            out.append(AgentMessage(
-                agent=self.name, kind="info",
-                payload={"note": "Scope adjustment expired",
-                         "scope": adj.scope, "trigger": adj.trigger},
-            ))
-
-        if mode == "suggest":
-            for adj in await _pull_approved():
+        books = _book_ids()
+        if not books:
+            return [AgentMessage(agent=self.name, kind="info", payload={
+                "event": "scope_no_books", "note": "No routable books; no scope controls applied"})]
+        for user_id in books:
+            state = scope_state.for_book(user_id)
+            for adj in scope_state.expire_stale(user_id):
+                await _persist(adj)
+                out.append(AgentMessage(agent=self.name, kind="info", payload={
+                    "user_id": user_id, "note": "Scope adjustment expired",
+                    "scope": adj.scope, "trigger": adj.trigger}))
+            # Restore this book's still-valid controls after restart. Query
+            # ownership is enforced again locally, so old global rows never act.
+            for adj in await _pull_approved(user_id):
                 if adj.action == "flag_ticker":
-                    scope_state.flag_ticker(adj)
+                    state.flag_ticker(adj)
+                elif adj.action == "set_posture":
+                    state.set_posture(adj)
                 else:
-                    scope_state.set_posture(adj)
-                out.append(AgentMessage(
-                    agent=self.name, kind="scope", confidence=1.0,
-                    payload={"note": "User-approved scope change applied",
-                             "action": adj.action, "scope": adj.scope,
-                             "reason": adj.reason},
-                ))
+                    continue
+                out.append(AgentMessage(agent=self.name, kind="scope", payload={
+                    "user_id": user_id, "note": "Book scope control restored",
+                    "action": adj.action, "scope": adj.scope, "reason": adj.reason}))
 
         # Stock-price-derived regime.
         read = await read_market_regime()
@@ -202,71 +233,67 @@ class AdaptiveScopeAgent(Agent):
         except Exception:  # noqa: BLE001
             pass
 
-        posture = regime_posture(read)
-        posture.status = "suggested" if mode == "suggest" else "applied"
-
-        cur = scope_state.current_posture() if hasattr(scope_state, "current_posture") else None
-        same = (
-            cur is not None
-            and getattr(cur, "scope", None) == posture.scope
-            and float(getattr(cur, "stop_multiplier", 1.0)) == float(posture.stop_multiplier)
-            and int(getattr(cur, "tcs_bump", 0)) == int(posture.tcs_bump)
-            and tuple(getattr(cur, "paused_strategies", ()) or ()) == tuple(posture.paused_strategies or ())
-            and getattr(cur, "trigger", None) == posture.trigger
-        )
-        if same:
-            return out
-
-        if mode != "suggest":
-            scope_state.set_posture(posture)
-        await _persist(posture)
-
-        verb = "suggested" if mode == "suggest" else "set"
-        out.append(AgentMessage(
-            agent=self.name,
-            kind=("info" if mode == "suggest" else "scope"),
-            confidence=getattr(read, "confidence", 0.5),
-            payload={
-                "note": f"Regime posture {verb}",
-                "regime": read.regime,
-                "autonomy_mode": mode,
-                "stop_multiplier": posture.stop_multiplier,
-                "tcs_bump": posture.tcs_bump,
-                "paused_strategies": list(posture.paused_strategies),
-                "summary": read.summary,
-            },
-        ))
+        for user_id in books:
+            mode = _autonomy_mode(user_id)
+            state = scope_state.for_book(user_id)
+            posture = regime_posture(read)
+            posture.user_id = user_id
+            posture.status = "suggested" if mode == "suggest" else "applied"
+            cur = state.current_posture()
+            same = (cur is not None
+                    and cur.stop_multiplier == posture.stop_multiplier
+                    and cur.tcs_bump == posture.tcs_bump
+                    and cur.paused_strategies == posture.paused_strategies
+                    and cur.trigger == posture.trigger)
+            if same:
+                continue  # a quiet book must not skip its siblings
+            if mode != "suggest":
+                state.set_posture(posture)
+            await _persist(posture)
+            verb = "suggested" if mode == "suggest" else "set"
+            out.append(AgentMessage(
+                agent=self.name, kind="info" if mode == "suggest" else "scope",
+                confidence=getattr(read, "confidence", 0.5), payload={
+                    "user_id": user_id, "note": f"Regime posture {verb}",
+                    "regime": read.regime, "autonomy_mode": mode,
+                    "stop_multiplier": posture.stop_multiplier,
+                    "tcs_bump": posture.tcs_bump,
+                    "paused_strategies": list(posture.paused_strategies),
+                    "summary": read.summary}))
         return out
 
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
         if message.kind != "event":
             return []
-        mode = _autonomy_mode()
-        adj = event_adjustment(message.payload, mode=mode)
-        if adj is None:
-            return []
-
-        if mode == "suggest":
-            adj.status = "suggested"
+        books = _book_ids()
+        event_book = str(message.payload.get("user_id") or "")
+        if event_book:
+            books = [uid for uid in books if uid == event_book]
+        out = []
+        for user_id in books:
+            mode = _autonomy_mode(user_id)
+            adj = event_adjustment(message.payload, mode=mode)
+            if adj is None:
+                continue
+            adj.user_id = user_id
+            if mode == "suggest":
+                adj.status = "suggested"
+                await _persist(adj)
+                out.append(AgentMessage(agent=self.name, kind="info", payload={
+                    "user_id": user_id,
+                    "note": "Scope change suggested (awaiting approval)",
+                    "action": adj.action, "scope": adj.scope, "reason": adj.reason}))
+                continue
+            applied = scope_state.for_book(user_id).flag_ticker(adj)
+            if not applied:
+                adj.status = "suggested"
             await _persist(adj)
-            return [AgentMessage(
-                agent=self.name, kind="info",
-                payload={"note": "Scope change suggested (awaiting approval)",
-                         "action": adj.action, "scope": adj.scope,
-                         "reason": adj.reason},
-            )]
-
-        applied = scope_state.flag_ticker(adj)
-        await _persist(adj)
-        if not applied:
-            return [AgentMessage(
-                agent=self.name, kind="info",
-                payload={"note": "Ticker-flag cap reached - flag not applied",
-                         "scope": adj.scope},
-            )]
-        return [AgentMessage(
-            agent=self.name, kind="scope", confidence=0.9,
-            payload={"note": "Ticker flagged - Risk Manager will veto its signals",
-                     "action": adj.action, "scope": adj.scope,
-                     "trigger": adj.trigger, "reason": adj.reason},
-        )]
+            out.append(AgentMessage(
+                agent=self.name, kind="scope" if applied else "info",
+                confidence=0.9 if applied else 0.0, payload={
+                    "user_id": user_id,
+                    "note": ("Ticker flagged - Risk Manager will veto its signals"
+                             if applied else "Ticker-flag cap reached - flag not applied"),
+                    "action": adj.action, "scope": adj.scope,
+                    "trigger": adj.trigger, "reason": adj.reason}))
+        return out

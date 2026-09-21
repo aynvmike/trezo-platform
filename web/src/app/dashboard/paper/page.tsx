@@ -11,6 +11,7 @@ import {
 } from "@/components/dashboard/trading-view-redesign";
 import { fetchAlpacaSnapshot, type AlpacaPosition, fetchPositionAdvice } from "@/lib/alpaca-snapshot";
 import { describeAgentMessage, agentLabel, type FeedMessage } from "@/lib/agent-message";
+import { optionExposure } from "@/lib/trade-exposure";
 import { Disclosure } from "@/components/ui/disclosure";
 import { ExitAdvisorAlerts } from "@/components/dashboard/exit-advisor-alerts";
 import { CapitalPressurePanel } from "@/components/dashboard/capital-pressure-panel";
@@ -68,11 +69,13 @@ async function fetchForexQuotes(symbols: string[]): Promise<Record<string, numbe
 function layerFor(assetType: string, strategy: string): { layer: number; name: string } {
   const a = (assetType || "").toLowerCase();
   const s = (strategy || "").toLowerCase();
+  if (s.startsWith("wheel")) return { layer: 5, name: "Wheel" };
+  if (s.includes("dividend") || s.includes("yieldmax")) return { layer: 6, name: "Dividends" };
+  if (s.startsWith("kindrip")) return { layer: 7, name: "KINDRIP" };
+  if (s.startsWith("extended")) return { layer: 4, name: "Extended" };
   if (a === "crypto") return { layer: 1, name: "Crypto" };
   if (a === "forex") return { layer: 6, name: "Forex" };
   if (a === "option" || a === "options") return { layer: 3, name: "Options" };
-  if (s.startsWith("wheel") || s.includes("dividend")) return { layer: 5, name: "Wheel" };
-  if (s.startsWith("extended")) return { layer: 4, name: "Extended" };
   return { layer: 2, name: "Stock" };
 }
 function agentLayerOf(agent: string): number {
@@ -266,6 +269,7 @@ export default async function PaperPage() {
     const locked = stopN != null && entryN > 0 && (isLong ? stopN > entryN : stopN < entryN);
     return {
       id: p.id, ticker: p.ticker, side: sideU,
+      exposure: String(p.asset_type ?? "").toLowerCase().startsWith("option") ? optionExposure(p.strategy ?? "", p.ticker, sideU) : undefined,
       layer: name, chip: layer, entry: entryN, qty: Number(p.quantity ?? 0),
       current: curN,
       pnl: ap ? Number(ap.unrealized_pl) : fxPnl,

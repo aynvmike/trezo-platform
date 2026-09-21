@@ -6,8 +6,9 @@ import { BotTuningForm } from "./_bot-form";
 import { SettingsAuditPanel } from "@/components/dashboard/settings-audit-panel";
 import { LearningInsights } from "@/components/dashboard/learning-insights";
 import { TradeImport } from "@/components/dashboard/trade-import";
-import { fetchAlpacaSnapshot } from "@/lib/alpaca-snapshot";
 import { AccountSwitcher, type BookOption } from "./_account-switcher";
+import { BookCapabilitiesPanel } from "@/components/dashboard/book-capabilities-panel";
+import { fetchBookBrokerSnapshot } from "@/lib/book-broker-snapshot";
 
 export const dynamic = "force-dynamic";
 
@@ -26,16 +27,19 @@ export default async function BotTuningPage({
   // book, not to the person, so resolve which book is being edited before
   // reading anything. RLS on trading_accounts already limits rows to
   // owner_id = auth.uid(), so this cannot surface someone else's account.
-  const { data: accountRows } = await supabase
+  const { data: accountRows, error: accountsError } = await supabase
     .from("trading_accounts")
     .select("account_key, label, is_paper")
     .eq("owner_id", user.id)
     .eq("is_active", true)
     .order("label");
 
+  if (accountsError) return <p role="alert" className="p-6 text-amber-800">Your accounts could not be loaded: {accountsError.message}</p>;
+  if (!accountRows?.length) return <p className="p-6">No active trading account is available to tune.</p>;
+
   const { data: capitalRows } = await supabase
     .from("paper_accounts")
-    .select("user_id, starting_capital_usd");
+    .select("user_id, starting_capital_usd").in("user_id", accountRows.map((row) => String(row.account_key)));
 
   const capitalByKey = new Map<string, number | null>(
     (capitalRows ?? []).map((r) => [
@@ -51,29 +55,29 @@ export default async function BotTuningPage({
     starting_capital_usd: capitalByKey.get(String(r.account_key)) ?? null
   }));
 
-  // Requested book must be one of the caller's own. Anything else falls
-  // back to their own key rather than erroring -- a stale bookmark should
-  // land somewhere sane, not on a stranger's settings.
+  // An invalid selection must never silently edit a different book.
   const requested = searchParams?.account;
+  if (requested && !books.some((book) => book.account_key === requested)) {
+    return <div className="p-6 space-y-4"><p role="alert">That active account is unavailable. Select one of your accounts.</p><AccountSwitcher books={books} activeKey="" /></div>;
+  }
   const activeKey =
-    requested && books.some((b) => b.account_key === requested)
-      ? requested
-      : books.some((b) => b.account_key === user.id)
-        ? user.id
-        : (books[0]?.account_key ?? user.id);
+    requested ?? books[0].account_key;
 
-  let { data: settings } = await supabase
+  let { data: settings, error: settingsError } = await supabase
     .from("bot_settings")
     .select("*")
     .eq("user_id", activeKey)
     .maybeSingle();
 
+  if (settingsError) return <p role="alert" className="p-6 text-amber-800">Settings for this account could not be loaded: {settingsError.message}</p>;
+
   if (!settings) {
-    const { data: created } = await supabase
+    const { data: created, error: createError } = await supabase
       .from("bot_settings")
       .insert({ user_id: activeKey })
       .select("*")
       .single();
+    if (createError) return <p role="alert" className="p-6 text-amber-800">Settings for this account could not be initialized: {createError.message}</p>;
     settings = created;
   }
 
@@ -108,6 +112,7 @@ export default async function BotTuningPage({
       </div>
 
       <AccountSwitcher books={books} activeKey={activeKey} />
+      <BookCapabilitiesPanel accountKey={activeKey} />
 
       <BotTuningForm
         key={activeKey}
@@ -116,10 +121,8 @@ export default async function BotTuningPage({
         initial={settings}
         liveEquity={await (async () => {
           try {
-            const snap = await fetchAlpacaSnapshot();
-            return snap?.configured && snap.account
-              ? Number(snap.account.equity)
-              : null;
+            const snapshot = await fetchBookBrokerSnapshot(activeKey);
+            return snapshot?.equity === undefined ? null : Number(snapshot.equity);
           } catch {
             return null;
           }

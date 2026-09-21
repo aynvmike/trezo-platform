@@ -41,7 +41,7 @@ const STRATEGIES = [
  *
  * Both honor TTLs server-side; clearing here is immediate.
  */
-export function ExpertOverrides() {
+export function ExpertOverrides({ accountKey }: { accountKey: string }) {
   const [overrides, setOverrides] = useState<Override[]>([]);
   const [disabled, setDisabled] = useState<Disabled[]>([]);
   const [loading, setLoading] = useState(true);
@@ -63,8 +63,8 @@ export function ExpertOverrides() {
     setErr(null);
     try {
       const [oRes, dRes] = await Promise.all([
-        fetch("/api/expert/overrides", { cache: "no-store" }),
-        fetch("/api/expert/disabled", { cache: "no-store" })
+        fetch(`/api/expert/overrides?account_key=${encodeURIComponent(accountKey)}`, { cache: "no-store" }),
+        fetch(`/api/expert/disabled?account_key=${encodeURIComponent(accountKey)}`, { cache: "no-store" })
       ]);
       const oJson = await oRes.json();
       const dJson = await dRes.json();
@@ -96,6 +96,7 @@ export function ExpertOverrides() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          account_key: accountKey,
           ticker: pinTicker,
           strategy: pinStrategy,
           reason: pinReason || null,
@@ -118,9 +119,11 @@ export function ExpertOverrides() {
 
   async function removePin(ticker: string) {
     try {
-      await fetch(`/api/expert/overrides?ticker=${encodeURIComponent(ticker)}`, {
+      const response = await fetch(`/api/expert/overrides?ticker=${encodeURIComponent(ticker)}&account_key=${encodeURIComponent(accountKey)}`, {
         method: "DELETE"
       });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error ?? "Could not remove pin.");
       await load();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Delete failed");
@@ -134,6 +137,7 @@ export function ExpertOverrides() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          account_key: accountKey,
           ticker: disTicker,
           reason: disReason || null,
           expires_at: expiresAtIso(disExpiresHours)
@@ -155,9 +159,11 @@ export function ExpertOverrides() {
 
   async function removeDisable(ticker: string) {
     try {
-      await fetch(`/api/expert/disabled?ticker=${encodeURIComponent(ticker)}`, {
+      const response = await fetch(`/api/expert/disabled?ticker=${encodeURIComponent(ticker)}&account_key=${encodeURIComponent(accountKey)}`, {
         method: "DELETE"
       });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error ?? "Could not remove restriction.");
       await load();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Delete failed");

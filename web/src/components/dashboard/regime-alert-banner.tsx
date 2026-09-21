@@ -7,6 +7,8 @@ import { useLiteRefresh } from "@/lib/use-lite";
 
 type Adjustment = {
   id: string;
+  user_id: string;
+  book_label?: string;
   action: string;
   scope: string;
   reason: string;
@@ -25,7 +27,7 @@ const SEEN_KEY = "trezo.regime.lastSeenId";
 const SEEN_SIG_KEY = "trezo.regime.lastSeenSignature";
 
 function signatureOf(row: Adjustment): string {
-  return `${row.action || ""}|${row.scope || ""}`;
+  return `${row.user_id || ""}|${row.action || ""}|${row.scope || ""}`;
 }
 
 /**
@@ -104,12 +106,12 @@ export function RegimeAlertBanner() {
       </span>
       <div className="flex-1 min-w-0">
         <p className="font-medium text-sm">
-          {latest.action.replace(/_/g, " ")} on {latest.scope}
+          {latest.book_label ?? "Account"}: {latest.action.replace(/_/g, " ")} on {latest.scope}
         </p>
         <p className="text-xs leading-relaxed mt-0.5">{latest.reason}</p>
       </div>
       <Link
-        href="/dashboard/strategy"
+        href={`/dashboard/strategy?account=${encodeURIComponent(latest.user_id)}`}
         className="text-xs underline shrink-0"
       >
         View

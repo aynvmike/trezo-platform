@@ -92,26 +92,32 @@ def _merged_weights(ctx: MarketContext) -> dict[str, int]:
 # ---- Individual criteria --------------------------------------------------
 
 
-def _criteria_trend(c: list[Candle]) -> bool:
+def _criteria_trend(c: list[Candle], direction: str = "bullish") -> bool:
     if len(c) < 50:
         return False
     cl = closes(c)
     e20 = ema(cl, 20)[-1]
     e50 = ema(cl, 50)[-1]
+    if direction == "bearish":
+        return c[-1].close < e20 and e20 < e50
     return c[-1].close > e20 and e20 > e50
 
 
-def _criteria_momentum(c: list[Candle]) -> bool:
+def _criteria_momentum(c: list[Candle], direction: str = "bullish") -> bool:
     if len(c) < 15:
         return False
     r = rsi(closes(c), 14)[-1]
+    if direction == "bearish":
+        return 30 < r < 50
     return 50 < r < 70
 
 
-def _criteria_macd(c: list[Candle]) -> bool:
+def _criteria_macd(c: list[Candle], direction: str = "bullish") -> bool:
     if len(c) < 35:
         return False
     m = macd_fn(closes(c))
+    if direction == "bearish":
+        return m["hist"][-1] < 0 and m["macd"][-1] < m["signal"][-1]
     return m["hist"][-1] > 0 and m["macd"][-1] > m["signal"][-1]
 
 
@@ -122,9 +128,11 @@ def _criteria_volume(c: list[Candle]) -> bool:
     return avg20 > 0 and c[-1].volume > avg20 * 1.5
 
 
-def _criteria_breakout(c: list[Candle]) -> bool:
+def _criteria_breakout(c: list[Candle], direction: str = "bullish") -> bool:
     if len(c) < 21:
         return False
+    if direction == "bearish":
+        return c[-1].close < min(bar.low for bar in c[-21:-1])
     prior_high = highest_high(c[-21:-1])
     return c[-1].close > prior_high
 
@@ -277,15 +285,17 @@ def calculate_score(
     score = 0.0
     _w = _merged_weights(ctx)
 
-    if _criteria_trend(candles):
+    # The pattern's direction must reach every directional factor. A
+    # bearish pattern used to be scored as a failed bullish setup here.
+    if _criteria_trend(candles, direction):
         score += _w["trend"]; breakdown["trend"] = _w["trend"]
-    if _criteria_momentum(candles):
+    if _criteria_momentum(candles, direction):
         score += _w["momentum"]; breakdown["momentum"] = _w["momentum"]
-    if _criteria_macd(candles):
+    if _criteria_macd(candles, direction):
         score += _w["macd"]; breakdown["macd"] = _w["macd"]
     if _criteria_volume(candles):
         score += _w["volume"]; breakdown["volume"] = _w["volume"]
-    if _criteria_breakout(candles):
+    if _criteria_breakout(candles, direction):
         score += _w["breakout"]; breakdown["breakout"] = _w["breakout"]
     if _criteria_candle_pattern(detections):
         score += _w["candle_pattern"]; breakdown["candle_pattern"] = _w["candle_pattern"]
@@ -328,12 +338,12 @@ def calculate_score(
         breakdown["dividend_market_alignment"] = 10.0
 
     score_int = max(0, min(100, int(round(core))))
-    rr_ratio = _reward_risk_ratio(candles)
+    rr_ratio = _reward_risk_ratio(candles, direction)
     if rr_ratio is not None:
         breakdown["reward_risk_ratio"] = round(rr_ratio, 2)
     return Score(
         score=score_int,
-        tcs=scale_to_tcs(score_int, ctx, rr_ratio=rr_ratio),
+        tcs=scale_to_tcs(score_int, ctx, rr_ratio=rr_ratio, direction=direction),
         detected_patterns=hit_patterns,
         breakdown=breakdown,
         dominant_pattern=dominant,
@@ -344,11 +354,14 @@ def calculate_score(
 # ---- TCS scaling ----------------------------------------------------------
 
 
-def _reward_risk_ratio(candles) -> "Optional[float]":
-    """Structure-based reward/risk for a LONG entry (2026-06-16; replaces the
-    old constant placeholder). Room up to recent resistance vs. room down to
-    recent support, each ATR-floored so a fresh breakout is not unfairly
-    zeroed and a tight entry cannot divide-by-zero. None when data is thin."""
+def _reward_risk_ratio(candles, direction: str = "bullish") -> "Optional[float]":
+    """Structure-based reward/risk in the signal's direction.
+
+    Longs risk the distance down to support and target resistance; shorts
+    risk the distance up to resistance and target support. Both retain
+    identical ATR floors and measured-move targets for fresh breakouts.
+    The default preserves the original long calculation for direct callers.
+    """
     if not candles or len(candles) < 15:
         return None
     look = candles[-20:]
@@ -370,18 +383,22 @@ def _reward_risk_ratio(candles) -> "Optional[float]":
         pc = float(look[i - 1].close)
         trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
     atr_val = (sum(trs) / len(trs)) if trs else 0.0
-    # Risk = distance to a realistic recent stop (last ~5 bars' low),
-    # ATR-floored - NOT the full-range low (which over-states breakout risk).
+    # Risk uses a recent structural stop, rather than the full range.
     recent = look[-5:] if len(look) >= 5 else look
-    recent_low = min(float(c.low) for c in recent)
-    risk = max(close - recent_low, 0.75 * atr_val, close * 0.001)
-    # Reward = room to resistance; a genuine breakout (at/above the prior
-    # high) earns a measured-move target (~half the range) instead of ~0,
-    # so momentum/ORB entries are not unfairly zeroed.
-    if close >= swing_high - 0.25 * atr_val:
-        reward = max(0.5 * rng, 2.0 * atr_val)
+    if direction == "bearish":
+        recent_high = max(float(c.high) for c in recent)
+        risk = max(recent_high - close, 0.75 * atr_val, close * 0.001)
+        if close <= swing_low + 0.25 * atr_val:
+            reward = max(0.5 * rng, 2.0 * atr_val)
+        else:
+            reward = max(close - swing_low, 2.0 * atr_val)
     else:
-        reward = max(swing_high - close, 2.0 * atr_val)
+        recent_low = min(float(c.low) for c in recent)
+        risk = max(close - recent_low, 0.75 * atr_val, close * 0.001)
+        if close >= swing_high - 0.25 * atr_val:
+            reward = max(0.5 * rng, 2.0 * atr_val)
+        else:
+            reward = max(swing_high - close, 2.0 * atr_val)
     if risk <= 0:
         return None
     return reward / risk
@@ -397,7 +414,8 @@ def _rr_points(rr_ratio: "Optional[float]") -> float:
 
 
 def scale_to_tcs(score_100: int, ctx: MarketContext,
-                 rr_ratio: "Optional[float]" = None) -> int:
+                 rr_ratio: "Optional[float]" = None,
+                 direction: str = "bullish") -> int:
     """Translate the 0-100 pattern score into the FINAL 0-100 TCS.
 
     Allocation (from TREZO_PATTERN_ENGINE.md section 4):
@@ -423,7 +441,7 @@ def scale_to_tcs(score_100: int, ctx: MarketContext,
     fundamental = 200.0 if ctx.catalyst_today else 80.0
     rr = _rr_points(rr_ratio)  # 2026-06-16: real structure-based R/R
     market = 50.0
-    if ctx.spy_trending_up is True:
+    if _criteria_market_alignment(ctx, direction):
         market += 30.0
     if ctx.confluence_bonus >= 30:
         market += 20.0

@@ -688,6 +688,12 @@ def _directional_seams(states):
     async def _acct(token=None):
         return types.SimpleNamespace(equity=10_000.0, options_approved_level=3)
 
+    async def _clock(token=None):
+        return {"is_open": True}
+
+    async def _inventory(client, uid):
+        return {k: [] for k in ("positions", "orders", "tracked", "ledger")}
+
     async def _cnd(sym, kind):
         return _candles(close=100.0)
 
@@ -700,13 +706,17 @@ def _directional_seams(states):
     stack = contextlib.ExitStack()
     stack.enter_context(_patched(
         scanner, _lane_enabled=lambda name: True, _primary_book=lambda: "U1",
-        fetch_candles_for=_cnd, _user_halted=_not_halted))
+        fetch_candles_for=_cnd, _user_halted=_not_halted,
+        _option_inventory=_inventory))
+    stack.enter_context(_patched(rs, get_bot_settings=lambda uid: types.SimpleNamespace(
+        auto_trade_enabled=True, long_options_enabled=True)))
     stack.enter_context(_patched(ks, check_states=_states))
     stack.enter_context(_patched(
-        alp, alpaca_configured=lambda: True, get_account=_acct,
+        alp, alpaca_configured=lambda: True, get_account=_acct, get_clock=_clock,
         submit_option_order=_never_submit))
     stack.enter_context(_patched(alp_data, live_option_pick=_never_pick))
-    stack.enter_context(_patched(accounts, bind_for_user=binding.bind_for_user))
+    stack.enter_context(_patched(accounts, bind_for_user=binding.bind_for_user,
+                                  load_accounts=lambda: [types.SimpleNamespace(user_id="U1")]))
     stack.enter_context(_patched(route_guard, check_route=_route))
     stack.enter_context(_patched(act, record=rec))
     return stack, binding, activity
@@ -729,19 +739,19 @@ def test_a_recovering_books_directional_lane_does_not_fire():
     with stack, _generals([{"sym": "NVDA", "d3": 4.0}]), \
             _scanner_state(rescore_age_s=0) as A:
         out = _run(scanner.OptionsScannerAgent()._run_directional(_Client(_positions())))
-        assert out == [], out
+        assert not any(m.kind == "execute" for m in out), out
         assert not A._long_fired, "a skipped name must not burn its one-shot"
     skips = [a for a in activity if a["event"] == "option_long_skip"]
     assert skips and "recovery suspends long_call" in skips[0]["reason"], activity
     assert skips[0]["user_id"] == "U1"
-    assert binding.seen == ["U1"], "the lane body must run bound to the primary book"
+    assert binding.seen == ["U1"], "the lane body must run bound to its own book"
 
 
 def test_an_unreadable_kill_switch_stands_the_directional_lane_down():
     stack, binding, activity = _directional_seams(None)
     with stack, _generals([{"sym": "NVDA", "d3": 4.0}]), _scanner_state(0):
         out = _run(scanner.OptionsScannerAgent()._run_directional(_Client(_positions())))
-    assert out == []
+    assert not any(m.kind == "execute" for m in out)
     assert any(a["event"] == "option_long_skip" and "unreadable" in a["reason"]
                for a in activity), activity
 
@@ -765,19 +775,19 @@ def test_a_clean_book_still_reaches_the_live_pick():
 
 # --- NEQ-09: lane switches and the primary book ---------------------------
 
-def test_lanes_are_off_by_default_and_never_touch_the_book():
-    """No Settings field, no env var -> the switch is False and the lane
-    returns before it resolves a book or binds anything."""
-    for name in ("TREZO_DAY_OPTIONS", "TREZO_SPREADS", "TREZO_LONG_OPTIONS"):
-        assert os.getenv(name) is None, f"{name} set in this shell; test env is dirty"
-        assert scanner._lane_enabled(name) is False
-
-    def _boom():
-        raise AssertionError("_primary_book reached with the lane off")
+def test_a_books_disabled_lanes_never_enter_a_broker_binding():
+    """All three flags are local to the owning book, including an explicit OFF."""
+    def _boom(uid):
+        raise AssertionError("binding reached with this book's lane off")
     a = scanner.OptionsScannerAgent()
-    with _patched(scanner, _primary_book=_boom):
+    with _patched(accounts, load_accounts=lambda: [types.SimpleNamespace(user_id="U-off")],
+                  bind_for_user=_boom), \
+            _patched(rs, get_bot_settings=lambda uid: types.SimpleNamespace(
+                day_options_enabled=False, spreads_enabled=False, long_options_enabled=False)), \
+            _patched(act, record=_recorder()[1]):
         for fn in (a._run_same_day, a._run_spreads, a._run_directional):
-            assert _run(fn(_Client(_positions()))) == []
+            out = _run(fn(_Client(_positions())))
+            assert len(out) == 1 and "off for this book" in out[0].payload["reason"], out
 
 
 def test_lane_switch_reads_settings_first_then_the_process_env():
@@ -804,14 +814,14 @@ def test_lane_bodies_run_only_inside_a_verified_binding():
     async def _never(self, client, uid):
         raise AssertionError("lane body entered for an unresolved book")
     a = scanner.OptionsScannerAgent()
-    with _patched(scanner, _lane_enabled=lambda n: True,
-                  _primary_book=lambda: "U-unknown-1"), \
+    with _patched(rs, get_bot_settings=lambda uid: types.SimpleNamespace()), \
             _patched(scanner.OptionsScannerAgent, _run_same_day_for=_never,
                      _run_spreads_for=_never, _run_directional_for=_never), \
-            _patched(accounts, bind_for_user=binding.bind_for_user), \
+            _patched(accounts, bind_for_user=binding.bind_for_user,
+                     load_accounts=lambda: [types.SimpleNamespace(user_id="U-unknown-1")]), \
             _patched(route_guard, check_route=_route), _patched(act, record=rec):
         for fn in (a._run_same_day, a._run_spreads, a._run_directional):
-            assert _run(fn(_Client(_positions()))) == []
+            assert not any(m.kind == "execute" for m in _run(fn(_Client(_positions()))))
     assert len([x for x in activity if x["event"] == "route_mismatch"]) == 3, activity
     assert binding.now is None
 
@@ -928,6 +938,9 @@ def _step_seams(users, *, auto_execute=True, approval=0, oauth=False):
         return [{"symbol": "AGNC", "qty": "100", "avg_entry_price": "10.0",
                  "asset_class": "us_equity"}]
 
+    async def _orders(token=None):
+        return []
+
     async def _cnd(sym, kind):
         return _candles(close=10.0)
 
@@ -956,7 +969,8 @@ def _step_seams(users, *, auto_execute=True, approval=0, oauth=False):
     stack.enter_context(_patched(cyc, get_cycle_position=_raise))
     stack.enter_context(_patched(ds, screen=_raise))
     stack.enter_context(_patched(ks, check_states=_states))
-    stack.enter_context(_patched(alp, get_account=_acct, get_positions=_lots,
+    stack.enter_context(_patched(alp, get_account=_acct, get_positions_strict=_lots,
+                                 get_open_orders_all_strict=_orders,
                                  alpaca_configured=lambda: True))
     stack.enter_context(_patched(wt, get_user_broker_token=_token))
     stack.enter_context(_patched(
@@ -981,8 +995,7 @@ def test_wheel_step_clears_the_binding_each_fire_sets_and_reads_kill_states_once
     assert binding.seen == ["U-w1", "U-w2"], binding.seen
     assert seen["acct_bound"] == ["U-w1", "U-w2"], (
         "the fire's broker read must run under its own book")
-    assert seen["settings_bound"] and all(b is None for b in seen["settings_bound"]), (
-        f"a settings read ran under a stale binding: {seen['settings_bound']}")
+    assert set(seen["settings_bound"]) <= {None, "U-w1", "U-w2"}, seen
     assert seen["ks_calls"] == 1, f"kill states read {seen['ks_calls']}x for a 2-book step"
     evs = [(m.payload or {}).get("event") for m in out]
     assert evs == ["wheel_auto_blocked", "wheel_auto_blocked"], evs
@@ -1002,7 +1015,7 @@ def test_cc_overlay_step_clears_the_binding_its_fire_set():
     with stack:
         out = _run(scanner.OptionsScannerAgent()._run_cc_overlay(client))
         assert binding.now is None, "overlay step returned with a book still bound"
-    assert binding.seen == ["U-ov1"], binding.seen
+    assert binding.seen == ["U-ov1", "U-ov1"], binding.seen
     assert seen["acct_bound"] == ["U-ov1"], seen
     assert seen["ks_calls"] == 1, seen
     assert len(out) == 1 and out[0].payload.get("overlay") is True, out
@@ -1059,6 +1072,9 @@ def _fire_seams(*, strict, db_csp_rows, bp=0.0):
         reads.append(binding.now)
         return strict
 
+    async def _orders(token=None):
+        return []
+
     async def _submit(occ_symbol, contracts, side, time_in_force="day",
                       limit_price=None, token=None):
         submitted.append({"occ": occ_symbol, "qty": contracts, "side": side,
@@ -1076,7 +1092,8 @@ def _fire_seams(*, strict, db_csp_rows, bp=0.0):
             account_posture="growth", wheel_auto_execute=True)))
     stack.enter_context(_patched(
         alp, get_account=_acct, get_clock=_clock,
-        get_option_positions_strict=_strict, submit_option_order=_submit))
+        get_positions_strict=_strict, get_open_orders_all_strict=_orders,
+        submit_option_order=_submit))
     stack.enter_context(_patched(alp_data, live_option_pick=_pick))
     stack.enter_context(_patched(wt, get_user_broker_token=_token))
     stack.enter_context(_patched(
@@ -1087,40 +1104,33 @@ def _fire_seams(*, strict, db_csp_rows, bp=0.0):
     return stack, db, binding, reads, submitted, activity
 
 
-def _fire(db, uid="U-fire-1", strategy="wheel_csp", leg=None):
+def _fire(db, uid="U-fire-1", strategy="wheel_csp", leg=None, **options):
     for name in ("TREZO_WHEEL_MAX_OPEN_CSP", "TREZO_WHEEL_COLLATERAL_PCT",
                  "TREZO_WHEEL_MAX_DTE"):
         assert os.getenv(name) is None, f"{name} set in this shell; test env is dirty"
     return _run(scanner.OptionsScannerAgent()._wheel_auto_fire(
         user_id=uid, underlying="AGNC", leg=leg or _fake_leg(),
-        strategy=strategy, priced="Live-quoted", client=db))
+        strategy=strategy, priced="Live-quoted", client=db, **options))
 
 
-def test_csp_gate_on_an_unreadable_broker_falls_back_to_the_db_count_and_says_so():
-    """Strict read None, DB already at the growth max (1): the gate still
-    refuses on the DB count and the log names the unreadable read."""
+def test_csp_gate_on_an_unreadable_broker_refuses_even_with_tracking_rows():
     stack, db, binding, reads, submitted, activity = _fire_seams(
         strict=None, db_csp_rows=[{"strike": 9.5, "contracts": 1}])
     with stack:
         msg = _fire(db)
-    assert msg is not None and msg.payload["event"] == "wheel_limit", msg
+    assert msg is not None and msg.payload["event"] == "wheel_auto_blocked", msg
+    assert "unreadable" in msg.payload["reason"], msg
     assert reads == ["U-fire-1"], "the strict read must run under the book's binding"
-    assert any(a["event"] == "wheel_limit_unreadable" and a["user_id"] == "U-fire-1"
-               for a in activity), activity
     assert submitted == []
 
 
-def test_csp_gate_on_an_unreadable_broker_with_an_empty_db_proceeds_but_logs():
-    """Strict read None, DB empty: non-destructive either way -- the fire
-    proceeds to the next gate (buying power 0 stops it) and the log is
-    honest that the broker half was missing."""
+def test_csp_gate_on_an_unreadable_broker_with_an_empty_db_still_refuses():
     stack, db, binding, reads, submitted, activity = _fire_seams(
         strict=None, db_csp_rows=[])
     with stack:
         msg = _fire(db)
     assert msg is not None and msg.payload["event"] == "wheel_auto_blocked", msg
-    assert "buying power" in msg.payload["reason"], msg.payload
-    assert any(a["event"] == "wheel_limit_unreadable" for a in activity), activity
+    assert "unreadable" in msg.payload["reason"], msg.payload
     assert not any(a["event"] == "wheel_limit" for a in activity), activity
     assert submitted == []
 
@@ -1129,7 +1139,7 @@ def test_csp_gate_counts_the_brokers_own_short_puts_when_the_db_lags():
     """The 2026-07-22 belt-and-suspenders merge, still bound: the DB shows
     nothing open but the broker holds a short put -> the gate refuses,
     and no 'unreadable' line is written for a good read."""
-    occ = _occ("AGNC", _EXP_FUTURE, "P", 9.5)
+    occ = _occ("OTHER", _EXP_FUTURE, "P", 9.5)
     stack, db, binding, reads, submitted, activity = _fire_seams(
         strict=[{"symbol": occ, "qty": "-1", "avg_entry_price": "0.4"}],
         db_csp_rows=[])
@@ -1148,7 +1158,8 @@ def test_wheel_auto_placed_is_filed_under_the_option_lane():
     CSP gate; the advisor block is stubbed fail-open, the order accepted)
     and hand the payload to the REAL watchdog classifier."""
     stack, db, binding, reads, submitted, activity = _fire_seams(
-        strict=[], db_csp_rows=[], bp=5_000.0)
+        strict=[{"symbol": "AGNC", "qty": "100", "avg_entry_price": "10"}],
+        db_csp_rows=[], bp=5_000.0)
 
     async def _allow(**k):
         return types.SimpleNamespace(allow=True, max_contracts=None)
@@ -1204,6 +1215,267 @@ def test_lane_switch_setting_names_are_declared_in_config_and_default_off():
             assert scanner._lane_enabled(env) is True, attr
         with _patched(scanner, get_settings=lambda a=attr: types.SimpleNamespace(**{a: False})):
             assert scanner._lane_enabled(env) is False, attr
+
+
+# --- 2026-09-10: drive each independent book through actual entry paths ---
+
+def _independent_entry_seams():
+    states = {uid: ks.KillSwitch(False, None, None) for uid in ("U1", "U2")}
+    stack, binding, activity = _directional_seams(states)
+    submitted = []
+    client = _Client(_positions())
+
+    async def _submit(occ_symbol, contracts, side, **kw):
+        submitted.append({"book": binding.now, "occ": occ_symbol,
+                          "contracts": contracts, "side": side, **kw})
+        return {"id": f"order-{binding.now}", "status": "accepted"}, None
+
+    async def _pick(sym, kind, strike, exp):
+        return types.SimpleNamespace(occ=_occ(sym, exp, "P" if kind == "put" else "C", strike),
+                                     strike=strike, expiration=exp, premium=0.5)
+
+    stack.enter_context(_patched(accounts, load_accounts=lambda: [
+        types.SimpleNamespace(user_id=uid) for uid in ("U1", "U2")]))
+    stack.enter_context(_patched(alp, submit_option_order=_submit))
+    stack.enter_context(_patched(alp_data, live_option_pick=_pick))
+    return stack, client, binding, submitted, activity
+
+
+def test_directional_puts_fire_independently_without_sharing_one_shots():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    generals = [{"sym": f"UP{i}", "d3": 1.0} for i in range(10)]
+    generals.append({"sym": "DOWN", "d3": -8.0})
+    with stack, _generals(generals), _scanner_state(0):
+        agent = scanner.OptionsScannerAgent()
+        out = _run(agent._run_directional(client))
+        second = _run(agent._run_directional(client))
+    assert [order["book"] for order in submitted] == ["U1", "U2"], submitted
+    assert all(order["side"] == "buy" and "P" in order["occ"] for order in submitted)
+    assert [m.payload["user_id"] for m in out if m.kind == "execute"] == ["U1", "U2"]
+    assert all(m.payload["underlying_direction"] == "bearish" for m in out if m.kind == "execute")
+    assert not any(m.kind == "execute" for m in second)
+    assert binding.now is None
+
+
+def test_one_books_disabled_setting_cannot_disable_another_books_puts():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    with stack, _generals([{"sym": "DOWN", "d3": -8.0}]), _scanner_state(0), \
+            _patched(rs, get_bot_settings=lambda uid: types.SimpleNamespace(
+                long_options_enabled=uid != "U1", auto_trade_enabled=True)):
+        out = _run(scanner.OptionsScannerAgent()._run_directional(client))
+    assert [order["book"] for order in submitted] == ["U2"], submitted
+    assert any(m.payload["user_id"] == "U1" and "off for this book" in m.payload.get("reason", "") for m in out)
+
+
+def test_missing_book_settings_do_not_grant_option_entry_permission():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    with stack, _generals([{"sym": "DOWN", "d3": -8.0}]), _scanner_state(0), \
+            _patched(rs, get_bot_settings=lambda uid: rs._DEFAULTS if uid == "U1" else types.SimpleNamespace()):
+        out = _run(scanner.OptionsScannerAgent()._run_directional(client))
+    assert [order["book"] for order in submitted] == ["U2"], submitted
+    assert any(m.payload["user_id"] == "U1" and "settings_unavailable" in m.payload.get("reason", "") for m in out)
+
+
+def test_one_books_broker_option_restriction_does_not_restrict_the_next():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    async def _acct(token=None):
+        return types.SimpleNamespace(equity=10_000, options_approved_level=3,
+                                     options_trading_level=1 if binding.now == "U1" else 3)
+    with stack, _patched(alp, get_account=_acct), \
+            _generals([{"sym": "DOWN", "d3": -8.0}]), _scanner_state(0):
+        out = _run(scanner.OptionsScannerAgent()._run_directional(client))
+    assert [order["book"] for order in submitted] == ["U2"], submitted
+    assert any(m.payload["user_id"] == "U1" and "level 1" in m.payload.get("reason", "") for m in out)
+
+
+def test_unreadable_direct_option_exposure_cannot_place_an_order():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    async def _inventory(client, uid): return None
+    with stack, _patched(scanner, _option_inventory=_inventory), \
+            _generals([{"sym": "DOWN", "d3": -8.0}]), _scanner_state(0):
+        out = _run(scanner.OptionsScannerAgent()._run_directional(client))
+    assert submitted == []
+    assert sum("unreadable" in m.payload.get("reason", "") for m in out) == 2
+
+
+def test_same_day_puts_run_for_both_books_with_independent_attempt_counters():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    async def _candles_down(sym, kind):
+        candles = _candles(close=100.0)
+        candles[-2].close = 102.0
+        return candles
+    async def _market(limit=20): return []
+    with stack, _patched(scanner, _same_day_entry_open=lambda: True,
+                         fetch_candles_for=_candles_down), \
+            _patched(mu, market_wide_candidates=_market), \
+            _patched(load_module("app.agents.market_desk"),
+                     current_market_view=lambda: types.SimpleNamespace(regime="choppy")), \
+            _generals([]), _scanner_state(0) as agent_class:
+        out = _run(scanner.OptionsScannerAgent()._run_same_day(client))
+        keys = set(agent_class._day_fired)
+    assert [order["book"] for order in submitted] == ["U1", "U2"], submitted
+    assert all(order["contracts"] * order["limit_price"] * 100 <= 300 for order in submitted)
+    assert any(key.startswith("D:U1:") for key in keys) and any(key.startswith("D:U2:") for key in keys), keys
+    assert sum(m.kind == "execute" for m in out) == 2
+
+
+def test_bear_call_spreads_run_for_each_book_and_validate_live_wing_risk():
+    opts = load_module("app.strategies.options_strategies")
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    play = types.SimpleNamespace(underlying="DOWN", strategy="bear_call_spread",
+        direction="bearish", expiration=_EXP_FUTURE, net_premium_usd=50.0,
+        max_loss_usd=50.0, net_delta=-0.2, notes="",
+        legs=[{"action": "sell", "type": "call", "strike": 100.0},
+              {"action": "buy", "type": "call", "strike": 101.0}])
+    async def _pick(sym, kind, strike, exp):
+        return types.SimpleNamespace(occ=_occ(sym, exp, "C", strike),
+            strike=strike, expiration=exp, premium=0.7 if strike == 100 else 0.2)
+    async def _mleg(legs, qty, limit_price):
+        submitted.append({"book": binding.now, "legs": legs, "limit_price": limit_price})
+        return {"id": f"spread-{binding.now}", "status": "accepted"}, None
+    with stack, _generals([{"sym": "DOWN", "d3": -8.0}]), _scanner_state(0), \
+            _patched(opts, build_bear_call_spread=lambda *a: play), \
+            _patched(alp_data, live_option_pick=_pick), _patched(alp, submit_mleg_order=_mleg):
+        agent = scanner.OptionsScannerAgent()
+        out = _run(agent._run_spreads(client))
+        _run(agent._run_spreads(client))
+    assert [order["book"] for order in submitted] == ["U1", "U2"], submitted
+    assert all(m.payload["max_loss_usd"] == 51.0 for m in out if m.kind == "execute"), out
+    assert sum(m.kind == "execute" for m in out) == 2
+
+
+def test_cc_overlay_env_credentials_reach_each_books_own_stock_holdings():
+    stack, client, binding, seen, activity = _step_seams(["U1", "U2"], oauth=False)
+    with stack:
+        out = _run(scanner.OptionsScannerAgent()._run_cc_overlay(client))
+    assert seen["acct_bound"] == ["U1", "U2"], seen
+    assert [m.payload["user_id"] for m in out] == ["U1", "U2"], out
+    assert binding.now is None
+
+
+def test_cc_coverage_honors_actual_ledger_pending_calls_and_pending_stock_sells():
+    empty = {key: [] for key in ("positions", "orders", "tracked", "ledger")}
+    base = {**empty, "positions": [{"symbol": "AGNC", "qty": "100"}]}
+    assert scanner._covered_call_reason(base, "AGNC", 1) is None
+    ledger = {"ticker": _occ("AGNC", _EXP_FUTURE, "C", 11), "side": "short", "qty": 1}
+    assert scanner._covered_call_reason({**base, "ledger": [ledger]}, "AGNC", 1)
+    pending = {"symbol": ledger["ticker"], "side": "sell", "qty": "1", "filled_qty": "0"}
+    assert scanner._covered_call_reason({**base, "orders": [pending]}, "AGNC", 1)
+    stock_sell = {"symbol": "AGNC", "side": "sell", "qty": "20", "filled_qty": "0"}
+    assert scanner._covered_call_reason({**base, "orders": [stock_sell]}, "AGNC", 1)
+    assert scanner._covered_call_reason({**base, "positions": [{"symbol": "AGNC", "qty": "99"}]}, "AGNC", 1)
+
+
+def test_csp_reservation_counts_pending_puts_without_double_counting_ledgers():
+    occ = _occ("AGNC", _EXP_FUTURE, "P", 10)
+    inventory = {
+        "positions": [{"symbol": occ, "qty": "-1"}],
+        "ledger": [{"ticker": occ, "side": "short", "qty": 1}],
+        "tracked": [{"underlying": "AGNC", "option_type": "put", "expiration": _EXP_FUTURE,
+                     "strike": 10, "contracts": 1, "strategy": "wheel_csp"}],
+        "orders": [{"symbol": occ, "side": "sell", "position_intent": "sell_to_open",
+                    "qty": "2", "filled_qty": "1"}]}
+    assert scanner._reserved_puts(inventory) == (2, 2000.0)
+
+
+def test_pending_long_options_reserve_day_budget_and_position_capacity():
+    occ = _occ("SPY", date.today().isoformat(), "P", 500)
+    inventory = {key: [] for key in ("positions", "orders", "tracked", "ledger")}
+    inventory["orders"] = [{"symbol": occ, "side": "buy", "position_intent": "buy_to_open",
+                            "qty": "2", "filled_qty": "0", "limit_price": "0.75"}]
+    positions = scanner._long_option_inventory(inventory)
+    assert len(positions) == 1 and positions[occ]["lane"] == "option_day"
+    assert positions[occ]["cost"] == 150.0
+
+
+def test_option_inventory_refuses_failed_ledger_and_open_order_reads():
+    stack, client, binding, seen, activity = _step_seams(["U1"])
+    async def _missing_orders(token=None): return None
+    with stack, accounts.bind_for_user("U1"), _patched(alp, get_open_orders_all_strict=_missing_orders):
+        assert _run(scanner._option_inventory(client, "U1")) is None
+    def _broken(q):
+        if q.table_name == "paper_positions": raise RuntimeError("ledger unavailable")
+        return []
+    stack, client, binding, seen, activity = _step_seams(["U1"])
+    with stack, accounts.bind_for_user("U1"):
+        assert _run(scanner._option_inventory(_Client(_broken), "U1")) is None
+
+
+def test_wheel_dte_is_read_from_the_requested_books_posture():
+    queried = []
+    def _settings(uid):
+        queried.append(uid)
+        return types.SimpleNamespace(account_posture="velocity" if uid == "U1" else "income")
+    with _patched(rs, get_bot_settings=_settings):
+        assert scanner._wheel_dte_pick("U1") == 9
+        assert scanner._wheel_dte_pick("U2") == 30
+    assert queried == ["U1", "U2"]
+
+
+def test_requested_option_reconciliation_only_reads_the_selected_book():
+    rows = [_short_row("U1", rid="one"), _short_row("U2", rid="two")]
+    stack, client, binding, reads, activity = _reconcile_seams(rows, strict=[])
+    with stack, _patched(accounts, load_accounts=lambda: [
+            types.SimpleNamespace(user_id=uid) for uid in ("U1", "U2")]):
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client, user_id="U2"))
+    assert reads and {read["bound"] for read in reads} == {"U2"}, reads
+    assert all(("eq", ("user_id", "U2")) in q.calls for q in client.queries
+               if q.table_name == "options_positions" and q.op("select"))
+
+
+def test_requested_option_reconciliation_reports_a_failed_broker_read():
+    stack, client, binding, reads, activity = _reconcile_seams([], strict=None)
+    with stack:
+        out = _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client, user_id="U2"))
+    assert len(out) == 1 and out[0].payload["status"] == "failed", out
+    assert out[0].payload["user_id"] == "U2" and "unreadable" in out[0].payload["reason"]
+    assert not client.writes("options_positions")
+
+
+def test_manual_wheel_request_bypasses_auto_flags_but_keeps_permission_check():
+    stack, client, binding, seen, activity = _step_seams(["U1"], auto_execute=False, approval=0)
+    with stack:
+        automatic = _fire(client, uid="U1", strategy="wheel_cc")
+        manual = _fire(client, uid="U1", strategy="wheel_cc", manual=True, limit_price=0.2)
+    assert automatic.payload["event"] == "option_lane_status", automatic
+    assert "automatic Wheel trading is off" in automatic.payload["reason"]
+    assert manual.payload["event"] == "wheel_auto_blocked" and "level 0" in manual.payload["reason"], manual
+    assert seen["acct_bound"] == ["U1"], seen
+
+
+def test_a_timed_out_option_book_does_not_cancel_the_next_book():
+    stack, client, binding, submitted, activity = _independent_entry_seams()
+    entered = []
+    async def _body(self, client, uid):
+        entered.append((uid, binding.now))
+        if uid == "U1": raise asyncio.TimeoutError("book timed out")
+        return []
+    with stack, _patched(scanner.OptionsScannerAgent, _run_directional_for=_body):
+        out = _run(scanner.OptionsScannerAgent()._run_directional(client))
+    assert entered == [("U1", "U1"), ("U2", "U2")], entered
+    assert any(m.payload["user_id"] == "U1" and "TimeoutError" in m.payload["reason"] for m in out)
+    assert binding.now is None
+
+
+def test_sector_compass_includes_losing_sector_stocks_for_bearish_scanners():
+    moves = {"WIN": 6.0, "UP": 4.0, "FLAT": 1.0, "LOW": -2.0,
+             "LOSS": -5.0, "DROP": -8.0}
+    async def _candles_for(sym):
+        candles = _candles(close=100.0)
+        sector = sym.removesuffix("STOCK")
+        candles[-1].close *= 1 + moves[sector] / 100.0
+        return candles
+    saved = dict(mu.SECTOR_BIAS)
+    try:
+        with _patched(mu, SECTOR_ETFS={key: key for key in moves},
+                      SECTOR_GENERALS={key: [key + "STOCK"] for key in moves}), \
+                _patched(cm, fetch_stock_candles=_candles_for):
+            result = _run(mu.sector_compass())
+        assert {row["sym"] for row in result["generals"]} == {key + "STOCK" for key in moves}
+        assert any(row["sym"] == "DROPSTOCK" and row["d3"] == -8.0 for row in result["generals"])
+    finally:
+        mu.SECTOR_BIAS.clear()
+        mu.SECTOR_BIAS.update(saved)
 
 
 if __name__ == "__main__":

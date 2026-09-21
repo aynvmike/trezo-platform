@@ -65,6 +65,7 @@ export function AgentTicker() {
               <span className="font-medium text-weave-700">
                 {agentLabel(m.agent_name)}
               </span>
+              {m.book_label && <span className="text-weave-600">{m.book_label}</span>}
               <span className="text-weave-500">{describeAgentMessage(m)}</span>
               <span className="text-weave-300">·</span>
             </span>

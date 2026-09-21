@@ -14,7 +14,7 @@ import json
 import math
 from typing import Any
 
-POLICY_VERSION = "restricted-research-v1"
+POLICY_VERSION = "restricted-research-v2-directional"
 MIN_BARS = 180
 MAX_BARS = 1200
 MAX_CANDIDATES = 4
@@ -102,11 +102,16 @@ class Candidate:
     max_hold_bars: int = 12
     parent_id: str | None = None
     policy_version: str = POLICY_VERSION
+    direction: str = "long"
 
     def __post_init__(self):
         if not self.book_id or not self.symbol or self.policy_version != POLICY_VERSION:
             raise ValueError("candidate scope or policy is invalid")
-        if self.entry_rule not in {"breakout_high", "pullback_recovery"}:
+        if self.direction not in {"long", "short"}:
+            raise ValueError("candidate direction must be long or short")
+        rules = ({"breakout_high", "pullback_recovery"} if self.direction == "long"
+                 else {"breakdown_low", "rally_rejection"})
+        if self.entry_rule not in rules:
             raise ValueError("entry rule is not in the approved grammar")
         for name, lo, hi in (("trend_bars", 10, 60), ("entry_bars", 2, 30),
                              ("max_hold_bars", 2, 30)):
@@ -119,8 +124,9 @@ class Candidate:
             raise ValueError("target is outside the approved bounds")
 
     def spec(self) -> dict:
-        return {**asdict(self), "entry_rules": ["close_above_trend_sma", self.entry_rule],
-                "direction": "long", "execution": "next_bar_open",
+        trend = "close_above_trend_sma" if self.direction == "long" else "close_below_trend_sma"
+        return {**asdict(self), "entry_rules": [trend, self.entry_rule],
+                "execution": "next_bar_open",
                 "exit_rules": ["gap_aware_stop", "target", "maximum_hold", "window_end"],
                 "position_policy": "quarter_equity_fractional_simulation"}
 
@@ -131,7 +137,7 @@ class Candidate:
 
 def propose(book_id: str, symbol: str) -> list[Candidate]:
     return [Candidate(book_id, symbol, "breakout_high"),
-            Candidate(book_id, symbol, "pullback_recovery", entry_bars=3)]
+            Candidate(book_id, symbol, "breakdown_low", direction="short")]
 
 
 def refine(parent: Candidate, train_result: dict) -> list[Candidate]:
@@ -162,6 +168,14 @@ def _entry(candles: list[dict], index: int, candidate: Candidate) -> bool:
         return False
     current = candles[index]
     trend = sum(bar["close"] for bar in candles[index + 1 - candidate.trend_bars:index + 1]) / candidate.trend_bars
+    if candidate.direction == "short":
+        if current["close"] >= trend:
+            return False
+        prior = candles[index - candidate.entry_bars:index]
+        if candidate.entry_rule == "breakdown_low":
+            return current["close"] < min(bar["low"] for bar in prior)
+        return (max(bar["high"] for bar in prior) >= trend
+                and current["close"] < candles[index - 1]["close"])
     if current["close"] <= trend:
         return False
     prior = candles[index - candidate.entry_bars:index]
@@ -192,51 +206,55 @@ def replay(candles: list[dict], candidate: Candidate, assumptions: Assumptions,
     peak = capital
     max_dd = 0.0
     total_fees = 0.0
+    direction = 1 if candidate.direction == "long" else -1
 
     for index in range(start, end):
         bar = candles[index]
         if pending is not None:
-            entry_price = bar["open"] * (1 + slip)
+            entry_price = bar["open"] * (1 + direction * slip)
             budget = cash * assumptions.position_fraction
             qty = math.floor(budget / (entry_price * (1 + fee)) * 1_000_000) / 1_000_000
             if qty > 0:
                 entry_fee = qty * entry_price * fee
-                cash -= qty * entry_price + entry_fee
+                cash -= direction * qty * entry_price + entry_fee
                 total_fees += entry_fee
                 position = {"entry_index": index, "entry_at": bar["timestamp"],
                             "decision_index": pending, "decision_at": candles[pending]["timestamp"],
-                            "entry_price": entry_price, "qty": qty, "entry_fee": entry_fee}
+                            "entry_price": entry_price, "qty": qty, "entry_fee": entry_fee,
+                            "direction": candidate.direction}
             pending = None
 
         if position is not None:
-            stop = position["entry_price"] * (1 - candidate.stop_pct)
-            target = position["entry_price"] * (1 + candidate.target_pct)
+            stop = position["entry_price"] * (1 - direction * candidate.stop_pct)
+            target = position["entry_price"] * (1 + direction * candidate.target_pct)
             exit_raw, reason = None, None
-            if bar["open"] <= stop:
+            adverse = bar["low"] if direction == 1 else bar["high"]
+            favorable = bar["high"] if direction == 1 else bar["low"]
+            if direction * (bar["open"] - stop) <= 0:
                 exit_raw, reason = bar["open"], "gap_stop"
-            elif bar["open"] >= target:
+            elif direction * (bar["open"] - target) >= 0:
                 exit_raw, reason = bar["open"], "gap_target"
-            elif bar["low"] <= stop:
+            elif direction * (adverse - stop) <= 0:
                 exit_raw, reason = stop, "stop"
-            elif bar["high"] >= target:
+            elif direction * (favorable - target) >= 0:
                 exit_raw, reason = target, "target"
             elif index - position["entry_index"] + 1 >= candidate.max_hold_bars:
                 exit_raw, reason = bar["close"], "maximum_hold"
             if index == end - 1 and exit_raw is None:
                 exit_raw, reason = bar["close"], "window_end"
             if exit_raw is not None:
-                exit_price = exit_raw * (1 - slip)
+                exit_price = exit_raw * (1 - direction * slip)
                 exit_fee = position["qty"] * exit_price * fee
-                cash += position["qty"] * exit_price - exit_fee
+                cash += direction * position["qty"] * exit_price - exit_fee
                 total_fees += exit_fee
-                pnl = (position["qty"] * (exit_price - position["entry_price"])
+                pnl = (direction * position["qty"] * (exit_price - position["entry_price"])
                        - position["entry_fee"] - exit_fee)
                 trades.append({**position, "exit_index": index, "exit_at": bar["timestamp"],
                                "exit_price": exit_price, "exit_fee": exit_fee,
                                "net_pnl_usd": pnl, "exit_reason": reason})
                 position = None
 
-        equity = cash + (position["qty"] * bar["close"] if position else 0.0)
+        equity = cash + (direction * position["qty"] * bar["close"] if position else 0.0)
         # Fixed research-period costs are charged proportionally to each
         # time window, at its end. They never become trading income.
         if index == end - 1:
@@ -247,7 +265,7 @@ def replay(candles: list[dict], candidate: Candidate, assumptions: Assumptions,
         max_dd = max(max_dd, (peak - equity) / peak)
         equity_curve.append({"index": index, "timestamp": bar["timestamp"],
                              "equity": equity, "cash": cash,
-                             "position_qty": position["qty"] if position else 0.0})
+                             "position_qty": direction * position["qty"] if position else 0.0})
         if position is None and index < end - 1 and _entry(candles, index, candidate):
             pending = index
 
