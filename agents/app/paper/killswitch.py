@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -44,6 +46,93 @@ MAX_SLIPPAGE_BREACHES = 3   # fills slipping worse than the limit / session
 
 _ROWSUM_CACHE: dict[str, tuple] = {}   # user -> (ts, wk, dy, streak) 30s TTL
 _LAST_MODE: dict[str, str] = {}        # user -> last seen mode, for transition records
+
+
+@dataclass
+class ReadFailureCapture:
+    """The sanitized failure for one kill-switch evaluation only."""
+
+    failure: dict | None = None
+
+
+_READ_FAILURE_CAPTURE: ContextVar[ReadFailureCapture | None] = ContextVar(
+    "killswitch_read_failure_capture", default=None)
+
+
+@contextmanager
+def capture_read_failure():
+    """Keep concurrent approvals isolated and restore an enclosing capture.
+
+    The fresh holder also follows awaited child tasks, including to_thread.
+    No exception text, response body, headers or database rows are retained.
+    """
+    capture = ReadFailureCapture()
+    token = _READ_FAILURE_CAPTURE.set(capture)
+    try:
+        yield capture
+    finally:
+        _READ_FAILURE_CAPTURE.reset(token)
+
+
+def record_check_failure(stage: str, exc: Exception | None = None, *,
+                         category: str | None = None) -> None:
+    """Capture allowlisted metadata without parsing arbitrary error text."""
+    capture = _READ_FAILURE_CAPTURE.get()
+    if capture is None:
+        return
+    stage = stage if stage in {
+        "client", "paper_accounts_read", "paper_accounts_response",
+        "kill_switch_evaluation",
+    } else "kill_switch_evaluation"
+    diagnostic = {"stage": stage, "category": "unclassified_failure"}
+    if category in {"no_client", "invalid_response", "state_unavailable"}:
+        diagnostic["category"] = category
+    elif exc is not None:
+        # PostgREST and HTTP clients expose different structured attributes.
+        # Read only bounded status/code values; never serialize the exception.
+        status = None
+        code = None
+        try:
+            raw = getattr(exc, "status_code", None)
+            if raw is None:
+                raw = getattr(getattr(exc, "response", None), "status_code", None)
+            raw_code = getattr(exc, "code", None)
+            if type(raw_code) in (int, str):
+                code = str(raw_code)
+            if raw is None and code is not None and len(code) == 3:
+                raw = code
+            if (type(raw) is int or
+                    (type(raw) is str and len(raw) == 3 and raw.isdecimal())):
+                candidate = int(raw)
+                if 400 <= candidate <= 599:
+                    status = candidate
+        except Exception:  # noqa: BLE001
+            pass
+        if status is not None:
+            diagnostic["http_status"] = status
+            diagnostic["category"] = (
+                "authentication_failed" if status == 401 else
+                "permission_denied" if status == 403 else
+                "rate_limited" if status == 429 else
+                "service_unavailable" if status >= 500 else "http_error")
+        elif code in {"PGRST301", "28000", "28P01"}:
+            diagnostic["category"] = "authentication_failed"
+        elif code == "42501":
+            diagnostic["category"] = "permission_denied"
+        else:
+            categories = {
+                "ConnectTimeout": "connect_timeout", "ReadTimeout": "read_timeout",
+                "WriteTimeout": "write_timeout", "PoolTimeout": "pool_timeout",
+                "TimeoutError": "timeout", "TimeoutException": "timeout",
+                "ConnectionError": "connection_failed", "ConnectError": "connection_failed",
+                "ReadError": "read_failed", "RemoteProtocolError": "protocol_error",
+                "JSONDecodeError": "invalid_response",
+            }
+            for cls in type(exc).__mro__:
+                if cls.__name__ in categories:
+                    diagnostic["category"] = categories[cls.__name__]
+                    break
+    capture.failure = diagnostic
 
 
 class _RowsumCached(Exception):
@@ -365,6 +454,7 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
     "no halts anywhere" — a dead database looked like a healthy one.
     """
     if not client:
+        record_check_failure("client", category="no_client")
         return None
 
     def _fetch():
@@ -372,9 +462,27 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
 
     try:
         res = await asyncio.to_thread(_fetch)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        record_check_failure("paper_accounts_read", exc)
         return None
 
+    try:
+        rows = getattr(res, "data", None)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            record_check_failure("paper_accounts_response", category="invalid_response")
+            return None
+    except Exception:  # noqa: BLE001
+        record_check_failure("paper_accounts_response", category="invalid_response")
+        return None
+
+    try:
+        return await _evaluate_accounts(client, rows)
+    except Exception as exc:  # noqa: BLE001
+        record_check_failure("kill_switch_evaluation", exc)
+        return None
+
+
+async def _evaluate_accounts(client, rows: list[dict]) -> dict[str, KillSwitch]:
     states: dict[str, KillSwitch] = {}
     # 2026-08-18 (Mike: "the agents are not responding to each book's own
     # setting"). He was right. consecutive_loss_limit was read ONCE, here,
@@ -385,7 +493,7 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
     #
     # The limit is a per-book setting. Read it per book, inside the loop.
     from app.runtime.settings import get_bot_settings
-    for acct in (res.data or []):
+    for acct in rows:
         try:
             consec_limit = int(get_bot_settings(
                 str(acct.get("user_id") or "")).consecutive_loss_limit)

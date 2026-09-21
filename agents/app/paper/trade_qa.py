@@ -1738,6 +1738,7 @@ async def _check_enforceable_stop(client, uid: str, key: str, r: dict,
     resting = [o for o in open_orders
                if isinstance(o, dict)
                and ledger_symbol(o.get("symbol"), asset_class_of(o)) == key
+               and _closes_side(o, r.get("side"))
                and str(o.get("type") or o.get("order_type") or "").lower()
                in _protective_types()
                and str(o.get("status") or "").lower() in _non_terminal()]
@@ -1753,7 +1754,8 @@ async def _check_enforceable_stop(client, uid: str, key: str, r: dict,
         "qa_unenforceable_stop", key, severity="warn",
         message=(f"Row {rid} shows a stop at {stop:g}, but there is no "
                  f"resting stop order at the broker. If Trezo is down "
-                 f"when price reaches it, nothing sells. QA does not "
+                 f"when price reaches it, the position has no "
+                 f"broker-enforced exit at that stop. QA does not "
                  f"place orders -- this is a flag, not a repair."),
         row_id=rid), rep)
 

@@ -6,15 +6,17 @@ factory below. The rest of Trezo (Wheel, Options Scanner, dashboard
 snapshots) only ever calls the active broker — no hardcoded Alpaca
 imports leak into business logic anymore.
 
-Selection order (per user, then global):
-  1. The user's connected OAuth broker (broker_connections table).
-  2. Env-key Alpaca (single-tenant fallback).
-  3. None — pure modeled mode.
+Snapshot selection order:
+  1. An explicit registered paper book's own credentials.
+  2. The user's connected OAuth broker (broker_connections table).
+  3. Env-key Alpaca for requests without an explicit user/book.
+  4. None when an explicit snapshot route cannot be verified.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Optional
 
 
@@ -30,6 +32,7 @@ class BrokerSnapshot:
     options_approved_level: int = 0
     trading_blocked: bool = False
     raw: dict | None = None          # provider-specific blob for debugging
+    book_key: str | None = None      # explicit registry binding, never a guessed owner
 
 
 @dataclass
@@ -77,15 +80,27 @@ async def active_broker_name(user_id: Optional[str] = None) -> str:
 async def active_broker_snapshot(user_id: Optional[str] = None) -> Optional[BrokerSnapshot]:
     """Normalised account snapshot from whichever broker is active.
 
-    Returns None when in pure modeled mode (nothing configured)."""
-    name = await active_broker_name(user_id)
-    if name == "alpaca":
-        return await _alpaca_snapshot(user_id)
-    if name == "webull":
-        return await _webull_snapshot(user_id)
-    if name == "robinhood":
-        return await _robinhood_snapshot(user_id)
-    return None
+    Returns None when configuration, routing or the broker read is unavailable.
+    An explicit registered book takes its own registry route; it is not
+    interchangeable with an OAuth owner's identity or the default book.
+    """
+    try:
+        if user_id:
+            from app.brokers.accounts import account_for_user
+            if account_for_user(user_id) is not None:
+                return await _alpaca_snapshot(user_id)
+        name = await active_broker_name(user_id)
+        if name == "alpaca":
+            return await _alpaca_snapshot(user_id)
+        if name == "webull":
+            return await _webull_snapshot(user_id)
+        if name == "robinhood":
+            return await _robinhood_snapshot(user_id)
+        return None
+    except Exception:  # noqa: BLE001
+        # Failed or malformed reads are unavailable, never a zero balance.
+        # asyncio cancellation still propagates and releases the binding.
+        return None
 
 
 async def active_broker_option_chain(
@@ -107,32 +122,65 @@ async def active_broker_option_chain(
 
 async def _alpaca_snapshot(user_id: Optional[str]) -> Optional[BrokerSnapshot]:
     from app.brokers.alpaca import get_account, broker_venue, UserToken
+    from app.brokers.accounts import (
+        account_for_user, bind_for_user, multi_account_active,
+    )
+    book_key = None
     token = None
     if user_id:
         try:
-            from app.integrations.web_tokens import get_user_broker_token
-            bt = await get_user_broker_token(user_id, "alpaca")
-            if bt and bt.access_token:
+            account = account_for_user(user_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if account is not None:
+            # The existing Alpaca transport deliberately ignores registry
+            # bindings in live mode and single-account mode. Never label
+            # an unsupported secondary route with the primary's equity.
+            if broker_venue() != "paper":
+                return None
+            if not multi_account_active() and account.account_id != "primary":
+                return None
+            with bind_for_user(user_id) as bound:
+                if bound is None or bound.account_key != user_id:
+                    return None
+                acct = await get_account()
+                book_key = user_id
+        else:
+            # A user outside the paper registry may have an OAuth account.
+            # If lookup fails or no token exists, the answer is unknown;
+            # explicit requests must never fall through to env credentials.
+            try:
+                from app.integrations.web_tokens import get_user_broker_token
+                bt = await get_user_broker_token(user_id, "alpaca")
+                if not bt or not bt.access_token:
+                    return None
                 token = UserToken(
                     access_token=bt.access_token,
                     refresh_token=bt.refresh_token,
                     expires_at=bt.expires_at,
                 )
-        except Exception:  # noqa: BLE001
-            pass
-    acct = await get_account(token=token)
+            except Exception:  # noqa: BLE001
+                return None
+            acct = await get_account(token=token)
+    else:
+        acct = await get_account()
     if not acct:
+        return None
+    try:
+        amounts = {key: float(getattr(acct, key)) for key in
+                   ("equity", "last_equity", "cash", "buying_power")}
+        if not all(math.isfinite(value) for value in amounts.values()):
+            return None
+    except (AttributeError, TypeError, ValueError):
         return None
     return BrokerSnapshot(
         name="alpaca",
         venue=broker_venue(),
-        equity=float(acct.equity),
-        last_equity=float(acct.last_equity),
-        cash=float(acct.cash),
-        buying_power=float(acct.buying_power),
+        **amounts,
         options_approved_level=int(acct.options_approved_level),
         trading_blocked=bool(acct.trading_blocked),
         raw=acct.to_dict(),
+        book_key=book_key,
     )
 
 

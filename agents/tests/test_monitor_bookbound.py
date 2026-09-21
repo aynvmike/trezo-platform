@@ -9,9 +9,9 @@ TE-12 / BI-07  The pre-holiday review and the open-bell gap check run
                the row's own book INSIDE and refuses an unknown book;
                its broker-truth read is STRICT (None = read failed = do
                nothing), never "no shares".
-TE-11 / BI-06  Same-day option exits were submitted unbound. Each row
-               binds its own book; rid is marked done only after an
-               ACCEPTED order under that binding.
+TE-11 / BI-06  Same-day option exits bind each row's book. New submissions
+               require fresh quotes; durable receipt polling replaces
+               the old in-memory accepted-order latch.
 BI-05          The liquidation throttle / circuit was keyed by symbol
                alone, so one book's reject storm on a shared ticker
                silenced every other book's exit, and a tripped circuit
@@ -73,6 +73,7 @@ route_guard = load_module("app.brokers.route_guard")
 alp_data = load_module("app.brokers.alpaca_data")
 alog = load_module("app.agents.activity_log")
 engine = load_module("app.paper.engine")
+broker_exit = load_module("app.paper.broker_exit")
 leg_sync = load_module("app.paper.leg_sync")
 pm = load_module("app.agents.position_monitor")
 # Seams the NEQ-05 real-tick tests pin: the equity session gate the
@@ -234,6 +235,31 @@ class _Client:
 
     def table(self, name):
         return _Query(self, name)
+
+
+async def _claim_exit(pos, expected, pending):
+    payload = dict(pos.get("source_payload") or {})
+    if payload.get(broker_exit.PENDING_KEY) != expected:
+        return False
+    if pending is None:
+        payload.pop(broker_exit.PENDING_KEY, None)
+    else:
+        payload[broker_exit.PENDING_KEY] = dict(pending)
+    pos["source_payload"] = payload
+    return True
+
+
+def _receipt_orders(client, price):
+    """Explicit broker fills for absence tests; the ledger mark is unused."""
+    async def _read(after):
+        return [{"id": "exit-" + r["id"], "symbol": r["ticker"],
+                 "side": "sell" if r["side"] == "long" else "buy",
+                 "status": "filled", "filled_qty": str(r["quantity"]),
+                 "filled_avg_price": str(price),
+                 "submitted_at": datetime.now(timezone.utc).isoformat(),
+                 "filled_at": datetime.now(timezone.utc).isoformat()}
+                for r in client.rows.get("paper_positions", [])]
+    return _read
 
 
 class _Candle:
@@ -455,9 +481,15 @@ def test_gap_check_resyncs_under_the_rows_own_book():
         got.append((row["ticker"], user_id, row["stop_price"]))
         return True, "ok"
 
+    async def _quote(symbol):
+        return alp_data.Quote(symbol=symbol, bid=95.0, ask=95.1,
+                              bid_size=100, ask_size=100,
+                              ts=datetime.now(timezone.utc).isoformat())
+
     at_open = datetime(2026, 9, 1, 13, 45, tzinfo=timezone.utc)
-    with _patched(pm, _utc_now=lambda: at_open, _GAP_DAY="",
-                  fetch_candles_for=_cnd), \
+    with _registry(_two_books()), _patched(pm, _utc_now=lambda: at_open, _GAP_DAY="",
+              fetch_candles_for=_cnd), \
+            _patched(alp_data, get_quote=_quote), \
             _patched(rsettings, _supabase=lambda: client), \
             _patched(leg_sync, resync_alpaca_legs=_resync), \
             _patched(alog, record=_norec):
@@ -498,80 +530,143 @@ def _opt_row(rid, uid):
             "net_premium_usd": -100.0, "expiration": "2026-09-01"}
 
 
-def test_day_option_exits_are_bound_per_row_and_done_only_when_accepted():
+def _fresh_option_response(params, stamp):
+    return {"quotes": {params["symbols"]: {"bp": 1.4, "ap": 1.6, "t": stamp.isoformat()}}}
+
+
+def test_day_option_exits_delegate_bound_requests_without_accepted_latch():
     rows = [_opt_row("o-a", "book-a"), _opt_row("o-b", "book-b"),
             _opt_row("o-x", "book-unknown")]
     client = _Client({"options_positions": rows})
-    submitted = []
-    skipped = []
-
-    async def _quote(occ):
-        return 1.5                       # entry 1.00 -> +50%: fast take
-
-    async def _order(occ, ct, side, time_in_force="day", limit_price=None,
-                     token=None):
-        submitted.append((occ, side, _bound_id()))
-        if _bound_id() == "acct2":
-            return None, "rejected: insufficient contracts"
-        return {"id": "ord-1"}, None
-
-    def _rec(event, ticker, **kw):
-        if event == "option_day_exit_skipped":
-            skipped.append((kw.get("extra") or {}).get("user_id"))
-
+    exits = load_module("app.paper.option_exit")
+    requests, events = [], []
     midday = datetime(2026, 9, 1, 16, 0, tzinfo=timezone.utc)
-    pm._day_opt_done.clear()
+
+    async def quote(path, params):
+        assert params["feed"] == "indicative"
+        return _fresh_option_response(params, midday)
+
+    async def request(client, row, **kwargs):
+        requests.append((row["id"], _bound_id(), dict(kwargs)))
+        row["broker_exit_pending"] = {"order_id": "accepted-" + row["id"]}
+        return engine.FillResult(ok=False, pending=True, error="awaiting fill")
+
     with _registry(_two_books()), \
             _patched(pm, _day_opt_last=0.0, _utc_now=lambda: midday), \
             _patched(rsettings, _supabase=lambda: client), \
-            _patched(alp_data, get_option_quote=_quote), \
-            _patched(alp, submit_option_order=_order), \
-            _patched(alog, record=_rec):
-        accounts.set_account_for_user("book-a")         # tick-start state
+            _patched(alp_data, _data_get=quote), \
+            _patched(exits, settle_or_request_option_close=request), \
+            _patched(alog, record=lambda e, t, **kw: events.append((e, kw))):
         _run(pm._manage_day_options())
-        done = set(pm._day_opt_done)
-    pm._day_opt_done.clear()
-    assert [b for _, _, b in submitted] == ["primary", "acct2"], submitted
-    assert all(s == "sell" for _, s, _ in submitted)
-    assert "o-a" in done, "accepted order on the right book -> done"
-    assert "o-b" not in done, "rejected order must retry next pass"
-    assert "o-x" not in done and skipped == ["book-unknown"], (
-        "an unresolved book is skipped with a logged reason, never routed "
-        "to the primary")
+        pm._day_opt_last = 0
+        _run(pm._manage_day_options())
+    assert [r[1] for r in requests] == ["primary", "acct2", "primary", "acct2"], requests
+    assert [r[2].get("side") for r in requests[:2]] == ["sell", "sell"]
+    assert all(r[2] == {} for r in requests[2:]), "restart/pending pass must only poll"
+    assert not any(e == "option_day_fill_confirmed" for e, _ in events)
+    assert any(e == "option_day_exit_skipped" for e, _ in events)
 
 
 def test_day_option_exit_refuses_when_the_route_guard_says_no():
     rows = [_opt_row("o-b", "book-b")]
     client = _Client({"options_positions": rows})
-    submitted = []
-    mismatches = []
+    exits = load_module("app.paper.option_exit")
+    requests, mismatches = [], []
 
-    async def _quote(occ):
-        return 1.5
+    async def request(*a, **k):
+        requests.append(a)
+        raise AssertionError("refused route reached exit helper")
 
-    async def _order(*a, **k):
-        submitted.append(a)
-        return {"id": "ord-1"}, None
+    def mismatch(ticker, uid, note, where):
+        mismatches.append((ticker, uid, where))
 
-    def _mm(ticker, user_id, note, where):
-        mismatches.append((ticker, user_id, where))
+    with _registry(_two_books()), \
+            _patched(pm, _day_opt_last=0.0), \
+            _patched(rsettings, _supabase=lambda: client), \
+            _patched(exits, settle_or_request_option_close=request), \
+            _patched(route_guard, check_route=lambda uid: (False, "guard says no"), record_mismatch=mismatch), \
+            _patched(alog, record=_norec):
+        _run(pm._manage_day_options())
+    assert not requests
+    assert mismatches == [("SPY", "book-b", "day_options")], mismatches
 
+
+def test_day_option_pending_poll_does_not_need_price_or_entry_fields():
+    row = {"id": "pending", "user_id": "book-b", "underlying": "SPY",
+           "broker_exit_pending": {"order_id": "own-order"}}
+    client = _Client({"options_positions": [row]})
+    exits = load_module("app.paper.option_exit")
+    polled = []
+
+    async def quote(*a, **k):
+        raise AssertionError("pending receipt must not ask for a price")
+
+    async def poll(client, row, **kwargs):
+        polled.append((_bound_id(), kwargs))
+        return engine.FillResult(ok=False, pending=True, error="receipt unavailable")
+
+    with _registry(_two_books()), _patched(pm, _day_opt_last=0.0), \
+            _patched(rsettings, _supabase=lambda: client), \
+            _patched(exits, settle_or_request_option_close=poll), \
+            _patched(alp_data, _data_get=quote), _patched(alog, record=_norec):
+        _run(pm._manage_day_options())
+    assert polled == [("acct2", {})]
+
+
+def test_day_option_missing_or_stale_quote_never_uses_entry_for_forced_exit():
+    exits = load_module("app.paper.option_exit")
+    force_time = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    for invalid in (None, {"bp": 1.4, "ap": 1.6, "t": "2026-09-01T19:58:00Z"},
+                    {"bp": 1.6, "ap": 1.4, "t": force_time.isoformat()},
+                    {"bp": "nan", "ap": 1.6, "t": force_time.isoformat()},
+                    {"bp": 1.4, "ap": 1.6}):
+        client = _Client({"options_positions": [_opt_row("o-b", "book-b")]})
+        calls, events = [], []
+
+        async def quote(path, params):
+            return {"quotes": {params["symbols"]: invalid}}
+
+        async def request(*a, **k):
+            calls.append(a)
+            raise AssertionError("unverified quote triggered a new exit")
+
+        with _registry(_two_books()), \
+                _patched(pm, _day_opt_last=0.0, _utc_now=lambda: force_time), \
+                _patched(rsettings, _supabase=lambda: client), \
+                _patched(exits, settle_or_request_option_close=request), \
+                _patched(alp_data, _data_get=quote), \
+                _patched(alog, record=lambda e, t, **kw: events.append((e, kw))):
+            _run(pm._manage_day_options())
+        assert not calls
+        assert len(events) == 1 and events[0][0] == "option_day_exit_deferred", events
+        assert events[0][1]["extra"]["time_exit_due"] is True
+
+
+def test_day_option_confirmed_log_uses_receipt_price_and_pnl():
+    row = _opt_row("o-b", "book-b")
+    client = _Client({"options_positions": [row]})
+    exits = load_module("app.paper.option_exit")
     midday = datetime(2026, 9, 1, 16, 0, tzinfo=timezone.utc)
-    pm._day_opt_done.clear()
+    events = []
+
+    async def quote(path, params):
+        return _fresh_option_response(params, midday)
+
+    async def request(client, row, **kwargs):
+        return engine.FillResult(ok=True, fill_price=1.37, realized_pnl_usd=37, remaining_qty=0)
+
     with _registry(_two_books()), \
             _patched(pm, _day_opt_last=0.0, _utc_now=lambda: midday), \
             _patched(rsettings, _supabase=lambda: client), \
-            _patched(alp_data, get_option_quote=_quote), \
-            _patched(alp, submit_option_order=_order), \
-            _patched(route_guard, check_route=lambda uid: (False, "guard says no"),
-                     record_mismatch=_mm), \
-            _patched(alog, record=_norec):
+            _patched(exits, settle_or_request_option_close=request), \
+            _patched(alp_data, _data_get=quote), \
+            _patched(alog, record=lambda e, t, **kw: events.append((e, kw))):
         _run(pm._manage_day_options())
-        done = set(pm._day_opt_done)
-    pm._day_opt_done.clear()
-    assert submitted == [], "a refused route must not reach the broker"
-    assert mismatches == [("SPY", "book-b", "day_options")], mismatches
-    assert "o-b" not in done
+    assert len(events) == 1 and events[0][0] == "option_day_fill_confirmed", events
+    assert events[0][1]["extra"]["exit_price"] == 1.37
+    assert events[0][1]["extra"]["realized_pnl_usd"] == 37
+    assert events[0][1]["extra"]["pnl_provisional"] is True
+    assert events[0][1]["extra"]["fees_complete"] is False
 
 
 # =======================================================================
@@ -670,18 +765,19 @@ def test_an_unattributed_call_keys_under_the_bound_book():
         assert "book-b:GM" in pm._liq_attempt_at, pm._liq_attempt_at
 
 
-def test_every_monitor_liquidate_call_names_the_book():
-    """BUILT BUT NOT BOUND guard for the five call sites in the tick."""
-    import re
+def test_every_monitor_broker_exit_uses_the_book_bound_receipt_boundary():
+    """Direct liquidation call sites may not bypass durable receipt settlement."""
+    import inspect
     src = (Path(__file__).resolve().parents[1]
            / "app/agents/position_monitor.py").read_text(
         encoding="utf-8", errors="replace")
-    calls = [m.start() for m in re.finditer(r"await _throttled_liquidate\(", src)]
-    assert len(calls) == 5, f"expected 5 liquidate call sites, found {len(calls)}"
-    for i in calls:
-        chunk = src[i:i + 140]
-        assert "user_id=r.get(\"user_id\")" in chunk, (
-            f"a liquidate call is not keyed by the row's book:\n{chunk}")
+    assert "await _throttled_liquidate(" not in src
+    assert "await settle_or_request_close(row, reason," in src
+    assert "await reconcile_broker_close(row)" in src
+    helper = inspect.getsource(broker_exit.settle_or_request_close)
+    assert "with bind_for_user(uid) as account:" in helper
+    assert "user_id=uid)" in helper
+    assert "check_route(uid)" in helper
 
 
 # =======================================================================
@@ -701,8 +797,9 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
     client = _Client({"paper_positions": [row]})
     seen = {}
 
-    async def _rec_close(user_id, position_id, exit_price,
-                         reason="alpaca_bracket"):
+    async def _rec_close(pos, order, reason):
+        user_id, position_id = pos["user_id"], pos["id"]
+        exit_price = float(order["filled_avg_price"])
         seen.update(user_id=user_id, pid=position_id, reason=reason)
         return engine.FillResult(ok=True, position_id=position_id,
                                  fill_price=exit_price, realized_pnl_usd=10.0)
@@ -727,12 +824,13 @@ def test_crypto_gone_at_broker_is_booked_as_alpaca_external():
     pm.PositionMonitorAgent._did_initial_reconcile = True
     try:
         # Shield swept, nothing working -> False -> the close proceeds.
-        with _registry([]), _qa_shield({"book-a": set()}), \
+        with _registry(_two_books()), _qa_shield({"book-a": set()}), \
                 _patched(pm, _supabase=lambda: client, _latest_price=_price,
                          _manage_day_options=_noop, _gap_check_open_bell=_noop,
                          _pre_break_review=_noop, check_and_lock_profit=_nolock), \
                 _patched(book_scope, held_symbols=_held), \
-                _patched(engine, record_external_close=_rec_close), \
+                _patched(broker_exit, _record=_rec_close,
+                         _read_closing_orders=_receipt_orders(client, 1.1)), \
                 _patched(alog, record=_norec):
             out = _run(agent.tick())
     finally:
@@ -776,6 +874,11 @@ def _real_tick(client, price, **extra):
     async def _price(tk, at):
         return price
 
+    async def _quote(tk):
+        return alp_data.Quote(symbol=tk, bid=price, ask=price,
+                              bid_size=100, ask_size=100,
+                              ts=datetime.now(timezone.utc).isoformat())
+
     async def _noop():
         return None
 
@@ -784,6 +887,9 @@ def _real_tick(client, price, **extra):
 
     async def _nostep(*_a, **_k):
         return False, 0          # keeps the step ladder off the database
+
+    async def _verified_quantity(*_args, **_kwargs):
+        return True
 
     saved = (pm.PositionMonitorAgent._recon_tick_counter,
              pm.PositionMonitorAgent._did_initial_reconcile)
@@ -794,6 +900,10 @@ def _real_tick(client, price, **extra):
                       _manage_day_options=_noop, _gap_check_open_bell=_noop,
                       _pre_break_review=_noop, check_and_lock_profit=_nolock,
                       _step_check=_nostep, **extra), \
+                _patched(alp_data, get_quote=_quote, get_crypto_quote=_quote), \
+                _patched(broker_exit, _claim=_claim_exit,
+                         _read_closing_orders=_receipt_orders(client, price),
+                         _verify_exit_quantity=_verified_quantity), \
                 _patched(alog, record=_norec):
             yield
     finally:
@@ -858,7 +968,7 @@ def test_a_flagged_modeled_row_far_below_a_stale_stop_is_not_closed():
         return None
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _real_tick(client, 10.0, close_position=_close,
+    with _registry(_two_books()), _real_tick(client, 10.0, close_position=_close,
                                    reeval_is_enabled=lambda: True,
                                    reevaluate_position=_reeval,
                                    _maybe_trail_stock_profit=_trail):
@@ -894,10 +1004,12 @@ def test_a_flagged_alpaca_row_gets_no_broker_stop_and_no_naked_check():
 
     async def _liq(symbol, asset_type="stock"):
         liquidated.append(symbol)
-        return {"id": "liq"}, None
+        return {"id": "liq", "symbol": symbol, "side": "sell",
+                "status": "accepted", "filled_qty": "0",
+                "submitted_at": datetime.now(timezone.utc).isoformat()}, None
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _clean_liq(), _clean_naked(), _real_tick(client, 10.0), \
+    with _registry(_two_books()), _clean_liq(), _clean_naked(), _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(alp, ensure_stock_protection=_ensure,
                      get_open_orders_for=_open, liquidate_position=_liq), \
@@ -923,7 +1035,7 @@ def test_a_manual_close_still_closes_a_flagged_row():
                                  realized_pnl_usd=0.0)
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _real_tick(client, 10.0, close_position=_close,
+    with _registry(_two_books()), _real_tick(client, 10.0, close_position=_close,
                                    reeval_is_enabled=lambda: False):
         _run(agent.tick())
     assert closed == [("pos-PG", "manual")], closed
@@ -940,21 +1052,22 @@ def test_external_fill_detection_still_applies_to_a_flagged_row():
     async def _held(user_id, *, where="", max_age_s=None):
         return {"KO"}                    # PG is gone at the broker
 
-    async def _rec_close(user_id, position_id, exit_price,
-                         reason="alpaca_bracket"):
+    async def _rec_close(pos, order, reason):
+        user_id, position_id = pos["user_id"], pos["id"]
+        exit_price = float(order["filled_avg_price"])
         seen.update(pid=position_id, reason=reason)
         return engine.FillResult(ok=True, position_id=position_id,
                                  fill_price=exit_price, realized_pnl_usd=1.0)
 
     agent = pm.PositionMonitorAgent()
     # Shield swept, nothing working -> False -> the close proceeds.
-    with _registry([]), _qa_shield({"book-a": set()}), \
+    with _registry(_two_books()), _qa_shield({"book-a": set()}), \
             _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
-            _patched(engine, record_external_close=_rec_close):
+            _patched(broker_exit, _record=_rec_close):
         out = _run(agent.tick())
-    assert seen == {"pid": "pos-PG", "reason": "alpaca_bracket"}, seen
-    assert [m.payload["reason"] for m in out if m.kind == "close"] == ["alpaca_bracket"]
+    assert seen == {"pid": "pos-PG", "reason": "alpaca_external"}, seen
+    assert [m.payload["reason"] for m in out if m.kind == "close"] == ["alpaca_external"]
 
 
 def test_gap_check_leaves_a_flagged_row_alone_but_logs_the_read():
@@ -981,7 +1094,7 @@ def test_gap_check_leaves_a_flagged_row_alone_but_logs_the_read():
         logged.append((event, ticker, kw.get("reason", "")))
 
     at_open = datetime(2026, 9, 1, 13, 45, tzinfo=timezone.utc)
-    with _patched(pm, _utc_now=lambda: at_open, _GAP_DAY="",
+    with _registry(_two_books()), _patched(pm, _utc_now=lambda: at_open, _GAP_DAY="",
                   fetch_candles_for=_cnd), \
             _patched(rsettings, _supabase=lambda: client), \
             _patched(leg_sync, resync_alpaca_legs=_resync), \
@@ -1113,7 +1226,9 @@ def test_a_flagged_extended_row_is_neither_laddered_nor_trail_locked():
 
     async def _liq(symbol, asset_type="stock"):
         liquidated.append(symbol)
-        return {"id": "liq"}, None
+        return {"id": "liq", "symbol": symbol, "side": "sell",
+                "status": "accepted", "filled_qty": "0",
+                "submitted_at": datetime.now(timezone.utc).isoformat()}, None
 
     async def _ensure(sym, qty, stop, target=None):
         return False, "not armed"
@@ -1122,7 +1237,7 @@ def test_a_flagged_extended_row_is_neither_laddered_nor_trail_locked():
         return [{"id": "leg"}]           # exit legs resting: not naked
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _clean_liq(), _clean_naked(), \
+    with _registry(_two_books()), _clean_liq(), _clean_naked(), \
             _real_tick(client, 52.0, _push_stop_to_broker=_push), \
             _patched(book_scope, held_symbols=_held), \
             _patched(alp, liquidate_position=_liq, ensure_stock_protection=_ensure,
@@ -1136,8 +1251,10 @@ def test_a_flagged_extended_row_is_neither_laddered_nor_trail_locked():
     assert rows[1]["stop_price"] == 45.0, "the flagged row's stop was ratcheted"
     assert pushed == [("KO", 53.0)], f"stop pushed for the wrong rows: {pushed}"
     assert liquidated == ["KO"], f"trail_lock liquidated the wrong rows: {liquidated}"
-    ko = [m.payload.get("reason") for m in out if m.payload.get("ticker") == "KO"]
-    assert ko == ["trail_lock"], ko
+    assert rows[0]["source_payload"][broker_exit.PENDING_KEY]["reason"] == "trail_lock"
+    ko = [m.payload.get("event") for m in out if m.payload.get("ticker") == "KO"]
+    assert ko == ["broker_exit_pending"], ko
+    assert not [m for m in out if m.kind == "close"], out
     pg = [m for m in out if m.payload.get("ticker") == "PG"]
     assert pg == [], f"a flagged row produced messages: {[m.payload for m in pg]}"
 
@@ -1158,7 +1275,9 @@ def test_a_flagged_extended_row_is_not_time_stopped_either():
 
     async def _liq(symbol, asset_type="stock"):
         liquidated.append(symbol)
-        return {"id": "liq"}, None
+        return {"id": "liq", "symbol": symbol, "side": "sell",
+                "status": "accepted", "filled_qty": "0",
+                "submitted_at": datetime.now(timezone.utc).isoformat()}, None
 
     async def _ensure(sym, qty, stop, target=None):
         return False, "not armed"
@@ -1167,15 +1286,17 @@ def test_a_flagged_extended_row_is_not_time_stopped_either():
         return [{"id": "leg"}]
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _clean_liq(), _clean_naked(), _real_tick(client, 50.0), \
+    with _registry(_two_books()), _clean_liq(), _clean_naked(), _real_tick(client, 50.0), \
             _patched(book_scope, held_symbols=_held), \
             _patched(alp, liquidate_position=_liq, ensure_stock_protection=_ensure,
                      get_open_orders_for=_open), \
             _patched(ops_watchdog, _us_market_open=lambda: True):
         out = _run(agent.tick())
     assert liquidated == ["KO"], f"time stop liquidated the wrong rows: {liquidated}"
-    ko = [m.payload.get("note", "") for m in out if m.payload.get("ticker") == "KO"]
-    assert any("swing time stop" in n for n in ko), ko
+    assert rows[0]["source_payload"][broker_exit.PENDING_KEY]["reason"] == "time"
+    ko = [m.payload.get("event") for m in out if m.payload.get("ticker") == "KO"]
+    assert ko == ["broker_exit_pending"], ko
+    assert not [m for m in out if m.kind == "close"], out
     assert not [m for m in out if m.payload.get("ticker") == "PG"], out
     assert client.updates == [], f"a stop was written at entry price: {client.updates}"
 
@@ -1215,8 +1336,8 @@ def test_the_tick_clears_its_inline_binding_when_a_row_raises():
 #
 # The shield shipped wired into stocks_reconcile and options_scanner --
 # and both of those run on the 30-minute reconcile. These two run on the
-# 60-second tick, close via record_external_close at a MODELLED price,
-# and are the paths the acceptance case would have hit first: NOBL's own
+# 60-second tick. These previously closed using a modeled price; their
+# receipt-only successors retain the same shield. NOBL's own
 # order was working for 78 minutes, so the stock/option branch's only
 # guard -- a 5-minute fresh-row grace -- is walked straight through, and
 # the crypto branch has no grace at all.
@@ -1247,16 +1368,17 @@ def _no_close_tick(rows, held, shield):
     async def _held(user_id, *, where="", max_age_s=None):
         return set(held)
 
-    async def _rec_close(user_id, position_id, exit_price,
-                         reason="alpaca_bracket"):
+    async def _rec_close(pos, order, reason):
+        user_id, position_id = pos["user_id"], pos["id"]
+        exit_price = float(order["filled_avg_price"])
         seen.update(pid=position_id, reason=reason)
         return engine.FillResult(ok=True, position_id=position_id,
                                  fill_price=exit_price, realized_pnl_usd=1.0)
 
     agent = pm.PositionMonitorAgent()
-    with _registry([]), _qa_shield(shield), _real_tick(client, 10.0), \
+    with _registry(_two_books()), _qa_shield(shield), _real_tick(client, 10.0), \
             _patched(book_scope, held_symbols=_held), \
-            _patched(engine, record_external_close=_rec_close):
+            _patched(broker_exit, _record=_rec_close):
         out = _run(agent.tick())
     return seen, [m for m in out if m.kind == "close"], client
 

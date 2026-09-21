@@ -139,6 +139,112 @@ def test_check_states_empty_table_is_a_real_empty_answer():
     assert out == {} and out is not None
 
 
+class _ReadClient:
+    def __init__(self, *, data=None, error=None):
+        self.data, self.error = data, error
+
+    def table(self, _name):
+        return self
+
+    def select(self, *_args):
+        return self
+
+    def execute(self):
+        if self.error is not None:
+            raise self.error
+        return types.SimpleNamespace(data=self.data)
+
+
+def test_check_states_captures_safe_timeout_from_the_real_read():
+    with ks.capture_read_failure() as capture:
+        out = _run(ks.check_states(_ReadClient(error=TimeoutError(
+            "SECRET-TOKEN https://private.invalid?key=SECRET-TOKEN"))))
+    assert out is None
+    assert capture.failure == {"stage": "paper_accounts_read", "category": "timeout"}
+    assert "SECRET" not in repr(capture.failure)
+
+
+def test_check_states_rejects_missing_or_malformed_data_but_accepts_empty_list():
+    for malformed in (None, {}, "", [None], ["row"], ()):
+        with ks.capture_read_failure() as capture:
+            assert _run(ks.check_states(_ReadClient(data=malformed))) is None
+        assert capture.failure == {
+            "stage": "paper_accounts_response", "category": "invalid_response"}
+    with ks.capture_read_failure() as capture:
+        assert _run(ks.check_states(_ReadClient(data=[]))) == {}
+    assert capture.failure is None
+
+
+def test_check_states_distinguishes_structured_http_and_database_failures():
+    cases = [
+        ({"status_code": 401}, "authentication_failed", 401),
+        ({"response": types.SimpleNamespace(status_code=403)}, "permission_denied", 403),
+        ({"code": "429"}, "rate_limited", 429),
+        ({"status_code": 503}, "service_unavailable", 503),
+        ({"status_code": 400}, "http_error", 400),
+        ({"code": "42501"}, "permission_denied", None),
+        ({"code": "PGRST301"}, "authentication_failed", None),
+        ({"status_code": "SECRET", "code": "SECRET"}, "unclassified_failure", None),
+    ]
+    for attrs, category, status in cases:
+        error = RuntimeError("SECRET: Authorization Bearer key SQL credentials")
+        for key, value in attrs.items():
+            setattr(error, key, value)
+        with ks.capture_read_failure() as capture:
+            assert _run(ks.check_states(_ReadClient(error=error))) is None
+        expected = {"stage": "paper_accounts_read", "category": category}
+        if status is not None:
+            expected["http_status"] = status
+        assert capture.failure == expected
+        assert "SECRET" not in repr(capture.failure)
+
+
+def test_check_states_captures_outer_evaluation_failures():
+    def broken_period(*_args, **_kwargs):
+        raise ValueError("SECRET invalid account data")
+
+    allocation = load_module("app.paper.allocation")
+
+    async def no_equity(_uid):
+        return 0
+
+    with _patched(ks, period_updates=broken_period), \
+         _patched(allocation, effective_equity=no_equity), \
+         ks.capture_read_failure() as capture:
+        assert _run(ks.check_states(_ReadClient(data=[_acct()]))) is None
+    assert capture.failure == {
+        "stage": "kill_switch_evaluation", "category": "unclassified_failure"}
+
+
+def test_read_failure_capture_is_concurrent_child_safe_and_resets():
+    async def read(client):
+        with ks.capture_read_failure() as capture:
+            # wait_for runs the real read in an awaited child task.
+            out = await asyncio.wait_for(ks.check_states(client), timeout=3)
+            await asyncio.sleep(0)
+        return out, capture.failure
+
+    async def concurrent():
+        return await asyncio.gather(
+            read(_ReadClient(error=TimeoutError("SECRET"))),
+            read(_ReadClient(data=[])), read(None))
+
+    before = ks._READ_FAILURE_CAPTURE.get()
+    timeout, healthy, absent = _run(concurrent())
+    assert timeout == (None, {"stage": "paper_accounts_read", "category": "timeout"})
+    assert healthy == ({}, None)
+    assert absent == (None, {"stage": "client", "category": "no_client"})
+    assert ks._READ_FAILURE_CAPTURE.get() is before
+    with ks.capture_read_failure() as outer:
+        _run(ks.check_states(None))
+        with ks.capture_read_failure() as inner:
+            _run(ks.check_states(_ReadClient(data=[])))
+        assert inner.failure is None
+        assert outer.failure == {"stage": "client", "category": "no_client"}
+        assert ks._READ_FAILURE_CAPTURE.get() is outer
+    assert ks._READ_FAILURE_CAPTURE.get() is before
+
+
 # --- KS-4: per-book reject reset -----------------------------------------
 
 def test_per_book_reset_leaves_the_other_books_rejects():

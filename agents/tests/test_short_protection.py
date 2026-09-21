@@ -168,3 +168,50 @@ def test_a_crypto_short_row_is_never_armed():
          _patched(pm, _stop_armed_at={}):
         out = _run(pm._arm_broker_stop(row))
     assert out is None and calls == []
+
+
+def test_closed_session_does_not_consume_the_stop_check_cooldown():
+    calls = []
+    market = {"open": False}
+
+    async def fake_short(*args, **kwargs):
+        calls.append(args)
+        return True, "placed buy stop"
+
+    row = {"id": "r-open", "user_id": "u-open", "ticker": "TSLA",
+           "side": "short", "broker": "alpaca", "asset_type": "stock",
+           "quantity": 1, "stop_price": 367.416}
+    with _patched(alpaca, ensure_short_protection=fake_short), \
+         _patched(wd, _us_market_open=lambda: market["open"]), \
+         _patched(alog, record=lambda *a, **k: None), \
+         _patched(pm, _stop_armed_at={}):
+        assert _run(pm._arm_broker_stop(row)) is None
+        assert calls == [] and pm._stop_armed_at == {}
+        market["open"] = True
+        assert _run(pm._arm_broker_stop(row)) == "placed buy stop"
+        assert len(calls) == 1
+        _run(pm._arm_broker_stop(row))
+        assert len(calls) == 1, "actual attempts still respect the cooldown"
+
+
+def test_unexpected_stop_failure_is_visible_without_exception_secrets():
+    events = []
+
+    async def failed_short(*args, **kwargs):
+        raise RuntimeError("secret-auth-header-never-log")
+
+    row = {"id": "r-failed", "user_id": "u-failed", "ticker": "TSLA",
+           "side": "short", "broker": "alpaca", "asset_type": "stock",
+           "quantity": 1, "stop_price": 367.416}
+    with _patched(alpaca, ensure_short_protection=failed_short), \
+         _patched(wd, _us_market_open=lambda: True), \
+         _patched(alog, record=lambda *a, **k: events.append((a, k))), \
+         _patched(pm, _stop_armed_at={}):
+        assert _run(pm._arm_broker_stop(row)) is None
+    assert len(events) == 1
+    args, data = events[0]
+    assert args == ("broker_stop_unplaced", "TSLA")
+    assert data["extra"]["row_id"] == row["id"]
+    assert data["extra"]["user_id"] == row["user_id"]
+    assert "unverified" in data["reason"]
+    assert "secret-auth-header" not in repr(events)

@@ -807,9 +807,11 @@ def test_the_monitors_two_absence_paths_both_reach_the_shield():
     # ...and it is consulted where the CLOSE is decided, not after it.
     for branch in ("crypto_symbol_variants(tk)", "tk.upper() not in alpaca_held"):
         i = src.index(branch)
-        j = src.index("record_external_close", i)
+        j = src.index('await _broker_exit(r, "alpaca_external", reconcile=True)', i)
         assert "_qa_shield_blocks_close" in src[i:j], (
-            f"the shield is not consulted between {branch!r} and its close")
+            f"the shield is not consulted between {branch!r} and its receipt lookup")
+    assert "await reconcile_broker_close(row)" in src, (
+        "absence must be reconciled from a broker receipt, never a modeled mark")
 
 
 # =========================================================================
@@ -1431,6 +1433,31 @@ def test_a_stock_row_with_no_resting_stop_anywhere_is_still_flagged():
     assert "qa_unenforceable_stop" in [f["finding"] for f in rep["findings"]], \
         rep["findings"]
     assert "qa_unenforceable_stop" in ev, ev
+
+
+def test_stop_evidence_must_close_the_positions_side():
+    for side, protective_side, opposite_side in (
+        ("long", "sell", "buy"), ("short", "buy", "sell"),
+    ):
+        qa.reset_state()
+        row = _stock_row_with_a_stop(side=side)
+        position = {**_xle_position(), "qty": "-10" if side == "short" else "10"}
+        c = FakeClient(paper_positions=[row])
+        wrong = {**_resting_stop_leg(), "side": opposite_side}
+        right = {**_resting_stop_leg(), "side": protective_side}
+        with _env(TREZO_QA_AUTOFIX="0"):
+            rep, _ev, _s = _sweep(c, positions=[position], orders=[],
+                                  fills=[], open_orders=[wrong])
+            findings = [f for f in rep["findings"]
+                        if f["finding"] == "qa_unenforceable_stop"]
+            assert len(findings) == 1, rep
+            assert "nothing sells" not in repr(findings)
+            assert (ACCT3, "XLE", "qa_unenforceable_stop") in qa._OPEN_TICKETS
+            rep, ev, _s = _sweep(c, positions=[position], orders=[],
+                                 fills=[], open_orders=[right])
+            assert "qa_unenforceable_stop" not in [f["finding"] for f in rep["findings"]]
+            assert (ACCT3, "XLE", "qa_unenforceable_stop") not in qa._OPEN_TICKETS
+            assert "qa_cleared" in ev
 
 
 def test_i5_is_skipped_not_answered_when_the_live_order_read_fails():

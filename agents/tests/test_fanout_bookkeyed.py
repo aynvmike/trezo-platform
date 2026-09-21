@@ -33,6 +33,7 @@ Run: python -m tests.run_all   (the deploy gate)   or pytest.
 from __future__ import annotations
 
 import asyncio
+import ast
 import contextlib
 import inspect
 import os
@@ -233,13 +234,15 @@ class Harness:
     def _settings(self, user_id=None):
         return self.books[str(user_id)]
 
-    def run(self, payload, *, via_on_message=False):
-        client = _FakeClient(list(self.books))
+    def run(self, payload, *, via_on_message=False, client=None,
+            real_states=False):
+        client = client if client is not None else _FakeClient(list(self.books))
+        state_reader = ks.check_states if real_states else self._check_states
         with _quiet_activity_log(), \
              _patched(persistence, _client=lambda: client), \
              _patched(accounts, bind_for_user=self._bind), \
              _patched(route_guard, check_route=lambda uid: (True, "stub")), \
-             _patched(ks, check_states=self._check_states,
+             _patched(ks, check_states=state_reader,
                       daily_dollar_over=self._dollar_over), \
              _patched(settings_mod, get_bot_settings=self._settings), \
              _patched(alpaca, get_account=self._get_account,
@@ -404,6 +407,85 @@ def test_an_empty_state_map_is_a_real_answer_and_trades():
     h = Harness(_books(), states={})
     h.run(_payload())
     assert set(h.executed) == {BOOK_A, BOOK_B}
+
+
+class _StateReadFaultQuery(_Query):
+    def __init__(self, rows, error):
+        super().__init__(rows)
+        self.error = error
+        self.state_read = False
+
+    def select(self, *args, **kwargs):
+        self.state_read = args == ("*",)
+        return self
+
+    def execute(self):
+        if self.state_read:
+            if self.error is not None:
+                raise self.error
+            return _Res(None)  # invalid response, not an empty account table
+        return super().execute()
+
+
+class _StateReadFaultClient(_FakeClient):
+    def __init__(self, user_ids, error):
+        super().__init__(user_ids)
+        self.error = error
+
+    def table(self, name):
+        if name == "paper_accounts":
+            return _StateReadFaultQuery(self._tables[name], self.error)
+        return super().table(name)
+
+
+def test_real_killswitch_failure_reaches_execution_and_activity_without_orders():
+    """Drive both execution paths through the real failed database read."""
+    activity = load_module("app.agents.activity_log")
+    for pinned in (False, True):
+        for lane, ticker in (("stock", "XLE"), ("crypto", "BTC")):
+            for error, expected in (
+                (TimeoutError("SECRET Authorization bearer token"),
+                 {"stage": "paper_accounts_read", "category": "timeout"}),
+                (None, {"stage": "paper_accounts_response", "category": "invalid_response"}),
+            ):
+                h = Harness(_books())
+                records = []
+                payload = _payload(ticker=ticker, asset_type=lane)
+                if pinned:
+                    payload.update(user_id=BOOK_B, book_scoped=True)
+                with _patched(activity, record=lambda *a, **kw: records.append((a, kw))):
+                    out = h.run(payload, via_on_message=True, real_states=True,
+                                client=_StateReadFaultClient(list(h.books), error))
+                assert h.executed == {}, "no order path may run with unknown brakes"
+                assert h.account_reads == [], "failure must precede brokerage work"
+                assert len(out) == 1 and out[0].kind == "error"
+                msg = out[0].payload
+                assert msg["event"] == "execute_error" and msg["lane"] == lane
+                assert msg["kill_switch_diagnostic"] == expected
+                assert "fail closed" in msg["reason"]
+                assert expected["category"] in msg["error"]
+                if pinned:
+                    assert msg["user_id"] == BOOK_B
+                logged = [kw for args, kw in records if args[0] == "execute_error"]
+                assert len(logged) == 1
+                assert logged[0]["extra"]["kill_switch_diagnostic"] == expected
+                assert len(logged[0]["reason"]) <= 180
+                assert "SECRET" not in repr((msg, logged))
+
+
+def test_executor_reports_outer_failure_without_reusing_an_earlier_diagnostic():
+    failed = Harness(_books(), states=_RAISE)
+    msg = failed.run(_payload())[0].payload
+    assert msg["kill_switch_diagnostic"] == {
+        "stage": "kill_switch_evaluation", "category": "unclassified_failure"}
+    assert failed.executed == {}
+    unknown = Harness(_books(), states=None)
+    msg = unknown.run(_payload())[0].payload
+    assert msg["kill_switch_diagnostic"] == {
+        "stage": "kill_switch_evaluation", "category": "state_unavailable"}
+    healthy = Harness(_books(), states={})
+    healthy.run(_payload())
+    assert set(healthy.executed) == {BOOK_A, BOOK_B}
 
 
 # --- (5) TE-07: 'long' is a long; anything unknown is refused ---------------
@@ -701,6 +783,7 @@ def _alpaca_no_stop_run(payload, *, side="long", remaining=10_000.0,
     Returns (out, calls): calls['buy'] / ['bracket'] / ['rows']."""
     wt = load_module("app.integrations.web_tokens")
     engine = load_module("app.paper.engine")
+    prices = load_module("app.brokers.execution_price")
     agent = te.TradeExecutionAgent()
     calls: dict = {"buy": [], "bracket": [], "rows": []}
     _a = acct or _acct(cash=50_000, equity=100_000)      # BP 200k
@@ -730,11 +813,20 @@ def _alpaca_no_stop_run(payload, *, side="long", remaining=10_000.0,
         return engine.FillResult(ok=True, position_id="p1",
                                  fill_price=kw["entry_price"])
 
+    async def _quote(*a, **kw):
+        from datetime import datetime, timezone
+        return prices.ExecutionPrice(price, datetime.now(timezone.utc), "alpaca:stock:iex", "PG", side)
+
+    async def _pending(*a, **kw):
+        return {"id": "ord-1", "symbol": "PG", "side": "buy", "status": "accepted"}, None
+
     agent._allocation_gate = _gate
     with _quiet_activity_log(), \
          _patched(wt, get_user_broker_token=_no_token), \
          _patched(alpaca, get_clock=_open, get_account=_acct_ok,
-                  submit_market_buy=_buy, submit_bracket_order=_bracket), \
+                  submit_market_buy=_buy, submit_bracket_order=_bracket,
+                  get_order_strict=_pending), \
+         _patched(prices, execution_price=_quote), \
          _patched(engine, record_external_position=_rec), \
          _patched(settings_mod, get_bot_settings=lambda uid=None: Book()):
         out = _run(agent._execute_alpaca(
@@ -849,26 +941,20 @@ def test_every_error_and_fill_message_in_the_module_carries_a_lane():
     """Source-shape guard for the contract: each kind="error" and
     kind="execute" AgentMessage built in trade_execution carries "lane"
     in its payload dict."""
-    src = inspect.getsource(te)
-    starts = [m.start() for m in re.finditer(r'kind="(error|execute)"', src)]
-    assert starts, "no outcome messages found?"
-    for s in starts:
-        window = src[s:s + 900]
-        payload_start = window.find("payload=")
-        assert payload_start >= 0, src[s:s + 200]
-        # the payload dict ends at the first ')' that closes AgentMessage(
-        depth, end = 0, None
-        for i, ch in enumerate(window[payload_start:], payload_start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-        assert end is not None, window[:200]
-        assert '"lane"' in window[payload_start:end], \
-            "outcome message without a lane:\n" + window[:end]
+    tree = ast.parse(inspect.getsource(te))
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "AgentMessage":
+            continue
+        fields = {kw.arg: kw.value for kw in node.keywords}
+        kind = fields.get("kind")
+        if not isinstance(kind, ast.Constant) or kind.value not in ("error", "execute"):
+            continue
+        payload = fields.get("payload")
+        assert isinstance(payload, ast.Dict), f"outcome payload at {node.lineno}"
+        assert any(isinstance(key, ast.Constant) and key.value == "lane" for key in payload.keys), node.lineno
+        checked += 1
+    assert checked, "no outcome messages found?"
 
 
 if __name__ == "__main__":

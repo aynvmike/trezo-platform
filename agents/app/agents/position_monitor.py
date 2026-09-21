@@ -33,6 +33,8 @@ from app.data.candles import fetch_candles_for
 import os
 
 from app.paper.engine import close_position, check_and_lock_profit
+from app.brokers.execution_price import execution_price
+from app.paper.broker_exit import settle_or_request_close, reconcile_broker_close, PENDING_KEY
 from app.brokers.accounts import (
     set_account_for_user as _pm_set_account,
     clear_account as _pm_clear_account,
@@ -56,7 +58,6 @@ _step_state: dict[str, dict] = {}
 # hoping ("it reverses way too fast to hope of a comeback"), and
 # nothing is held past 3:45 PM ET.
 _day_opt_last: float = 0.0
-_day_opt_done: set = set()
 _GAP_DAY = ""   # open-bell gap audit marker (Mike 2026-07-15)
 _PRE_BREAK_DAY = ""   # pre-holiday review marker (Mike 2026-07-16)
 
@@ -147,8 +148,11 @@ async def _pre_break_review() -> None:
                     continue
                 entry = float(r.get("entry_price") or 0)
                 stop = float(r.get("stop_price") or 0)
-                cnd = await fetch_candles_for(tk, "stock")
-                px = float(cnd[-1].close) if cnd else 0.0
+                if str(r.get("broker") or "") == "alpaca":
+                    px = await _broker_price(r) or 0.0
+                else:
+                    cnd = await fetch_candles_for(tk, "stock")
+                    px = float(cnd[-1].close) if cnd else 0.0
                 if px <= 0 or entry <= 0:
                     continue
                 if stop >= entry:
@@ -246,7 +250,11 @@ async def _gap_check_open_bell() -> None:
                 if not cnd or len(cnd) < 2:
                     continue
                 prev = float(cnd[-2].close)
-                cur = float(cnd[-1].close)
+                # A flagged hold only receives an advisory gap annotation;
+                # actionable broker stop changes require a fresh quote.
+                cur = ((await _broker_price(r) or 0.0)
+                       if r.get("broker") == "alpaca" and not _is_no_price_stop(r)
+                       else float(cnd[-1].close))
                 if prev <= 0 or cur <= 0:
                     continue
                 gap = cur / prev - 1.0
@@ -311,117 +319,113 @@ async def _gap_check_open_bell() -> None:
 
 
 async def _manage_day_options() -> None:
-    """Same-day options leash (see the block comment above). Runs at
-    tick start, BEFORE the per-row binding, so every exit order is
-    bound to its own row's book right here (TE-11 / BI-06)."""
+    """Same-day decisions use fresh quotes; only durable receipts book exits."""
     global _day_opt_last
-    import os as _os2
+    import math as _math
     import time as _t2
     if (_t2.time() - _day_opt_last) < 55.0:
         return
     _day_opt_last = _t2.time()
     try:
         from app.runtime.settings import _supabase as _sb
+        from app.paper.option_exit import settle_or_request_option_close
+        from app.paper.broker_exit import _bound_book_verified
+        from app.brokers.route_guard import check_route, record_mismatch
+        from app.agents.activity_log import record
+        from app.brokers.alpaca_data import _data_get
         client = _sb()
         if client is None:
             return
-        import asyncio as _aio
 
         def _q():
             return (client.table("options_positions")
-                    .select("id, user_id, underlying, option_type, strike, "
-                            "contracts, net_premium_usd, expiration")
+                    .select("id,user_id,underlying,option_type,strike,contracts,"
+                            "net_premium_usd,expiration,strategy,opened_at,broker_exit_pending")
                     .eq("status", "open").eq("strategy", "option_day")
-                    .limit(4).execute())
-        rows = (await _aio.to_thread(_q)).data or []
-        if not rows:
-            return
-        _now = _utc_now()
-        _h = _now.hour + _now.minute / 60.0
-        _force = _h >= 19.75      # 3:45 PM EDT (safely early in EST too)
-        _tp = 1.0 + float(_os2.getenv("TREZO_DAY_OPT_TP", "0.30"))
-        _cut = 1.0 - float(_os2.getenv("TREZO_DAY_OPT_CUT", "0.25"))
-        for r in rows:
-            rid = str(r.get("id"))
-            if rid in _day_opt_done:
-                continue
-            u = str(r.get("underlying") or "").upper()
-            strike = float(r.get("strike") or 0)
-            ct = int(r.get("contracts") or 1)
-            otype = str(r.get("option_type") or "call").lower()
-            exp = str(r.get("expiration") or "")
-            entry = (abs(float(r.get("net_premium_usd") or 0))
-                     / (100.0 * max(ct, 1)))
-            if not u or strike <= 0 or len(exp) < 10 or entry <= 0:
-                continue
-            occ = (f"{u}{exp[2:4]}{exp[5:7]}{exp[8:10]}"
-                   f"{'C' if otype.startswith('c') else 'P'}"
-                   f"{int(round(strike * 1000)):08d}")
-            from app.brokers.alpaca_data import get_option_quote
-            prem = await get_option_quote(occ)
-            if not prem or prem <= 0:
-                if not _force:
-                    continue
-                prem = entry          # force-close blind if the quote is gone
-            ratio = float(prem) / entry
-            why = None
-            if ratio >= _tp:
-                why = (f"+{(_tp - 1) * 100:.0f}% fast take -- "
-                       f"banked the quick move")
-            elif ratio <= _cut:
-                why = (f"-{(1 - _cut) * 100:.0f}% reversal cut -- it "
-                       f"reverses too fast to hope for a comeback")
-            elif _force:
-                why = "3:45 ET force-close -- same-day trades never sleep over"
-            if not why:
-                continue
-            # TE-11 / BI-06: the exit goes to THIS row's book. This ran
-            # before the monitor's per-row binding, so the sell went to
-            # whichever account was bound last -- the primary at tick
-            # start -- and a 25k/75k contract was sold (or failed to
-            # sell) on the wrong account. Bind per row, verify the
-            # route, skip an unresolved book with a logged reason. rid
-            # joins _day_opt_done only after the broker ACCEPTED the
-            # order under that binding; anything else retries next pass.
-            _uid = str(r.get("user_id") or "")
-            _o, _e = None, None
-            if _pm_skip_unresolved(_uid):
-                try:
-                    from app.agents.activity_log import record as _rec2s
-                    _rec2s("option_day_exit_skipped", u, strategy="option_day",
-                           reason=(f"book {_uid[:8] or '?'} unresolved -- "
-                                   f"refusing to route the exit to the "
-                                   f"primary"),
-                           extra={"user_id": _uid})
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            from app.brokers.alpaca import submit_option_order
-            from app.brokers.route_guard import (
-                check_route as _do_check, record_mismatch as _do_mm)
-            with _pm_bind(_uid):
-                _rok, _rnote = _do_check(_uid)
-                if not _rok:
-                    _do_mm(u, _uid, _rnote, "day_options")
-                    continue
-                _o, _e = await submit_option_order(
-                    occ, ct, "sell", time_in_force="day",
-                    limit_price=round(max(0.01, float(prem)) * 0.95, 2))
+                    .limit(1000).execute())
+        rows = (await asyncio.to_thread(_q)).data or []
+        now = _utc_now()
+        force = now.hour + now.minute / 60.0 >= 19.75
+        tp = 1.0 + float(os.getenv("TREZO_DAY_OPT_TP", "0.30"))
+        cut = 1.0 - float(os.getenv("TREZO_DAY_OPT_CUT", "0.25"))
+        for row in rows:
+            uid = str(row.get("user_id") or "")
+            underlying = str(row.get("underlying") or "").upper()
             try:
-                from app.agents.activity_log import record as _rec2
-                _rec2("option_day_exit", u, strategy="option_day",
-                      reason=((f"selling {ct} {otype.upper()} {strike:g} at "
-                               f"~{float(prem):.2f} ({ratio:.2f}x entry) -- "
-                               f"{why}")
-                              if not _e else
-                              f"same-day exit order failed: {str(_e)[:90]}"),
-                      extra={"user_id": _uid})
-            except Exception:  # noqa: BLE001
-                pass
-            if _o and not _e:
-                _day_opt_done.add(rid)   # accepted, on the right book
-            # a rejected / failed order is NOT marked done: retry next pass
-    except Exception:  # noqa: BLE001
+                with _pm_bind(uid) as account:
+                    okay, note = check_route(uid)
+                    if not okay or not _bound_book_verified(uid, account):
+                        record_mismatch(underlying, uid, note, "day_options")
+                        record("option_day_exit_skipped", underlying, strategy="option_day",
+                               reason="paper book transport unverified; exit not submitted",
+                               extra={"user_id": uid, "position_id": row.get("id")})
+                        continue
+                    # Poll before reading prices or evaluating the strategy. The
+                    # database claim, not an in-memory accepted-order latch,
+                    # prevents resubmission after a timeout or process restart.
+                    if row.get("broker_exit_pending") is not None:
+                        result = await settle_or_request_option_close(client, row)
+                    else:
+                        strike = float(row.get("strike") or 0)
+                        contracts = int(row.get("contracts") or 0)
+                        exp = str(row.get("expiration") or "")
+                        premium_paid = float(row.get("net_premium_usd") or 0)
+                        if (not underlying or not _math.isfinite(strike) or strike <= 0
+                                or contracts <= 0 or len(exp) < 10
+                                or not _math.isfinite(premium_paid) or premium_paid >= 0):
+                            continue  # This manager closes long same-day contracts.
+                        entry = abs(premium_paid) / (100.0 * contracts)
+                        otype = str(row.get("option_type") or "call").lower()
+                        occ = (f"{underlying}{exp[2:4]}{exp[5:7]}{exp[8:10]}"
+                               f"{'C' if otype.startswith('c') else 'P'}"
+                               f"{int(round(strike * 1000)):08d}")
+                        # Preserve the existing indicative-mid strategy source,
+                        # but retain and validate the provider's quote timestamp.
+                        # This is a decision mark, never a booked execution price.
+                        raw = await _data_get("/v1beta1/options/quotes/latest",
+                                              {"symbols": occ, "feed": "indicative"})
+                        quote = (raw.get("quotes") or {}).get(occ) if isinstance(raw, dict) else None
+                        premium = None
+                        try:
+                            stamp = datetime.fromisoformat(str(quote["t"]).replace("Z", "+00:00"))
+                            age = (_utc_now() - stamp).total_seconds()
+                            bid, ask = float(quote["bp"]), float(quote["ap"])
+                            if (not isinstance(quote["bp"], bool) and not isinstance(quote["ap"], bool)
+                                    and -2 <= age <= 60 and all(_math.isfinite(p) and p > 0 for p in (bid, ask))
+                                    and bid <= ask):
+                                premium = (bid + ask) / 2.0
+                        except (TypeError, KeyError, ValueError, OverflowError):
+                            pass
+                        if premium is None:
+                            record("option_day_exit_deferred", underlying, strategy="option_day",
+                                   reason="fresh option quote unavailable; no reference-price exit submitted",
+                                   extra={"user_id": uid, "position_id": row.get("id"),
+                                          "quote_source": "alpaca:option:indicative", "time_exit_due": force})
+                            continue
+                        ratio = premium / entry
+                        reason = ("day_take" if ratio >= tp else "day_cut" if ratio <= cut
+                                  else "day_time" if force else None)
+                        if reason is None:
+                            continue
+                        result = await settle_or_request_option_close(
+                            client, row, symbol=occ, side="sell", quantity=contracts,
+                            limit_price=round(max(0.01, premium) * 0.95, 2), reason=reason)
+                    confirmed = result.ok and not getattr(result, "duplicate", False)
+                    record("option_day_fill_confirmed" if confirmed else "option_day_exit_pending",
+                           underlying, strategy="option_day",
+                           reason=("broker fill recorded" if confirmed else
+                                   result.error or "no new confirmed broker fill"),
+                           extra={"user_id": uid, "position_id": row.get("id"),
+                                  "pending": bool(getattr(result, "pending", False)),
+                                  **({"exit_price": result.fill_price,
+                                      "realized_pnl_usd": result.realized_pnl_usd,
+                                      "pnl_provisional": bool(getattr(result, "pnl_provisional", True)),
+                                      "fees_complete": bool(getattr(result, "fees_complete", False))} if confirmed else {})})
+            except Exception:
+                record("option_day_exit_pending", underlying, strategy="option_day",
+                       reason="option exit read or submission unresolved; no fill assumed",
+                       extra={"user_id": uid, "position_id": row.get("id")})
+    except Exception:
         pass
 
 
@@ -479,12 +483,13 @@ async def _step_check(pid: str, user_id, run: float,
         pass
     st = _step_state.get(pid)
     if st is None:
-        n0 = 0
         try:
             from app.paper.engine import count_profit_steps
             n0 = await count_profit_steps(str(user_id), pid)
+            if n0 is None:
+                return False, 0
         except Exception:  # noqa: BLE001
-            n0 = 0
+            return False, 0
         st = {"n": int(n0), "ts": 0.0}
         _step_state[pid] = st
     if st["n"] >= max_n:
@@ -500,6 +505,19 @@ def _step_mark(pid: str) -> None:
     st = _step_state.setdefault(pid, {"n": 0, "ts": 0.0})
     st["n"] += 1
     st["ts"] = _t.time()
+
+
+async def _step_refresh(pid: str, user_id) -> None:
+    """Reload one completed order's step count, preserving its cooldown."""
+    import time as _t
+    _step_state.pop(pid, None)
+    try:
+        from app.paper.engine import count_profit_steps
+        n = await count_profit_steps(str(user_id), pid)
+        if n is not None:
+            _step_state[pid] = {"n": int(n), "ts": _t.time()}
+    except Exception:  # noqa: BLE001 -- next check remains fail-closed
+        pass
 from app.strategies.extended import SWING_MAX_HOLD_DAYS
 from app.agents.reevaluator import reeval_is_enabled, reevaluate_position
 
@@ -1224,6 +1242,55 @@ async def _latest_price(ticker: str, asset_type: str) -> float | None:
     return float(candles[-1].close)
 
 
+async def _broker_price(row: dict) -> float | None:
+    """A broker decision must use a fresh, sided quote from its venue."""
+    uid = str(row.get("user_id") or "")
+    if _pm_skip_unresolved(uid):
+        return None
+    with _pm_bind(uid) as account:
+        from app.paper.broker_exit import _bound_book_verified
+        if not _bound_book_verified(uid, account):
+            return None
+        from app.brokers.route_guard import check_route
+        try:
+            verified, _ = check_route(uid)
+        except Exception:
+            verified = False
+        if not verified:
+            return None
+        mark = await execution_price(str(row.get("ticker") or ""),
+                                     str(row.get("asset_type") or "stock"),
+                                     str(row.get("side") or "long"))
+    if mark is None:
+        try:
+            from app.agents.activity_log import record
+            record("broker_price_unavailable", str(row.get("ticker") or "?"),
+                   reason="fresh execution-venue quote unavailable; price exits deferred",
+                   extra={"user_id": uid, "position_id": str(row.get("id") or "")})
+        except Exception:
+            pass
+        return None
+    return mark.price
+
+
+def _broker_exit_message(row, fill, reason):
+    if not fill.ok or getattr(fill, "duplicate", False):
+        return None
+    remaining = getattr(fill, "remaining_qty", None)
+    closed = remaining is not None and remaining <= 1e-9
+    return AgentMessage(agent="position_monitor", kind="close" if closed else "info",
+                        confidence=1.0, payload={
+        "user_id": row["user_id"], "ticker": row["ticker"],
+        "side": row["side"], "reason": reason,
+        "event": "broker_close_confirmed" if closed else "broker_partial_fill_confirmed",
+        "exit_price": fill.fill_price, "realized_pnl_usd": fill.realized_pnl_usd,
+        "remaining_qty": remaining, "position_id": row["id"], "broker": "alpaca",
+        "broker_order_id": getattr(fill, "broker_order_id", None),
+        "fees_complete": getattr(fill, "fees_complete", False),
+        "pnl_provisional": getattr(fill, "pnl_provisional", True),
+    })
+
+
 def _minutes_since(iso_ts) -> float:
     """Minutes elapsed since an ISO timestamp. 0 if missing or unparseable."""
     if not iso_ts:
@@ -1397,7 +1464,6 @@ async def _arm_broker_stop(r: dict) -> str | None:
         _k = _throttle_key(r, tk)
         if now_s - _stop_armed_at.get(_k, 0.0) < _STOP_ARM_EVERY_S:
             return None
-        _stop_armed_at[_k] = now_s
         if pol.session_gated:
             try:
                 from app.agents.ops_watchdog import _us_market_open
@@ -1405,6 +1471,9 @@ async def _arm_broker_stop(r: dict) -> str | None:
                     return None
             except Exception:  # noqa: BLE001
                 pass
+        # A closed session is not an attempt. Do not postpone protection
+        # after the open because the previous tick ran before it.
+        _stop_armed_at[_k] = now_s
         if pol.stop_order_type == "stop_limit":
             # Crypto (2026-08-19). Mirroring a stop only ever happened
             # from the three RATCHET sites -- hodl trail, ladder, profit
@@ -1452,7 +1521,19 @@ async def _arm_broker_stop(r: dict) -> str | None:
                strategy=str(r.get("strategy") or ""), reason=note,
                extra={"user_id": str(r.get("user_id") or "")})
         return note
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # Failed protection must leave a receipt, including unexpected
+        # helper errors. Never copy exception text (it can contain secrets).
+        try:
+            from app.agents.activity_log import record
+            record("broker_stop_unplaced", tk,
+                   strategy=str(r.get("strategy") or ""),
+                   reason="protective stop check raised an exception; protection unverified",
+                   extra={"user_id": str(r.get("user_id") or ""),
+                          "row_id": str(r.get("id") or ""),
+                          "error_type": type(exc).__name__[:64]})
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
 
@@ -1497,18 +1578,30 @@ def _liq_book(user_id) -> str:
     return uid or "?"
 
 
+async def _reprotect_step_remainder(r, fill) -> bool:
+    """Re-arm only the broker-confirmed remainder, never the requested slice."""
+    remaining = getattr(fill, "remaining_qty", None)
+    if remaining is None or remaining <= 1e-9:
+        return remaining is not None
+    from app.runtime.asset_policy import policy_for
+    pol = policy_for(r.get("asset_type"))
+    stop_p = float(r.get("stop_price") or 0)
+    target_p = float(r.get("target_price") or 0)
+    sym = str(r.get("ticker") or "")
+    if pol.resting_exits and not pol.native_brackets:
+        note = await _rest_crypto_exits(r, sym, remaining, stop_p, target_p)
+        return "STOP NOT RESTED" not in note and "stop rested" in note
+    if pol.native_brackets:
+        # Idempotent if the terminal-status poll repeats after a crash.
+        from app.brokers.alpaca import ensure_stock_protection
+        changed, note = await ensure_stock_protection(sym, remaining, stop_p, target_p)
+        return changed or note == "stop already resting at the broker"
+    return True
+
+
 async def _alpaca_profit_step(r, price: float,
                               frac: float | None = None) -> tuple[bool, str]:
-    """Bank a slice of a broker-held LONG winner, then re-protect the
-    remainder. VERIFIED at each step; on failure it restores protection
-    and reports. (Mike 2026-07-02: partial selling controls drawdown --
-    but a botched leg dance leaves shares naked, so nothing proceeds
-    unverified.) Returns (stepped, note).
-
-    Any asset class the registry allows to step: the policy decides the
-    slice size, whether there are bracket legs to renegotiate first, and
-    whether the venue is even open. It was stocks-only until 2026-08-17,
-    which is why crypto banked nothing for six weeks."""
+    """Submit one slice and book its confirmed receipt before re-protecting."""
     from app.brokers.alpaca import (
         cancel_open_orders_for, get_open_orders_for,
         submit_market_sell, submit_oco_sell,
@@ -1516,11 +1609,6 @@ async def _alpaca_profit_step(r, price: float,
     from app.runtime.asset_policy import policy_for
     sym = str(r.get("ticker") or "").upper()
     pol = policy_for(r.get("asset_type"))
-    # 2026-08-17: this used to be stocks-only by omission, not by
-    # decision -- the caller gated on `at == "stock"` and crypto could
-    # never bank a slice however far it ran. The asset policy now says
-    # who may step, how small a slice may be, and whether the venue
-    # holds a bracket we have to renegotiate first.
     if not pol.supports_partial_step:
         return False, f"{pol.label} does not step out by policy"
     try:
@@ -1530,148 +1618,58 @@ async def _alpaca_profit_step(r, price: float,
         target_p = float(r.get("target_price") or 0)
     except (TypeError, ValueError):
         return False, "bad row numbers"
-    if entry <= 0 or target_p <= entry:
-        return False, "row lacks a usable target"
-    # A broker-held bracket must be re-placed after the slice, so it needs
-    # a stop to re-place. Where the venue holds no bracket at all (Alpaca
-    # crypto) there is nothing to renegotiate, and a missing stop must not
-    # block banking a winner.
-    if pol.native_brackets and stop_p <= 0:
+    if entry <= 0 or target_p <= entry or (pol.native_brackets and stop_p <= 0):
         return False, "row lacks usable stop/target"
     if frac is None:
-        frac = min(0.9, max(0.1, float(
-            os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
+        frac = min(0.9, max(0.1, float(os.getenv("TREZO_PROFIT_STEP_FRACTION", "0.5"))))
     slice_qty = pol.slice_size(qty_total, frac)
     if slice_qty <= 0:
         return False, "too small to split"
-    remaining = qty_total - slice_qty
-    # 0) SESSION GATE (2026-08-05). Equity bracket legs cannot be
-    #    cancelled while the market is shut, so every overnight attempt
-    #    failed at step 1 and retried forever: 47 identical aborts on
-    #    PYPL at 03:00 ET in a single night, 78% of every abort ever
-    #    logged. The profit was never taken because the harvest kept
-    #    running when it could not possibly succeed. Crypto is exempt --
-    #    it genuinely trades 24/7.
     if pol.session_gated:
-        try:
-            from app.agents.ops_watchdog import _us_market_open
-            if not _us_market_open():
-                return False, "market closed - step harvest deferred to the open"
-        except Exception:  # noqa: BLE001
-            pass
-    # 1) Release the units: cancel bracket legs (cancel-legs-first, 6/12
-    #    lesson) and VERIFY they are gone before selling anything. Skipped
-    #    where the venue holds no bracket -- there are no legs to cancel,
-    #    and asking would only invent a failure mode.
-    if pol.native_brackets:
-        _n, err = await cancel_open_orders_for(sym)
-        if err:
-            return False, f"could not list legs ({err}) - aborted untouched"
-        left = None
-        for _ in range(4):
-            left = await get_open_orders_for(sym)
-            if left == []:
-                break
-            await asyncio.sleep(0.7)
-    elif pol.resting_exits:
-        # No bracket here, but our own resting take-profit limit is
-        # holding the units (2026-08-18). Before this branch existed the
-        # code assumed "no bracket" meant "nothing resting" and sold
-        # straight into an insufficient-balance reject. Cancel our TP,
-        # then verify -- an unverifiable release must abort exactly like
-        # an unverifiable leg cancel.
-        from app.brokers.alpaca import (cancel_crypto_exits,
-                                        open_crypto_orders)
-        # BOTH the stop-limit and the target, because crypto has no OCO:
-        # they are independent orders and each reserves inventory, so
-        # clearing one leaves the other holding the coins.
-        _n, err = await cancel_crypto_exits(sym)
-        if err:
-            return False, f"could not release resting exits ({err}) - aborted untouched"
-        left = []
-        for _ in range(4):
-            await asyncio.sleep(0.5)
-            # open_crypto_orders, not get_open_orders_for: a bare ticker
-            # asked of the equity-shaped query returns [] no matter what
-            # is resting, and a verify that cannot fail verifies nothing.
-            _open = await open_crypto_orders(sym)
-            if _open is None:
-                return False, "could not verify exits released - aborted untouched"
-            left = [o for o in _open
-                    if str(o.get("side") or "").lower() == "sell"]
-            if not left:
-                break
-    else:
-        left = []
-    # get_open_orders_for returns None when the CALL ITSELF failed, and
-    # [] only when the broker confirmed there is nothing open. `if left:`
-    # treated None as falsy, so a failed check read as "all clear" and
-    # the sell proceeded without ever verifying the legs were gone --
-    # the exact naked-shares outcome the 6/12 cancel-legs-first rule
-    # exists to prevent. An unverifiable check must abort, not assume.
-    if left is None:
-        return False, "could not verify legs were cancelled - aborted untouched"
-    if left:
-        return False, "legs did not cancel - aborted untouched"
-    # 2) Sell the slice at market, through the venue's own order shape.
-    #    Crypto is a different endpoint and a different time-in-force
-    #    ('day' is rejected on a 24/7 venue), so the asset policy picks.
-    if pol.asset_type == "crypto":
-        from app.brokers.alpaca import submit_crypto_order
-        order, serr = await submit_crypto_order(sym, "sell", slice_qty)
-    else:
-        order, serr = await submit_market_sell(sym, slice_qty)
-    if serr or not order:
-        # Nothing sold -- put the FULL protection back before leaving.
+        from app.agents.ops_watchdog import _us_market_open
+        if not _us_market_open():
+            return False, "market closed - step harvest deferred to the open"
+
+    async def _submit_slice():
+        # The durable claim exists BEFORE cancelling legs or submitting.
         if pol.native_brackets:
-            await submit_oco_sell(sym, qty_total, target_p, stop_p)
-            return False, f"slice sell rejected ({serr}); protection restored"
-        if pol.resting_exits:
-            # We released the venue orders to free the units and then
-            # sold nothing. Walking away here strips the protection we
-            # came to improve. STOP first -- it is the one that matters,
-            # and with no OCO there may only be room for one.
-            _restored = await _rest_crypto_exits(r, sym, qty_total,
-                                                 stop_p, target_p)
-            return False, f"slice sell rejected ({serr}); {_restored}"
-        return False, f"slice sell rejected ({serr}); position untouched"
-    # 3) Re-protect the remainder (OCO: original target + stop), retry once.
-    #    Where the venue holds no bracket, protection was never AT the
-    #    broker: the monitor enforces this row's stop client-side every
-    #    tick, so the remainder is as protected as it ever was.
-    if pol.resting_exits and not pol.native_brackets:
-        # Put protection back on what is left, stop first.
-        if remaining > 0:
-            await _rest_crypto_exits(r, sym, remaining, stop_p, target_p)
-        protected = True
-    elif not pol.native_brackets:
-        protected = True
-    else:
-        prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
-        if perr or not prot:
-            await asyncio.sleep(1.0)
-            prot, perr = await submit_oco_sell(sym, remaining, target_p, stop_p)
-        protected = bool(prot) and not perr
-    # 4) Book the slice (closed_partial row + reduced open row).
-    from app.paper.engine import record_external_partial_close
-    fill = await record_external_partial_close(
-        r["user_id"], r["id"], slice_qty, price)
-    # 2026-08-17: this said the bare words "booking failed" on every
-    # single step for six weeks -- the slice really sold at the broker,
-    # the ledger insert was rejected by a status CHECK constraint, and
-    # the reason was thrown away right here. An error we swallow is an
-    # error nobody fixes. Say what the database said.
-    if fill.ok:
-        booked = f"${fill.realized_pnl_usd:+.2f}"
-    else:
-        booked = f"BOOKING FAILED: {str(fill.error or 'unknown')[:120]}"
-    _unit = "units" if pol.fractional else "shares"
-    _fmt = (f"{slice_qty:g}/{qty_total:g}" if pol.fractional
-            else f"{int(slice_qty)}/{int(qty_total)}")
-    note = (f"banked {_fmt} {_unit} ({booked}); "
-            + ("remainder re-protected (OCO)" if protected
-               else "remainder NOT re-protected - naked-guard enforcing"))
-    return True, note
+            _n, err = await cancel_open_orders_for(sym)
+            if err:
+                return None, "deferred:could not list legs - aborted untouched"
+            left = await get_open_orders_for(sym)
+        elif pol.resting_exits:
+            from app.brokers.alpaca import cancel_crypto_exits, open_crypto_orders
+            _n, err = await cancel_crypto_exits(sym)
+            if err:
+                return None, "deferred:could not release resting exits - aborted untouched"
+            orders = await open_crypto_orders(sym)
+            left = (None if orders is None else
+                    [o for o in orders if str(o.get("side") or "").lower() == "sell"])
+        else:
+            left = []
+        if left is None:
+            return None, "deferred:could not verify legs were cancelled - aborted untouched"
+        if left:
+            return None, "deferred:legs did not cancel - aborted untouched"
+        if pol.asset_type == "crypto":
+            from app.brokers.alpaca import submit_crypto_order
+            order, err = await submit_crypto_order(sym, "sell", slice_qty)
+        else:
+            order, err = await submit_market_sell(sym, slice_qty)
+        return order, ("error:" + str(err) if err else "ok")
+
+    fill = await settle_or_request_close(r, "profit_step", submit=_submit_slice, quantity=slice_qty)
+    if not fill.ok:
+        return False, fill.error or "slice awaiting confirmed broker fill"
+    if getattr(fill, "pending", False):
+        return False, "partial broker fill recorded; remaining order still working"
+    protected = await _reprotect_step_remainder(r, fill)
+    if getattr(fill, "duplicate", False):
+        await _step_refresh(str(r["id"]), r["user_id"])
+        return False, "broker receipt already booked"
+    return True, (f"broker-confirmed profit step at {fill.fill_price:g}, "
+                  f"P/L ${fill.realized_pnl_usd:+.2f}; "
+                  + ("remainder re-protected" if protected else "remainder protection unverified"))
 
 
 async def _rest_crypto_exits(r: dict, sym: str, qty: float,
@@ -1898,12 +1896,45 @@ class PositionMonitorAgent(Agent):
         alpaca_held = None
 
         async def _price(tk: str, at: str) -> float | None:
+            if r.get("broker") == "alpaca":
+                # No cross-book mark cache and no historical-data fallback.
+                return await _broker_price(r)
             key = f"{tk}:{at}"
             if key not in price_cache:
                 p = await _latest_price(tk, at)
                 if p is not None:
                     price_cache[key] = p
             return price_cache.get(key)
+
+        async def _broker_exit(row, reason, *, reconcile=False, detail="", event=""):
+            fill = (await reconcile_broker_close(row) if reconcile
+                    else await settle_or_request_close(row, reason, detail=detail, event=event))
+            message = _broker_exit_message(row, fill, reason)
+            if message is not None:
+                if detail:
+                    message.payload["detail"] = detail
+                affected_users.add(row["user_id"])
+                out.append(message)
+                if message.kind == "close" and event:
+                    try:
+                        from app.agents.activity_log import record
+                        record(event, str(row.get("ticker") or "?"),
+                               strategy=str(row.get("strategy") or ""), reason=detail,
+                               extra={"user_id": str(row.get("user_id") or ""),
+                                      "broker": "alpaca", "position_id": str(row.get("id")),
+                                      "broker_order_id": getattr(fill, "broker_order_id", None),
+                                      "exit_price": fill.fill_price,
+                                      "realized_pnl_usd": fill.realized_pnl_usd})
+                    except Exception:
+                        pass
+            elif not fill.ok:
+                out.append(AgentMessage(agent=self.name, kind="info", payload={
+                    "user_id": row["user_id"], "ticker": row["ticker"],
+                    "position_id": row["id"], "broker": "alpaca",
+                    "event": "broker_exit_pending" if getattr(fill, "pending", False) else "broker_exit_deferred",
+                    "note": fill.error or "broker receipt unavailable; position remains open",
+                }))
+            return fill
 
         # Bind per row, clear once the loop is done -- on EVERY path.
         # REVIEW position_monitor.py:28/:1545 (2026-09-01) cleared it after
@@ -1948,6 +1979,21 @@ class PositionMonitorAgent(Agent):
                 # ratchet, no broker stop, no naked check, no reeval. Manual
                 # close_requested and external-fill detection still run.
                 _nps = _is_no_price_stop(r)
+                _pending_exit = (r.get("source_payload") or {}).get(PENDING_KEY)
+                if r.get("broker") == "alpaca" and _pending_exit is not None:
+                    _pending_reason = (str(_pending_exit.get("reason") or "manual")
+                                       if isinstance(_pending_exit, dict) else "manual")
+                    _settled = await _broker_exit(
+                        r, _pending_reason,
+                        detail=str(_pending_exit.get("detail") or "") if isinstance(_pending_exit, dict) else "",
+                        event=str(_pending_exit.get("event") or "") if isinstance(_pending_exit, dict) else "")
+                    if (_pending_reason == "profit_step" and _settled.ok
+                            and not getattr(_settled, "pending", False)):
+                        await _reprotect_step_remainder(r, _settled)
+                        # An order can finish without a new fill delta. Reload
+                        # the persisted distinct-order count on either path.
+                        await _step_refresh(str(r["id"]), r["user_id"])
+                    continue
                 # Broker truth for THIS book -- not for whichever account
                 # happened to be bound first. Cached per book for the tick.
                 if r.get("broker") == "alpaca":
@@ -1958,6 +2004,9 @@ class PositionMonitorAgent(Agent):
 
                 # --- Alpaca-routed positions (Phase 8b / 8g) -------------------
                 if r.get("broker") == "alpaca":
+                    if alpaca_held is None:
+                        alpaca_managed += 1
+                        continue  # Failed holdings reads never trigger an order.
                     # --- Crypto exits (Task #10 fix, 2026-06-11) ---------------
                     # Alpaca crypto has NO native bracket order, so stops and
                     # targets are enforced client-side right here -- exactly
@@ -1983,33 +2032,10 @@ class PositionMonitorAgent(Agent):
                             # both skip; see _qa_shield_blocks_close.
                             if _qa_shield_blocks_close(r.get("user_id"), tk, r.get("side")):
                                 continue
-                            # Genuinely gone at the broker -> reconcile books.
-                            price_c = await _price(tk, at)
-                            if price_c is not None:
-                                from app.paper.engine import record_external_close
-                                # PH-3: name the reason. Left to the default
-                                # this row was booked as 'alpaca_bracket' --
-                                # a bracket crypto cannot have at Alpaca --
-                                # while the bus message said alpaca_external.
-                                fill = await record_external_close(
-                                    r["user_id"], r["id"], price_c,
-                                    reason="alpaca_external")
-                                if fill.ok:
-                                    alpaca_reconciled += 1
-                                    affected_users.add(r["user_id"])
-                                    out.append(AgentMessage(
-                                        agent=self.name, kind="close",
-                                        confidence=1.0,
-                                        payload={
-                                            "user_id": r["user_id"],
-                                            "ticker": tk,
-                                            "side": r["side"],
-                                            "reason": "alpaca_external",
-                                            "exit_price": fill.fill_price,
-                                            "realized_pnl_usd": fill.realized_pnl_usd,
-                                            "position_id": r["id"],
-                                            "broker": "alpaca",
-                                        }))
+                            # Broker absence alone is not a fill or an exit price.
+                            fill = await _broker_exit(r, "alpaca_external", reconcile=True)
+                            if fill.ok:
+                                alpaca_reconciled += 1
                             continue
                         price_c = await _price(tk, at)
                         if price_c is None:
@@ -2335,60 +2361,7 @@ class PositionMonitorAgent(Agent):
                                 await _push_crypto_tp(r, target_c)
                             alpaca_managed += 1
                             continue
-                        _liq, _cstat = await _throttled_liquidate(
-                            tk, asset_type="crypto",
-                            user_id=r.get("user_id"))     # BI-05: this book's slot
-                        if _cstat in ("throttled", "circuit_open"):
-                            alpaca_managed += 1
-                            continue
-                        liq_err = _cstat[6:] if _cstat.startswith("error:") else None
-                        if liq_err:
-                            # Leave the row open and retry next tick. NEVER
-                            # close the Trezo row while Alpaca may still be
-                            # holding the coins (Gap 2 lesson).
-                            out.append(AgentMessage(
-                                agent=self.name, kind="error",
-                                payload={
-                                    "user_id": r["user_id"], "ticker": tk,
-                                    "error": (
-                                        f"crypto {reason_c} exit: Alpaca "
-                                        f"liquidate failed: {liq_err}"),
-                                    "position_id": r["id"],
-                                    "broker": "alpaca",
-                                }))
-                            continue
-                        fill = await close_position(
-                            r["user_id"], r["id"], price_c, reason=reason_c)
-                        if fill.ok:
-                            affected_users.add(r["user_id"])
-                            if _cexit_event:
-                                # Said AFTER the fill, not at the decision: a
-                                # throttled or rejected liquidate must not
-                                # log an exit that did not happen (the
-                                # exit_error row covers the reject).
-                                try:
-                                    from app.agents.activity_log import record as _arec
-                                    _arec(_cexit_event, tk,
-                                          strategy=str(r.get("strategy") or ""),
-                                          reason=_cexit_detail,
-                                          extra={"user_id": str(r.get("user_id") or ""),
-                                                 "broker": "alpaca",
-                                                 "position_id": str(r.get("id")),
-                                                 "exit_price": fill.fill_price,
-                                                 "realized_pnl_usd": fill.realized_pnl_usd})
-                                except Exception:  # noqa: BLE001
-                                    pass
-                            out.append(AgentMessage(
-                                agent=self.name, kind="close", confidence=1.0,
-                                payload={
-                                    "user_id": r["user_id"], "ticker": tk,
-                                    "side": r["side"], "reason": reason_c,
-                                    "exit_price": fill.fill_price,
-                                    "realized_pnl_usd": fill.realized_pnl_usd,
-                                    "position_id": r["id"],
-                                    "broker": "alpaca",
-                                    **({"detail": _cexit_detail} if _cexit_detail else {}),
-                                }))
+                        await _broker_exit(r, reason_c, detail=_cexit_detail, event=_cexit_event)
                         continue
                     if alpaca_held is not None and tk.upper() not in alpaca_held:
                         # Fresh-row grace (2026-06-12: at the open, WMT/GM/
@@ -2426,23 +2399,9 @@ class PositionMonitorAgent(Agent):
                         # _qa_shield_blocks_close.
                         if _qa_shield_blocks_close(r.get("user_id"), tk, r.get("side")):
                             continue
-                        # Alpaca's bracket order closed it - reconcile our books.
-                        price = await _price(tk, at)
-                        if price is not None:
-                            from app.paper.engine import record_external_close
-                            fill = await record_external_close(r["user_id"], r["id"], price)
-                            if fill.ok:
-                                alpaca_reconciled += 1
-                                affected_users.add(r["user_id"])
-                                out.append(AgentMessage(
-                                    agent=self.name, kind="close", confidence=1.0,
-                                    payload={
-                                        "user_id": r["user_id"], "ticker": tk,
-                                        "side": r["side"], "reason": "alpaca_bracket",
-                                        "exit_price": fill.fill_price,
-                                        "realized_pnl_usd": fill.realized_pnl_usd,
-                                        "position_id": r["id"], "broker": "alpaca",
-                                    }))
+                        fill = await _broker_exit(r, "alpaca_external", reconcile=True)
+                        if fill.ok:
+                            alpaca_reconciled += 1
                     else:
                         # Swing time stop (Phase 10c): an Extended position
                         # held past its multi-day window is closed at market
@@ -2464,28 +2423,7 @@ class PositionMonitorAgent(Agent):
                                     r, r["side"], price_a, stop_a,
                                 )
                                 if ts_reason:
-                                    _liq, _liq_st = await _throttled_liquidate(
-                                        tk, user_id=r.get("user_id"))   # BI-05
-                                    if _liq_st in ("throttled", "circuit_open"):
-                                        continue
-                                    liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
-                                    out.append(AgentMessage(
-                                        agent=self.name, kind="info",
-                                        payload={
-                                            "user_id": r["user_id"],
-                                            "ticker": tk,
-                                            "note": (
-                                                f"Intraday time stop ({ts_detail}) - "
-                                                f"Alpaca position closed at market"
-                                                + (f" (error: {liq_err})" if liq_err else "")
-                                            ),
-                                            "position_id": r["id"],
-                                            "broker": "alpaca",
-                                            "reason": ts_detail,
-                                        }))
-                                    # Skip the rest for this row; next tick
-                                    # reconciles the Trezo row once Alpaca
-                                    # drops it from open positions.
+                                    await _broker_exit(r, ts_reason)
                                     continue
 
                         # Profit stepping for Alpaca-held stock longs (Mike
@@ -2567,21 +2505,7 @@ class PositionMonitorAgent(Agent):
                                 await _maybe_ladder_stop(r, price_x, EXTENDED_PROFIT_LADDER)
                                 _xstop = float(r["stop_price"]) if r.get("stop_price") else None
                                 if _xstop is not None and price_x <= _xstop:
-                                    _xliq, _x_st = await _throttled_liquidate(
-                                        tk, user_id=r.get("user_id"))   # BI-05
-                                    if _x_st in ("throttled", "circuit_open"):
-                                        continue
-                                    _xerr = _x_st[6:] if _x_st.startswith("error:") else None
-                                    out.append(AgentMessage(
-                                        agent=self.name, kind="info",
-                                        payload={
-                                            "user_id": r["user_id"], "ticker": tk,
-                                            "note": ("Extended trailing-lock stop hit - "
-                                                     "Alpaca position closed at market"
-                                                     + (f" (error: {_xerr})" if _xerr else "")),
-                                            "position_id": r["id"], "broker": "alpaca",
-                                            "reason": "trail_lock",
-                                        }))
+                                    await _broker_exit(r, "trail_lock")
                                     continue
 
                         # vf:no-price-stop-monitor: same for the swing time stop --
@@ -2589,18 +2513,7 @@ class PositionMonitorAgent(Agent):
                         # exit the lane did not ask for.
                         if (strat_a.startswith("extended") and not _nps
                                 and held_days >= SWING_MAX_HOLD_DAYS):
-                            _liq, _liq_st = await _throttled_liquidate(
-                                tk, user_id=r.get("user_id"))           # BI-05
-                            if _liq_st in ("throttled", "circuit_open"):
-                                continue
-                            liq_err = _liq_st[6:] if _liq_st.startswith("error:") else None
-                            out.append(AgentMessage(
-                                agent=self.name, kind="info",
-                                payload={"user_id": r["user_id"], "ticker": tk,
-                                         "note": ("Extended swing time stop - Alpaca "
-                                                  "position closed at market"
-                                                  + (f" (error: {liq_err})" if liq_err else "")),
-                                         "position_id": r["id"], "broker": "alpaca"}))
+                            await _broker_exit(r, "time")
                         else:
                             alpaca_managed += 1
                             # Naked-position alert (2026-06-11 PM). A day-TIF
@@ -2645,17 +2558,8 @@ class PositionMonitorAgent(Agent):
                                             elif _tp is not None and _pn <= _tp:
                                                 _hit = "target"
                                     if _hit is not None:
-                                        _ol, _ost = await _throttled_liquidate(
-                                            tk, user_id=r.get("user_id"))   # BI-05
-                                        if _ost == "ok":
-                                            _enforced = True
-                                            out.append(AgentMessage(
-                                                agent=self.name, kind="info",
-                                                payload={"user_id": r["user_id"], "ticker": tk,
-                                                    "note": (f"Orphan/naked {_hit} hit - enforced "
-                                                             f"exit at market (was unmanaged)."),
-                                                    "position_id": r["id"], "broker": "alpaca",
-                                                    "reason": f"orphan_{_hit}"}))
+                                        _orphan_fill = await _broker_exit(r, _hit)
+                                        _enforced = _orphan_fill.ok or getattr(_orphan_fill, "pending", False)
                                     if not _enforced:
                                         out.append(AgentMessage(
                                             agent=self.name, kind="error",

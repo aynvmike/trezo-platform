@@ -161,7 +161,7 @@ def direction_blocked(bias: MarketBias, side: str) -> Optional[str]:
     return None
 
 
-def liquidity_check(candles, strategy: str | None = None) -> Optional[str]:
+def liquidity_check(candles, strategy: str | None = None, *, volume_candles=None) -> Optional[str]:
     """Return a veto reason if the symbol fails the liquidity floor.
 
     Per-strategy floors per Mike's 2026-06-03 ask. The global constants
@@ -175,7 +175,8 @@ def liquidity_check(candles, strategy: str | None = None) -> Optional[str]:
     if price < min_price:
         return (f"Liquidity filter [{strategy or 'default'}]: price "
                 f"${price:.2f} is below the ${min_price:.0f} minimum")
-    av = avg_volume(candles, 20)
+    # Price retains the strategy tape; volume may use completed SIP days.
+    av = avg_volume(candles if volume_candles is None else volume_candles, 20)
     if av < min_volume:
         return (f"Liquidity filter [{strategy or 'default'}]: average "
                 f"volume {av:,.0f} is below the {min_volume:,.0f}-share "
@@ -183,7 +184,7 @@ def liquidity_check(candles, strategy: str | None = None) -> Optional[str]:
     return None
 
 
-def profiles_accepting(candles) -> list[str]:
+def profiles_accepting(candles, *, volume_candles=None) -> list[str]:
     """Which strategy liquidity profiles WOULD accept this symbol.
 
     Mike 2026-06-12 (mem0 72c35e29: YMAT, TCS 670, $1.23, vetoed by the
@@ -195,7 +196,7 @@ def profiles_accepting(candles) -> list[str]:
     if not candles:
         return []
     price = float(candles[-1].close)
-    av = avg_volume(candles, 20)
+    av = avg_volume(candles if volume_candles is None else volume_candles, 20)
     out: list[str] = []
     for name, floors in STRATEGY_LIQUIDITY_FLOORS.items():
         if (price >= float(floors.get("min_price", MIN_PRICE))

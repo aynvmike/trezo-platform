@@ -75,6 +75,7 @@ overrides = load_module("app.runtime.overrides")
 daily_goal = load_module("app.paper.daily_goal")
 engine = load_module("app.paper.engine")
 alp = load_module("app.brokers.alpaca")
+alp_data = load_module("app.brokers.alpaca_data")
 market_filter = load_module("app.strategies.market_filter")
 candles = load_module("app.data.candles")
 activity_log = load_module("app.agents.activity_log")
@@ -246,6 +247,9 @@ def _desk(*, states, daily_over=frozenset(), verdicts=None,
          _patched(engine, get_account=_async(
              {"current_cash_usd": 1_000.0, "vault_balance_usd": 0.0})), \
          _patched(alp, get_account=_acct), \
+         _patched(alp_data, get_completed_liquidity_bars=_async([
+             {"t": f"2026-08-{day:02d}T04:00:00Z", "o": 100, "h": 101,
+              "l": 99, "c": 100, "v": 1_000_000} for day in range(1, 21)])), \
          _patched(market_filter, get_market_bias=_async(_bias), **_mkt), \
          _patched(candles, fetch_candles_for=_async(list(rows or []))), \
          _patched(cap_tiers, tier_for=_async("unknown")), \
@@ -801,6 +805,57 @@ def test_the_reattribution_and_rotation_gates_are_on_the_0_100_scale():
     assert "weakest_score < 75" not in src,         "no 0-100 signal clears a 75-point rotation gap"
     assert "if fits and tcs >= 60:" in src
     assert "incoming_tcs - weakest_score < 8" in src
+
+
+def test_dynamic_crypto_uses_crypto_gates_and_benches_only_affected_books():
+    for ticker in ("ARB", "ADA", "HYPE", "UNI"):
+        with _desk(states=THREE_OPEN, bias="bearish",
+                   verdicts={"A": (True, "coin loss"), "B": (False, "")}) as (agent, calls):
+            with _patched(alp_data, get_completed_liquidity_bars=_raising(
+                    AssertionError("crypto must not fetch stock volume"))):
+                v = _verdict(_run(agent.on_message(_signal(ticker=ticker))))
+        assert v.kind == "approve", (ticker, v.payload)
+        assert v.payload.get("benched_books") == ["A"], v.payload
+        assert calls.by_book == [ticker]
+
+
+def test_explicit_stock_and_stock_names_containing_coin_names_keep_equity_gates():
+    for ticker in ("LINK", "ADAP", "UNIM"):
+        with _desk(states=THREE_OPEN, bias="bearish") as (agent, calls):
+            v = _verdict(_run(agent.on_message(_stock(ticker=ticker, direction="long"))))
+        assert v.kind == "veto" and "long trades blocked" in v.payload["reason"]
+        assert calls.by_book == []
+
+
+def test_stock_volume_gate_uses_sip_but_price_and_overextension_keep_strategy_tape():
+    from datetime import datetime, timezone
+    from app.patterns.candle import Candle
+    rows = [Candle(datetime(2026, 9, 8, tzinfo=timezone.utc), 100, 101, 99, 100, 203433)]
+    seen = []
+    with _desk(states=THREE_OPEN, rows=rows) as (agent, _), \
+         _patched(market_filter, overextension_check=lambda cs: seen.append(cs) or None,
+                  spread_quality_check=_async(None)):
+        v = _verdict(_run(agent.on_message(_stock())))
+    assert v.kind == "approve", v.payload
+    assert seen == [rows], "overextension must retain original price candles"
+    # A truly thin consolidated tape remains vetoed, with no floor change.
+    bars = [{"t": f"2026-08-{day:02d}T04:00:00Z", "o": 100, "h": 101,
+             "l": 99, "c": 100, "v": 150000} for day in range(1, 21)]
+    with _desk(states=THREE_OPEN, rows=rows) as (agent, _), \
+         _patched(alp_data, get_completed_liquidity_bars=_async(bars)):
+        v = _verdict(_run(agent.on_message(_stock())))
+    assert v.kind == "veto" and "150,000" in v.payload["reason"], v.payload
+    assert "250,000" in v.payload["reason"], v.payload
+    assert "stms" in v.payload.get("reattribution_candidates", [])
+    assert "orb" not in v.payload.get("reattribution_candidates", [])
+
+
+def test_missing_consolidated_history_has_a_distinct_fail_closed_reason():
+    with _desk(states=THREE_OPEN, pass_market=True) as (agent, _), \
+         _patched(alp_data, get_completed_liquidity_bars=_async([])):
+        v = _verdict(_run(agent.on_message(_stock())))
+    assert v.kind == "veto" and "Consolidated liquidity data unavailable" in v.payload["reason"]
+    assert "reattribution_candidates" not in v.payload
 
 
 if __name__ == "__main__":

@@ -29,7 +29,9 @@ because directional options carry more risk.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+import math
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import structlog
 
@@ -167,6 +169,58 @@ async def _user_has_alpaca(user_id: str) -> bool:
         from app.brokers.alpaca import alpaca_configured
         return alpaca_configured()
     except Exception:  # noqa: BLE001
+        return False
+
+
+async def _modeled_expiry_block(row: dict) -> str | None:
+    """Only a confirmed simulation may settle from a modeled spot price.
+
+    options_positions predates a broker column. Notes identify receipts
+    on newer rows; account configuration also protects older rows whose
+    notes did not retain that provenance. An unavailable lookup is unknown,
+    never proof that the row is a simulation.
+    """
+    notes = str(row.get("notes") or "").lower()
+    if any(marker in notes for marker in
+           ("placed via alpaca", "adopted from the broker", "broker_order_id")):
+        return "broker-backed row needs a fill or settlement receipt"
+    if not notes.startswith(("modeled ", "simulation ")):
+        return "row has no explicit simulation provenance"
+    uid = str(row.get("user_id") or "")
+    if not uid:
+        return "book identity is unknown"
+    try:
+        from app.brokers.accounts import account_for_user
+        from app.brokers.alpaca import alpaca_configured
+        from app.integrations.web_tokens import get_user_broker_token
+        if account_for_user(uid) is not None:
+            return "broker-backed book needs a fill or settlement receipt"
+        token = await get_user_broker_token(uid, "alpaca")
+        if token and token.access_token:
+            return "broker-connected book needs a fill or settlement receipt"
+        if alpaca_configured():
+            return "broker configuration exists; modeled ownership is unverified"
+    except Exception:  # noqa: BLE001
+        return "broker provenance lookup failed; settlement is unknown"
+    return None
+
+
+def _matching_option_close(row: dict, fill: dict, occ: str) -> bool:
+    """A terminal fill must identify this contract, lifecycle and quantity."""
+    try:
+        opened = datetime.fromisoformat(str(row.get("opened_at") or "").replace("Z", "+00:00"))
+        filled = datetime.fromisoformat(str(fill.get("filled_at") or "").replace("Z", "+00:00"))
+        price = float(fill.get("filled_avg_price") or 0)
+        qty = float(fill.get("filled_qty") or 0)
+        contracts = float(row.get("contracts") or 0)
+        side = "sell" if str(row.get("strategy") or "").startswith("long_") else "buy"
+        return (bool(fill.get("id")) and fill.get("status") == "filled"
+                and str(fill.get("symbol") or "").upper() == occ.upper()
+                and fill.get("side") == side
+                and opened.tzinfo is not None and filled.tzinfo is not None
+                and filled >= opened and math.isfinite(price) and price > 0
+                and math.isfinite(qty) and qty == contracts and contracts > 0)
+    except (ValueError, TypeError, OverflowError):
         return False
 
 
@@ -1348,20 +1402,49 @@ class OptionsScannerAgent(Agent):
         return out
 
     async def _settle_expired(self, client) -> list[AgentMessage]:
-        today = date.today().isoformat()
+        today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
 
         def _sync_get():
             return (
                 client.table("options_positions")
-                .select("id, user_id, underlying, strategy, option_type, strike, contracts, net_premium_usd, expiration")
+                .select("id, user_id, underlying, strategy, option_type, strike, contracts, net_premium_usd, expiration, notes")
                 .eq("status", "open")
-                .lte("expiration", today)
+                .lt("expiration", today)
                 .execute()
             )
 
         res = await asyncio.to_thread(_sync_get)
         rows = res.data or []
         out: list[AgentMessage] = []
+        # Recovery is independent of the hourly strategy re-score and of
+        # expiry dates. A restarted process polls the same persisted order.
+        def _pending_rows():
+            return (client.table("options_positions")
+                    .select("id,user_id,underlying,strategy,option_type,strike,contracts,"
+                            "net_premium_usd,expiration,opened_at,broker_exit_pending")
+                    .filter("broker_exit_pending", "not.is", "null").limit(1000).execute())
+        try:
+            pending_reply = await asyncio.to_thread(_pending_rows)
+            for pending_row in pending_reply.data or []:
+                if pending_row.get("broker_exit_pending") is None:
+                    continue
+                from app.paper.option_exit import settle_or_request_option_close
+                token, _ = await _book_token(str(pending_row.get("user_id") or ""))
+                result = await settle_or_request_option_close(client, pending_row, token=token)
+                if getattr(result, "duplicate", False):
+                    continue
+                out.append(AgentMessage(
+                    agent=self.name, kind="info",
+                    payload={"user_id": pending_row.get("user_id"),
+                             "position_id": pending_row.get("id"),
+                             "event": "option_exit_receipt_poll",
+                             "confirmed_fill_booked": result.ok,
+                             "pending": result.pending,
+                             "note": result.error or "Broker fill accounted atomically."}))
+        except Exception:
+            out.append(AgentMessage(agent=self.name, kind="alert", payload={
+                "event": "option_exit_receipts_unavailable",
+                "note": "Pending option exits could not be read; no fill assumed."}))
 
         # Held-option RE-SCORE (Mike 2026-07-02: "re-evaluate the IV score
         # ... for a current trade it is holding even though it has a stop
@@ -1380,9 +1463,9 @@ class OptionsScannerAgent(Agent):
                         client.table("options_positions")
                         .select("id, user_id, underlying, strategy, "
                                 "option_type, strike, contracts, "
-                                "net_premium_usd, expiration, legs")
+                                "net_premium_usd, expiration, legs, opened_at, broker_exit_pending")
                         .eq("status", "open")
-                        .gt("expiration", today)
+                        .gte("expiration", today)
                         .execute()
                     )
                 _live = (await asyncio.to_thread(_sync_open_live)).data or []
@@ -1395,6 +1478,8 @@ class OptionsScannerAgent(Agent):
                          + _wgd.now(_wgz.utc).minute / 60.0)
                 _wk_guard = _brk_days >= 2 and _wg_h >= 18.0
                 for lr in _live[:12]:
+                    if lr.get("broker_exit_pending") is not None:
+                        continue  # exact known order is polled independently every tick
                     try:
                         _u = str(lr.get("underlying") or "").upper()
                         _strike = float(lr.get("strike") or 0)
@@ -1708,85 +1793,26 @@ class OptionsScannerAgent(Agent):
                                             _fire = None
                                         else:
                                             _tok_h, _routed_h = await _book_token(_uid_h)
-                                            OptionsScannerAgent._harvested.add(_hk)
-                                            from app.brokers.alpaca import (
-                                                submit_option_order as _soo)
-                                            _o2, _e2 = await _soo(
-                                                _occ, int(_fire[3]), _fire[0],
-                                                time_in_force="day",
-                                                limit_price=_fire[1],
-                                                token=_tok_h)
+                                            from app.paper.option_exit import settle_or_request_option_close
+                                            _exit_result = await settle_or_request_option_close(
+                                                client, lr, symbol=_occ, side=_fire[0],
+                                                quantity=int(_fire[3]), limit_price=_fire[1],
+                                                reason=_fire[2], token=_tok_h)
+                                            if _exit_result.ok or lr.get("broker_exit_pending") is not None:
+                                                OptionsScannerAgent._harvested.add(_hk)
                                 if _fire:
-                                    _arec("option_harvest", _u,
-                                          strategy=_strat_l,
-                                          reason=(_fire[2] + f" (limit {_fire[1]:.2f}, "
-                                                  f"book {_uid_h[:8]} via {_routed_h})"
-                                                  if not _e2 else
-                                                  f"harvest order failed: {str(_e2)[:90]}"),
+                                    _arec("option_harvest", _u, strategy=_strat_l,
+                                          reason=(_fire[2] + " · " +
+                                                  ("confirmed broker fill booked" if _exit_result.ok
+                                                   else str(_exit_result.error or "pending receipt"))),
                                           extra={"user_id": _uid_h})
-                                    # Step-down bookkeeping: shrink the open
-                                    # row, book the sold slice at the limit
-                                    # (conservative -- a sell fills at limit
-                                    # or better).
-                                    if (not _e2) and int(_fire[3]) < _ct:
-                                        try:
-                                            _n = int(_fire[3])
-                                            _keep = _ct - _n
-                                            _entry_ps = float(_entry_prem or 0)
-                                            # Long slice: proceeds - debit.
-                                            # Short slice: credit - buy-back.
-                                            _slice_pnl = round(
-                                                ((_entry_ps - float(_fire[1]))
-                                                 if _short else
-                                                 (float(_fire[1]) - _entry_ps))
-                                                * 100.0 * _n, 2)
-
-                                            _sgn = 1.0 if _short else -1.0
-
-                                            def _shrink(rid=lr.get("id"),
-                                                        k=_keep,
-                                                        ep=_entry_ps,
-                                                        sg=_sgn):
-                                                return (client
-                                                        .table("options_positions")
-                                                        .update({
-                                                            "contracts": k,
-                                                            "net_premium_usd":
-                                                                round(sg * ep * 100.0 * k, 2),
-                                                        })
-                                                        .eq("id", rid)
-                                                        .execute())
-                                            await asyncio.to_thread(_shrink)
-
-                                            def _slice(n=_n, ep=_entry_ps,
-                                                       pnl=_slice_pnl,
-                                                       lim=float(_fire[1]),
-                                                       sg=_sgn):
-                                                return (client
-                                                        .table("options_positions")
-                                                        .insert({
-                                                            "user_id": lr.get("user_id"),
-                                                            "underlying": _u,
-                                                            "strategy": _strat_l,
-                                                            "direction": ("income" if sg > 0
-                                                                          else "long"),
-                                                            "option_type": _otype,
-                                                            "strike": _strike,
-                                                            "expiration": _exp,
-                                                            "contracts": n,
-                                                            "net_premium_usd":
-                                                                round(sg * ep * 100.0 * n, 2),
-                                                            "status": "closed_partial",
-                                                            "realized_pnl_usd": pnl,
-                                                            "closed_at": "now()",
-                                                            "notes": (f"Step-down: sold {n} of "
-                                                                      f"{_ct} at ~{lim:.2f}; ROI "
-                                                                      f"banked, remainder reaches "
-                                                                      f"for more."),
-                                                        }).execute())
-                                            await asyncio.to_thread(_slice)
-                                        except Exception:  # noqa: BLE001
-                                            pass
+                                    if not _exit_result.ok:
+                                        out.append(AgentMessage(
+                                            agent=self.name, kind="info",
+                                            payload={"user_id": _uid_h, "position_id": lr.get("id"),
+                                                     "event": "option_exit_pending",
+                                                     "note": _exit_result.error,
+                                                     "pending": _exit_result.pending}))
                         except Exception:  # noqa: BLE001
                             pass
                         if _risk:
@@ -1809,6 +1835,21 @@ class OptionsScannerAgent(Agent):
             pass
 
         for r in rows:
+            # A calendar date is not a broker settlement event. In
+            # particular an option expiring TODAY is still tradable.
+            if str(r.get("expiration") or "")[:10] >= today:
+                continue
+            blocked = await _modeled_expiry_block(r)
+            if blocked:
+                out.append(AgentMessage(
+                    agent=self.name, kind="alert",
+                    payload={"user_id": r.get("user_id"),
+                             "position_id": r.get("id"),
+                             "underlying": r.get("underlying"),
+                             "event": "settlement_unverified",
+                             "note": f"Expiry left open: {blocked}.",
+                             "settlement_verified": False}))
+                continue
             try:
                 candles = await fetch_candles_for(r["underlying"], "stock")
             except Exception:  # noqa: BLE001
@@ -1857,15 +1898,20 @@ class OptionsScannerAgent(Agent):
                 # Other strategies: settle at the modeled credit/debit for now
                 status, realized = "closed_expired", credit
 
-            def _sync_close(rid=r["id"], st=status, pnl=realized):
+            def _sync_close(rid=r["id"], uid=r["user_id"], st=status,
+                            pnl=realized, notes=str(r.get("notes") or "")):
                 return (
                     client.table("options_positions")
                     .update({
                         "status": st,
                         "realized_pnl_usd": round(pnl, 2),
                         "closed_at": "now()",
+                        "notes": (notes + " · Modeled expiry simulation; "
+                                  "not a broker settlement receipt.").strip(" ·"),
                     })
                     .eq("id", rid)
+                    .eq("user_id", uid)
+                    .eq("status", "open")
                     .execute()
                 )
 
@@ -1878,6 +1924,8 @@ class OptionsScannerAgent(Agent):
                     "strategy": r["strategy"],
                     "status": status,
                     "realized_pnl_usd": round(realized, 2),
+                    "metric_basis": "modeled_option_settlement",
+                    "settlement_verified": False,
                 },
             ))
         return out
@@ -1920,7 +1968,7 @@ class OptionsScannerAgent(Agent):
                 client.table("options_positions")
                 .select("id, user_id, underlying, strategy, option_type, "
                         "strike, expiration, contracts, notes, "
-                        "net_premium_usd")
+                        "net_premium_usd, opened_at, broker_exit_pending")
                 .eq("status", "open")
                 .execute()
             )
@@ -2009,26 +2057,73 @@ class OptionsScannerAgent(Agent):
                 except Exception:  # noqa: BLE001
                     continue
 
+            # Read both open and closed option mirrors BEFORE booking a
+            # close or adopting. A receipt must not be counted in both
+            # ledgers; ambiguous ownership remains visible for reconciliation.
+            def _ledger_open(uid=user_id):
+                return (
+                    client.table("paper_positions")
+                    .select("ticker,status")
+                    .eq("user_id", uid)
+                    .eq("asset_type", "option").limit(1000)
+                    .execute()
+                )
+            try:
+                _lres = await asyncio.to_thread(_ledger_open)
+                _lrows = getattr(_lres, "data", None)
+                if _lrows is None or len(_lrows) >= 1000:
+                    raise RuntimeError("ledger read missing or truncated")
+            except Exception as _le:  # noqa: BLE001
+                try:
+                    from app.agents.activity_log import record as _lrec
+                    _lrec("reconcile_adopt_skipped_unreadable", "ACCOUNT",
+                          reason=("paper_positions option ledger unreadable "
+                                  "-- no close booked or contract adopted this tick "
+                                  f"(adopting on a guess is the split-brain "
+                                  f"this dedupe closes): {str(_le)[:120]}"),
+                          extra={"user_id": user_id})
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            mirror_occs: set[str] = set()
+            for _lr in _lrows:
+                try:
+                    _lt = str(_lr.get("ticker") or "").upper().strip()
+                    if len(_lt) < 16:
+                        continue
+                    _lund, _lymd, _lcp, _lk = (_lt[:-15], _lt[-15:-9],
+                                               _lt[-9], _lt[-8:])
+                    if not (_lund.isalpha() and _lymd.isdigit()
+                            and _lcp in ("C", "P") and _lk.isdigit()):
+                        continue
+                    # Same key row_occs uses: UND + YYMMDD + C/P + 8-digit
+                    # strike*1000 -- re-emitted so a stray pad or case in
+                    # the ledger ticker still collides with the broker OCC.
+                    canonical = f"{_lund}{_lymd}{_lcp}{int(_lk):08d}"
+                    mirror_occs.add(canonical)
+                    if _lr.get("status", "open") == "open":
+                        row_occs.add(canonical)
+                except Exception:  # noqa: BLE001
+                    continue
+
+
             closed_count = 0
             for r in user_rows:
+                if r.get("broker_exit_pending") is not None:
+                    continue  # its exact receipt is recovered by _settle_expired
                 # Close logic is for the Wheel lanes only; other option
                 # strategies are managed by their own exits.
                 if str(r.get("strategy") or "") not in ("wheel_csp",
                                                         "wheel_cc"):
                     continue
-                # If the row was placed via the new place-leg flow it has
-                # 'Placed via Alpaca' in its notes — leave those alone for
-                # the broker to manage. Anything else is a modeled phantom.
+                # Broker-held contracts remain open regardless of legacy notes.
                 notes = str(r.get("notes") or "")
-                if "Placed via Alpaca" in notes:
-                    # Verify it still exists at broker; if it doesn't, that
-                    # means the broker closed/expired it — also close locally.
-                    matched = any(_occ_match(
-                        occ, r["underlying"], r["option_type"],
-                        float(r["strike"]), str(r["expiration"]))
-                        for occ in broker_occ)
-                    if matched:
-                        continue
+                matched = any(_occ_match(
+                    occ, r["underlying"], r["option_type"],
+                    float(r["strike"]), str(r["expiration"]))
+                    for occ in broker_occ)
+                if matched:
+                    continue
                 # QA SHIELD (2026-09-02, app/paper/trade_qa.py). Before
                 # treating "not at the broker" as a close, ask whether an
                 # ENTRY order for THIS CONTRACT is still working. Order
@@ -2079,85 +2174,60 @@ class OptionsScannerAgent(Agent):
                         pass
                     continue
 
-                # No match at the broker -> close it as Reconciled.
-                # 2026-07-14 (Mike saw a wall of $0 rows): recover the TRUE
-                # exit instead of booking zero. Find the closing fill at
-                # Alpaca for this OCC and book credit-vs-debit properly:
-                # short premium -> credit kept minus the buy-back cost;
-                # long options -> sale proceeds minus the debit paid.
-                realized = 0.0
-                exit_note = " · Reconciled — not present at broker."
+                # Absence alone cannot close the row. A receipt for this
+                # exact lifecycle goes through the atomic options ledger.
+                close_receipt = None
                 try:
-                    _credit = float(r.get("net_premium_usd") or 0)
-                    _ctr = int(r.get("contracts") or 1)
-                    _is_long = str(r.get("strategy") or "").startswith("long_")
                     _occ_r = (f"{str(r['underlying']).upper()}"
                               f"{str(r['expiration'])[2:4]}{str(r['expiration'])[5:7]}"
                               f"{str(r['expiration'])[8:10]}"
                               f"{'C' if str(r['option_type']).lower().startswith('c') else 'P'}"
                               f"{int(round(float(r['strike']) * 1000)):08d}")
+                    duplicate_rows = sum(
+                        _occ_match(_occ_r, other["underlying"], other["option_type"],
+                                   float(other["strike"]), str(other["expiration"]))
+                        for other in user_rows)
+                    if _occ_r in mirror_occs or duplicate_rows > 1:
+                        out.append(AgentMessage(
+                            agent=self.name, kind="alert",
+                            payload={"user_id": user_id, "position_id": r["id"],
+                                     "event": "option_ledger_ownership_unverified",
+                                     "ticker": _occ_r,
+                                     "note": "Close deferred: contract appears in multiple ledger rows."}))
+                        continue
                     from app.brokers.alpaca import get_recent_closed_orders as _grco
                     _fills = await _grco(_occ_r, token=token, limit=8)
                     for f in _fills:
-                        if str(f.get("status", "")) != "filled":
+                        if not _matching_option_close(r, f, _occ_r):
                             continue
-                        _px = float(f.get("filled_avg_price") or 0)
-                        if _px <= 0:
-                            continue
-                        _amt = _px * 100.0 * _ctr
-                        _side = str(f.get("side", ""))
-                        if _is_long and _side.startswith("sell"):
-                            realized = round(_amt - abs(_credit), 2)
-                            exit_note = (f" · Sold to close at {_px:.2f} -> "
-                                         f"realized ${realized:+.2f}.")
-                            break
-                        if (not _is_long) and _side.startswith("buy"):
-                            realized = round(_credit - _amt, 2)
-                            exit_note = (f" · Bought back at {_px:.2f} -> "
-                                         f"realized ${realized:+.2f}.")
-                            break
+                        close_receipt = f
+                        break
                 except Exception:  # noqa: BLE001
                     pass
 
-                if (not broker_occ) and realized == 0.0 \
-                        and "Reconciled" in exit_note:
-                    # THIS book's broker holds ZERO options while this row
-                    # is open and no closing fill exists. HOLD the row
-                    # instead of closing on no evidence. rv:options_scanner
-                    # :1927: now that each book is judged against its OWN
-                    # broker (TE-15), a row the old unbound reconcile
-                    # copied from the primary into a 25k/75k book lands
-                    # here every tick -- expected noise until those rows
-                    # are cleaned by hand (agents/tools/verify_books.py).
+                if close_receipt is None:
+                    # Unrelated holdings cannot turn an absent contract
+                    # into a proven close. Neither can a fill from a prior
+                    # lifecycle, an unfilled order, or a partial quantity.
                     try:
                         from app.agents.activity_log import record as _hrec
                         _hrec("reconcile_hold", r["underlying"],
-                              reason=("kept open: this book's broker holds "
-                                      "no options and no closing fill was "
-                                      "found -- not closing on absence of "
-                                      "evidence (a row mis-adopted from the "
-                                      "primary by the old unbound reconcile "
-                                      "holds here every tick; verify_books "
-                                      "lists it for a manual close)"),
+                              reason=("kept open: no matching closing fill "
+                                      "for this contract, quantity and "
+                                      "lifecycle; settlement remains unknown"),
                               extra={"user_id": user_id})
                     except Exception:  # noqa: BLE001
                         pass
                     continue
 
-                def _sync_close(rid=r["id"], pnl=realized, en=exit_note):
-                    return (
-                        client.table("options_positions")
-                        .update({
-                            "status": "closed_manual",
-                            "realized_pnl_usd": pnl,
-                            "closed_at": "now()",
-                            "notes": (notes + en).strip(" ·"),
-                        })
-                        .eq("id", rid)
-                        .execute()
-                    )
-                await asyncio.to_thread(_sync_close)
-                closed_count += 1
+                from app.paper.option_exit import record_option_receipt
+                settled = await record_option_receipt(client, r, close_receipt, "reconciled")
+                if settled.ok and not settled.duplicate:
+                    closed_count += 1
+                elif not settled.ok:
+                    out.append(AgentMessage(agent=self.name, kind="alert", payload={
+                        "user_id": user_id, "position_id": r["id"],
+                        "event": "option_exit_accounting_pending", "note": settled.error}))
 
             if closed_count:
                 out.append(AgentMessage(
@@ -2171,68 +2241,6 @@ class OptionsScannerAgent(Agent):
                         "closed_count": closed_count,
                     },
                 ))
-
-            # ADOPT the other direction (Mike 2026-07-15: the F 12.5 put
-            # lived at Alpaca for NINE DAYS with no book row, so the Wheel
-            # card showed nothing). Any broker option with no open row
-            # becomes a tracked row -- UI, harvest, settle and realized
-            # accounting all see it again.
-            #
-            # vf:truth-sweep (audit 2026-09-01): row_occs above is built
-            # only from options_positions, but the engine's own option
-            # legs live in the LT-05 ledger -- paper_positions rows with
-            # asset_type='option' and ticker = OCC code. A contract that
-            # adoption had already placed there got an options_positions
-            # row from THIS pass on the next 30-min tick, so the "one
-            # contract, two managers" churn the same-sweep reorder ended
-            # kept coming back here. Read this book's open ledger legs
-            # under the binding set at the top of the loop and add them
-            # to the dedupe set, keyed exactly the way row_occs is keyed
-            # (a canonical OCC string). A failed read is ANSWERLESS, not
-            # empty: adopting on a guess is the split-brain being closed,
-            # so the adopt pass is skipped for this book with a log line.
-            # The close/hold pass above has already run and is untouched.
-            def _ledger_open(uid=user_id):
-                return (
-                    client.table("paper_positions")
-                    .select("ticker")
-                    .eq("user_id", uid).eq("status", "open")
-                    .eq("asset_type", "option")
-                    .execute()
-                )
-            try:
-                _lres = await asyncio.to_thread(_ledger_open)
-                _lrows = getattr(_lres, "data", None)
-                if _lrows is None:
-                    raise RuntimeError("ledger read returned no data")
-            except Exception as _le:  # noqa: BLE001
-                try:
-                    from app.agents.activity_log import record as _lrec
-                    _lrec("reconcile_adopt_skipped_unreadable", "ACCOUNT",
-                          reason=("paper_positions option ledger unreadable "
-                                  "-- no contract adopted this tick "
-                                  f"(adopting on a guess is the split-brain "
-                                  f"this dedupe closes): {str(_le)[:120]}"),
-                          extra={"user_id": user_id})
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            for _lr in _lrows:
-                try:
-                    _lt = str(_lr.get("ticker") or "").upper().strip()
-                    if len(_lt) < 16:
-                        continue
-                    _lund, _lymd, _lcp, _lk = (_lt[:-15], _lt[-15:-9],
-                                               _lt[-9], _lt[-8:])
-                    if not (_lund.isalpha() and _lymd.isdigit()
-                            and _lcp in ("C", "P") and _lk.isdigit()):
-                        continue
-                    # Same key row_occs uses: UND + YYMMDD + C/P + 8-digit
-                    # strike*1000 -- re-emitted so a stray pad or case in
-                    # the ledger ticker still collides with the broker OCC.
-                    row_occs.add(f"{_lund}{_lymd}{_lcp}{int(_lk):08d}")
-                except Exception:  # noqa: BLE001
-                    continue
 
             adopted = 0
             for p in broker_options:
@@ -3391,7 +3399,7 @@ class OptionsScannerAgent(Agent):
                             "legs": [{"action": "sell", "type": lg.option_type,
                                       "strike": lg.strike,
                                       "premium": lg.premium_per_share}],
-                            "notes": nt,
+                            "notes": "Modeled simulation · " + nt,
                         }).execute()
                     )
 

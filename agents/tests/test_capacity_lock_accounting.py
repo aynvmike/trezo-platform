@@ -8,10 +8,10 @@ pinged Mike "EXECUTION STARVATION: none of them produced an outcome at
 all" -- urgent, wrong, and every 30 minutes, about a lane that was
 behaving exactly as configured.
 
-The rule these tests pin: refusals count. A window whose approvals were
-ALL refused on purpose reports once as a warn CAPACITY LOCK (free a
-slot or raise a cap); an approve that VANISHES still raises the urgent
-alarm, because that is the 8/27 outage shape and nothing may mask it.
+Refusals count, but they are per book while approvals are per signal.
+Refusal-heavy windows warn once about capacity pressure; they cannot
+prove every approval received an answer. Execution errors and a numeric
+shortfall in outcomes retain the urgent alarm.
 
 Deliberately dependency-free (no pytest, no .env, no network) so the
 deploy guard can run them in a bare checkout.
@@ -148,7 +148,11 @@ def test_a_fully_refused_window_is_a_capacity_lock_not_a_starvation():
             if m.payload.get("event") == "capacity_lock"][0]
     assert lock["lane"] == "crypto"
     assert lock["refusals"] == 14
-    assert "refused on purpose" in lock["note"]
+    assert "deliberate per-book refusal(s)" in lock["note"]
+    assert "ALL refused" not in lock["note"]
+    assert "not a malfunction" not in lock["note"]
+    assert "do not prove every approval received an outcome" in lock["note"]
+    assert lock["outcome_accounting"] == "uncorrelated_per_book_counts"
     assert ("capacity_lock", "crypto") in a._open_alerts
 
 
@@ -164,8 +168,23 @@ def test_a_vanished_approve_still_raises_the_urgent_alarm():
     assert b, [m.payload for m in out]
     assert b[0]["refusals"] == 2
     assert b[0]["unaccounted"] == 4
-    assert "4 produced NO outcome" in b[0]["note"], b[0]["note"]
+    assert "at least 4 approval(s) have no counted outcome" in b[0]["note"], b[0]["note"]
     assert "2 per-book refusal(s)" in b[0]["note"], b[0]["note"]
+
+
+def test_fanout_totals_do_not_claim_every_approval_was_answered():
+    """Two signals can each produce three book refusals while four
+    other signals vanish. Six refusals cannot prove six approvals ended."""
+    a = _agent()
+    _approve(a, 6)
+    for ticker in ("ETH", "BTC"):
+        _refuse(a, 3, ticker=ticker)
+    out = _check(a)
+    p = out[0].payload
+    assert p["outcome_accounting"] == "uncorrelated_per_book_counts"
+    assert "not matched to individual approvals" in p["note"]
+    assert "ALL refused" not in p["note"]
+    assert "policy-only" in p["note"]
 
 
 def test_kills_keep_the_urgent_alarm_even_when_refusals_cover_the_rest():

@@ -143,15 +143,33 @@ FLOW_MIN_APPROVES_FOR_KILL = 3
 # an outcome. Alarm B counted it as "no outcome at all" and pinged
 # urgent every 30 minutes all Labor Day weekend while every book sat
 # correctly at capacity (crypto pockets 3/2, 6/6; stock 5/4, 6/5, 3/3).
-# A window whose approvals are ALL refused on purpose is a CAPACITY
-# LOCK: worth one warn -- Mike must free a slot or raise a cap for the
-# lane to trade -- but it is a policy state, not a malfunction, and the
-# 8/27 outage shape it must never mask is the VANISHED approve, which
-# still alarms urgent below. Spellings are asserted against
+# Refusal-heavy windows report capacity pressure, but these aggregate
+# counts cannot prove ALL approvals were answered: one approval can
+# produce several per-book refusals. The alert must keep that uncertainty
+# visible. Execution errors and numerically missing outcomes still alarm
+# urgent below. Spellings are asserted against
 # trade_execution's own source by the guard suite so the two files
 # cannot drift apart.
 _DELIBERATE_REFUSALS = ("book_at_capacity", "pocket_at_capacity",
                         "book_already_holds")
+
+# Keep diagnostic cardinality bounded even if every veto carries a
+# different price, ticker or book. The overflow bucket preserves totals.
+_FLOW_DETAIL_LIMIT = 16
+_FLOW_DETAIL_OTHER = "(other)"
+
+
+def _count_flow_detail(counts: dict[str, int], label: str) -> None:
+    if label not in counts and len(counts) >= _FLOW_DETAIL_LIMIT:
+        label = _FLOW_DETAIL_OTHER
+    counts[label] = counts.get(label, 0) + 1
+
+
+def _top_flow_details(counts: dict[str, int], limit: int = 3) -> list[dict]:
+    return [{"label": label, "count": count}
+            for label, count in sorted(counts.items(),
+                                       key=lambda item: (-item[1], item[0]))[:limit]]
+
 
 # NET2-GLOBAL: the flow counters are keyed by LANE. A single global
 # count let one crypto approve (24/7 lane) silence a starving stock lane
@@ -204,7 +222,8 @@ def _lane_of(payload: Any) -> str:
 def _new_lane_counters() -> dict[str, Any]:
     return {"signals": 0, "approves": 0, "vetoes": 0, "executes": 0,
             "kills": 0, "handler_fails": 0, "kill_reasons": {},
-            "refusals": 0, "refusal_reasons": {}}
+            "refusals": 0, "refusal_reasons": {},
+            "veto_reasons": {}, "veto_books": {}}
 
 
 def _lane_market_applies(lane: str, market_open: bool) -> bool:
@@ -229,6 +248,9 @@ class OpsWatchdogAgent(Agent):
         # In-memory dedupe: don't re-alert the same condition every tick
         # while it persists. Keyed by (alert_kind, target_name).
         self._open_alerts: set[tuple[str, str]] = set()
+        # A counted veto warning must not suppress a later missing-
+        # verdict emergency under the same (kind, lane) dedupe key.
+        self._flow_alert_severity: dict[tuple[str, str], str] = {}
         # Flow counters (2026-08-31), keyed by LANE since NET2-GLOBAL.
         # {"since": epoch, "lanes": {lane: _new_lane_counters()}}.
         self._flow: dict[str, Any] = {"since": _time.time(), "lanes": {}}
@@ -253,6 +275,11 @@ class OpsWatchdogAgent(Agent):
                 lane["approves"] += 1
             elif k == "veto":
                 lane["vetoes"] += 1
+                reason = " ".join(str(p.get("reason") or
+                                      "(no reason given)").split())[:180]
+                book = str(p.get("user_id") or "unattributed")[:80]
+                _count_flow_detail(lane["veto_reasons"], reason)
+                _count_flow_detail(lane["veto_books"], book)
             elif k == "execute":
                 lane["executes"] += 1
             elif k == "info":
@@ -284,7 +311,7 @@ class OpsWatchdogAgent(Agent):
                             and str(p.get("trigger_kind") or "") == "approve"):
                         lane["kills"] += 1
                         reason = str(p.get("error")
-                                     or "(executor crashed)")[:80]
+                                     or "(executor crashed)")[:180]
                         rs = lane["kill_reasons"]
                         rs[reason] = rs.get(reason, 0) + 1
                 elif ev == "execute_error" or (
@@ -298,7 +325,7 @@ class OpsWatchdogAgent(Agent):
                     # also accepts the older event-less error shape.
                     lane["kills"] += 1
                     reason = str(p.get("error") or p.get("reason")
-                                 or "(no reason given)")[:80]
+                                 or "(no reason given)")[:180]
                     rs = lane["kill_reasons"]
                     rs[reason] = rs.get(reason, 0) + 1
         except Exception:  # noqa: BLE001
@@ -328,12 +355,11 @@ class OpsWatchdogAgent(Agent):
              killed-with-a-reason (execute_error, or the executor
              crashing on the approve), refused ON PURPOSE (the audible
              capacity / already-held refusals from 4ed24ad), and
-             vanished (no outcome at all: a disabled executor, a
-             dropped message). A window whose approvals were ALL
-             refused on purpose is not this alarm at all: it reports
-             once as a warn CAPACITY LOCK -- free a slot or raise a cap
-             -- because a book correctly full is policy, not the 8/27
-             outage shape.
+             potentially missing (a disabled executor, a dropped
+             message). A refusal-heavy window reports capacity pressure
+             once as a warning. Per-book refusal totals are not matched
+             to individual approvals, so they cannot establish that every
+             approval received an outcome or rule out a dropped message.
              NET2-COUNT-BEFORE-KILL: approvals were counted at approve
              time, so an approve killed at execution still read as "the
              pipeline works" through the whole equity starvation. The
@@ -379,23 +405,42 @@ class OpsWatchdogAgent(Agent):
 
         # ---- A: signals in, nothing approved ---------------------------
         if signals >= FLOW_MIN_SIGNALS and approves == 0:
-            # Say which shape it is: accounted-for (every signal has a
-            # veto) vs UNACCOUNTED, which is the dangerous one -- signals
-            # going in and nothing at all coming out is a crash, not a
-            # decision.
+            # Report the aggregate count shortfall without claiming that
+            # each signal is correlated to an individual veto. A missing
+            # counted verdict can indicate a pipeline failure.
             unaccounted = max(0, signals - vetoes)
-            shape = (f"{vetoes} veto(es) explain them"
+            shape = (f"{vetoes} veto(es) recorded"
                      if unaccounted == 0 else
-                     f"{unaccounted} of them produced NO verdict at all -- "
-                     f"not an approval, not a veto")
+                     f"at least {unaccounted} signal(s) lack a counted verdict")
+            top_vetoes = _top_flow_details(c.get("veto_reasons") or {})
+            veto_books = _top_flow_details(c.get("veto_books") or {},
+                                          _FLOW_DETAIL_LIMIT + 1)
+            details = ""
+            if top_vetoes:
+                details += "; top veto reasons: " + "; ".join(
+                    f"{item['count']}x {item['label']}" for item in top_vetoes)
+            if veto_books:
+                book_details = []
+                for item in veto_books[:4]:
+                    label = item["label"]
+                    if label not in ("unattributed", _FLOW_DETAIL_OTHER):
+                        label = label[:8]
+                    book_details.append(f"{label}={item['count']}")
+                details += "; veto counts by reported book: " + ", ".join(book_details)
+            next_step = (
+                ". The veto count covers the observed signal count; review "
+                "these risk-gate reasons and the affected books before changing limits. "
+                "This count pattern alone does not establish a pipeline outage."
+                if unaccounted == 0 else
+                ". Missing verdicts can indicate a pipeline failure. Check "
+                "risk_manager handler errors and message routing first."
+            )
             msg = (
                 f"APPROVAL STARVATION [{lane}]: {signals} signal(s) in "
                 f"{window_min:.0f} min produced ZERO approvals on the "
                 f"{lane} lane; {shape}"
                 + (f"; {hfails} handler crash(es) reported" if hfails else "")
-                + ". A silent pipeline is what the 8/27-8/31 outage looked "
-                  "like: every agent ticking, nothing traded. Check "
-                  "risk_manager first, then trade_execution."
+                + details + next_step
             )
             await self._raise_flow(
                 key_a, severity="urgent" if unaccounted else "warn",
@@ -405,6 +450,8 @@ class OpsWatchdogAgent(Agent):
                 payload={"event": "approval_starvation", "lane": lane,
                          "signals": signals, "approves": 0,
                          "vetoes": vetoes, "unaccounted": unaccounted,
+                         "top_veto_reasons": top_vetoes,
+                         "veto_books": veto_books,
                          "handler_failures": hfails,
                          "window_min": round(window_min, 1), "note": msg}))
         elif approves > 0:
@@ -413,6 +460,7 @@ class OpsWatchdogAgent(Agent):
             # re-pinged the webhook every other window while the lane
             # stayed starved. (The pre-NET2 global check had this right.)
             self._open_alerts.discard(key_a)
+            self._flow_alert_severity.pop(key_a, None)
 
         # ---- B: approved, and NOTHING filled ---------------------------
         # NET2-REV-01: the audit shape was "kills >= approves", which is
@@ -427,34 +475,37 @@ class OpsWatchdogAgent(Agent):
             reasons = c.get("kill_reasons") or {}
             top, top_n = (max(reasons.items(), key=lambda kv: kv[1])
                           if reasons else ("(no reason given)", 0))
-            # NET2-REFUSED: refusals are per BOOK (one approval fans out
-            # to up to three), so they can legitimately exceed approves;
-            # the clamp keeps the arithmetic honest either way.
+            # Refusals are per BOOK while approvals are per SIGNAL. This
+            # subtraction is only a lower bound on missing outcomes; it
+            # cannot prove that individual approvals all received answers.
             unaccounted_b = max(0, approves - kills - refusals)
             if kills == 0 and refusals and unaccounted_b == 0:
-                # Every approval was answered with a deliberate refusal:
-                # the lane is CAPACITY-LOCKED. One warn, actionable, and
-                # NOT the 8/27 shape -- nothing vanished.
+                # Retain the existing warning for observed capacity
+                # pressure, without claiming aggregate counts prove all
+                # approvals were deliberately refused.
                 rref = c.get("refusal_reasons") or {}
                 rtop, rtop_n = (max(rref.items(), key=lambda kv: kv[1])
                                 if rref else ("(unrecorded)", 0))
                 msg = (
-                    f"CAPACITY LOCK [{lane}]: {approves} approval(s) in "
-                    f"{window_min:.0f} min were ALL refused on purpose "
-                    f"({refusals} per-book refusal(s); top ({rtop_n}x): "
-                    f"{rtop}). Nothing on this lane fills until a "
-                    f"position exits or a cap changes in Bot Tuning -- "
-                    f"a policy state, not a malfunction."
+                    f"CAPACITY PRESSURE [{lane}]: {approves} approval(s) in "
+                    f"{window_min:.0f} min produced zero fills; "
+                    f"{refusals} deliberate per-book refusal(s) were recorded "
+                    f"(top ({rtop_n}x): {rtop}). These totals are not matched "
+                    f"to individual approvals, so they do not prove every "
+                    f"approval received an outcome. Review the affected "
+                    f"books' holdings and limits, then reconcile approval "
+                    f"outcomes before treating this as policy-only."
                 )
                 await self._raise_flow(
                     key_c, severity="warn",
-                    title=f"Trezo: {lane} lane is capacity-locked",
+                    title=f"Trezo: {lane} lane has capacity pressure",
                     msg=msg)
                 out.append(AgentMessage(
                     agent=self.name, kind="info",
                     payload={"event": "capacity_lock", "lane": lane,
                              "approves": approves, "refusals": refusals,
                              "top_refusal": rtop,
+                             "outcome_accounting": "uncorrelated_per_book_counts",
                              "window_min": round(window_min, 1),
                              "note": msg}))
                 return out
@@ -466,9 +517,8 @@ class OpsWatchdogAgent(Agent):
                 parts.append(f"{refusals} per-book refusal(s) on purpose "
                              f"(capacity / already-held)")
             if unaccounted_b:
-                parts.append(f"{unaccounted_b} produced NO outcome at all "
-                             f"-- not a fill, not a rejection, not a "
-                             f"refusal")
+                parts.append(f"at least {unaccounted_b} approval(s) have "
+                             f"no counted outcome")
             shape_b = ("; ".join(parts)
                        or "none of them produced an outcome at all")
             msg = (
@@ -476,7 +526,9 @@ class OpsWatchdogAgent(Agent):
                 f"{window_min:.0f} min produced ZERO fills on the {lane} "
                 f"lane; {shape_b}. The gate said yes and nothing filled "
                 f"-- check trade_execution (is it registered, enabled, "
-                f"crashing?), then the book's buying power and route."
+                f"crashing?), then the book's buying power and route. "
+                f"Per-book outcomes are not matched to individual approvals; "
+                f"aggregate totals cannot rule out missing outcomes."
             )
             await self._raise_flow(
                 key_b, severity="urgent",
@@ -488,28 +540,37 @@ class OpsWatchdogAgent(Agent):
                          "approves": approves, "executes": 0,
                          "kills": kills, "refusals": refusals,
                          "unaccounted": unaccounted_b,
+                         "outcome_accounting": "uncorrelated_per_book_counts",
                          "top_kill_reason": top,
                          "window_min": round(window_min, 1), "note": msg}))
         elif executes > 0:
             # NET2-REV-02 (as above): a fill is recovery; silence is not.
             self._open_alerts.discard(key_b)
             self._open_alerts.discard(key_c)
+            self._flow_alert_severity.pop(key_b, None)
+            self._flow_alert_severity.pop(key_c, None)
         return out
 
     async def _raise_flow(self, key: tuple[str, str], *, severity: str,
                           title: str, msg: str) -> None:
-        """Persist + webhook ONCE per (kind, lane) while it persists."""
-        if key in self._open_alerts:
+        """Persist + notify once per condition, and again on escalation."""
+        escalated = (self._flow_alert_severity.get(key) == "warn"
+                     and severity == "urgent")
+        if key in self._open_alerts and not escalated:
             return
         self._open_alerts.add(key)
+        self._flow_alert_severity[key] = severity
         await self._persist_alert(kind=key[0], target=key[1],
                                   severity=severity, message=msg)
         try:
             from app.runtime.alerts import notify
             # NET2-REV-03: pass the severity through; it was pinned to
             # "urgent" so a fully-vetoed (warn) window pinged as red.
+            # The outbound notifier also dedupes by key. Include severity
+            # so a recent warning cannot consume an urgent escalation's
+            # cooldown even though the watchdog now allows it through.
             await notify(title, msg, severity=severity,
-                         key=f"{key[0]}:{key[1]}")
+                         key=f"{key[0]}:{key[1]}:{severity}")
         except Exception:  # noqa: BLE001
             pass
 

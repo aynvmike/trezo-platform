@@ -14,6 +14,7 @@ ledger that drives Phase 6.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -58,9 +59,24 @@ class FillResult:
     fill_price: float = 0.0
     realized_pnl_usd: float = 0.0
     error: Optional[str] = None
+    pending: bool = False
+    duplicate: bool = False
+    remaining_qty: float = 0.0
+    fees_complete: bool = False
+    pnl_provisional: bool = True
+    broker_order_id: Optional[str] = None
 
 
 # ---- Helpers --------------------------------------------------------------
+
+
+def _payload_dict(value: Any) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def apply_slippage(price: float, side: str, action: str) -> float:
@@ -305,6 +321,9 @@ async def close_position(
     pos = res.data if res else None
     if not pos or pos.get("status") != "open":
         return FillResult(ok=False, error="Position not open")
+    if str(pos.get("broker") or "").strip().lower() == "alpaca":
+        return FillResult(ok=False, position_id=position_id, pending=True,
+                          error="Broker-managed position requires confirmed fill accounting")
 
     side  = pos["side"]
     qty   = float(pos["quantity"])
@@ -466,6 +485,9 @@ async def close_partial_position(
     pos = res.data if res else None
     if not pos or pos.get("status") != "open":
         return FillResult(ok=False, error="Position not open")
+    if str(pos.get("broker") or "").strip().lower() == "alpaca":
+        return FillResult(ok=False, position_id=position_id, pending=True,
+                          error="Broker-managed position requires confirmed fill accounting")
 
     side = pos["side"]
     total_qty = float(pos["quantity"])
@@ -787,13 +809,56 @@ async def record_external_position(
                 _tn = (max(_t0, target_price) if (_t0 and target_price and _long)
                        else min(_t0, target_price) if (_t0 and target_price)
                        else (target_price or _t0))
+                _old_payload = _payload_dict(_row.get("source_payload"))
+                _add_payload = _payload_dict(source_payload)
+                _verified = (_old_payload.get("entry_basis_verified") is True
+                             and _add_payload.get("entry_basis_verified") is True)
+                _fees_known = (_old_payload.get("entry_fees_known") is True
+                               and _add_payload.get("entry_fees_known") is True)
+                _basis_keys = ("broker_order_id", "entry_basis_verified", "entry_fees_known",
+                               "entry_status", "entry_price_source", "broker_entry_notional",
+                               "broker_entry_filled_qty", "broker_entry_filled_avg_price",
+                               "broker_entry_filled_at", "entry_cost_includes_measured_coin_fee")
+                _components = _old_payload.get("broker_entry_components")
+                _components = list(_components) if isinstance(_components, list) else []
+                if not _components:
+                    _components.append({k: _old_payload[k] for k in _basis_keys if k in _old_payload})
+                _components.append({**{k: _add_payload[k] for k in _basis_keys if k in _add_payload},
+                                    "broker_order_id": broker_order_id})
+                # Keep strategy/protection metadata, but never let a verified
+                # old lot certify a provisional add. Per-entry receipts remain
+                # available without presenting the first lot as the whole basis.
+                _merged_payload = {k: v for k, v in _old_payload.items()
+                                   if k not in ("broker_entry_notional", "broker_entry_filled_qty",
+                                                "broker_entry_filled_avg_price")}
+                _merged_payload.update({"entry_basis_verified": _verified,
+                                        "entry_fees_known": _fees_known,
+                                        "entry_price_source": "weighted_broker_fills" if _verified else "mixed_provisional",
+                                        "entry_status": "filled" if (_old_payload.get("entry_status") == "filled"
+                                                                     and _add_payload.get("entry_status") == "filled")
+                                                        else "pending_verification",
+                                        "broker_entry_components": _components})
                 _patch = {"quantity": _qn, "entry_price": _en,
-                          "stop_price": _sn, "target_price": _tn}
+                          "stop_price": _sn, "target_price": _tn,
+                          "source_payload": _merged_payload}
 
                 def _do_merge():
-                    return (client.table("paper_positions")
-                            .update(_patch).eq("id", _row["id"]).execute())
-                await asyncio.to_thread(_do_merge)
+                    query = (client.table("paper_positions").update(_patch)
+                             .eq("id", _row["id"]).eq("user_id", user_id).eq("status", "open")
+                             .eq("quantity", _row["quantity"]).eq("entry_price", _row["entry_price"]))
+                    if _row.get("source_payload") is None:
+                        query = query.is_("source_payload", "null")
+                    else:
+                        query = query.eq("source_payload", json.dumps(_row["source_payload"]))
+                    return query.execute()
+                try:
+                    _merged = await asyncio.to_thread(_do_merge)
+                    if not isinstance(_merged.data, list) or len(_merged.data) != 1:
+                        return FillResult(ok=False, position_id=_row.get("id"), pending=True,
+                                          error="Position changed during broker entry merge; reconcile the confirmed entry")
+                except Exception:
+                    return FillResult(ok=False, position_id=_row.get("id"), pending=True,
+                                      error="Broker entry merge unverified; reconcile the confirmed entry")
                 try:
                     from app.agents.activity_log import record as _mrec
                     _mrec("position_merged", ticker.upper(),
@@ -855,26 +920,43 @@ async def record_external_position(
         return FillResult(ok=False, error=str(e))
 
 
-async def count_profit_steps(user_id: str, position_id: str) -> int:
-    """How many profit-step slices this position has already banked
-    (trade_outcomes rows, exit_reason='profit_step'). Makes the step
-    ladder restart-proof (2026-07-02). Best-effort: 0 on any failure."""
+async def count_profit_steps(user_id: str, position_id: str) -> Optional[int]:
+    """Count completed order identities, not cumulative partial-fill polls.
+
+    Legacy outcomes without a broker order ID retain their per-row identity.
+    An incomplete/failed read is unknown, never a fresh zero-step ladder.
+    """
     client = _supabase()
     if not client:
-        return 0
+        return None
 
     def _q():
-        return (client.table("trade_outcomes")
-                .select("position_id")
-                .eq("user_id", user_id)
-                .eq("position_id", position_id)
-                .eq("exit_reason", "profit_step")
-                .limit(10).execute())
+        identities = set()
+        page_size = 500
+        for offset in range(0, 50000, page_size):
+            response = (client.table("trade_outcomes")
+                        .select("id,entry_payload")
+                        .eq("user_id", user_id).eq("position_id", position_id)
+                        .eq("exit_reason", "profit_step").order("id")
+                        .range(offset, offset + page_size - 1).execute())
+            rows = response.data
+            if not isinstance(rows, list):
+                return None
+            for row in rows:
+                order_id = _payload_dict(_payload_dict(row.get("entry_payload")).get("broker_accounting")).get("exit_order_id")
+                if order_id:
+                    identities.add(("order", str(order_id)))
+                elif row.get("id"):
+                    identities.add(("legacy", str(row["id"])))
+                else:
+                    return None
+            if len(rows) < page_size:
+                return len(identities)
+        return None
     try:
-        res = await asyncio.to_thread(_q)
-        return len(res.data or [])
+        return await asyncio.to_thread(_q)
     except Exception:  # noqa: BLE001
-        return 0
+        return None
 
 
 from app.paper.position_status import assert_valid as _assert_status
@@ -885,198 +967,110 @@ from app.paper.position_status import assert_valid as _assert_status
 _POS_PARTIAL = _assert_status("closed_partial", "record_external_partial_close")
 
 
-async def record_external_partial_close(
-    user_id: str,
-    position_id: str,
-    slice_qty: float,
-    fill_price: float,
-    reason: str = "profit_step",
+def _validated_broker_receipt(receipt: dict) -> dict:
+    """Keep only a confirmed cumulative order receipt, never a quote/model.
+
+    `fee_usd` means a known cumulative cash fee for THIS closing order. Absence
+    is unknown, not a free trade. Entry-cost provenance is checked in the RPC.
+    """
+    from decimal import Decimal, InvalidOperation
+    if not isinstance(receipt, dict):
+        raise ValueError("Broker order receipt required")
+    out = {key: receipt.get(key) for key in (
+        "id", "symbol", "side", "status", "filled_qty", "filled_avg_price", "filled_at")}
+    if (not isinstance(out["id"], str) or not out["id"].strip()
+            or not isinstance(out["symbol"], str) or not out["symbol"].strip()
+            or out["side"] not in ("buy", "sell")
+            or out["status"] not in ("filled", "partially_filled", "canceled", "expired", "rejected", "done_for_day")):
+        raise ValueError("Broker receipt is incomplete or unfilled")
+    for key in ("filled_qty", "filled_avg_price", "fee_usd"):
+        val = receipt.get(key)
+        if key == "fee_usd" and val is None:
+            continue
+        try:
+            num = Decimal(str(val))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("Broker receipt has invalid numeric evidence") from None
+        if not num.is_finite() or (num < 0 if key == "fee_usd" else num <= 0):
+            raise ValueError("Broker receipt has invalid numeric evidence")
+        if key == "filled_qty":
+            try:
+                if num >= Decimal("1e18") or num != num.quantize(Decimal("0.000000000001")):
+                    raise ValueError("Broker receipt quantity exceeds ledger precision")
+            except InvalidOperation:
+                raise ValueError("Broker receipt quantity exceeds ledger precision") from None
+        out[key] = str(num)
+    try:
+        stamp = datetime.fromisoformat(str(out["filled_at"]).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValueError("Broker receipt requires a timezone-aware fill timestamp") from None
+    out["filled_at"] = stamp.astimezone(timezone.utc).isoformat()
+    return out
+
+
+async def record_broker_close(
+    user_id: str, position_id: str, receipt: dict, reason: str = "manual",
 ) -> FillResult:
-    """Book a PARTIAL close of an external-broker (Alpaca) position:
-    a closed-slice row is written (so the row-truth kill-switch and the
-    learning loop both see the banked P/L) and the open row's quantity is
-    reduced. No cash/counter mutation -- external rows follow
-    record_external_close's convention: rows are the truth (2026-07-02)."""
+    """Atomically book only new confirmed fills; duplicate orders are harmless.
+
+    Requires the broker_close_receipts migration to be installed first.
+    Missing RPC, rejected evidence or DB failure leaves every ledger row intact.
+    The transaction owns outcome/counter writes; never repeat them in Python.
+    Cash stays broker-snapshot sourced, avoiding a second credit after a sync.
+    """
+    try:
+        evidence = _validated_broker_receipt(receipt)
+    except ValueError as exc:
+        return FillResult(ok=False, position_id=position_id, pending=True, error=str(exc))
     client = _supabase()
     if not client:
-        return FillResult(ok=False, error="Supabase not configured")
-
-    def _sync_get():
-        return (
-            client.table("paper_positions")
-            .select("*")
-            .eq("id", position_id)
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
-
-    res = await asyncio.to_thread(_sync_get)
-    pos = res.data if res else None
-    if not pos or pos.get("status") != "open":
-        return FillResult(ok=False, error="Position not open")
-    qty_total = float(pos.get("quantity") or 0)
-    sq = float(slice_qty)
-    if sq <= 0 or sq >= qty_total:
-        return FillResult(ok=False, error="Bad slice quantity")
-    entry = float(pos.get("entry_price") or 0)
-    side = pos.get("side") or "long"
-    pnl = (sq * (fill_price - entry) if side == "long"
-           else sq * (entry - fill_price))
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    def _ins_slice():
-        return client.table("paper_positions").insert({
-            "user_id": user_id,
-            "ticker": pos.get("ticker"),
-            "asset_type": pos.get("asset_type"),
-            "side": side,
-            "broker": pos.get("broker"),
-            "strategy": pos.get("strategy"),
-            "quantity": sq,
-            "entry_price": entry,
-            "entry_at": pos.get("entry_at"),
-            "stop_price": pos.get("stop_price"),
-            "target_price": pos.get("target_price"),
-            "source_payload": pos.get("source_payload"),
-            "fees_usd": 0,
-            # One source of truth with migration 0051's CHECK constraint.
-            # This literal string is what the database rejected for six
-            # weeks (2026-07-02 -> 2026-08-17) while the caller printed
-            # "booking failed" and threw the reason away.
-            "status": _POS_PARTIAL,
-            "exit_price": fill_price,
-            "exit_at": now_iso,
-            "realized_pnl_usd": round(pnl, 2),
-        }).execute()
-
-    def _shrink():
-        return (client.table("paper_positions")
-                .update({"quantity": qty_total - sq})
-                .eq("id", position_id).execute())
-
+        return FillResult(ok=False, pending=True, error="Supabase not configured")
     try:
-        await asyncio.to_thread(_ins_slice)
-        await asyncio.to_thread(_shrink)
-        try:
-            from app.learning.outcomes import record_paper_close
-            await record_paper_close(
-                user_id=user_id,
-                position_id=position_id,
-                ticker=pos.get("ticker"),
-                asset_type=pos.get("asset_type"),
-                side=side,
-                strategy=pos.get("strategy"),
-                direction=(pos.get("source_payload") or {}).get("direction"),
-                entry_price=entry,
-                exit_price=fill_price,
-                quantity=sq,
-                realized_pnl_usd=pnl,
-                exit_reason=reason,
-                status="closed_partial",
-                opened_at=pos.get("entry_at"),
-                closed_at=now_iso,
-                source_payload=pos.get("source_payload"),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return FillResult(ok=True, position_id=position_id,
-                          fill_price=fill_price,
-                          realized_pnl_usd=round(pnl, 2))
-    except Exception as e:  # noqa: BLE001
-        return FillResult(ok=False, error=str(e))
+        result = await asyncio.to_thread(lambda: client.rpc("record_broker_close", {
+            "p_user_id": str(user_id), "p_position_id": str(position_id),
+            "p_receipt": evidence, "p_reason": str(reason),
+        }).execute())
+        data = getattr(result, "data", None)
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            return FillResult(ok=False, position_id=position_id, pending=True,
+                              error="Atomic broker fill accounting returned no confirmation")
+        return FillResult(
+            ok=True, position_id=position_id, broker_order_id=evidence["id"],
+            fill_price=float(data.get("fill_price") or 0),
+            realized_pnl_usd=float(data.get("realized_pnl_usd") or 0),
+            duplicate=bool(data.get("duplicate")), pending=bool(data.get("pending")),
+            remaining_qty=float(data.get("remaining_qty") or 0),
+            fees_complete=bool(data.get("fees_complete")),
+            pnl_provisional=bool(data.get("pnl_provisional", True)),
+        )
+    except Exception:  # No sequential-write fallback; no credential-bearing error text.
+        return FillResult(ok=False, position_id=position_id, pending=True,
+                          error="Atomic broker fill accounting unavailable or receipt rejected; "
+                                "verify schema installation and reconcile the pending order")
+
+
+async def record_external_partial_close(
+    user_id: str, position_id: str, slice_qty: float, fill_price: float,
+    reason: str = "profit_step", *, receipt: Optional[dict] = None,
+) -> FillResult:
+    """Compatibility boundary: a caller-supplied slice/price is not evidence."""
+    if receipt is None:
+        return FillResult(ok=False, position_id=position_id, pending=True,
+                          error="Confirmed broker order receipt required for external partial close")
+    return await record_broker_close(user_id, position_id, receipt, reason)
 
 
 async def record_external_close(
-    user_id: str,
-    position_id: str,
-    exit_price: float,
-    reason: str = "alpaca_bracket",
+    user_id: str, position_id: str, exit_price: float,
+    reason: str = "alpaca_bracket", *, receipt: Optional[dict] = None,
 ) -> FillResult:
-    """Mark an external-broker tracking position closed."""
-    client = _supabase()
-    if not client:
-        return FillResult(ok=False, error="Supabase not configured")
-
-    def _sync_get():
-        return (
-            client.table("paper_positions")
-            .select("*")
-            .eq("id", position_id)
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
-
-    res = await asyncio.to_thread(_sync_get)
-    pos = res.data if res else None
-    if not pos or pos.get("status") != "open":
-        return FillResult(ok=False, error="Position not open")
-
-    qty = float(pos.get("quantity") or 0)
-    entry = float(pos.get("entry_price") or 0)
-    side = pos.get("side")
-    tgt = float(pos.get("target_price") or 0)
-    stp = float(pos.get("stop_price") or 0)
-
-    if side == "long":
-        pnl = qty * (exit_price - entry)
-        status = ("closed_target" if (tgt and exit_price >= tgt)
-                  else "closed_stop" if (stp and exit_price <= stp)
-                  else "closed_manual")
-    else:
-        pnl = qty * (entry - exit_price)
-        status = ("closed_target" if (tgt and exit_price <= tgt)
-                  else "closed_stop" if (stp and exit_price >= stp)
-                  else "closed_manual")
-
-    def _sync_close():
-        return (
-            client.table("paper_positions")
-            .update({
-                "status": status,
-                "exit_price": exit_price,
-                "exit_at": datetime.now(timezone.utc).isoformat(),
-                "realized_pnl_usd": round(pnl, 2),
-            })
-            .eq("id", position_id)
-            .execute()
-        )
-
-    try:
-        await asyncio.to_thread(_sync_close)
-
-        # Phase 13/14 - learning-loop recorder.
-        try:
-            from app.learning.outcomes import record_paper_close
-            await record_paper_close(
-                user_id=user_id,
-                position_id=position_id,
-                ticker=pos.get("ticker"),
-                asset_type=pos.get("asset_type"),
-                side=side,
-                strategy=pos.get("strategy"),
-                direction=(pos.get("source_payload") or {}).get("direction"),
-                entry_price=entry,
-                exit_price=exit_price,
-                quantity=qty,
-                realized_pnl_usd=pnl,
-                exit_reason=reason,
-                status=status,
-                opened_at=pos.get("entry_at"),
-                closed_at=datetime.now(timezone.utc).isoformat(),
-                source_payload=pos.get("source_payload"),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-        return FillResult(
-            ok=True, position_id=position_id,
-            fill_price=exit_price, realized_pnl_usd=pnl,
-        )
-    except Exception as e:  # noqa: BLE001
-        return FillResult(ok=False, error=str(e))
-
+    """Quote-only reconciliation must leave the position pending verification."""
+    if receipt is None:
+        return FillResult(ok=False, position_id=position_id, pending=True,
+                          error="Confirmed broker order receipt required for external close")
+    return await record_broker_close(user_id, position_id, receipt, reason)
 
 
 async def trim_position(
@@ -1206,83 +1200,30 @@ async def trim_position(
 
 
 async def close_position_broker_aware(
-    user_id: str,
-    position_id: str,
-    market_price: float,
-    reason: str = "manual",
+    user_id: str, position_id: str, market_price: float, reason: str = "manual",
 ) -> FillResult:
-    """Broker-aware wrapper around close_position().
-
-    For rows where broker == "alpaca", first calls Alpaca's
-    DELETE /v2/positions/{ticker} (liquidate_position) which
-    automatically cancels any open bracket legs and submits a market
-    close at Alpaca. Only after Alpaca returns success do we update the
-    Trezo row via close_position(). On Alpaca failure the Trezo row
-    stays open so the next reconcile tick can retry; we DO NOT
-    optimistically close the Trezo row and leave Alpaca holding the bag
-    (that was the Gap 2 bug from 2026-06-11).
-
-    For non-Alpaca rows, falls through to plain close_position().
-    """
-    import structlog
-    _log = structlog.get_logger("trezo.engine")
+    """Internal rows simulate; broker rows use bound, durable receipt settlement."""
     client = _supabase()
     if not client:
         return FillResult(ok=False, error="Supabase not configured")
-
-    # Read the row to find out broker + ticker
-    def _sync_get():
-        return (
-            client.table("paper_positions")
-            .select("ticker, broker, status, asset_type")
-            .eq("id", position_id)
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
-    res = await asyncio.to_thread(_sync_get)
-    pos = res.data if res else None
-    if not pos:
-        return FillResult(ok=False, error="Position not found")
-    if pos.get("status") != "open":
+    try:
+        res = await asyncio.to_thread(lambda: client.table("paper_positions")
+            .select("*").eq("id", position_id).eq("user_id", user_id)
+            .maybe_single().execute())
+        pos = res.data if res else None
+    except Exception:
+        return FillResult(ok=False, pending=True, error="Position lookup unavailable")
+    if not pos or pos.get("status") != "open":
         return FillResult(ok=False, error="Position not open")
-
-    broker = (pos.get("broker") or "").lower().strip()
-    ticker = (pos.get("ticker") or "").upper().strip()
-    # Task #10 (2026-06-11): pass asset_type so crypto liquidations hit
-    # Alpaca with the pair symbol ('BTCUSD'), not the bare ticker ('BTC')
-    # which 404s and would leave the row stuck open forever.
-    a_type = (pos.get("asset_type") or "stock").lower().strip()
-
-    if broker == "alpaca" and ticker:
-        # 1) Liquidate at Alpaca (cancels bracket legs + closes the position).
+    if str(pos.get("broker") or "").strip().lower() == "alpaca":
+        from app.brokers.accounts import bind_for_user
+        from app.brokers.route_guard import check_route
+        from app.paper.broker_exit import settle_or_request_close
         try:
-            from app.brokers.alpaca import liquidate_position
-            liq, liq_err = await liquidate_position(ticker, asset_type=a_type)
-            if liq_err:
-                _log.warning(
-                    "engine.broker_aware_close.alpaca_liquidate_failed",
-                    ticker=ticker, position_id=position_id, error=liq_err,
-                )
-                # Leave the Trezo row open - next Position Monitor tick will
-                # reconcile naturally if Alpaca did actually close.
-                return FillResult(
-                    ok=False,
-                    error=f"alpaca liquidate failed: {liq_err}",
-                )
-            _log.info(
-                "engine.broker_aware_close.alpaca_liquidate_ok",
-                ticker=ticker, position_id=position_id, reason=reason,
-            )
-        except Exception as e:  # noqa: BLE001
-            _log.warning(
-                "engine.broker_aware_close.alpaca_liquidate_raised",
-                ticker=ticker, position_id=position_id, error=str(e)[:200],
-            )
-            return FillResult(
-                ok=False,
-                error=f"alpaca liquidate raised: {str(e)[:200]}",
-            )
-
-    # 2) Mark the Trezo row closed (always, whether Alpaca-routed or not).
+            with bind_for_user(str(user_id)) as account:
+                if account is None or not check_route(str(user_id))[0]:
+                    return FillResult(ok=False, pending=True, error="Unresolved broker book")
+                return await settle_or_request_close(pos, reason)
+        except Exception:
+            return FillResult(ok=False, pending=True, error="Broker exit remains unverified")
     return await close_position(user_id, position_id, market_price, reason=reason)

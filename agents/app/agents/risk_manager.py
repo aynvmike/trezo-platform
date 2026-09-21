@@ -993,12 +993,15 @@ class RiskManagerAgent(Agent):
         from app.data.candles import COIN_MAP as _COIN_MAP_ACC
         from app.strategies.crypto import is_accumulation_strategy
         _coin_u = ticker.upper()
-        _is_crypto = _coin_u in _COIN_MAP_ACC
+        _asset_type = str(message.payload.get("asset_type") or "").strip().lower()
+        # Explicit asset class covers dynamically discovered coins, while
+        # the exact legacy ticker map only fills in an absent class.
+        _is_crypto = (_asset_type == "crypto"
+                      or (not _asset_type and _coin_u in _COIN_MAP_ACC))
         # Forex (2026-07-02): fiat pairs skip the US-equity session and
         # stock-liquidity gates; costs are tiny (5bps slip each way) and
         # the scanner's ATR targets clear them. Pocket + sizing still gate.
-        _is_forex = (str(message.payload.get("asset_type") or "").lower()
-                     == "forex")
+        _is_forex = _asset_type == "forex"
         _accumulate_mode = is_accumulation_strategy(strategy)
         accumulation_add = False
         if _is_crypto:
@@ -1130,15 +1133,14 @@ class RiskManagerAgent(Agent):
 
         # Market regime + symbol-quality filter (Phase 8d) - stocks only.
         # Crypto trades 24/7 and is not tied to the US equity session.
-        # Read the crypto set from COIN_MAP so the ISO 20022-aligned
-        # coin expansion (Mike 2026-05-31) is picked up automatically.
-        from app.data.candles import COIN_MAP as _COIN_MAP
+        # Use the same asset classification as the crypto risk checks;
+        # dynamically discovered coins are not limited to COIN_MAP.
         # BI-04: books whose per-coin loss halt is tripped for THIS coin
         # (scanner signals only -- a user-scoped signal is judged for its
         # own book above). Travels on the approve payload so the fan-out
         # skips them instead of the whole platform losing the coin.
         benched_books: list[str] = []
-        if ticker.upper() not in _COIN_MAP and not _is_forex:
+        if not _is_crypto and not _is_forex:
             from app.strategies.market_filter import (
                 get_market_bias, direction_blocked, liquidity_check,
                 overextension_check, spread_quality_check,
@@ -1154,7 +1156,20 @@ class RiskManagerAgent(Agent):
             if blocked:
                 return [self._veto(ticker, tcs, blocked)]
             stock_candles = await fetch_candles_for(ticker, "stock")
-            liq = liquidity_check(stock_candles, strategy=strategy)
+            if not stock_candles:
+                return [self._veto(ticker, tcs, "No price data for the liquidity check")]
+            from app.brokers.alpaca_data import get_completed_liquidity_bars
+            from app.data.candles import _bars_to_candles
+            liquidity_candles = _bars_to_candles(
+                await get_completed_liquidity_bars(ticker))
+            if len(liquidity_candles) != 20:
+                return [self._veto(
+                    ticker, tcs,
+                    "Consolidated liquidity data unavailable: need 20 valid "
+                    "completed SIP daily bars", strategy=strategy,
+                    user_id=message.payload.get("user_id"))]
+            liq = liquidity_check(stock_candles, strategy=strategy,
+                                  volume_candles=liquidity_candles)
             if liq:
                 # Strategy reattribution (Mike 2026-06-12, mem0 72c35e29:
                 # YMAT TCS 670 died on the $5 DEFAULT floor because its
@@ -1172,7 +1187,8 @@ class RiskManagerAgent(Agent):
                 fits = []
                 try:
                     from app.strategies.market_filter import profiles_accepting
-                    fits = [s for s in profiles_accepting(stock_candles)
+                    fits = [s for s in profiles_accepting(
+                                stock_candles, volume_candles=liquidity_candles)
                             if s != (strategy or "").lower()]
                 except Exception:  # noqa: BLE001
                     fits = []
@@ -1221,7 +1237,7 @@ class RiskManagerAgent(Agent):
             spread = await spread_quality_check(ticker)
             if spread:
                 return [self._veto(ticker, tcs, spread)]
-        else:
+        elif _is_crypto:
             # Per-coin daily loss limit (QW6) - crypto only. Benches a
             # single coin without halting the rest of the book.
             # BI-04: PER BOOK. A PINNED signal (user_id + book_scoped) is

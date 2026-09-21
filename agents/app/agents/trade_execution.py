@@ -408,13 +408,30 @@ class TradeExecutionAgent(Agent):
         Returns (states, dollar_over, fail_closed_msg)."""
         _lane = _lane_of(ticker, source_payload)
         _book_ks: dict | None = None
+        _ks_diagnostic = {"stage": "kill_switch_evaluation",
+                          "category": "unclassified_failure"}
         try:
-            from app.paper.killswitch import check_states as _ck_states
-            _book_ks = await _ck_states(client)
+            from app.paper.killswitch import (
+                check_states as _ck_states, capture_read_failure,
+                record_check_failure,
+            )
+            with capture_read_failure() as _ks_read:
+                try:
+                    _book_ks = await _ck_states(client)
+                except Exception as exc:  # noqa: BLE001
+                    record_check_failure("kill_switch_evaluation", exc)
+                _ks_diagnostic = _ks_read.failure or {
+                    "stage": "kill_switch_evaluation", "category": "state_unavailable"}
         except Exception:  # noqa: BLE001
             _book_ks = None
         if _book_ks is None:
-            _ks_err = ("kill-switch state unreadable — fail closed: "
+            _ks_note = (f"{_ks_diagnostic['stage']}: "
+                        f"{_ks_diagnostic['category']}"
+                        + (f" (HTTP {_ks_diagnostic['http_status']})"
+                           if "http_status" in _ks_diagnostic else ""))
+            _ks_reason = ("kill-switch state unreadable — fail closed "
+                          f"[{_ks_note}]")
+            _ks_err = (f"{_ks_reason}: "
                        f"{ticker} {side} not executed for any of "
                        f"{n_books} book(s)")
             try:
@@ -423,6 +440,7 @@ class TradeExecutionAgent(Agent):
                       strategy=source_payload.get("strategy"),
                       reason=_ks_err[:180],
                       extra={"lane": _lane, "books": n_books,
+                             "kill_switch_diagnostic": _ks_diagnostic,
                              **({"user_id": str(user_id)} if user_id
                                 else {})})
             except Exception:  # noqa: BLE001
@@ -432,7 +450,8 @@ class TradeExecutionAgent(Agent):
                 payload={**({"user_id": user_id} if user_id else {}),
                          "ticker": ticker, "side": side,
                          "event": "execute_error", "lane": _lane,
-                         "reason": "kill-switch state unreadable — fail closed",
+                         "reason": _ks_reason,
+                         "kill_switch_diagnostic": _ks_diagnostic,
                          "error": _ks_err})
         _dollar_over: set | None = None
         try:
@@ -1427,6 +1446,17 @@ class TradeExecutionAgent(Agent):
         if acct.trading_blocked:
             return _err("Alpaca account has trading blocked")
 
+        if side not in ("long", "short"):
+            return _err(f"unknown side {side!r} -- refusing rather than defaulting to short")
+        from app.brokers.execution_price import execution_price
+        quote = await execution_price(ticker, "stock", side, action="open")
+        if quote is None:
+            return _err("Fresh Alpaca entry quote unavailable; order not submitted")
+        market_price = quote.price
+        source_payload = {**(source_payload or {}),
+                          "entry_quote_at": quote.timestamp.isoformat(),
+                          "entry_quote_source": quote.source}
+
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "stock")
         if remaining <= 0:
@@ -1617,19 +1647,26 @@ class TradeExecutionAgent(Agent):
                   extra={"user_id": str(user_id), "asset_type": "stock"})
         except Exception:  # noqa: BLE001
             pass
+        from app.brokers.entry_basis import resolve_entry_basis
+        basis = await resolve_entry_basis(
+            order, order_id=order_id, ticker=ticker, asset_type="stock", side=side,
+            requested_quantity=plan.quantity, reference_price=market_price, token=token)
+        if not basis.record_position:
+            return _err("Broker entry ended without a fill; no position booked")
         rec = await record_external_position(
             user_id=user_id,
             ticker=ticker,
             asset_type="stock",
             side=side,
-            quantity=plan.quantity,
-            entry_price=market_price,
+            quantity=basis.quantity,
+            entry_price=basis.price,
+            entry_at=basis.metadata.get("broker_entry_filled_at"),
             stop_price=stop_price,
             target_price=target_price,
             strategy=strategy,
             broker="alpaca",
             broker_order_id=order_id,
-            source_payload={**source_payload, "broker": "alpaca",
+            source_payload={**source_payload, **basis.metadata, "broker": "alpaca",
                     "broker_order_id": order_id},
         )
         return [
@@ -1742,19 +1779,26 @@ class TradeExecutionAgent(Agent):
                          "no_price_stop": True})
         except Exception:  # noqa: BLE001
             pass
+        from app.brokers.entry_basis import resolve_entry_basis
+        basis = await resolve_entry_basis(
+            order, order_id=order_id, ticker=ticker, asset_type="stock", side=side,
+            requested_quantity=qty, reference_price=market_price, token=token)
+        if not basis.record_position:
+            return err("Broker entry ended without a fill; no position booked")
         await record_external_position(
             user_id=user_id,
             ticker=ticker,
             asset_type="stock",
             side=side,
-            quantity=qty,
-            entry_price=market_price,
+            quantity=basis.quantity,
+            entry_price=basis.price,
+            entry_at=basis.metadata.get("broker_entry_filled_at"),
             stop_price=None,
             target_price=None,
             strategy=strategy,
             broker="alpaca",
             broker_order_id=order_id,
-            source_payload={**source_payload, "broker": "alpaca",
+            source_payload={**source_payload, **basis.metadata, "broker": "alpaca",
                             "broker_order_id": order_id,
                             "no_price_stop": True},
         )
@@ -1835,6 +1879,17 @@ class TradeExecutionAgent(Agent):
             return _err("Could not read the Alpaca account")
         if acct.trading_blocked:
             return _err("Alpaca account has trading blocked")
+
+        if side not in ("long", "short"):
+            return _err(f"unknown side {side!r} -- refusing rather than defaulting to short")
+        from app.brokers.execution_price import execution_price
+        quote = await execution_price(ticker, "crypto", side, action="open")
+        if quote is None:
+            return _err("Fresh Alpaca entry quote unavailable; order not submitted")
+        market_price = quote.price
+        source_payload = {**(source_payload or {}),
+                          "entry_quote_at": quote.timestamp.isoformat(),
+                          "entry_quote_source": quote.source}
 
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "crypto")
@@ -2035,20 +2090,29 @@ class TradeExecutionAgent(Agent):
                 user_id=str(user_id),
             )
             _book_qty = float(_arrived.quantity)
+        from app.brokers.entry_basis import resolve_entry_basis
+        basis = await resolve_entry_basis(
+            order, order_id=order_id, ticker=ticker, asset_type="crypto", side=side,
+            requested_quantity=plan.quantity, reference_price=market_price,
+            arrival=_arrived, token=token)
+        if not basis.record_position:
+            return _err("Broker entry ended without a fill; no position booked")
+        _book_qty = basis.quantity
         await record_external_position(
             user_id=user_id,
             ticker=ticker,
             asset_type="crypto",
             side=side,
             quantity=_book_qty,
-            entry_price=market_price,
+            entry_price=basis.price,
+            entry_at=basis.metadata.get("broker_entry_filled_at"),
             stop_price=stop_price,
             target_price=target_price,
             strategy=strategy,
             broker="alpaca",
             broker_order_id=order_id,
             source_payload={
-                **source_payload, "broker": "alpaca",
+                **source_payload, **basis.metadata, "broker": "alpaca",
                 "broker_order_id": order_id,
                 "alpaca_crypto": True,
                 # Provenance of the booked size, so a human reading the row
@@ -2073,7 +2137,8 @@ class TradeExecutionAgent(Agent):
                     "strategy": strategy,
                     "quantity": _book_qty,
                     "qty_source": (_arrived.source if _arrived else "request"),
-                    "entry_price": market_price,
+                    "entry_price": basis.price,
+                    "entry_basis_verified": basis.metadata["entry_basis_verified"],
                     "stop_price": stop_price,
                     "target_price": target_price,
                     "routed_via": routed,

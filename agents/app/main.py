@@ -1353,19 +1353,24 @@ async def broker_snapshot_endpoint(user_id: str | None = None):
     """Active broker's account snapshot - normalised across providers.
     Goes through the broker-agnostic adapter so the Wheel page never
     hard-codes Alpaca."""
-    from app.brokers.active import active_broker_snapshot, active_broker_name
+    from app.brokers.active import active_broker_snapshot
     snap = await active_broker_snapshot(user_id)
     if not snap:
         return {
-            "ok": True,
-            "broker": await active_broker_name(user_id),
+            "ok": False,
+            "broker": None,
             "snapshot": None,
-            "note": "No broker connected - running in modeled mode.",
+            "requested_book": user_id,
+            "read_status": "unavailable",
+            "note": "Broker snapshot unavailable: account routing or the broker read could not be verified.",
         }
     return {
         "ok": True,
         "broker": snap.name,
         "venue": snap.venue,
+        "requested_book": user_id,
+        "book_key": snap.book_key,
+        "read_status": "ok",
         "snapshot": {
             "equity": snap.equity,
             "last_equity": snap.last_equity,

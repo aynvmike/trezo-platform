@@ -32,25 +32,11 @@ skipped with a reason. A failed read that read as an empty broker would
 alarm every live contract and close every expired one on the book.
 
 WHAT THIS DOES
-Per book, every pass:
-  1. Ask Alpaca what option positions it actually holds (broker truth).
-  2. Read the ledger's open option rows for that book.
-  3. PHANTOM (ledger has it, broker doesn't):
-       - past expiry + underlying settled OTM  -> close 'closed_expired',
-         realized = premium kept (short) or premium lost (long)
-       - past expiry + underlying settled ITM  -> flag 'closed_assigned'
-         WITHOUT auto-closing: assignment moves shares and cash, and
-         guessing that wrong is worse than a loud flag.
-       - NOT past expiry                       -> flag only. A live
-         contract missing from the broker is a routing incident, not
-         housekeeping, and it must reach a human.
-  4. ORPHAN (broker has it, ledger doesn't) -> flag. Adoption is the
-     Options Scanner's job; this module never invents ledger rows.
-
-The asymmetry is deliberate: it CLOSES only the unambiguous case (expired,
-settled out of the money, nothing to move) and FLAGS everything else.
-Reconcilers that guess produce phantom fixes, which are harder to find
-than the drift they replaced.
+Per book, compare strict broker holdings with tracked option rows and flag
+missing or untracked contracts. A missing expired contract stays open until
+an actual broker fill or lifecycle receipt establishes its settlement.
+Today's underlying quote cannot establish yesterday's exercise/assignment
+result. This audit never fabricates a zero exit or premium-kept P&L.
 """
 
 from __future__ import annotations
@@ -182,7 +168,7 @@ async def _broker_option_symbols(user_id: str) -> tuple[Optional[set], Optional[
 
 async def reconcile_options_for_book(client, user_id: str,
                                      *, dry_run: bool = False) -> dict:
-    """One book. Returns a report; closes only the unambiguous case."""
+    """One book. Report drift; absence alone never establishes settlement."""
     report: dict[str, Any] = {
         "user_id": user_id, "closed": [], "flagged": [], "orphans": [],
         "checked": 0, "skipped_reason": None,
@@ -234,55 +220,15 @@ async def reconcile_options_for_book(client, user_id: str,
                     f"a human")})
             continue
 
-        price = await _underlying_price(parsed["underlying"])
-        worthless = settled_worthless(parsed, price)
-
-        if worthless is None:
-            report["flagged"].append({
-                "symbol": sym, "why": (
-                    f"expired {parsed['expiry']} but no price for "
-                    f"{parsed['underlying']} — cannot tell worthless from "
-                    f"assigned, left open")})
-            continue
-
-        if not worthless:
-            report["flagged"].append({
-                "symbol": sym, "why": (
-                    f"expired {parsed['expiry']} IN the money "
-                    f"({parsed['underlying']} {price:.2f} vs strike "
-                    f"{parsed['strike']:.2f}) — likely ASSIGNED. Shares "
-                    f"and cash move; not auto-closing")})
-            continue
-
-        qty = float(row.get("quantity") or 0)
-        entry = float(row.get("entry_price") or 0)
-        is_short = str(row.get("side") or "").lower() in ("short", "sell")
-        # Short: premium collected is kept in full. Long: premium paid is
-        # lost in full. Either way the contract settles at zero.
-        pnl = round(entry * 100.0 * qty * (1.0 if is_short else -1.0), 2)
-
-        if dry_run:
-            report["closed"].append(
-                {"symbol": sym, "realized": pnl, "dry_run": True})
-            continue
-
-        def _close(rid=row["id"], p=pnl, exp=parsed["expiry"]):
-            return (client.table("paper_positions").update({
-                "status": "closed_expired",
-                "exit_price": 0,
-                "exit_at": _dt.datetime(exp.year, exp.month, exp.day, 20, 0,
-                                        tzinfo=_dt.timezone.utc).isoformat(),
-                "realized_pnl_usd": p,
-                "close_requested": False,
-            }).eq("id", rid).execute())
-        try:
-            await asyncio.to_thread(_close)
-            report["closed"].append({"symbol": sym, "realized": pnl})
-            log.info("broker_truth.expired_closed", user_id=user_id[:8],
-                     symbol=sym, realized=pnl)
-        except Exception as e:  # noqa: BLE001
-            report["flagged"].append(
-                {"symbol": sym, "why": f"close failed: {str(e)[:120]}"})
+        report["flagged"].append({
+            "symbol": sym,
+            "event": "settlement_unverified",
+            "why": (f"expired {parsed['expiry']} and absent from the broker; "
+                    "fill or settlement receipt is required to distinguish "
+                    "closure, expiration, exercise and assignment — left "
+                    "open with P&L unknown"),
+            "settlement_verified": False,
+        })
 
     for sym in sorted(broker - ledger_syms):
         report["orphans"].append({

@@ -301,11 +301,9 @@ def test_a_refused_route_is_skipped_and_recorded_under_broker_truth():
 
 # --- the values arrive: a good bound read still does the real work ------------
 
-def test_a_good_bound_read_closes_only_the_unambiguous_case():
-    """Same three ledger rows, broker answers under the binding. BMY
-    (expired, settled OTM at 67.015 vs 61 strike) closes with the premium
-    kept; AGNC is held -> untouched; PG is live but missing -> flagged,
-    never closed; T is held with no row -> orphan."""
+def test_a_good_bound_read_flags_expiry_without_manufacturing_a_settlement():
+    """BMY is absent, but today's OTM quote is no settlement receipt.
+    Keep it open/unknown; still report live missing and orphan contracts."""
     binder = _Binder()
     seen = {}
 
@@ -320,15 +318,27 @@ def test_a_good_bound_read_closes_only_the_unambiguous_case():
 
     assert seen["bound"] == UID
     assert rep["skipped_reason"] is None and rep["checked"] == 3, rep
-    assert rep["closed"] == [{"symbol": EXPIRED_OTM, "realized": 19.0}], rep
-    assert [f["symbol"] for f in rep["flagged"]] == [LIVE_MISSING], rep
-    assert "routing incident" in rep["flagged"][0]["why"]
+    assert rep["closed"] == [], rep
+    assert [f["symbol"] for f in rep["flagged"]] == [EXPIRED_OTM, LIVE_MISSING], rep
+    assert rep["flagged"][0]["event"] == "settlement_unverified"
+    assert rep["flagged"][0]["settlement_verified"] is False
+    assert "routing incident" in rep["flagged"][1]["why"]
     assert [o["symbol"] for o in rep["orphans"]] == [ORPHAN], rep
     closes = [w for w in client.writes if w["op"] == "update"]
-    assert len(closes) == 1 and closes[0]["eq"] == [("id", 1)], closes
-    assert closes[0]["payload"]["status"] == "closed_expired"
-    assert closes[0]["payload"]["realized_pnl_usd"] == 19.0
-    assert closes[0]["payload"]["exit_at"].startswith("2026-08-21")
+    assert closes == [], closes
+
+
+def test_expiry_dry_run_does_not_claim_a_quote_would_prove_settlement():
+    binder = _Binder()
+    async def _flat(token=None):
+        return []
+    async def _must_not_quote(symbol):
+        raise AssertionError("current quotes cannot prove settlement")
+    client = FakeClient(_ledger())
+    with _seams(binder, _flat), _patched(bt, _underlying_price=_must_not_quote):
+        rep = _run(bt.reconcile_options_for_book(client, UID, dry_run=True))
+    assert rep["closed"] == [] and client.writes == []
+    assert rep["flagged"][0]["event"] == "settlement_unverified"
 
 
 def test_all_books_counts_the_skipped_ones_and_keeps_going():

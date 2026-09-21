@@ -287,5 +287,116 @@ def test_upward_proxy_does_not_loosen_risk_or_invent_wheel_pressure():
         assert advisor.check_market_pressure("wheel_csp", "SPY", movers_down=view.movers_down).allow
 
 
+def _liquidity_rows(now=NOW):
+    day = now.astimezone(context._new_york_timezone()).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    rows = []
+    while len(rows) < 20:
+        day -= timedelta(days=1)
+        if day.weekday() < 5:
+            rows.append(_bar(100, day.isoformat(), v=1_000_000))
+    return rows
+
+
+@contextmanager
+def _liquidity_environment(rows=None, now=NOW):
+    clock = SimpleNamespace(now=now, tick=1000.0)
+    response = {"bars": _liquidity_rows(now) if rows is None else rows}
+    calls = []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock.now.astimezone(tz) if tz else clock.now.replace(tzinfo=None)
+
+    async def fetch(path, params):
+        calls.append((path, dict(params)))
+        return deepcopy(response)
+
+    with patch.object(data, "datetime", Clock), \
+            patch.object(data.time, "monotonic", lambda: clock.tick), \
+            patch.object(data, "alpaca_configured", lambda: True), \
+            patch.object(data, "_LIQUIDITY_CACHE", {}), \
+            patch.object(data, "_data_get", fetch):
+        yield SimpleNamespace(clock=clock, response=response, calls=calls)
+
+
+def test_liquidity_history_uses_delayed_sip_completed_days_without_changing_quote_feed():
+    today = NOW.astimezone(context._new_york_timezone()).replace(hour=0, minute=0, second=0)
+    rows = _liquidity_rows() + [_bar(100, today.isoformat(), v=1)]
+    with _liquidity_environment(rows) as env:
+        bars = asyncio.run(data.get_completed_liquidity_bars("jpm"))
+        assert len(bars) == 20 and all(b["v"] == 1_000_000 for b in bars)
+        assert [b["t"] for b in bars] == sorted(b["t"] for b in bars)
+        path, params = env.calls[0]
+        assert path == "/v2/stocks/JPM/bars" and params["feed"] == "sip"
+        assert NOW - datetime.fromisoformat(params["end"]) >= timedelta(minutes=20)
+        asyncio.run(data.get_quote("JPM"))
+        assert env.calls[-1][1]["feed"] == "iex"
+
+
+def test_liquidity_history_rejects_bad_numbers_duplicates_short_and_stale_history():
+    for field, value in (("c", 0), ("o", -1), ("h", float("inf")),
+                         ("l", None), ("c", float("nan")), ("v", float("nan")),
+                         ("v", -1), ("v", True), ("v", None), ("c", False)):
+        rows = _liquidity_rows()
+        rows[0][field] = value
+        with _liquidity_environment(rows):
+            assert asyncio.run(data.get_completed_liquidity_bars("JPM")) == [], (field, value)
+    rows = _liquidity_rows()
+    invalid_histories = [rows[:19], rows + [rows[0]],
+                         _liquidity_rows(NOW - timedelta(days=14))]
+    naive = deepcopy(rows)
+    naive[0]["t"] = "2026-09-08T00:00:00"
+    invalid_histories.append(naive)
+    for invalid in invalid_histories:
+        with _liquidity_environment(invalid):
+            assert asyncio.run(data.get_completed_liquidity_bars("JPM")) == []
+
+
+def test_liquidity_cache_expires_on_time_session_or_source_and_never_serves_failed_refresh():
+    with _liquidity_environment() as env:
+        first = asyncio.run(data.get_completed_liquidity_bars("JPM"))
+        first[0]["v"] = -1
+        again = asyncio.run(data.get_completed_liquidity_bars("JPM"))
+        assert again[0]["v"] == 1_000_000 and len(env.calls) == 1
+        env.clock.tick += data._LIQUIDITY_CACHE_TTL + 1
+        env.response["bars"] = []
+        assert asyncio.run(data.get_completed_liquidity_bars("JPM")) == []
+        assert asyncio.run(data.get_completed_liquidity_bars("JPM")) == []
+        assert len(env.calls) == 3, "failed refresh cannot revive or cache old history"
+    with _liquidity_environment() as env:
+        assert asyncio.run(data.get_completed_liquidity_bars("JPM"))
+        with patch.object(data, "DATA_BASE_URL", "https://other.example"):
+            assert asyncio.run(data.get_completed_liquidity_bars("JPM"))
+        assert len(env.calls) == 2
+        env.clock.now += timedelta(days=1)
+        assert asyncio.run(data.get_completed_liquidity_bars("JPM"))
+        assert len(env.calls) == 3
+
+
+def test_liquidity_gate_keeps_price_floor_and_profiles_on_original_price_tape():
+    market_filter = load_module("app.strategies.market_filter")
+    prices = [SimpleNamespace(close=2, volume=0)]
+    consolidated = [SimpleNamespace(close=100, volume=1_000_000)] * 20
+    with patch.dict(market_filter.STRATEGY_LIQUIDITY_FLOORS,
+                    {"price_test": {"min_price": 5, "min_avg_volume": 250000}}):
+        reason = market_filter.liquidity_check(prices, "price_test", volume_candles=consolidated)
+        assert "price $2.00" in reason
+        assert "price_test" not in market_filter.profiles_accepting(prices, volume_candles=consolidated)
+
+
+def test_liquidity_timezone_failure_is_closed_and_windows_fallback_remains_usable():
+    from zoneinfo import ZoneInfoNotFoundError
+    with _liquidity_environment() as env, \
+            patch.object(context, "ZoneInfo", side_effect=ZoneInfoNotFoundError("missing")):
+        assert len(asyncio.run(data.get_completed_liquidity_bars("JPM"))) == 20
+        assert len(env.calls) == 1
+    with _liquidity_environment() as env, \
+            patch.object(context, "_new_york_timezone", side_effect=context.TimezoneUnavailable("missing")):
+        assert asyncio.run(data.get_completed_liquidity_bars("JPM")) == []
+        assert env.calls == []
+
+
 if __name__ == "__main__":
     raise SystemExit(run_tests(globals()))

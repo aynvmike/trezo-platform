@@ -11,12 +11,94 @@ Best-effort: with no keys, or on any error, every function returns None /
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import math
+import time
 from typing import Optional
 
 from app.brokers.alpaca import alpaca_configured, _headers, _base_url
 
 DATA_BASE_URL = "https://data.alpaca.markets"
-DATA_FEED = "iex"        # free tier; "sip" needs a paid Alpaca subscription
+DATA_FEED = "iex"        # latest SIP data needs a paid Alpaca subscription
+
+_LIQUIDITY_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
+_LIQUIDITY_CACHE_TTL = 300.0
+_LIQUIDITY_CACHE_LIMIT = 256
+
+
+async def get_completed_liquidity_bars(symbol: str) -> list[dict]:
+    """Twenty completed consolidated daily bars, or [] (fail closed).
+
+    IEX is one exchange, so its volume cannot measure the all-market
+    liquidity floor. Historical SIP is available without a paid plan when
+    end is >15 minutes old: https://docs.alpaca.markets/us/docs/market-data-faq
+    This dedicated history never changes the latest-quote/strategy feed.
+    """
+    if not alpaca_configured():
+        return []
+    try:
+        from app.knowledge.internal_market_context import _new_york_timezone
+        now = datetime.now(timezone.utc)
+        # Reuse the DST-aware pytz fallback on Windows without IANA data.
+        ny = _new_york_timezone()
+        today = now.astimezone(ny).date()
+    except Exception:  # noqa: BLE001 -- no uncertain session boundary
+        return []
+    tick = time.monotonic()
+    key = (DATA_BASE_URL, "sip", symbol.upper(), today)
+    # Neither an old session nor a failed refresh can extend cached data.
+    for old_key, (expiry, _) in list(_LIQUIDITY_CACHE.items()):
+        if expiry <= tick or old_key[-1] != today:
+            _LIQUIDITY_CACHE.pop(old_key, None)
+    cached = _LIQUIDITY_CACHE.get(key)
+    if cached is not None:
+        return [dict(bar) for bar in cached[1]]
+    try:
+        data = await _data_get(f"/v2/stocks/{symbol.upper()}/bars", {
+            "timeframe": "1Day", "feed": "sip", "adjustment": "raw",
+            "start": (now - timedelta(days=60)).isoformat(),
+            "end": (now - timedelta(minutes=20)).isoformat(),
+            "limit": 10000,
+        })
+        if (not isinstance(data, dict) or data.get("next_page_token")
+                or not isinstance(data.get("bars"), list)):
+            return []
+        by_day = {}
+        for bar in data["bars"]:
+            stamp = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                return []
+            local = stamp.astimezone(ny)
+            day = local.date()
+            # Today is partial even after the delayed historical cutoff.
+            if day >= today:
+                continue
+            if day in by_day or any((local.hour, local.minute, local.second, local.microsecond)):
+                return []
+            by_day[day] = bar
+        days = sorted(by_day)[-20:]
+        if len(days) != 20 or (today - days[-1]).days > 7:
+            return []
+        bars = []
+        for day in days:
+            raw = by_day[day]
+            bar = {"t": raw["t"]}
+            for field in ("o", "h", "l", "c", "v"):
+                value = raw[field]
+                if isinstance(value, bool):
+                    return []
+                number = float(value)
+                if not math.isfinite(number) or (number < 0 if field == "v" else number <= 0):
+                    return []
+                bar[field] = number
+            bars.append(bar)
+    except Exception:  # noqa: BLE001 -- no fallback to single-exchange volume
+        return []
+    if len(_LIQUIDITY_CACHE) >= _LIQUIDITY_CACHE_LIMIT:
+        oldest = min(_LIQUIDITY_CACHE, key=lambda k: _LIQUIDITY_CACHE[k][0])
+        _LIQUIDITY_CACHE.pop(oldest, None)
+    _LIQUIDITY_CACHE[key] = (tick + _LIQUIDITY_CACHE_TTL, bars)
+    return [dict(bar) for bar in bars]
 
 
 @dataclass

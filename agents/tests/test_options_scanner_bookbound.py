@@ -139,6 +139,8 @@ class _Client:
     def __init__(self, handler):
         self._h = handler
         self.queries: list[_Query] = []
+        self.rpc_calls = []
+        self.pending = {}
 
     def table(self, name):
         q = _Query(name, self._h)
@@ -149,14 +151,31 @@ class _Client:
         return [q for q in self.queries
                 if q.table_name == table and (q.op("update") or q.op("insert"))]
 
+    def rpc(self, name, args):
+        def execute():
+            self.rpc_calls.append((name, args))
+            if name == "claim_option_broker_exit":
+                key = args["p_position_id"]
+                claimed = self.pending.get(key) == args["p_expected_pending"]
+                if claimed:
+                    self.pending[key] = args["p_pending"]
+                return types.SimpleNamespace(data={"ok": True, "claimed": claimed})
+            if name == "record_option_broker_close":
+                return types.SimpleNamespace(data={"ok": True, "fill_price": .2,
+                                                  "realized_pnl_usd": 20, "pending": False})
+            raise AssertionError(name)
+        return types.SimpleNamespace(execute=execute)
 
-def _positions(expired=(), live=(), open_rows=()):
+
+def _positions(expired=(), live=(), open_rows=(), pending=()):
     def _h(q):
         if q.table_name != "options_positions":
             return []
-        if q.op("lte"):
+        if q.op("filter"):
+            return list(pending)
+        if q.op("lte") or q.op("lt"):
             return list(expired)
-        if q.op("gt"):
+        if q.op("gt") or q.op("gte"):
             return list(live)
         if q.op("select") and not q.op("update") and not q.op("insert"):
             return list(open_rows)
@@ -229,7 +248,8 @@ def _occ(und, exp, cp, strike):
 
 
 _EXP_FUTURE = (date.today() + timedelta(days=20)).isoformat()
-_EXP_PAST = (date.today() - timedelta(days=1)).isoformat()
+_EXP_PAST = (scanner.datetime.now(scanner.ZoneInfo("America/New_York")).date()
+             - timedelta(days=1)).isoformat()
 
 
 def _short_row(uid, contracts=1, rid="row-1"):
@@ -237,6 +257,7 @@ def _short_row(uid, contracts=1, rid="row-1"):
             "strategy": "wheel_csp", "option_type": "put", "strike": 9.5,
             "contracts": contracts, "net_premium_usd": 40.0 * contracts,
             "expiration": _EXP_FUTURE,
+            "opened_at": "2026-01-01T15:00:00+00:00",
             "legs": [{"action": "sell", "type": "put", "strike": 9.5}],
             "notes": "Placed via Alpaca"}
 
@@ -266,13 +287,19 @@ def _harvest_seams(rows, *, oauth_for=()):
     async def _cnd(sym, kind):
         return _candles()
 
+    async def _held(token=None):
+        return [{"symbol": _occ(r["underlying"], r["expiration"], "P", r["strike"]),
+                 "qty": str(-r["contracts"])} for r in rows if r["user_id"] == binding.now]
+
     client = _Client(_positions(live=rows))
     stack = contextlib.ExitStack()
     stack.enter_context(_patched(
         scanner, _multi_day_break=_no_break, fetch_candles_for=_cnd,
         _user_halted=_not_halted))
     stack.enter_context(_patched(alp_data, get_option_quote=_quote))
-    stack.enter_context(_patched(alp, submit_option_order=_submit))
+    stack.enter_context(_patched(alp, submit_option_order=_submit, get_option_positions_strict=_held))
+    broker_exit = load_module("app.paper.broker_exit")
+    stack.enter_context(_patched(broker_exit, _bound_book_verified=lambda uid, account: True))
     stack.enter_context(_patched(accounts, bind_for_user=binding.bind_for_user))
     stack.enter_context(_patched(route_guard, check_route=_route))
     stack.enter_context(_patched(wt, get_user_broker_token=_token))
@@ -351,26 +378,41 @@ def test_harvest_still_exits_on_a_halted_book():
         assert any(a["event"] == "option_harvest" and a["user_id"] == "U-halted-1"
                    for a in activity), activity
         assert any(k.startswith("h:row-1:") for k in A._harvested)
-        assert [q for q in client.writes("options_positions") if q.op("update")], (
-            "step-down bookkeeping must follow the accepted exit")
+        assert client.writes("options_positions") == [], "acceptance is not a fill"
+        assert client.pending["row-1"]["order_id"] == "ord-1"
     assert binding.now is None, "binding leaked past the harvest"
 
 
-def test_step_down_bookkeeping_runs_only_after_a_bound_accepted_order():
-    """Two contracts, ratio 0.25 -> step-out of 1 of 2. The shrink and the
-    closed_partial slice follow ONLY the accepted, bound submit."""
+def test_step_down_acceptance_persists_receipt_without_booking_a_fill():
+    """An accepted order leaves quantities/P&L untouched and stores its ID."""
     stack, client, binding, submitted, activity = _harvest_seams(
         [_short_row("U2", contracts=2)])
     with stack, _scanner_state(rescore_age_s=7200):
         _run(scanner.OptionsScannerAgent()._settle_expired(client))
     assert len(submitted) == 1 and submitted[0]["qty"] == 1, submitted
     assert submitted[0]["bound"] == "U2"
-    writes = client.writes("options_positions")
-    ups = [q for q in writes if q.op("update")]
-    ins = [q for q in writes if q.op("insert")]
-    assert ups and ups[0].op("update")[0][1][0]["contracts"] == 1, ups
-    assert ins and ins[0].op("insert")[0][1][0]["status"] == "closed_partial", ins
-    assert ins[0].op("insert")[0][1][0]["user_id"] == "U2"
+    assert client.writes("options_positions") == []
+    assert client.pending["row-1"]["order_id"] == "ord-1"
+    assert client.pending["row-1"]["quantity"] == 1
+    assert not [c for c in client.rpc_calls if c[0] == "record_option_broker_close"]
+
+
+def test_pending_option_exits_are_polled_before_hourly_rescore_is_due():
+    exits = load_module("app.paper.option_exit")
+    calls = []
+    row = {**_short_row("U2"), "broker_exit_pending": {"order_id": "pending-1"}}
+    async def poll(client, position, **kwargs):
+        calls.append(position)
+        return types.SimpleNamespace(ok=False, pending=True, error="awaiting fill")
+    async def token(uid):
+        return None, "env-keys"
+    client = _Client(_positions(pending=[row]))
+    with _scanner_state(rescore_age_s=0), _patched(scanner, _book_token=token), \
+            _patched(exits, settle_or_request_option_close=poll):
+        out = _run(scanner.OptionsScannerAgent()._settle_expired(client))
+    assert calls == [row]
+    assert out[0].payload["event"] == "option_exit_receipt_poll"
+    assert out[0].payload["pending"] is True
 
 
 # --- TE-15: reconcile is bound per book and honours a strict None -------
@@ -493,18 +535,24 @@ def test_reconcile_holds_a_row_when_the_broker_is_flat_and_no_fill_exists():
     assert [r["bound"] for r in reads if r["what"] == "orders"] == ["U2"], reads
 
 
+def _close_receipt(**overrides):
+    return {"id": "exit-order", "status": "filled", "filled_avg_price": "0.20",
+            "side": "buy", "filled_qty": "1", "filled_at": "2026-01-02T15:00:00+00:00",
+            "symbol": _occ("AGNC", _EXP_FUTURE, "P", 9.5), **overrides}
+
+
 def test_reconcile_books_the_true_exit_from_the_books_own_fill():
     """credit 40, bought back at 0.20 x 100 -> realized +20. Before this
     audit the select never fetched net_premium_usd, so this booked -20."""
     stack, client, binding, reads, activity = _reconcile_seams(
         [_short_row("U2")], strict=[],
-        fills=[{"status": "filled", "filled_avg_price": "0.20", "side": "buy"}])
+        fills=[_close_receipt()])
     with stack:
         out = _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
-    ups = [q for q in client.writes("options_positions") if q.op("update")]
-    assert len(ups) == 1, ups
-    body = ups[0].op("update")[0][1][0]
-    assert body["status"] == "closed_manual" and body["realized_pnl_usd"] == 20.0, body
+    calls = [c for c in client.rpc_calls if c[0] == "record_option_broker_close"]
+    assert len(calls) == 1, calls
+    assert calls[0][1]["p_receipt"]["id"] == "exit-order"
+    assert calls[0][1]["p_user_id"] == "U2"
     assert out and out[0].payload["closed_count"] == 1
 
 
@@ -570,24 +618,20 @@ def test_reconcile_does_not_adopt_a_contract_the_paper_ledger_already_holds():
     # The ledger was read for THIS book, under its binding, open option
     # legs only -- every book is its own book.
     assert len(ledger_reads) == 1 and ledger_reads[0]["bound"] == "U3", ledger_reads
-    assert {("user_id", "U3"), ("status", "open"), ("asset_type", "option")} \
+    assert {("user_id", "U3"), ("asset_type", "option")} \
         <= set(ledger_reads[0]["eq"]), ledger_reads
     assert not any(a["event"] == "reconcile_adopt_skipped_unreadable"
                    for a in activity), activity
 
 
-def test_reconcile_skips_adopt_but_still_closes_when_the_ledger_is_unreadable():
-    """A failed paper_positions read is answerless, not empty: nothing is
-    adopted for that book (T stays un-inserted), the log says why, and
-    the close pass that already ran is unaffected -- the AGNC row with no
-    broker match and a real buy-back fill is still closed at its true
-    exit."""
+def test_reconcile_neither_closes_nor_adopts_when_other_ledger_is_unreadable():
+    """A failed mirror read cannot establish who owns the close receipt."""
     exp = _EXP_FUTURE
     stack, _client, binding, reads, activity = _reconcile_seams(
         [_short_row("U3")],
         strict=[{"symbol": _occ("T", exp, "C", 20.0), "qty": "1",
                  "avg_entry_price": "0.5"}],
-        fills=[{"status": "filled", "filled_avg_price": "0.20", "side": "buy"}])
+        fills=[_close_receipt()])
     client, ledger_reads = _ledger_client(
         [_short_row("U3")], RuntimeError("429 from the ledger"), binding)
     with stack:
@@ -595,9 +639,7 @@ def test_reconcile_skips_adopt_but_still_closes_when_the_ledger_is_unreadable():
     writes = client.writes("options_positions")
     assert [q for q in writes if q.op("insert")] == [], "adopted on a failed read"
     ups = [q for q in writes if q.op("update")]
-    assert len(ups) == 1, ups
-    body = ups[0].op("update")[0][1][0]
-    assert body["status"] == "closed_manual" and body["realized_pnl_usd"] == 20.0, body
+    assert ups == [], ups
     assert any(a["event"] == "reconcile_adopt_skipped_unreadable"
                and a["user_id"] == "U3" for a in activity), activity
     assert ledger_reads and ledger_reads[0]["bound"] == "U3", ledger_reads
@@ -605,22 +647,51 @@ def test_reconcile_skips_adopt_but_still_closes_when_the_ledger_is_unreadable():
     assert binding.now is None, "reconcile must clear its binding"
 
 
+def test_mirrored_or_duplicate_option_rows_cannot_claim_the_same_receipt():
+    for status in ("open", "closed_manual"):
+        rows = [_short_row("U3")]
+        stack, _, binding, _, _ = _reconcile_seams(
+            rows, strict=[], fills=[_close_receipt()])
+        client, _ = _ledger_client(rows, [{
+            "ticker": _occ("AGNC", _EXP_FUTURE, "P", 9.5), "status": status,
+        }], binding)
+        with stack:
+            out = _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+        assert client.writes("options_positions") == []
+        assert not [c for c in client.rpc_calls if c[0] == "record_option_broker_close"]
+        assert any(m.payload.get("event") == "option_ledger_ownership_unverified" for m in out)
+    rows = [_short_row("U3", rid="a"), _short_row("U3", rid="b")]
+    stack, client, _, _, _ = _reconcile_seams(rows, strict=[], fills=[_close_receipt()])
+    with stack:
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    assert client.writes("options_positions") == []
+    assert not [c for c in client.rpc_calls if c[0] == "record_option_broker_close"]
+
+
 # --- NEQ-10: settle defers when there is no price ------------------------
 
 def _expired_csp(uid="U1"):
     return {"id": "row-x", "user_id": uid, "underlying": "F",
             "strategy": "wheel_csp", "option_type": "put", "strike": 12.5,
-            "contracts": 1, "net_premium_usd": 30.0, "expiration": _EXP_PAST}
+            "contracts": 1, "net_premium_usd": 30.0, "expiration": _EXP_PAST,
+            "notes": "Modeled simulation"}
 
 
-def _settle(client, candles):
+def _settle(client, candles, *, registered=False, token_error=False):
     activity, rec = _recorder()
 
     async def _cnd(sym, kind):
         if isinstance(candles, Exception):
             raise candles
         return candles
+    async def _token(*args):
+        if token_error:
+            raise RuntimeError("unavailable")
+        return None
     with _patched(scanner, fetch_candles_for=_cnd), _patched(act, record=rec), \
+            _patched(accounts, account_for_user=lambda uid: object() if registered else None), \
+            _patched(alp, alpaca_configured=lambda: False), \
+            _patched(wt, get_user_broker_token=_token), \
             _scanner_state(rescore_age_s=0):
         out = _run(scanner.OptionsScannerAgent()._settle_expired(client))
     return out, activity
@@ -648,11 +719,64 @@ def test_settle_still_books_a_priced_expiry_correctly():
     body = client.writes("options_positions")[0].op("update")[0][1][0]
     assert body["status"] == "closed_expired" and body["realized_pnl_usd"] == 30.0, body
     assert out and out[0].payload["status"] == "closed_expired"
+    assert out[0].payload["metric_basis"] == "modeled_option_settlement"
+    assert out[0].payload["settlement_verified"] is False
 
     client = _Client(_positions(expired=[_expired_csp()]))
     out, _ = _settle(client, _candles(close=12.0))
     body = client.writes("options_positions")[0].op("update")[0][1][0]
     assert body["status"] == "closed_assigned" and body["realized_pnl_usd"] == -20.0, body
+
+
+def test_broker_expiry_never_uses_spot_to_book_a_result():
+    for notes in ("Placed via Alpaca", "Adopted from the broker", ""):
+        row = {**_expired_csp(), "notes": notes}
+        client = _Client(_positions(expired=[row]))
+        out, _ = _settle(client, _candles(close=13.0))
+        assert client.writes("options_positions") == []
+        assert out[0].payload["event"] == "settlement_unverified"
+
+
+def test_registered_book_and_unreadable_provenance_cannot_be_settled_as_simulations():
+    for kwargs in ({"registered": True}, {"token_error": True}):
+        client = _Client(_positions(expired=[_expired_csp()]))
+        out, _ = _settle(client, _candles(close=13.0), **kwargs)
+        assert client.writes("options_positions") == []
+        assert out[0].payload["settlement_verified"] is False
+
+
+def test_expiration_date_is_not_the_end_of_the_trading_session():
+    row = {**_expired_csp(), "expiration": scanner.datetime.now(
+        scanner.ZoneInfo("America/New_York")).date().isoformat()}
+    client = _Client(_positions(expired=[row]))
+    out, _ = _settle(client, _candles(close=13.0))
+    assert client.writes("options_positions") == []
+    assert out == []
+    assert any(q.op("lt") for q in client.queries)
+
+
+def test_unrelated_broker_holdings_do_not_prove_the_missing_option_closed():
+    stack, client, _, _, activity = _reconcile_seams(
+        [_short_row("U2")],
+        strict=[{"symbol": _occ("T", _EXP_FUTURE, "C", 20.0), "qty": "1",
+                 "avg_entry_price": "0.5"}], fills=[])
+    with stack:
+        _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+    assert not [q for q in client.writes("options_positions") if q.op("update")]
+    assert any(a["event"] == "reconcile_hold" for a in activity)
+
+
+def test_option_reconcile_rejects_stale_partial_and_unidentified_fills():
+    for changes in ({"filled_at": "2025-12-31T15:00:00+00:00"},
+                    {"filled_qty": "0.5"}, {"symbol": "WRONG"},
+                    {"id": ""}, {"status": "accepted"}, {"side": "sell"},
+                    {"filled_avg_price": "NaN"}):
+        stack, client, _, _, _ = _reconcile_seams(
+            [_short_row("U2")], strict=[], fills=[_close_receipt(**changes)])
+        with stack:
+            _run(scanner.OptionsScannerAgent()._reconcile_with_broker(client))
+        assert client.writes("options_positions") == [], changes
+        assert not [c for c in client.rpc_calls if c[0] == "record_option_broker_close"]
 
 
 # --- KS-6: the fire-block verdict ---------------------------------------

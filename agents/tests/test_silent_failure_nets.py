@@ -158,7 +158,7 @@ def test_signals_with_no_approvals_raises_the_alarm():
     assert p["event"] == "approval_starvation"
     assert p["approves"] == 0 and p["signals"] == 40
     assert p["unaccounted"] == 35, p
-    assert "NO verdict at all" in p["note"]
+    assert "at least 35 signal(s) lack a counted verdict" in p["note"]
 
 
 def test_one_approval_is_enough_to_stay_quiet():
@@ -204,7 +204,102 @@ def test_fully_vetoed_flow_is_reported_as_accounted_for():
     with _patched(wd, _us_market_open=lambda *_a, **_k: True):
         out = _run(a._check_flow())
     assert out and out[0].payload["unaccounted"] == 0
-    assert "explain them" in out[0].payload["note"]
+    assert "30 veto(es) recorded" in out[0].payload["note"]
+
+
+def test_stock_veto_warning_names_reasons_and_books_without_claiming_outage():
+    """The 96-veto screenshot must carry the gate evidence users need;
+    book attribution comes from the message, never from the ticker."""
+    a = _agent()
+    _feed(a, signals=96, asset_type="us_equity")
+    for n, reason, book in ((90, "Already held by this book", "book-one"),
+                            (6, "TCS below threshold", "book-two")):
+        for _ in range(n):
+            _run(a.on_message(_Msg("veto", {
+                "ticker": "NVDA", "reason": reason, "user_id": book},
+                agent="risk_manager")))
+    _age_window(a, 25)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        out = _run(a._check_flow())
+    p = out[0].payload
+    assert p["unaccounted"] == 0
+    assert p["top_veto_reasons"] == [
+        {"label": "Already held by this book", "count": 90},
+        {"label": "TCS below threshold", "count": 6}]
+    assert p["veto_books"] == [
+        {"label": "book-one", "count": 90},
+        {"label": "book-two", "count": 6}]
+    assert "90x Already held by this book" in p["note"]
+    assert "book-one=90" in p["note"]
+    assert "does not establish a pipeline outage" in p["note"]
+    assert "8/27-8/31 outage" not in p["note"]
+
+
+def test_veto_details_are_bounded_and_unattributed_stays_explicit():
+    a = _agent()
+    _run(a.on_message(_Msg("veto", {"ticker": "NVDA"})))
+    c = _lane(a, "stock")
+    assert c["veto_reasons"] == {"(no reason given)": 1}
+    assert c["veto_books"] == {"unattributed": 1}
+    for i in range(100):
+        _run(a.on_message(_Msg("veto", {
+            "ticker": "NVDA", "reason": f"reason-{i} " + "x" * 400,
+            "user_id": f"book-{i}"})))
+    assert c["vetoes"] == 101
+    for key in ("veto_reasons", "veto_books"):
+        assert len(c[key]) <= wd._FLOW_DETAIL_LIMIT + 1
+        assert sum(c[key].values()) == 101
+        assert wd._FLOW_DETAIL_OTHER in c[key]
+    assert all(len(reason) <= 180 for reason in c["veto_reasons"])
+
+
+def test_a_veto_warning_does_not_suppress_later_missing_verdict_emergency():
+    a = _agent()
+    notified = []
+    persisted = []
+
+    async def _capture_notify(title, body="", **kw):
+        # Drive the real outbound dedupe, without any configured webhook
+        # or HTTP request: mocking notify alone hid a second suppression.
+        if not alerts._should_send(kw["key"], kw["severity"]):
+            return False
+        notified.append(kw["severity"])
+        return True
+
+    async def _capture_persist(**kw):
+        persisted.append(kw["severity"])
+
+    a._persist_alert = _capture_persist
+    with _patched(alerts, notify=_capture_notify, _SENT={}), \
+            _patched(wd, _us_market_open=lambda *_a, **_k: True):
+        # Start with deliberate vetoes, then lose verdicts without any
+        # intervening approval. A repeat or downgrade should not re-ping.
+        for vetoes in (30, 5, 5, 30):
+            _feed(a, signals=30, vetoes=vetoes, asset_type="us_equity")
+            _age_window(a, 25)
+            _run(a._check_flow())
+        assert notified == ["warn", "urgent"]
+        assert persisted == ["warn", "urgent"]
+        _feed(a, approves=1, asset_type="us_equity")
+        _age_window(a, 25)
+        _run(a._check_flow())
+    assert ("approval_starvation", "stock") not in a._flow_alert_severity
+
+
+def test_execution_alarm_preserves_the_kill_switch_read_diagnostic():
+    a = _agent()
+    reason = ("kill-switch state unreadable — fail closed "
+              "[paper_accounts_read: authentication_failed (HTTP 401)]: "
+              "BTC long not executed for any of 3 book(s)")
+    assert len(reason) > 80
+    _feed(a, approves=3, kills=1, asset_type="crypto", kill_reason=reason)
+    _age_window(a, 25)
+    with _patched(wd, _us_market_open=lambda *_a, **_k: False):
+        out = _run(a._check_flow())
+    p = out[0].payload
+    assert p["event"] == "execution_starvation"
+    assert p["top_kill_reason"] == reason
+    assert "authentication_failed (HTTP 401)" in p["note"]
 
 
 def test_the_window_resets_so_one_bad_window_cannot_poison_the_next():
@@ -469,7 +564,7 @@ def test_approvals_that_vanish_still_raise_alarm_b():
     b = [m.payload for m in out if m.payload["event"] == "execution_starvation"]
     assert b and b[0]["kills"] == 3 and b[0]["unaccounted"] == 2, b
     assert "insufficient buying power" in b[0]["note"]
-    assert "2 produced NO outcome" in b[0]["note"], b[0]["note"]
+    assert "at least 2 approval(s) have no counted outcome" in b[0]["note"], b[0]["note"]
 
 
 def test_an_executor_crash_on_an_approve_is_a_killed_approve():
@@ -569,8 +664,8 @@ def test_the_webhook_gets_the_severity_that_was_persisted():
         out = _run(a._check_flow())
     assert len(out) == 2
     sev = {k: s for _t, s, k in got}
-    assert sev == {"approval_starvation:stock": "warn",
-                   "approval_starvation:crypto": "urgent"}, got
+    assert sev == {"approval_starvation:stock:warn": "warn",
+                   "approval_starvation:crypto:urgent": "urgent"}, got
     assert {p["target"]: p["severity"] for p in persisted} == {
         "stock": "warn", "crypto": "urgent"}
 

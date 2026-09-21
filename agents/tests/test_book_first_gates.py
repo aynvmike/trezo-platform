@@ -28,9 +28,11 @@ Run: pytest agents/tests/test_book_first_gates.py
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -151,6 +153,7 @@ def _now_iso(minutes_ago: float) -> str:
             - timedelta(minutes=minutes_ago)).isoformat()
 
 
+@contextmanager
 def _patch_feed(quote, bar):
     import app.brokers.alpaca_data as ad
 
@@ -160,20 +163,23 @@ def _patch_feed(quote, bar):
     async def _gb(_t):
         return bar
 
-    ad.get_quote = _gq
-    ad.get_latest_bar = _gb
-    ad.market_data_available = lambda: True
+    # run_all shares module objects across suites. Restore every seam so
+    # later source/feed tests execute the real client, not this stale stub.
+    with patch.object(ad, "get_quote", _gq), \
+            patch.object(ad, "get_latest_bar", _gb), \
+            patch.object(ad, "market_data_available", lambda: True):
+        yield
 
 
 def test_empty_book_with_fresh_tape_passes():
-    _patch_feed(_Q(0, 0), {"c": 71.2, "t": _now_iso(3)})
-    assert _run(mf.spread_quality_check("WMT")) is None, \
-        "a name printing bars three minutes ago is not halted"
+    with _patch_feed(_Q(0, 0), {"c": 71.2, "t": _now_iso(3)}):
+        assert _run(mf.spread_quality_check("WMT")) is None, \
+            "a name printing bars three minutes ago is not halted"
 
 
 def test_empty_book_with_silent_tape_still_reads_as_halt():
-    _patch_feed(_Q(0, 0), {"c": 71.2, "t": _now_iso(240)})
-    reason = _run(mf.spread_quality_check("WMT"))
+    with _patch_feed(_Q(0, 0), {"c": 71.2, "t": _now_iso(240)}):
+        reason = _run(mf.spread_quality_check("WMT"))
     assert reason is not None and "halted" in reason, \
         "empty book AND four-hour-old tape keeps the halt suspicion"
 
@@ -181,14 +187,14 @@ def test_empty_book_with_silent_tape_still_reads_as_halt():
 def test_wide_spread_from_a_stale_book_passes():
     # book quotes 35/39 (10.8%) while the tape prints at 38.4 - the book
     # is stale, not the stock illiquid (the RBLX case, 166 vetoes/day)
-    _patch_feed(_Q(35.0, 39.0), {"c": 38.4, "t": _now_iso(2)})
-    assert _run(mf.spread_quality_check("RBLX")) is None
+    with _patch_feed(_Q(35.0, 39.0), {"c": 38.4, "t": _now_iso(2)}):
+        assert _run(mf.spread_quality_check("RBLX")) is None
 
 
 def test_wide_spread_confirmed_by_the_tape_still_vetoes():
     # tape prints inside the wide book - the spread is real
-    _patch_feed(_Q(35.0, 39.0), {"c": 37.0, "t": _now_iso(2)})
-    reason = _run(mf.spread_quality_check("THIN"))
+    with _patch_feed(_Q(35.0, 39.0), {"c": 37.0, "t": _now_iso(2)}):
+        reason = _run(mf.spread_quality_check("THIN"))
     assert reason is not None and "too wide" in reason
 
 

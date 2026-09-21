@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import sys
 from pathlib import Path
 
@@ -87,6 +88,10 @@ class _Query:
         self._filters.append((col, val))
         return self
 
+    def is_(self, col, val):
+        self._filters.append((col, None if val == "null" else val))
+        return self
+
     def order(self, *_a, **_k):
         return self
 
@@ -110,7 +115,10 @@ class _Query:
                          if all(str(r.get(k)) == str(v) for k, v in self._filters)])
         if self._op == "update":
             c.updates.append((self._t, self._payload, list(self._filters)))
-            return _Res([])
+            matches = [r for r in c.rows.get(self._t, []) if all(
+                r.get(k) == json.loads(v) if k == "source_payload" and v is not None
+                else str(r.get(k)) == str(v) for k, v in self._filters)]
+            return _Res([{**r, **self._payload} for r in matches])
         if self._op == "insert":
             c.inserts.append((self._t, self._payload))
             return _Res([{**self._payload, "id": f"new-{len(c.inserts)}"}])
@@ -243,8 +251,10 @@ def test_matching_ordinary_adds_still_merge_into_one_position():
     assert len(client.updates) == 1, client.updates
     table, patch, filters = client.updates[0]
     assert table == "paper_positions" and ("id", "pos-PG") in filters
-    assert patch == {"quantity": 10.0, "entry_price": 106.0,
-                     "stop_price": 95.0, "target_price": 130.0}, patch
+    assert {k: patch[k] for k in ("quantity", "entry_price", "stop_price", "target_price")} == {
+        "quantity": 10.0, "entry_price": 106.0, "stop_price": 95.0, "target_price": 130.0}, patch
+    assert patch["source_payload"]["entry_basis_verified"] is False
+    assert patch["source_payload"]["entry_fees_known"] is False
     kinds = [(k, t) for k, t, _ in events]
     assert ("position_merged", "PG") in kinds and \
         ("position_merge_refused", "PG") not in kinds, kinds

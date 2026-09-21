@@ -20,8 +20,8 @@ What this suite pins:
     until TREZO_CRYPTO_MAE_ADOPTED, the time limit only with
     TREZO_CRYPTO_TIME_EXIT, both measured from the row's own entry_at.
   * The REAL tick, crypto branch, on a closed equity market: the new
-    reasons flow into the EXISTING per-book _throttled_liquidate ->
-    close_position path, every activity row names the book, the
+    reasons flow through per-book durable intent and broker fill receipts,
+    every activity row names the book, the
     reevaluator call (behind TREZO_CRYPTO_REEVAL) passes target=None and
     only ratchets a returned stop UP, and an OFF flag is said hourly.
   * Two latent NameErrors fixed on the way: the ladder's
@@ -29,7 +29,7 @@ What this suite pins:
     names exist; and the ladder's record() calls passed kwargs record()
     does not accept.
   * Source pins: the crypto path has no session gate (crypto_scanner,
-    _execute_alpaca_crypto), the 5-liquidate / 3-resync / SELECT-tail
+    _execute_alpaca_crypto), the receipt-boundary / 3-resync / SELECT-tail
     contracts test_monitor_bookbound relies on are intact, peak_price is
     NOT in the tick SELECT (binding it flips the reevaluator's giveback
     rule for every once-green loser -- a fleet decision, not this track's).
@@ -66,6 +66,7 @@ route_guard = load_module("app.brokers.route_guard")
 alp_data = load_module("app.brokers.alpaca_data")
 alog = load_module("app.agents.activity_log")
 engine = load_module("app.paper.engine")
+broker_exit = load_module("app.paper.broker_exit")
 leg_sync = load_module("app.paper.leg_sync")
 reeval = load_module("app.agents.reevaluator")
 pm = load_module("app.agents.position_monitor")
@@ -227,6 +228,11 @@ def _real_tick(client, price, seen: _Seen, **extra):
     async def _price(tk, at):
         return price
 
+    async def _quote(tk):
+        return alp_data.Quote(symbol=tk, bid=price, ask=price,
+                              bid_size=100, ask_size=100,
+                              ts=datetime.now(timezone.utc).isoformat())
+
     async def _noop(*_a, **_k):
         return None
 
@@ -241,12 +247,34 @@ def _real_tick(client, price, seen: _Seen, **extra):
 
     async def _liq(symbol, asset_type="stock", user_id=None):
         seen.liq.append((symbol, asset_type, user_id, _bound_id()))
-        return object(), "ok"
+        return {"id": f"sell-{user_id}-{symbol}", "symbol": f"{symbol}USD",
+                "side": "sell", "status": "filled", "filled_qty": "100",
+                "filled_avg_price": str(price),
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+                "filled_at": datetime.now(timezone.utc).isoformat()}, "ok"
 
     async def _close(user_id, pid, exit_price, reason="stop"):
         seen.closes.append((user_id, pid, reason))
         return engine.FillResult(ok=True, position_id=pid,
                                  fill_price=exit_price, realized_pnl_usd=-1.0)
+
+    async def _claim(pos, expected, pending):
+        payload = dict(pos.get("source_payload") or {})
+        if payload.get(broker_exit.PENDING_KEY) != expected:
+            return False
+        if pending is None:
+            payload.pop(broker_exit.PENDING_KEY, None)
+        else:
+            payload[broker_exit.PENDING_KEY] = dict(pending)
+        pos["source_payload"] = payload
+        return True
+
+    async def _receipt(pos, order, reason):
+        return await _close(pos["user_id"], pos["id"],
+                            float(order["filled_avg_price"]), reason)
+
+    async def _verified_quantity(*_args, **_kwargs):
+        return True
 
     async def _tp(r, target):
         seen.tp.append(target)
@@ -284,6 +312,9 @@ def _real_tick(client, price, seen: _Seen, **extra):
     try:
         with _patched(pm, **defaults), \
                 _patched(book_scope, held_symbols=_held), \
+                _patched(alp_data, get_crypto_quote=_quote), \
+                _patched(broker_exit, _claim=_claim, _record=_receipt,
+                         _verify_exit_quantity=_verified_quantity), \
                 _patched(ops_watchdog, _us_market_open=lambda: False), \
                 _patched(alog, record=_rec):
             yield
@@ -347,9 +378,11 @@ def test_crypto_path_has_no_session_gate_source_pins():
     crypto_call = PM_SRC[i:PM_SRC.index("# Scalp net-edge auto-exit", i)]
     assert re.search(r"stop_c,\s*None,\s*\n\s*emit=out", crypto_call), \
         "the crypto reevaluate_position call must pass target=None"
-    # the exits flow into the EXISTING per-book liquidate: still 5 sites
-    calls = re.findall(r"await _throttled_liquidate\(", PM_SRC)
-    assert len(calls) == 5, f"liquidate call sites: {len(calls)} (expected 5)"
+    # Every broker exit crosses the durable, book-bound receipt boundary.
+    # No tick call may liquidate and then book a modeled close itself.
+    assert "await _throttled_liquidate(" not in PM_SRC
+    assert "await settle_or_request_close(row, reason," in PM_SRC
+    assert "await _broker_exit(r, reason_c," in PM_SRC
     assert PM_SRC.count("await resync_alpaca_legs(") == 3
     # the tick SELECT is unchanged: its tail, and NO peak_price binding
     assert 'close_requested, source_payload")' in PM_SRC
@@ -362,7 +395,7 @@ def test_crypto_path_has_no_session_gate_source_pins():
         "decision, not this track's (skeptic 2026-09-02)")
     # every new activity row is a LATE import, so a patched record reaches it
     for ev in ("crypto_reeval", "crypto_reeval_off", "adopted_underwater",
-               "_cexit_event, tk"):
+               "event=_cexit_event"):
         assert ev in PM_SRC, ev
     assert not re.search(r"^from app\.agents\.activity_log import record",
                          PM_SRC, re.M), "record must not be bound at module level"
