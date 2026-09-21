@@ -109,7 +109,8 @@ def main():
     updates = environment_updates(source, books, args.owner_id)
     # Confirm schema and existing settings for EVERY book before any write.
     prepared = []
-    fields = ','.join(['user_id', *ENABLED])
+    # Display the protective default without overwriting a book's own opt-out.
+    fields = ','.join(['user_id', *ENABLED, 'goal_lock_enabled'])
     for book in books:
         key = quote(book['account_key'], safe='')
         path = '/rest/v1/bot_settings?user_id=eq.' + key

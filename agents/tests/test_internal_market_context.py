@@ -65,7 +65,12 @@ def _environment(raw=None, *, briefing=None, now=NOW):
     async def relay(self):
         return briefing
 
-    with patch.object(md, "_current", None), patch.object(md, "_current_at", 0.0), \
+    async def no_scorecards():
+        return []
+    receipt_pnl = load_module("app.paper.receipt_pnl")
+
+    with patch.object(receipt_pnl, "morning_scorecards", no_scorecards), \
+            patch.object(md, "_current", None), patch.object(md, "_current_at", 0.0), \
             patch.object(md, "datetime", Clock), \
             patch.object(md.MarketDeskAgent, "_newest_briefing", relay), \
             patch.object(data, "_data_get", get), patch.object(data, "DATA_FEED", "iex"), \

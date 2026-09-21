@@ -151,7 +151,8 @@ FLOW_MIN_APPROVES_FOR_KILL = 3
 # trade_execution's own source by the guard suite so the two files
 # cannot drift apart.
 _DELIBERATE_REFUSALS = ("book_at_capacity", "pocket_at_capacity",
-                        "book_already_holds")
+                        "book_already_holds", "reentry_refused", "pdt_guard",
+                        "goal_lock_refused")
 
 # NET2-GLOBAL: the flow counters are keyed by LANE. A single global
 # count let one crypto approve (24/7 lane) silence a starving stock lane

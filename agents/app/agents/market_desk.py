@@ -179,6 +179,14 @@ class MarketDeskAgent(Agent):
     _last_seen_key: str = ""
 
     async def tick(self) -> list[AgentMessage]:
+        from app.paper.receipt_pnl import morning_scorecards
+        try:
+            scores = await morning_scorecards()
+        except Exception:
+            scores = []
+        return [*scores, *await self._tick_market_context()]
+
+    async def _tick_market_context(self) -> list[AgentMessage]:
         global _current, _current_at
         row = await self._newest_briefing()
         view = None

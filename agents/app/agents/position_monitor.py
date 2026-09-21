@@ -636,8 +636,8 @@ def _decide_time_stop(
     #
     # DO NOT "fix" this by adding a crypto_ prefix here. Changing it is a
     # trading decision that belongs to Mike, not a bug fix.
-    if not (strat.startswith("stms") or strat.startswith("orb")
-            or strat.startswith("scalp")):
+    from app.paper.entry_discipline import is_intraday
+    if not is_intraday(strat):
         return None, ""
 
     now = datetime.now(timezone.utc)
