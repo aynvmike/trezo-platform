@@ -192,6 +192,21 @@ def test_invalid_account_response_is_unknown_and_never_empty_books():
     assert "secret-service-key" not in str(activity)
 
 
+def test_response_error_preserves_safe_code_without_exposing_its_message():
+    class _ResponseError(RuntimeError):
+        code = "42501"
+    class _Client:
+        def table(self, name): return self
+        def select(self, *args): return self
+        def execute(self):
+            return types.SimpleNamespace(data=[], error=_ResponseError("private-key-value"))
+    with quiet_activity_log() as activity:
+        assert _run(ks.check_states(_Client())) is None
+    assert activity[0][2]["extra"] == {
+        "stage": "paper_accounts_response", "error_type": "_ResponseError", "code": "42501"}
+    assert "private-key-value" not in str(activity)
+
+
 def test_check_states_empty_table_is_a_real_empty_answer():
     """No books is an ANSWER ({}); only a failed read is answerless."""
     out = _run(ks.check_states(_Client(paper_accounts=[])))

@@ -408,7 +408,7 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
         _state_read_failed("paper_accounts_response", error)
         return None
     if response_error or not isinstance(account_rows, list):
-        _state_read_failed("paper_accounts_response")
+        _state_read_failed("paper_accounts_response", response_error)
         return None
 
     states: dict[str, KillSwitch] = {}
