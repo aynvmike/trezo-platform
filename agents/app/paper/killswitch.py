@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -44,6 +45,28 @@ MAX_SLIPPAGE_BREACHES = 3   # fills slipping worse than the limit / session
 
 _ROWSUM_CACHE: dict[str, tuple] = {}   # user -> (ts, wk, dy, streak) 30s TTL
 _LAST_MODE: dict[str, str] = {}        # user -> last seen mode, for transition records
+
+
+def _state_read_failed(stage: str, error: Exception | None = None) -> None:
+    """Say which state read failed without logging credentials or response bodies.
+
+    HTTP/SDK exceptions may include request headers, URLs or database row data
+    in their message. Only the class and a recognised SQLSTATE/PostgREST code
+    are safe diagnostic fields; the read still returns unknown to callers.
+    """
+    code = str(getattr(error, "code", "") or "")
+    if not re.fullmatch(r"(?:[0-9A-Z]{5}|PGRST[0-9]{3})", code):
+        code = "unknown"
+    error_type = type(error).__name__ if error is not None else "unavailable"
+    _log.warning("kill-switch state unreadable: stage=%s error_type=%s code=%s; "
+                 "execution remains fail closed", stage, error_type, code)
+    try:
+        from app.agents.activity_log import record
+        record("kill_switch_read_failed", "-",
+               reason="Risk state unavailable; execution remains fail closed",
+               extra={"stage": stage, "error_type": error_type, "code": code})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _RowsumCached(Exception):
@@ -365,6 +388,7 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
     "no halts anywhere" — a dead database looked like a healthy one.
     """
     if not client:
+        _state_read_failed("client")
         return None
 
     def _fetch():
@@ -372,7 +396,19 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
 
     try:
         res = await asyncio.to_thread(_fetch)
-    except Exception:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001
+        _state_read_failed("paper_accounts", error)
+        return None
+    # The SDK's valid empty table response is [] -- a missing data body or
+    # an error response is not evidence that there are no books to protect.
+    try:
+        account_rows = res.data
+        response_error = getattr(res, "error", None)
+    except Exception as error:  # noqa: BLE001
+        _state_read_failed("paper_accounts_response", error)
+        return None
+    if response_error or not isinstance(account_rows, list):
+        _state_read_failed("paper_accounts_response", response_error)
         return None
 
     states: dict[str, KillSwitch] = {}
@@ -385,7 +421,7 @@ async def check_states(client) -> dict[str, KillSwitch] | None:
     #
     # The limit is a per-book setting. Read it per book, inside the loop.
     from app.runtime.settings import get_bot_settings
-    for acct in (res.data or []):
+    for acct in account_rows:
         try:
             consec_limit = int(get_bot_settings(
                 str(acct.get("user_id") or "")).consecutive_loss_limit)

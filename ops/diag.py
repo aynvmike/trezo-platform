@@ -22,6 +22,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -142,6 +143,16 @@ def fnum(v, nd=2):
         return str(v)
 
 
+def boot_details(line):
+    # The deployed activity-log beacon stores these in its reason string.
+    # Prefer structured fields when a newer producer supplies them.
+    fields = {k: v for k, v in line.items() if k in ("commit", "pid", "agents")}
+    for key, value in re.findall(r"\b(commit|pid|agents)=([A-Za-z0-9_-]+)", str(line.get("reason") or "")):
+        fields.setdefault(key, value)
+    fields.setdefault("commit", line.get("sha") or line.get("git") or "?")
+    return fields
+
+
 # ----------------------------------------------------------------- Supabase
 class SB:
     def __init__(self, env):
@@ -165,13 +176,14 @@ def section_engine(sb: SB, since_iso: str):
         say("  engine_boot beacons (newest first):")
         for r in rows:
             line = r.get("line") or {}
-            commit = line.get("commit") or line.get("sha") or line.get("git") or "?"
-            rest = {k: v for k, v in line.items() if k not in ("event", "commit", "sha", "git", "ts")}
+            details = boot_details(line)
+            commit = details["commit"]
+            rest = {k: v for k, v in details.items() if k != "commit"}
             say("    %sZ %9s host=%s commit=%s %s" % (r["ts"][:19], age(r["ts"]), r.get("host"), commit, str(rest)[:160]))
         if rows:
             line = rows[0].get("line") or {}
             verdict("last engine boot: %s (%s) commit=%s" % (rows[0]["ts"][:16] + "Z", age(rows[0]["ts"]),
-                    line.get("commit") or line.get("sha") or line.get("git") or "?"))
+                    boot_details(line)["commit"]))
     code, rows, dt = sb.get("ops_log_tail", "select=ts,line&order=ts.desc", 12)
     if code == 200 and isinstance(rows, list) and rows:
         say("  ops_log_tail newest line: %sZ (%s) event=%s" % (rows[0]["ts"][:19], age(rows[0]["ts"]), (rows[0].get("line") or {}).get("event")))
@@ -191,12 +203,12 @@ def section_engine(sb: SB, since_iso: str):
                 r.get("today_realized_pnl_usd"), r.get("last_reset_date"), r.get("consecutive_losses")))
             hb.append("%s %s%s" % (n, age(r["updated_at"]), " HALTED" if r.get("trading_halted") else ""))
         verdict("heartbeat: " + "; ".join(hb))
-    code, rows, dt = sb.get("agent_messages", "select=created_at,agent,kind&order=created_at.desc", 2000)
+    code, rows, dt = sb.get("agent_messages", "select=created_at,agent_name,kind&order=created_at.desc", 2000)
     if code == 200 and isinstance(rows, list) and rows:
-        say("  agent_messages newest: %sZ (%s) from %s" % (rows[0]["created_at"][:19], age(rows[0]["created_at"]), rows[0].get("agent")))
+        say("  agent_messages newest: %sZ (%s) from %s" % (rows[0]["created_at"][:19], age(rows[0]["created_at"]), rows[0].get("agent_name")))
         last, kinds = {}, defaultdict(int)
         for r in rows:
-            a = r.get("agent") or "?"
+            a = r.get("agent_name") or "?"
             last.setdefault(a, r["created_at"])
             kinds[(a, r.get("kind"))] += 1
         say("  per-agent newest message (sample of %d msgs back to %sZ):" % (len(rows), rows[-1]["created_at"][:19]))
@@ -256,7 +268,7 @@ def section_engine(sb: SB, since_iso: str):
                     ("ROLLED BACK" if "ROLLED BACK" in str(rows[0].get("result")) else "ok")))
     else:
         say("  ops_tasks: HTTP %s %s" % (code, str(rows)[:120]))
-    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,qty,entry_price,entry_at,status&status=eq.open&order=entry_at.desc", 200)
+    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,quantity,entry_price,entry_at,status&status=eq.open&order=entry_at.desc", 200)
     if code == 200 and isinstance(rows, list):
         by = defaultdict(list)
         for r in rows:
@@ -267,7 +279,7 @@ def section_engine(sb: SB, since_iso: str):
         verdict("open ledger rows: " + ", ".join("%s=%d" % (b, len(rs)) for b, rs in by.items()) if by else "open ledger rows: none")
     else:
         say("  paper_positions open: HTTP %s %s" % (code, str(rows)[:120]))
-    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,qty,entry_price,exit_price,entry_at,exit_at,status,realized_pnl_usd,fees_usd,source_payload&status=like.closed*&exit_at=gte.%s&order=exit_at.desc" % since_iso, 2000)
+    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,quantity,entry_price,exit_price,entry_at,exit_at,status,realized_pnl_usd,fees_usd,source_payload&status=like.closed*&exit_at=gte.%s&order=exit_at.desc" % since_iso, 2000)
     if code == 200 and isinstance(rows, list):
         say("  ledger closes since %s: %d" % (since_iso[:10], len(rows)))
         agg = defaultdict(lambda: [0, 0.0, 0.0, 0, 0])

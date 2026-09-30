@@ -43,7 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+from _bootstrap import load_module, quiet_activity_log, run_tests, stub_config  # noqa: E402
 
 stub_config()
 te = load_module("app.agents.trade_execution")
@@ -398,6 +398,52 @@ def test_unreadable_killswitch_state_executes_nothing_and_says_so():
         assert p.get("event") == "execute_error"
         assert p.get("lane") == "stock"
         assert "fail closed" in (p.get("reason") or "")
+
+
+def test_real_account_state_read_failure_blocks_all_books_and_logs_its_stage():
+    """Enumeration succeeds; the real safety SELECT fails on this approval.
+
+    This drives the actual check_states rather than handing the executor a
+    canned None. No broker order path is reached, and no exception body leaks.
+    """
+    class _StateReadError(RuntimeError):
+        code = "PGRST301"
+
+    class _StateQuery(_Query):
+        def select(self, columns, *_a, **_k):
+            self.columns = columns
+            return self
+
+        def execute(self):
+            if getattr(self, "columns", "") == "*":
+                raise _StateReadError("private-service-token")
+            return super().execute()
+
+    def _table(client, name):
+        return _StateQuery(client._tables.get(name, []))
+
+    books = _books()
+    books["book-c-2222"] = Book()
+    h = Harness(books)
+    h._check_states = ks.check_states
+    said = []
+    with quiet_activity_log() as activity, \
+         _patched(_FakeClient, table=_table), \
+         _patched(ks._log, warning=lambda fmt, *args: said.append(fmt % args)):
+        out = h.run(_payload(ticker="LINK", strategy="crypto_swing",
+                             asset_type="crypto"))
+    assert h.executed == {} and h.account_reads == [], "no broker path on unknown risk state"
+    assert len(out) == 1 and out[0].payload.get("event") == "execute_error"
+    assert out[0].payload.get("lane") == "crypto"
+    assert "any of 3 book(s)" in out[0].payload.get("error", "")
+    assert len(said) == 1 and "stage=paper_accounts" in said[0]
+    assert "error_type=_StateReadError" in said[0] and "code=PGRST301" in said[0]
+    assert "private-service-token" not in said[0]
+    diagnostics = [row for row in activity if row[0] == "kill_switch_read_failed"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0][2]["extra"] == {
+        "stage": "paper_accounts", "error_type": "_StateReadError", "code": "PGRST301"}
+    assert "private-service-token" not in str(activity)
 
 
 def test_an_empty_state_map_is_a_real_answer_and_trades():
