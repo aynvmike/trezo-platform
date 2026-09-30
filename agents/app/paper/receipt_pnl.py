@@ -197,6 +197,8 @@ def build_report(fills, fees, *, start, end, lanes=None, opening=None,
         totals = metrics(trades)
         # No bid/ask observations exist in the FILL endpoint. Measured spread
         # cannot be reconstructed honestly from execution prices alone.
+        if equity_delta is None or mtm_delta is None or cash_flow is None:
+            issues.append("reconciliation_inputs_unavailable")
         reconciliation = (equity_delta is not None and mtm_delta is not None
                           and cash_flow is not None and not issues)
         unexplained = (equity_delta-mtm_delta-cash_flow-totals["net_pnl_usd"]

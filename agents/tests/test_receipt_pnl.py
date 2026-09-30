@@ -73,10 +73,18 @@ def test_three_books_never_share_fifo_lots():
 def test_reconciliation_reports_residual_and_missing_marks_stay_unknown():
     fills = [fill('b', 'buy', 1, 100, hour=14), fill('s', 'sell', 1, 110)]
     r = report(fills, equity_delta=16, mtm_delta=2, cash_flow=1)
+    assert r['status'] == 'complete' and r['reconciliation_status'] == 'measured'
     assert r['unexplained_usd'] == 3
+    for missing in ('equity_delta', 'mtm_delta', 'cash_flow'):
+        inputs = dict(equity_delta=16, mtm_delta=2, cash_flow=1)
+        inputs[missing] = None
+        r = report(fills, **inputs)
+        assert r['status'] == 'partial' and r['reconciliation_status'] == 'unknown'
+        assert 'reconciliation_inputs_unavailable' in r['issues']
+        assert r['unexplained_usd'] is None and r['totals']['net_pnl_usd'] == 10
+        assert r['measured_spread_usd'] is None and r['friction_share_of_equity'] is None
     r = report(fills, equity_delta=16)
-    assert r['unexplained_usd'] is None and r['equity_delta_minus_known_net_usd'] == 6
-    assert r['measured_spread_usd'] is None and r['friction_share_of_equity'] is None
+    assert r['equity_delta_minus_known_net_usd'] == 6
 
 
 def test_duplicate_receipts_and_unattributed_lane_are_honest():
@@ -129,6 +137,7 @@ def test_real_collector_binds_all_three_books_and_preserves_failed_read():
         uid = active[-1]
         reads.append((uid, kw.get('activity_types', 'fills')))
         if uid == 'C': return None
+        if uid == 'B' and kw.get('activity_types', '').startswith('CSD'): return None
         if 'activity_types' in kw: return []
         gain = 1 if uid == 'A' else 7
         return [fill('b', 'buy', 1, 100, hour=14), fill('s', 'sell', 1, 100+gain)]
@@ -138,13 +147,21 @@ def test_real_collector_binds_all_three_books_and_preserves_failed_read():
         assert path == '/v2/account/portfolio/history?period=1M&timeframe=1D'
         return {'timestamp': [100, 200], 'equity': [5000, 5001]}
     clock = datetime(2026, 9, 22, 1, 30, tzinfo=timezone.utc)
+    client = Client(book_daily_pnl=[{'user_id': 'B', 'day': '2026-09-20', 'report': {
+        'closing_marks_aligned': True, 'observed_at': START.isoformat(),
+        'equity_observed_usd': 4999, 'unrealized_observed_usd': 0}}])
     with patched(accounts, bind_for_user=bind), patched(guard, check_route=lambda uid: (True, 'ok')), \
          patched(alpaca, get_fill_activities_strict=activities, get_positions_strict=positions,
                  get_account=account, _get=get, broker_venue=lambda: 'paper',
                  _headers=lambda: {'test': active[-1]}):
-        results = [run(p.collect_book(b, '2026-09-21', client=Client(), now=clock)) for b in books]
+        results = [run(p.collect_book(b, '2026-09-21', client=client, now=clock)) for b in books]
     assert results[0]['totals']['gross_pnl_usd'] == 1
+    assert results[0]['status'] == 'partial' and results[0]['equity_delta_usd'] is None
     assert results[1]['totals']['gross_pnl_usd'] == 7
+    assert results[1]['status'] == 'partial' and results[1]['cash_flow_usd'] is None
+    assert results[1]['equity_delta_usd'] == 1 and results[1]['mtm_delta_usd'] == 0
+    assert all(r['reconciliation_status'] == 'unknown' and r['unexplained_usd'] is None
+               for r in results[:2])
     assert results[2]['status'] == 'unknown' and results[2]['totals'] is None
     assert {uid for uid, _ in reads} == {'A', 'B', 'C'}
     assert not active
@@ -189,10 +206,62 @@ def test_nightly_persists_unknown_as_null_and_requires_write_confirmation():
         assert rows[-1]['net_pnl_usd'] is None and rows[-1]['trades'] is None
         assert rows[-1]['user_id'] == 'A'
         assert 'receipts_unavailable' in (Path(folder)/'pnl-primary-2026-09-21.md').read_text()
-        async def complete(*a, **kw): return report([])
+        async def complete(*a, **kw):
+            return report([], equity_delta=0, mtm_delta=0, cash_flow=0)
         with patched(p, collect_book=complete):
             writer.confirmed = False
             assert run(p.run_nightly('2026-09-21', report_dir=folder, now=END))[0].payload['status'] == 'unknown'
+
+
+def test_unreconciled_status_reaches_saved_report_morning_and_cli():
+    import contextlib
+    import importlib.util
+    import io
+    import os
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+    settings = load_module('app.runtime.settings')
+    accounts = load_module('app.brokers.accounts')
+    saved_rows = []
+    class Writer:
+        def table(self, name):
+            assert name == 'book_daily_pnl'
+            return self
+        def upsert(self, row, on_conflict):
+            assert on_conflict == 'user_id,day'
+            saved_rows.append(row)
+            return self
+        def execute(self): return SimpleNamespace(data=[saved_rows[-1]])
+    async def collect(*a, **kw):
+        return report([fill('b', 'buy', 1, 100, hour=14), fill('s', 'sell', 1, 110)])
+    book = SimpleNamespace(user_id='A', account_id='primary')
+    with TemporaryDirectory() as folder, patched(settings, _supabase=lambda: Writer()), \
+         patched(accounts, load_accounts=lambda: [book]), patched(p, collect_book=collect):
+        messages = run(p.run_nightly('2026-09-21', report_dir=folder, now=END))
+        assert messages[0].payload['status'] == 'partial'
+        assert saved_rows[0]['status'] == 'partial' and saved_rows[0]['net_pnl_usd'] == 10
+        assert saved_rows[0]['unexplained_usd'] is None
+        assert 'Status: partial' in (Path(folder)/'pnl-primary-2026-09-21.md').read_text()
+        with patched(settings, _supabase=lambda: Client(book_daily_pnl=saved_rows)), \
+             patched(p, _MORNING_SEEN=set()):
+            morning = run(p.morning_scorecards(datetime(2026, 9, 22, 12, tzinfo=timezone.utc)))
+            assert morning[0].payload['status'] == 'partial'
+            assert morning[0].payload['unexplained_usd'] is None
+        cli_path = Path(__file__).parents[1]/'scripts/run_receipt_pnl.py'
+        spec = importlib.util.spec_from_file_location('receipt_pnl_cli_test', cli_path)
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        async def nightly(*a, **kw): return messages
+        old_cwd, old_path = os.getcwd(), list(sys.path)
+        try:
+            with patched(p, run_nightly=nightly), \
+                 patched(sys, argv=[str(cli_path), '--date', '2026-09-21']), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                assert cli.main() == 1
+                assert 'A: partial' in output.getvalue()
+        finally:
+            os.chdir(old_cwd)
+            sys.path[:] = old_path
 
 
 if __name__ == '__main__': raise SystemExit(run_tests(globals()))

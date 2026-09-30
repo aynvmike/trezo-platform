@@ -38,7 +38,7 @@ No first nightly files or live-book results were produced in this workspace: hos
 .\agents\.venv\Scripts\python.exe .\agents\scripts\run_receipt_pnl.py --date 2026-09-20
 ```
 
-The date labels the completed window ending at 21:30 ET on that date. The command processes all configured books and writes `C:\Trezo\reports\pnl-<account_id>-2026-09-20.md` plus one database row per book/day. It exits nonzero if any book is partial/unknown or none are configured. An incomplete first reconciliation is expected until an aligned baseline exists; inspect the reasons rather than treating missing evidence as zero.
+The date labels the completed window ending at 21:30 ET on that date. The command processes all configured books and writes `C:\Trezo\reports\pnl-<account_id>-2026-09-20.md` plus one database row per book/day. It exits nonzero if any book is partial/unknown or none are configured. Missing aligned equity, open-position marks or cash movements produce a partial report with `reconciliation_inputs_unavailable`, while preserving known FIFO totals. An incomplete first reconciliation is expected until an aligned baseline exists; inspect the reasons rather than treating missing evidence as zero.
 
 ## Verification and outstanding acceptance
 
