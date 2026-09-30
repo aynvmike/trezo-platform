@@ -1617,5 +1617,162 @@ def test_a_resting_exit_is_not_reported_as_a_stuck_order():
     events = [e for e, _t, _k in said]
     assert "qa_order_stuck" not in events and "qa_stale_working_order" not in events, said
 
+# =========================================================================
+# ENTRY TIME: the row's opening order, never an earlier symbol round trip
+# =========================================================================
+
+_SOXL_ENTRY = "2026-09-30T18:10:01.733380Z"
+_SOXL_OLDER = "2026-09-29T14:49:18.947066Z"
+
+
+def _drift_row(**over):
+    row = {"id": "r-soxl-short", "user_id": ACCT3, "ticker": "SOXL",
+           "asset_type": "stock", "side": "short", "quantity": 7,
+           "entry_price": 32.0, "status": "open", "broker": "alpaca",
+           "broker_order_id": "soxl-current-short", "entry_at": _SOXL_ENTRY,
+           "stop_price": None, "target_price": None, "close_requested": False}
+    row.update(over)
+    return row
+
+
+def _drift_fill(**over):
+    fill = {"id": "soxl-current-fill", "activity_type": "FILL",
+            "transaction_time": _SOXL_ENTRY, "symbol": "SOXL",
+            "asset_class": "us_equity", "order_id": "soxl-current-short",
+            "side": "sell_short", "qty": "7", "price": "32.0"}
+    fill.update(over)
+    return fill
+
+
+def _drift_sweep(row, fills, uid=ACCT3):
+    from datetime import datetime, timezone
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 30, 18, 22, 44, tzinfo=timezone.utc)
+
+    pos = {"symbol": row["ticker"], "asset_class": "us_equity",
+           "qty": str(-row["quantity"] if row["side"] == "short"
+                      else row["quantity"]), "avg_entry_price": str(row["entry_price"])}
+    if row["asset_type"] == "crypto":
+        pos.update(symbol=row["ticker"] + "USD", asset_class="crypto")
+    client = FakeClient(paper_positions=[row])
+    with _env(TREZO_QA_AUTOFIX="0", TREZO_QA_ENTRY_DRIFT_MIN="15"), \
+            _patched(qa, datetime=_Clock):
+        rep, events, sent = _sweep(client, uid=uid, positions=[pos],
+                                    orders=[], open_orders=[], fills=fills)
+    assert not _ledger_writes(client), client.writes
+    return rep, events, sent
+
+
+def _drift_findings(rep):
+    return [f for f in rep["findings"] if f["finding"] == "qa_entry_time_drift"]
+
+
+def test_new_soxl_short_is_not_dated_from_yesterdays_symbol_trade():
+    """Replay the September 30 alert: 1,641 minutes is yesterday's fill,
+    while this row carries the ID of a new short opened today."""
+    qa.reset_state()
+    old_buy = _drift_fill(id="old-long", order_id="old-long-order", side="buy",
+                          transaction_time=_SOXL_OLDER)
+    old_short = _drift_fill(id="old-short", order_id="old-short-order",
+                            transaction_time=_SOXL_OLDER)
+    rep, events, _ = _drift_sweep(_drift_row(),
+                                 [old_buy, old_short, _drift_fill()])
+    assert not _drift_findings(rep), rep["findings"]
+    assert "qa_read_deferred" not in events, events
+
+
+def test_real_entry_drift_uses_first_partial_of_the_rows_opening_order():
+    qa.reset_state()
+    first = "2026-09-30T17:30:00Z"
+    earlier_other_order = _drift_fill(id="old", order_id="old-roundtrip",
+                                     transaction_time=_SOXL_OLDER)
+    f1 = _drift_fill(id="partial-1", qty="3", transaction_time=first)
+    f2 = _drift_fill(id="partial-2", qty="4")
+    closing = _drift_fill(id="closing", side="buy_to_cover",
+                          transaction_time=_SOXL_OLDER)
+    expiry = _drift_fill(id="expiry", activity_type="OPEXP",
+                         transaction_time=_SOXL_OLDER)
+    rep, _events, _ = _drift_sweep(_drift_row(),
+                                  [earlier_other_order, f2, closing, expiry, f1])
+    findings = _drift_findings(rep)
+    assert len(findings) == 1, rep["findings"]
+    assert findings[0]["qa_true_entry_at"] == "2026-09-30T17:30:00+00:00", findings
+    assert findings[0]["order_ids"] == ["soxl-current-short"], findings
+    assert "40 minutes" in findings[0]["reason"], findings
+
+
+def test_missing_order_id_keeps_entry_time_unknown_instead_of_guessing():
+    qa.reset_state()
+    rep, events, _ = _drift_sweep(_drift_row(broker_order_id=None),
+                                 [_drift_fill(transaction_time=_SOXL_OLDER)])
+    assert not _drift_findings(rep), rep["findings"]
+    assert "qa_read_deferred" in events, events
+
+
+def test_unseen_order_receipt_does_not_clear_an_unresolved_drift_ticket():
+    qa.reset_state()
+    ticket = (ACCT3, "SOXL", "qa_entry_time_drift")
+    qa._OPEN_TICKETS.add(ticket)
+    rep, events, _ = _drift_sweep(_drift_row(),
+                                 [_drift_fill(order_id="different-order",
+                                               transaction_time=_SOXL_OLDER)])
+    assert not _drift_findings(rep), rep["findings"]
+    assert "qa_read_deferred" in events, events
+    assert ticket in qa._OPEN_TICKETS, "unread evidence must not mean cleared"
+    qa.reset_state()
+
+
+def test_a_fill_from_the_wrong_direction_symbol_or_asset_is_not_entry_evidence():
+    for overrides in ({"side": "buy_to_cover"}, {"symbol": "TQQQ"},
+                      {"asset_class": "us_option"},
+                      {"activity_type": "OPASN"}):
+        qa.reset_state()
+        rep, events, _ = _drift_sweep(_drift_row(),
+                                     [_drift_fill(transaction_time=_SOXL_OLDER,
+                                                   **overrides)])
+        assert not _drift_findings(rep), (overrides, rep["findings"])
+        assert "qa_read_deferred" in events, (overrides, events)
+
+
+def test_an_unusable_partial_time_does_not_make_a_later_partial_the_entry():
+    for raw in ("", "2026-09-30", "not-a-time", "2026-09-30T19:00:00Z"):
+        qa.reset_state()
+        rep, events, _ = _drift_sweep(_drift_row(),
+                                     [_drift_fill(id="partial-unknown", qty="3",
+                                                   transaction_time=raw),
+                                      _drift_fill(id="partial-good", qty="4")])
+        assert not _drift_findings(rep), (raw, rep["findings"])
+        assert "qa_read_deferred" in events, (raw, events)
+
+
+def test_entry_drift_uses_canonical_crypto_symbol_for_its_own_order():
+    qa.reset_state()
+    row = _drift_row(ticker="BTC", asset_type="crypto", side="long",
+                     quantity=0.1, entry_price=50000, broker_order_id="btc-entry")
+    own = _drift_fill(symbol="BTC/USD", asset_class="crypto", side="buy",
+                      qty="0.1", price="50000", order_id="btc-entry")
+    unrelated = _drift_fill(id="old-btc", symbol="BTCUSD", asset_class="crypto",
+                            side="buy", order_id="btc-previous",
+                            transaction_time=_SOXL_OLDER)
+    rep, events, _ = _drift_sweep(row, [unrelated, own])
+    assert not _drift_findings(rep), rep["findings"]
+    assert "qa_read_deferred" not in events, events
+
+
+def test_proven_entry_match_clears_only_this_books_old_drift_ticket():
+    qa.reset_state()
+    own = (ACCT3, "SOXL", "qa_entry_time_drift")
+    other = (ACCT2, "SOXL", "qa_entry_time_drift")
+    qa._OPEN_TICKETS.update([own, other])
+    rep, events, _ = _drift_sweep(_drift_row(), [_drift_fill()])
+    assert not _drift_findings(rep), rep["findings"]
+    assert own not in qa._OPEN_TICKETS and other in qa._OPEN_TICKETS
+    assert "qa_cleared" in events, events
+    qa.reset_state()
+
+
 if __name__ == "__main__":
     sys.exit(run_tests(dict(vars())))

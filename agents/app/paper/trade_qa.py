@@ -1662,24 +1662,57 @@ async def _check_row(client, uid: str, key: str, side: str, r: dict,
                          f"happened."), row_id=rid), rep)
 
     # entry_at drift: RECORDED, never corrected -- entry_at drives time
-    # stops, so "fixing" it moves an exit.
+    # stops, so "fixing" it moves an exit. Compare only with THIS row's
+    # opening order. The symbol window also contains prior round trips
+    # and closing fills: its oldest fill is not this position's receipt
+    # (SOXL, 2026-09-30: a new short was compared with yesterday's trade).
     if entry_at is not None:
-        best = None
-        for f in fills_by_sym.get(key, []):
-            ts = _parse_ts(f.get("transaction_time") or f.get("date"))
-            if ts and (best is None or ts < best):
-                best = ts
+        oid = str(r.get("broker_order_id") or "").strip()
+        opening_sides = ({"buy", "buy_to_open"} if side == "long"
+                         else {"sell", "sell_short", "sell_to_open"})
+        entry_fills = [f for f in fills_by_sym.get(key, [])
+                       if oid and str(f.get("order_id") or "").strip() == oid
+                       and str(f.get("activity_type") or "").upper() == "FILL"
+                       and str(f.get("side") or "").lower() in opening_sides
+                       and asset_class_of(f) == at
+                       and ledger_symbol(f.get("symbol"), asset_class_of(f)) == key]
+        # A date alone invents midnight, and discarding an unreadable
+        # partial could silently replace the FIRST fill with a later one.
+        # In either case this particular comparison remains unknown.
+        usable_times = True
+        now = datetime.now(timezone.utc)
+        for f in entry_fills:
+            raw = str(f.get("transaction_time") or f.get("date") or "").strip()
+            ts = _parse_ts(raw)
+            if (not (("T" in raw or " " in raw) and ":" in raw)
+                    or ts is None or ts > now):
+                usable_times = False
+                break
+        best = (_parse_ts(_entry_fill_at(entry_fills, oid))
+                if entry_fills and usable_times else None)
         if best is not None:
             drift = abs((entry_at - best).total_seconds()) / 60.0
             if drift > entry_drift_min():
                 await _raise_ticket(client, uid, Finding(
                     "qa_entry_time_drift", key, severity="info",
                     message=(f"Row {rid} records an entry time {drift:.0f} "
-                             f"minutes away from the broker's fill time "
-                             f"({best.isoformat()}). NOT corrected: entry_at "
+                             f"minutes away from this row's opening order "
+                             f"{oid}'s first fill time ({best.isoformat()}). "
+                             f"NOT corrected: entry_at "
                              f"drives time stops, so changing it would move an "
                              f"exit. Recorded for a human."),
-                    row_id=rid, extra={"qa_true_entry_at": best.isoformat()}), rep)
+                    row_id=rid, order_ids=(oid,),
+                    extra={"qa_true_entry_at": best.isoformat()}), rep)
+            else:
+                _clear_ticket(uid, key, "qa_entry_time_drift")
+        else:
+            _log("qa_read_deferred", key,
+                 reason=(f"entry time comparison for row {rid} is unknown: "
+                         "no complete, timestamped opening FILL receipt "
+                         f"for its own order {oid or '(missing)'}. Other "
+                         "trades in the symbol window are not its entry."),
+                 extra={"user_id": uid, "row_id": rid,
+                        "order_id": oid, "check": "entry_time"})
 
     # ---- I5: ROW => ENFORCEABLE PROTECTION ---------------------------
     await _check_enforceable_stop(client, uid, key, r, rid, at, open_orders, rep)

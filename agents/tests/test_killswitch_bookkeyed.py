@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _bootstrap import load_module, run_tests, stub_config  # noqa: E402
+from _bootstrap import load_module, quiet_activity_log, run_tests, stub_config  # noqa: E402
 
 stub_config()
 ks = load_module("app.paper.killswitch")
@@ -126,11 +126,70 @@ def _acct(**over) -> dict:
 # --- KS-11: check_states fails CLOSED with None ---------------------------
 
 def test_check_states_is_none_on_a_raising_client():
-    assert _run(ks.check_states(_RaisingClient())) is None
+    with quiet_activity_log() as said:
+        assert _run(ks.check_states(_RaisingClient())) is None
+    assert said[0][0] == "kill_switch_read_failed"
+    assert said[0][2]["extra"]["stage"] == "paper_accounts"
 
 
 def test_check_states_is_none_with_no_client():
-    assert _run(ks.check_states(None)) is None
+    with quiet_activity_log() as said:
+        assert _run(ks.check_states(None)) is None
+    assert said[0][2]["extra"]["stage"] == "client"
+
+
+def test_account_read_failure_logs_stage_type_and_code_without_response_body():
+    class _ReadError(RuntimeError):
+        code = "42501"
+
+    class _PrivateFailureClient:
+        def table(self, name):
+            raise _ReadError("secret-service-key in response with private account rows")
+
+    said = []
+    with quiet_activity_log() as activity, \
+         _patched(ks._log, warning=lambda fmt, *args: said.append(fmt % args)):
+        assert _run(ks.check_states(_PrivateFailureClient())) is None
+    assert len(said) == 1
+    assert "stage=paper_accounts" in said[0]
+    assert "error_type=_ReadError" in said[0] and "code=42501" in said[0]
+    assert "secret-service-key" not in said[0] and "private account rows" not in said[0]
+    assert "fail closed" in said[0]
+    assert activity[0][0] == "kill_switch_read_failed"
+    assert activity[0][2]["extra"] == {
+        "stage": "paper_accounts", "error_type": "_ReadError", "code": "42501"}
+    assert "secret-service-key" not in str(activity)
+
+
+def test_invalid_account_response_is_unknown_and_never_empty_books():
+    class _ResponseClient:
+        def __init__(self, response):
+            self.response = response
+
+        def table(self, name):
+            return self
+
+        def select(self, *args):
+            return self
+
+        def execute(self):
+            return self.response
+
+    responses = [types.SimpleNamespace(data=None),
+                 types.SimpleNamespace(data={}),
+                 types.SimpleNamespace(),
+                 types.SimpleNamespace(data=[], error="secret-service-key")]
+    said = []
+    with quiet_activity_log() as activity, \
+         _patched(ks._log, warning=lambda fmt, *args: said.append(fmt % args)):
+        for response in responses:
+            assert _run(ks.check_states(_ResponseClient(response))) is None
+    assert len(said) == len(responses)
+    assert all("stage=paper_accounts_response" in msg for msg in said)
+    assert all("secret-service-key" not in msg for msg in said)
+    assert len(activity) == len(responses)
+    assert all(row[0] == "kill_switch_read_failed" for row in activity)
+    assert "secret-service-key" not in str(activity)
 
 
 def test_check_states_empty_table_is_a_real_empty_answer():
