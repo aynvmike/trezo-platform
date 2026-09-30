@@ -61,11 +61,26 @@ def _wired(states):
         # Isolate token polling: this suite tests agent scheduling only.
         refresh.schedule_refresh_token_job = lambda _: None
         scheduler.start_scheduler()
+        # Preserve assertions about interval agents separately from the new
+        # nightly cron; its registration is checked explicitly below.
+        scheduler._scheduler.income_jobs = [j for j in scheduler._scheduler.jobs
+                                           if j['id'] == 'receipt_pnl:nightly']
+        scheduler._scheduler.jobs = [j for j in scheduler._scheduler.jobs
+                                    if j['id'].startswith('tick:')]
         yield scheduler._scheduler
     finally:
         for name, value in saved.items():
             setattr(scheduler, name, value)
         refresh.schedule_refresh_token_job = prior_refresh
+
+
+def test_nightly_income_job_is_registered_once_in_new_york_time():
+    with _wired([]) as wired:
+        assert len(wired.income_jobs) == 1
+        job = wired.income_jobs[0]
+        assert job['hour'] == 21 and job['minute'] == 30
+        assert job['timezone'] == 'America/New_York'
+        assert job['max_instances'] == 1
 
 
 def test_discovery_has_one_early_hourly_job_and_other_agents_keep_their_cadence():

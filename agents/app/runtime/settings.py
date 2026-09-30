@@ -33,6 +33,7 @@ class BotSettings:
     dividend_lt_enabled: bool = True
     reevaluation_enabled: bool = True
     crypto_reevaluation_enabled: bool = True
+    goal_lock_enabled: bool = True
     autonomy_mode: str = "guarded"
     account_posture: str = "auto"
     allocation_overrides: dict | None = None
@@ -190,6 +191,7 @@ def _from_row(r: dict) -> BotSettings:
         dividend_lt_enabled=bool(r.get("dividend_lt_enabled", False)),
         reevaluation_enabled=bool(r.get("reevaluation_enabled", False)),
         crypto_reevaluation_enabled=bool(r.get("crypto_reevaluation_enabled", False)),
+        goal_lock_enabled=bool(r.get("goal_lock_enabled", True)),
         autonomy_mode=str(r.get("autonomy_mode", "guarded") or "guarded"),
         account_posture=str(r.get("account_posture", "auto") or "auto"),
         allocation_overrides=(r.get("allocation_overrides") or None),

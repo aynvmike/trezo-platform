@@ -172,6 +172,8 @@ def start_scheduler() -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("refresh.poll.schedule_failed", error=str(e)[:200])
 
+    from app.paper.receipt_pnl import schedule_receipt_pnl
+    schedule_receipt_pnl(_scheduler)
     _scheduler.start()
     log.info("scheduler.started", agents=len(registry.all()))
 

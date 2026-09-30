@@ -209,6 +209,12 @@ class Harness:
                                           "side": side})]
 
         self.agent._execute_for_user = _exec_user
+        # This harness isolates the existing book/risk/capacity controls. The
+        # new entry-only controls are exercised through their real method in
+        # test_reentry_discipline / test_pdt_guard / test_goal_lock.
+        async def _income_allowed(*a, **k):
+            return None
+        self.agent._entry_discipline = _income_allowed
 
     @contextlib.contextmanager
     def _bind(self, uid):

@@ -57,6 +57,7 @@ class AlpacaAccount:
     account_number: str = ""
     account_id: str = ""
     shorting_enabled: bool | None = None
+    pdt_state_known: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -522,6 +523,9 @@ async def get_account(token: Optional["UserToken"] = None) -> Optional[AlpacaAcc
         status=str(data.get("status") or "UNKNOWN"),
         pattern_day_trader=bool(data.get("pattern_day_trader")),
         daytrade_count=int(data.get("daytrade_count") or 0),
+        pdt_state_known=(isinstance(data.get("pattern_day_trader"), bool)
+                         and type(data.get("daytrade_count")) is int
+                         and data["daytrade_count"] >= 0),
         trading_blocked=bool(data.get("trading_blocked")),
         options_approved_level=int(data.get("options_approved_level") or 0),
         options_trading_level=int(data.get("options_trading_level") or 0),

@@ -209,6 +209,9 @@ def test_book_scoped_true_still_pins_to_one_book():
         gate_saw.append((uid, kw.get("ks_state")))
         return te_mod._BookGate(payload=payload)
     agent._gate_book = _open_gate
+    async def _income_allowed(*a, **k):
+        return None
+    agent._entry_discipline = _income_allowed
 
     with _single_book_world(_healthy(BOOK)), quiet_activity_log() as said:
         out = _run(agent.on_message(_pinned()))
