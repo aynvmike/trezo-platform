@@ -98,6 +98,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--owner-id', required=True)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--db-only', action='store_true',
+                        help='write only the database rows (bot_settings, trading_accounts); '
+                             'skip the runtime .env rewrite -- for running away from the server, '
+                             'where the .env is not the one the engine reads')
     args = parser.parse_args()
     UUID(args.owner_id)
     env_path = Path(relay._find_env())
@@ -105,8 +109,9 @@ def main():
     owner = quote(args.owner_id, safe='')
     books = selected_books(relay.get('/rest/v1/trading_accounts?select=account_key,owner_id,label,is_paper,is_active'
                                      + '&owner_id=eq.' + owner), args.owner_id)
-    source = env_path.read_text(encoding='utf-8')
-    updates = environment_updates(source, books, args.owner_id)
+    source = '' if args.db_only else env_path.read_text(encoding='utf-8')
+    updates = ({'note': 'db-only: runtime .env untouched'} if args.db_only
+               else environment_updates(source, books, args.owner_id))
     # Confirm schema and existing settings for EVERY book before any write.
     prepared = []
     fields = ','.join(['user_id', *ENABLED])
@@ -138,6 +143,10 @@ def main():
         print(json.dumps({'book_id': book['account_key'], 'settings_verified': True,
                           'note': 'Broker permissions, funding and risk checks still decide each entry.'}))
 
+    if args.db_only:
+        print(json.dumps({'runtime_configuration_updated': [], 'restart_required': True,
+                          'note': 'db-only run: restart the agents so settings caches reload'}))
+        return
     if env_path.read_text(encoding='utf-8') != source:
         raise RuntimeError('Runtime configuration changed during activation; refusing to overwrite it')
     env_path.write_text(rewrite_environment(source, updates), encoding='utf-8')
