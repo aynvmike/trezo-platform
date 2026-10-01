@@ -191,12 +191,12 @@ def section_engine(sb: SB, since_iso: str):
                 r.get("today_realized_pnl_usd"), r.get("last_reset_date"), r.get("consecutive_losses")))
             hb.append("%s %s%s" % (n, age(r["updated_at"]), " HALTED" if r.get("trading_halted") else ""))
         verdict("heartbeat: " + "; ".join(hb))
-    code, rows, dt = sb.get("agent_messages", "select=created_at,agent,kind&order=created_at.desc", 2000)
+    code, rows, dt = sb.get("agent_messages", "select=created_at,agent_name,kind&order=created_at.desc", 2000)
     if code == 200 and isinstance(rows, list) and rows:
-        say("  agent_messages newest: %sZ (%s) from %s" % (rows[0]["created_at"][:19], age(rows[0]["created_at"]), rows[0].get("agent")))
+        say("  agent_messages newest: %sZ (%s) from %s" % (rows[0]["created_at"][:19], age(rows[0]["created_at"]), rows[0].get("agent_name")))
         last, kinds = {}, defaultdict(int)
         for r in rows:
-            a = r.get("agent") or "?"
+            a = r.get("agent_name") or "?"
             last.setdefault(a, r["created_at"])
             kinds[(a, r.get("kind"))] += 1
         say("  per-agent newest message (sample of %d msgs back to %sZ):" % (len(rows), rows[-1]["created_at"][:19]))
@@ -244,19 +244,19 @@ def section_engine(sb: SB, since_iso: str):
         verdict("lanes " + " | ".join(vb))
     else:
         say("  bot_settings: HTTP %s %s" % (code, str(rows)[:160]))
-    code, rows, dt = sb.get("ops_tasks", "select=id,kind,status,created_at,finished_at,payload,result&order=created_at.desc", 8)
+    code, rows, dt = sb.get("ops_tasks", "select=id,kind,status,created_at,finished_at,args,result&order=created_at.desc", 8)
     if code == 200 and isinstance(rows, list):
         say("  ops_tasks newest:")
         for r in rows:
             res = str(r.get("result") or "")
             flag = " ROLLED BACK" if "ROLLED BACK" in res else (" NOT restarted" if "NOT restarted" in res else "")
-            say("    %sZ %-18s %-9s %s%s" % (r["created_at"][:16], r["kind"], r["status"], str(r.get("payload"))[:70], flag))
+            say("    %sZ %-18s %-9s %s%s" % (r["created_at"][:16], r["kind"], r["status"], str(r.get("args"))[:70], flag))
         if rows:
             verdict("relay: last job %s %s %s (%s)" % (rows[0]["kind"], rows[0]["status"], age(rows[0]["created_at"]),
                     ("ROLLED BACK" if "ROLLED BACK" in str(rows[0].get("result")) else "ok")))
     else:
         say("  ops_tasks: HTTP %s %s" % (code, str(rows)[:120]))
-    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,qty,entry_price,entry_at,status&status=eq.open&order=entry_at.desc", 200)
+    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,quantity,entry_price,entry_at,status&status=eq.open&order=entry_at.desc", 200)
     if code == 200 and isinstance(rows, list):
         by = defaultdict(list)
         for r in rows:
@@ -267,7 +267,7 @@ def section_engine(sb: SB, since_iso: str):
         verdict("open ledger rows: " + ", ".join("%s=%d" % (b, len(rs)) for b, rs in by.items()) if by else "open ledger rows: none")
     else:
         say("  paper_positions open: HTTP %s %s" % (code, str(rows)[:120]))
-    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,qty,entry_price,exit_price,entry_at,exit_at,status,realized_pnl_usd,fees_usd,source_payload&status=like.closed*&exit_at=gte.%s&order=exit_at.desc" % since_iso, 2000)
+    code, rows, dt = sb.get("paper_positions", "select=user_id,ticker,asset_type,strategy,side,quantity,entry_price,exit_price,entry_at,exit_at,status,realized_pnl_usd,fees_usd,source_payload&status=like.closed*&exit_at=gte.%s&order=exit_at.desc" % since_iso, 2000)
     if code == 200 and isinstance(rows, list):
         say("  ledger closes since %s: %d" % (since_iso[:10], len(rows)))
         agg = defaultdict(lambda: [0, 0.0, 0.0, 0, 0])

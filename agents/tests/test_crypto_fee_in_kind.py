@@ -379,7 +379,7 @@ def test_the_executor_adjusts_buys_only():
     src = (Path(__file__).resolve().parents[1]
            / "app" / "agents" / "trade_execution.py").read_text(encoding="utf-8")
     i = src.index("async def _execute_alpaca_crypto")
-    body = src[i:i + 14000]
+    body = src[i:]
     assert 'if order_side == "buy":' in body, (
         "the arrival adjustment must be gated on the BUY side")
     j = body.index('if order_side == "buy":')
@@ -435,7 +435,7 @@ def test_the_pre_order_wallet_read_happens_before_the_order():
     src = (Path(__file__).resolve().parents[1]
            / "app" / "agents" / "trade_execution.py").read_text(encoding="utf-8")
     i = src.index("async def _execute_alpaca_crypto")
-    body = src[i:i + 14000]
+    body = src[i:]
     before = body.index("crypto_settle.position_qty")
     submit = body.index("order, err = await submit_crypto_order")
     after = body.index("arrived_buy_quantity")

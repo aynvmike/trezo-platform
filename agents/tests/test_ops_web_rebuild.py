@@ -207,6 +207,26 @@ def test_inline_kinds_still_release_the_latch_when_they_finish():
         _run_loop(scenario())
 
 
+def test_crypto_audit_report_is_detached_and_persists_the_result():
+    store = {"ops_tasks": [{"id": "audit", "kind": "report_status", "status": "queued",
+                           "args": {"crypto_audit_since": "2026-07-24"}, "attempts": 0}]}
+    async def scenario():
+        with _patched(relay, _TICK_BUSY=False), _patched_dict(relay.HANDLERS, report_status=lambda a: '{"books":[]}'):
+            out = await relay.drain_once(_FakeClient(store))
+            assert out["status"] == "started"
+            await _aio.gather(*list(relay._DETACHED_TASKS))
+            assert store["ops_tasks"][0]["result"] == '{"books":[]}'
+            assert relay._TICK_BUSY is False
+    with _patched(relay, HANDLERS=dict(relay.HANDLERS)), _patched(_alog, record=lambda *a, **k: None):
+        _run_loop(scenario())
+
+
+def test_hosted_crypto_audit_refuses_paths_and_invalid_dates():
+    for args in ({'crypto_audit_since':'2026-02-30'}, {'crypto_audit_since':'../../env'},
+                 {'crypto_audit_since':'2026-07-24', 'env':'secret'}, {'crypto_audit_since':None}):
+        assert relay._h_report_status(args).startswith('INCOMPLETE')
+
+
 # ---- dev-mode service: rebuild == restart (2026-09-02) ----------------------
 
 def test_a_dev_mode_web_service_is_restarted_not_built():

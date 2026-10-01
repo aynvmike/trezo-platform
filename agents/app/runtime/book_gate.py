@@ -34,6 +34,7 @@ guard test uses to keep the list honest.
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -158,6 +159,22 @@ def admits(settings, *, asset_type: str, strategy: str,
         if not getattr(settings, "auto_trade_enabled", True):
             return Verdict(False, "auto-trade is OFF for this book",
                            "would_have_traded")
+
+        # Explicit zero is an unfunded lane, including generic "default"
+        # stock signals that have no strategy-name toggle. Reject before
+        # coverage mode or sizing can turn a zero budget into exposure.
+        pockets = getattr(settings, "allocation_overrides", None) or {}
+        pocket = ("income" if st.startswith(("wheel", "dividend_lt")) else
+                  {"stock": "stocks", "option": "options", "crypto": "crypto",
+                   "forex": "forex"}.get(at))
+        if isinstance(pockets, dict) and pocket in pockets:
+            try:
+                amount = float(pockets[pocket])
+            except (TypeError, ValueError):
+                return Verdict(False, "lane allocation is unreadable", "book_declined")
+            if not math.isfinite(amount) or amount <= 0:
+                return Verdict(False, f"{pocket} allocation is zero or invalid for this book",
+                               "book_declined")
 
         for g in GATES:
             if g.applies(at, st) and not getattr(settings, g.flag, True):

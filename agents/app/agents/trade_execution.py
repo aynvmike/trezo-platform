@@ -1818,6 +1818,19 @@ class TradeExecutionAgent(Agent):
         if acct.trading_blocked:
             return _err("Alpaca account has trading blocked")
 
+        # Crypto quotes previously reached only the scanner's observation
+        # log. Bind freshness and measured spread to the actual entry path.
+        # This path opens exposure; exits use the separate close helpers.
+        if side != "long":
+            return _err("Alpaca spot crypto entries are long-only")
+        from app.runtime.crypto_entry import entry_quote
+        _target = float(target_pct) if isinstance(target_pct, (int, float)) and target_pct > 0 else 0.10
+        _quote, _quote_error = await entry_quote(ticker, _target)
+        if _quote_error:
+            return _err(_quote_error)
+        market_price = _quote["ask"]
+        source_payload = {**source_payload, "entry_quote": _quote}
+
         mt, budget, deployed, remaining, posture = await self._allocation_gate(
             user_id, acct.equity, strategy, "crypto")
         if remaining <= 0:
@@ -1974,6 +1987,15 @@ class TradeExecutionAgent(Agent):
             except Exception:  # noqa: BLE001
                 pass
 
+        # Wallet/token/database reads may have taken time since sizing.
+        # Revalidate quote age at the last point before submission.
+        from types import SimpleNamespace as _QuoteFields
+        from app.runtime.crypto_entry import evaluate_quote as _quote_check
+        _, _late_quote_error = _quote_check(
+            _QuoteFields(bid=_quote["bid"], ask=_quote["ask"], ts=_quote["quote_ts"]),
+            _target, _quote["fee_bps_per_side"])
+        if _late_quote_error:
+            return _err(_late_quote_error)
         order, err = await submit_crypto_order(
             symbol=ticker,
             side=order_side,

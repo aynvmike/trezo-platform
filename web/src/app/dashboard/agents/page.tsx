@@ -189,7 +189,7 @@ export default async function AgentsPage({ searchParams }: { searchParams?: { ac
       <section className="space-y-3">
         <div>
           <h2 className="font-serif text-xl text-[rgb(var(--foreground))]">Manage agents</h2>
-          <p className="mt-1 text-sm text-[rgb(var(--muted-foreground))]">Service controls affect shared workers across all books. Use &ldquo;Tune this book&rdquo; to change one account's strategy permissions.</p>
+          <p className="mt-1 text-sm text-[rgb(var(--muted-foreground))]">Service controls affect shared workers across all books. Use &ldquo;Tune this book&rdquo; to change one account&apos;s strategy permissions.</p>
         </div>
         <AgentsSettings />
       </section>
