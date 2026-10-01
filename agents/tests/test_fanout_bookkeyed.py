@@ -715,7 +715,8 @@ def test_pinned_approval_respects_its_pocket_slots():
     h = Harness(books)
     out = h.run(_pinned(), via_on_message=True)
     assert h.executed == {}
-    assert len(_events(out, "pocket_at_capacity", BOOK_B)) == 1
+    assert len(_events(out, "book_declined", BOOK_B)) == 1
+    assert "allocation is zero" in str(out[0].payload)
 
 
 def test_pinned_approval_refuses_unknown_capacity_and_never_fans_out():

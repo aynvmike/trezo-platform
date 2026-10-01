@@ -330,6 +330,8 @@ def _read_diagnostics() -> str:
 
 
 def _h_report_status(args: dict) -> str:
+    if "crypto_audit_since" in args:
+        return _h_crypto_audit(args)
     lines = []
     # 2026-08-28: queue report_status with {"send_test": true} to prove
     # the alert channel end to end — send_test() had zero callers while
@@ -391,6 +393,40 @@ def _h_report_status(args: dict) -> str:
     if args.get("diagnostics"):
         lines.append(_read_diagnostics())
     return "\n".join(lines)
+
+
+def _h_crypto_audit(args: dict) -> str:
+    """Fixed read-only report using host-held keys, no laptop bridge needed.
+
+    Return only the three summaries (below the relay's 8000-char limit).
+    No command, env path, file path, module or endpoint comes from the job.
+    """
+    if set(args) != {"crypto_audit_since"}:
+        return "INCOMPLETE: crypto audit accepts only crypto_audit_since"
+    value = args["crypto_audit_since"]
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return "INCOMPLETE: expected YYYY-MM-DD"
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return "INCOMPLETE: invalid date"
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("trezo_crypto_audit", REPO / "ops" / "ledger_audit.py")
+    audit = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(audit)
+        books = audit.collect(audit.load_env(str(REPO / "agents" / ".env")), value)
+        compact = [{k: b[k] for k in ("label", "summary", "error", "issues", "matched_realizations_since", "account_snapshot_all_assets") if k in b}
+                   for b in books]
+        report = {"since": value, "mode": "paper", "fee_bps_per_side_assumed": 25,
+                  "extra_slippage_bps_per_side_assumed": 5, "books": compact}
+        text = json.dumps(report, allow_nan=False)
+        if len(text) > 7800:
+            return "INCOMPLETE: audit summary exceeds relay output limit"
+        return text
+    except Exception:
+        # No exception strings, response bodies, env values or tracebacks.
+        return "INCOMPLETE: hosted crypto audit could not finish"
 
 
 def _h_tail_log(args: dict) -> str:
@@ -545,7 +581,8 @@ async def drain_once(client) -> dict | None:
             }).eq("id", jid).execute())
         await asyncio.to_thread(_claim)
 
-        if kind in DETACHED_KINDS and kind in HANDLERS:
+        if (kind in DETACHED_KINDS or
+                (kind == "report_status" and "crypto_audit_since" in args)) and kind in HANDLERS:
             # Hand the long job to its own task and give the tick back.
             # _TICK_BUSY stays True until that task finishes, so the drain
             # still runs one job at a time.
