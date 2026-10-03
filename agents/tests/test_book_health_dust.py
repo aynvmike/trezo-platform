@@ -35,6 +35,7 @@ from _bootstrap import (  # noqa: E402
 
 stub_config()
 bh = load_module("app.agents.book_health")
+qa = load_module("app.paper.trade_qa")
 
 
 def _run(coro):
@@ -117,7 +118,9 @@ def _check(broker_rows, open_rows=(), *, uid="book-1", price=None):
     # This suite drives the REAL method, so the rows must be captured or
     # run_all's leak net fails the suite -- correctly.
     with _patched(bh.book_scope, positions=_positions), \
-            _patched(bh, notify=_notify), quiet_activity_log():
+            _patched(bh, notify=_notify), \
+            _patched(qa, shield_due=lambda _uid: False, due=lambda _uid: False), \
+            quiet_activity_log():
         findings = _run(agent._check_book(_Client(list(open_rows)), uid, "Book"))
     return findings, sent
 
@@ -206,13 +209,38 @@ def test_a_failed_broker_read_says_nothing_rather_than_all_clear():
 
     agent = bh.BookHealthAgent()
     agent._open_findings = {"unmanaged:book-1": "unmanaged"}   # instance, see _check
-    with _patched(bh.book_scope, positions=_none), _patched(bh, notify=_notify):
+    with _patched(bh.book_scope, positions=_none), _patched(bh, notify=_notify), \
+            _patched(qa, shield_due=lambda _uid: False, due=lambda _uid: False):
         with quiet_activity_log():
             findings = _run(agent._check_book(_Client([]), "book-1",
                                               "Book"))
     assert findings == []
     assert sent == [], "a failed read announced a recovery"
     assert agent._open_findings == {"unmanaged:book-1": "unmanaged"}
+
+
+def test_shield_failure_is_reported_even_when_the_full_sweep_is_not_due():
+    """Drive the real monitor: the prior code discarded refresh failures."""
+    seen = []
+    finding = {"finding": "qa_shield_stale", "reason": "orders timeout"}
+
+    async def _refresh(uid):
+        seen.append(("refresh", uid))
+        return {"skipped_reason": "orders timeout"}
+
+    async def _report(client, uid):
+        seen.append(("report", uid))
+        return {"findings": [finding]}
+
+    async def _positions(uid, **_kw):
+        return None
+
+    with _patched(qa, shield_due=lambda _uid: True, due=lambda _uid: False,
+                  refresh_shield_for_book=_refresh, report_shield_health=_report), \
+            _patched(bh.book_scope, positions=_positions):
+        got = _run(bh.BookHealthAgent()._check_book(_Client([]), "book-1", "Book"))
+    assert got == [finding]
+    assert seen == [("refresh", "book-1"), ("report", "book-1")]
 
 
 def test_the_suite_leaves_the_real_class_attribute_alone():

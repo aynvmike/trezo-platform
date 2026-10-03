@@ -362,8 +362,7 @@ class TradeExecutionAgent(Agent):
 
         daily_dollar_over -> the books at their user-set daily $ limit
         (KS-12), read once next to the percent brake. None is "unknown"
-        (read failed): said in the log, then proceeds -- the percent
-        brake still holds and the risk gate already applied this one.
+        (read failed): logged here and refused at each book's gate.
 
         Returns (states, dollar_over, fail_closed_msg)."""
         _lane = _lane_of(ticker, source_payload)
@@ -405,8 +404,8 @@ class TradeExecutionAgent(Agent):
                 from app.agents.activity_log import record as _arec
                 _arec("daily_dollar_limit_unknown", ticker,
                       strategy=source_payload.get("strategy"),
-                      reason=("daily $ loss limits unreadable -- proceeding "
-                              "on the percent brake alone"),
+                      reason=("daily $ loss limits unreadable -- new entries "
+                              "require verified limits at each book's gate"),
                       extra={"lane": _lane})
             except Exception:  # noqa: BLE001
                 pass
@@ -466,6 +465,12 @@ class TradeExecutionAgent(Agent):
         if is_fallback_settings(cfg):
             return _skip("book_settings_unavailable",
                          "Skipped: this book's settings are unavailable; no guessed risk or auto-trade")
+        if ks_state is None:
+            return _skip("book_risk_state_unavailable",
+                         "Skipped: this book's kill-switch state is unavailable; no entry on unknown risk")
+        if dollar_over is None:
+            return _skip("daily_dollar_limit_unknown",
+                         "Skipped: this book's daily dollar loss limit could not be verified")
 
         # THIS book's own kill-switch verdict (2026-08-27). Hard halt
         # (daily / streak / session) -> this book sits out; the others
@@ -1053,7 +1058,7 @@ class TradeExecutionAgent(Agent):
 
     async def _allocation_gate(self, user_id, equity, strategy, asset_type):
         from app.paper.allocation import (
-            build_allocation, deployed_capital, market_type_for,
+            build_allocation, deployed_capital_strict, market_type_for,
             effective_equity,
         )
         # Pockets size from BROKER-truth equity (2026-07-02) -- the internal
@@ -1133,7 +1138,10 @@ class TradeExecutionAgent(Agent):
                 budget = budget * (1.0 + max(0.0, _ov))
         except Exception:  # noqa: BLE001
             pass
-        deployed = float((await deployed_capital(user_id)).get(mt, 0.0))
+        exposure = await deployed_capital_strict(user_id)
+        if exposure is None:
+            raise ValueError("Book exposure unavailable: allocation cannot assume an empty ledger")
+        deployed = float(exposure[mt])
         remaining = max(0.0, budget - deployed)
         return mt, budget, deployed, remaining, alloc.posture
 

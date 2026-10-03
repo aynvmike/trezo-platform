@@ -2186,10 +2186,9 @@ async def _on_startup() -> None:
     except Exception as e:
         log.error("agents.scheduler.FAILED", error=str(e))
 
-    # Patched 2026-06-05 (Task #61): start the batched-persistence
-    # flush loop. Every persist_message() call queues into an
-    # in-memory deque; the flush loop drains it via bulk-insert
-    # every second. Cuts Supabase round-trips ~50x.
+    # Start delivery from the bounded local telemetry outbox. Retries
+    # preserve message IDs and timestamps; replay never reaches the bus
+    # or broker. Database failures back off independently for each book.
     try:
         from app.runtime.persistence import start_flush_loop
         start_flush_loop()
@@ -2244,9 +2243,17 @@ async def integrity_check() -> dict:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict:
+    # This is process liveness, not proof that trading or the database is
+    # healthy. Local outbox counters remain readable during a DB outage.
+    try:
+        from app.runtime.persistence import buffer_stats
+        telemetry = buffer_stats()
+    except Exception:
+        telemetry = {"status": "unavailable"}
     return {
         "status": "ok",
         "service": "trezo-agents",
         "env": settings.env,
+        "telemetry": telemetry,
     }

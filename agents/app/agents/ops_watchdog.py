@@ -23,10 +23,10 @@ This agent watches the agent layer. Every 5 minutes it:
      is platform-level monitoring, not per-user). The UI surfaces
      these as a "System health" panel on the Trading page.
 
-  4. FLOW SENSOR, per lane (NET2-GLOBAL / NET2-COUNT-BEFORE-KILL):
+  4. FLOW SENSOR, per book and lane (NET2-GLOBAL / NET2-COUNT-BEFORE-KILL):
      tallies signals, approves, vetoes, executes, execution kills and
-     handler crashes off the bus, keyed by lane (stock / crypto /
-     option / ...), and alarms per lane when signals produce no
+     handler crashes off the bus, keyed by book + lane (stock / crypto /
+     option / ...), and alarms when signals produce no
      approvals or when approvals produce no fills (NET2-REV-01). See
      _check_flow(). There is no auto-tick and never was: the watchdog
      alerts, a human (or the ops relay) restarts.
@@ -204,7 +204,34 @@ def _lane_of(payload: Any) -> str:
 def _new_lane_counters() -> dict[str, Any]:
     return {"signals": 0, "approves": 0, "vetoes": 0, "executes": 0,
             "kills": 0, "handler_fails": 0, "kill_reasons": {},
-            "refusals": 0, "refusal_reasons": {}}
+            "refusals": 0, "refusal_reasons": {}, "policy_vetoes": 0,
+            "veto_reasons": {}}
+
+
+def _registered_books() -> set[str]:
+    """Use the same cached registry as RiskManager's signal fan-out.
+
+    This reads configuration only, never Supabase or the broker. If the
+    registry is unavailable, keep the unattributed flow alarm alive.
+    """
+    try:
+        from app.brokers.accounts import load_accounts
+        return {str(a.user_id) for a in load_accounts()
+                if getattr(a, "user_id", "")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _explicit_policy_veto(reason: str) -> bool:
+    """Only known admission decisions, never an unknown/read/kill failure.
+
+    A zero allocation and an invalid allocation share the producer's
+    reason, so report the actual reason as a policy block, not as health.
+    Confidence, stale-data and loss vetoes still merit starvation review.
+    """
+    return (reason == "auto-trade is OFF for this book"
+            or " is OFF for this book (" in reason
+            or reason.endswith(" allocation is zero or invalid for this book"))
 
 
 def _lane_market_applies(lane: str, market_open: bool) -> bool:
@@ -229,30 +256,53 @@ class OpsWatchdogAgent(Agent):
         # In-memory dedupe: don't re-alert the same condition every tick
         # while it persists. Keyed by (alert_kind, target_name).
         self._open_alerts: set[tuple[str, str]] = set()
-        # Flow counters (2026-08-31), keyed by LANE since NET2-GLOBAL.
-        # {"since": epoch, "lanes": {lane: _new_lane_counters()}}.
-        self._flow: dict[str, Any] = {"since": _time.time(), "lanes": {}}
+        # Aggregate lane counts remain diagnostic/legacy fallback only.
+        # Registered books are judged separately: one book filling must
+        # never hide a sibling whose approvals vanished.
+        self._flow: dict[str, Any] = {
+            "since": _time.time(), "lanes": {}, "books": {}}
 
     def _lane(self, name: str) -> dict[str, Any]:
         return self._flow["lanes"].setdefault(name, _new_lane_counters())
 
     async def on_message(self, message: AgentMessage) -> list[AgentMessage]:
-        # Count the shape of the decision pipeline, PER LANE. Deliberately
-        # free: no I/O, no awaits, just tallies read by _check_flow() on
-        # the 5-minute tick. This is the sensor for the outage that ran
-        # from 8/27 to 8/31 -- signals firing, nothing approved, and the
-        # only visible messages were vetoes from checks upstream of the
-        # crash. It runs on EVERY bus message, so it must never raise.
+        # Shared scanner observations fan out exactly as RiskManager does.
+        # Its per-book recursive signal copies are NOT republished on the
+        # bus, so counting only incoming user_id would miss that fan-out.
+        # Only explicitly book_scoped signals belong to a single book.
+        try:
+            p = message.payload if isinstance(message.payload, dict) else {}
+            name = _lane_of(p)
+            self._count_flow(self._lane(name), message)
+            books = _registered_books()
+            if books:
+                uid = str(p.get("user_id") or "")
+                targets = (books if message.kind == "signal"
+                           and not p.get("book_scoped") else ({uid} if uid else set()))
+                for target in targets:
+                    lanes = self._flow.setdefault("books", {}).setdefault(target, {})
+                    self._count_flow(lanes.setdefault(name, _new_lane_counters()), message)
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+
+    @staticmethod
+    def _count_flow(lane: dict[str, Any], message: AgentMessage) -> None:
+        """No I/O or awaits: this sensor runs on every bus message."""
         try:
             k = message.kind
             p = message.payload if isinstance(message.payload, dict) else {}
-            lane = self._lane(_lane_of(p))
             if k == "signal":
                 lane["signals"] += 1
             elif k == "approve":
                 lane["approves"] += 1
             elif k == "veto":
                 lane["vetoes"] += 1
+                reason = str(p.get("reason") or "(no reason given)")[:200]
+                rs = lane["veto_reasons"]
+                rs[reason] = rs.get(reason, 0) + 1
+                if _explicit_policy_veto(reason):
+                    lane["policy_vetoes"] += 1
             elif k == "execute":
                 lane["executes"] += 1
             elif k == "info":
@@ -272,6 +322,8 @@ class OpsWatchdogAgent(Agent):
                     rs[note] = rs.get(note, 0) + 1
             elif k == "error":
                 ev = p.get("event")
+                if ev == "book_risk_evaluation_failed":
+                    lane["handler_fails"] += 1
                 if ev == "handler_failed":
                     lane["handler_fails"] += 1
                     # NET2-REV-01: the executor CRASHING on an approve is
@@ -303,10 +355,9 @@ class OpsWatchdogAgent(Agent):
                     rs[reason] = rs.get(reason, 0) + 1
         except Exception:  # noqa: BLE001
             pass
-        return []
 
     async def _check_flow(self) -> list[AgentMessage]:
-        """Alarm, PER LANE, when signals go in and nothing comes out.
+        """Alarm per book and lane when signals go in and nothing comes out.
 
         THE CASE THIS EXISTS FOR (2026-08-31): risk_manager.on_message
         raised on every signal carrying a real direction. The router
@@ -315,7 +366,8 @@ class OpsWatchdogAgent(Agent):
         looked merely quiet. Every other check here asks "is this agent
         ticking?" and every one of them said yes.
 
-        Two shapes, each judged per lane:
+        Two shapes, each judged per registered book and lane (unattributed
+        legacy flow falls back to lane only):
 
           A. APPROVAL STARVATION -- at least FLOW_MIN_SIGNALS signals in
              the lane and zero approvals. The original check.
@@ -354,10 +406,25 @@ class OpsWatchdogAgent(Agent):
         # Reset the window whatever we decide, so one bad window does not
         # poison the next one.
         lanes = dict(f.get("lanes") or {})
-        self._flow = {"since": _time.time(), "lanes": {}}
+        books = dict(f.get("books") or {})
+        self._flow = {"since": _time.time(), "lanes": {}, "books": {}}
 
         market_open = _us_market_open()
+        scoped_lanes = set()
+        for uid, book_lanes in sorted(books.items()):
+            for lane, counts in sorted(book_lanes.items()):
+                scoped_lanes.add(lane)
+                if not _lane_market_applies(lane, market_open):
+                    continue
+                try:
+                    out.extend(await self._judge_lane(
+                        lane, counts, window_min, user_id=uid))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("ops_watchdog flow check failed for book %s lane %s: %s",
+                                   uid[:8], lane, e)
         for lane in sorted(lanes):
+            if lane in scoped_lanes:
+                continue  # never mix three books' vetoes with one scanner signal
             if not _lane_market_applies(lane, market_open):
                 continue
             try:
@@ -368,14 +435,42 @@ class OpsWatchdogAgent(Agent):
         return out
 
     async def _judge_lane(self, lane: str, c: dict[str, Any],
-                          window_min: float) -> list[AgentMessage]:
+                          window_min: float, *, user_id: str = "") -> list[AgentMessage]:
         out: list[AgentMessage] = []
         signals, approves = int(c.get("signals", 0)), int(c.get("approves", 0))
         vetoes, hfails = int(c.get("vetoes", 0)), int(c.get("handler_fails", 0))
         executes, kills = int(c.get("executes", 0)), int(c.get("kills", 0))
-        key_a = ("approval_starvation", lane)
-        key_b = ("execution_starvation", lane)
-        key_c = ("capacity_lock", lane)
+        target = f"{user_id}:{lane}" if user_id else lane
+        display = f"{lane} / book {user_id[:8]}" if user_id else lane
+        key_a = ("approval_starvation", target)
+        key_b = ("execution_starvation", target)
+        key_c = ("capacity_lock", target)
+        key_policy = ("entry_policy_block", target)
+
+        # Disabled entry lanes still produce explicit per-book vetoes.
+        # Report their exact admission reason without falsely describing
+        # an outage. A missing verdict or any unknown reason still alarms.
+        policy_vetoes = int(c.get("policy_vetoes", 0))
+        policy_only = (bool(user_id) and signals >= FLOW_MIN_SIGNALS
+                       and approves == 0 and vetoes == policy_vetoes
+                       and policy_vetoes >= signals and hfails == 0)
+        if policy_only:
+            reasons = c.get("veto_reasons") or {}
+            top, top_n = max(reasons.items(), key=lambda kv: kv[1])
+            msg = (f"ENTRY POLICY [{display}]: all {signals} signal(s) in "
+                   f"{window_min:.0f} min were declined by this book's entry "
+                   f"settings. Top reason ({top_n}x): {top}. "
+                   "The gate returned decisions; no approvals required execution.")
+            await self._raise_flow(key_policy, severity="info",
+                                   title=f"Trezo: entries blocked by settings ({display})", msg=msg)
+            self._open_alerts.discard(key_a)
+            out.append(AgentMessage(agent=self.name, kind="info", payload={
+                "event": "entry_policy_block", "lane": lane, "user_id": user_id,
+                "signals": signals, "vetoes": vetoes, "top_veto_reason": top,
+                "window_min": round(window_min, 1), "note": msg}))
+            return out
+        if approves > 0:
+            self._open_alerts.discard(key_policy)
 
         # ---- A: signals in, nothing approved ---------------------------
         if signals >= FLOW_MIN_SIGNALS and approves == 0:
@@ -389,7 +484,7 @@ class OpsWatchdogAgent(Agent):
                      f"{unaccounted} of them produced NO verdict at all -- "
                      f"not an approval, not a veto")
             msg = (
-                f"APPROVAL STARVATION [{lane}]: {signals} signal(s) in "
+                f"APPROVAL STARVATION [{display}]: {signals} signal(s) in "
                 f"{window_min:.0f} min produced ZERO approvals on the "
                 f"{lane} lane; {shape}"
                 + (f"; {hfails} handler crash(es) reported" if hfails else "")
@@ -399,10 +494,10 @@ class OpsWatchdogAgent(Agent):
             )
             await self._raise_flow(
                 key_a, severity="urgent" if unaccounted else "warn",
-                title=f"Trezo: nothing is being approved ({lane})", msg=msg)
+                title=f"Trezo: nothing is being approved ({display})", msg=msg)
             out.append(AgentMessage(
                 agent=self.name, kind="error",
-                payload={"event": "approval_starvation", "lane": lane,
+                payload={"event": "approval_starvation", "lane": lane, "user_id": user_id,
                          "signals": signals, "approves": 0,
                          "vetoes": vetoes, "unaccounted": unaccounted,
                          "handler_failures": hfails,
@@ -427,9 +522,9 @@ class OpsWatchdogAgent(Agent):
             reasons = c.get("kill_reasons") or {}
             top, top_n = (max(reasons.items(), key=lambda kv: kv[1])
                           if reasons else ("(no reason given)", 0))
-            # NET2-REFUSED: refusals are per BOOK (one approval fans out
-            # to up to three), so they can legitimately exceed approves;
-            # the clamp keeps the arithmetic honest either way.
+            # Clamp delayed/duplicate outcomes at the window boundary.
+            # Modern approvals are already per book; only the legacy
+            # unattributed fallback may mix a fan-out with one approval.
             unaccounted_b = max(0, approves - kills - refusals)
             if kills == 0 and refusals and unaccounted_b == 0:
                 # Every approval was answered with a deliberate refusal:
@@ -439,7 +534,7 @@ class OpsWatchdogAgent(Agent):
                 rtop, rtop_n = (max(rref.items(), key=lambda kv: kv[1])
                                 if rref else ("(unrecorded)", 0))
                 msg = (
-                    f"CAPACITY LOCK [{lane}]: {approves} approval(s) in "
+                    f"CAPACITY LOCK [{display}]: {approves} approval(s) in "
                     f"{window_min:.0f} min were ALL refused on purpose "
                     f"({refusals} per-book refusal(s); top ({rtop_n}x): "
                     f"{rtop}). Nothing on this lane fills until a "
@@ -448,11 +543,11 @@ class OpsWatchdogAgent(Agent):
                 )
                 await self._raise_flow(
                     key_c, severity="warn",
-                    title=f"Trezo: {lane} lane is capacity-locked",
+                    title=f"Trezo: lane is capacity-locked ({display})",
                     msg=msg)
                 out.append(AgentMessage(
                     agent=self.name, kind="info",
-                    payload={"event": "capacity_lock", "lane": lane,
+                    payload={"event": "capacity_lock", "lane": lane, "user_id": user_id,
                              "approves": approves, "refusals": refusals,
                              "top_refusal": rtop,
                              "window_min": round(window_min, 1),
@@ -472,7 +567,7 @@ class OpsWatchdogAgent(Agent):
             shape_b = ("; ".join(parts)
                        or "none of them produced an outcome at all")
             msg = (
-                f"EXECUTION STARVATION [{lane}]: {approves} approval(s) in "
+                f"EXECUTION STARVATION [{display}]: {approves} approval(s) in "
                 f"{window_min:.0f} min produced ZERO fills on the {lane} "
                 f"lane; {shape_b}. The gate said yes and nothing filled "
                 f"-- check trade_execution (is it registered, enabled, "
@@ -480,11 +575,11 @@ class OpsWatchdogAgent(Agent):
             )
             await self._raise_flow(
                 key_b, severity="urgent",
-                title=f"Trezo: approvals are dying at execution ({lane})",
+                title=f"Trezo: approvals are dying at execution ({display})",
                 msg=msg)
             out.append(AgentMessage(
                 agent=self.name, kind="error",
-                payload={"event": "execution_starvation", "lane": lane,
+                payload={"event": "execution_starvation", "lane": lane, "user_id": user_id,
                          "approves": approves, "executes": 0,
                          "kills": kills, "refusals": refusals,
                          "unaccounted": unaccounted_b,
@@ -498,7 +593,7 @@ class OpsWatchdogAgent(Agent):
 
     async def _raise_flow(self, key: tuple[str, str], *, severity: str,
                           title: str, msg: str) -> None:
-        """Persist + webhook ONCE per (kind, lane) while it persists."""
+        """Persist + webhook ONCE per (kind, book:lane) while it persists."""
         if key in self._open_alerts:
             return
         self._open_alerts.add(key)

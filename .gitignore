@@ -102,6 +102,9 @@ agents/local_state/
 agents/scratch/
 # Old paper-trading dumps from before Supabase was source of truth.
 *.paperdump.json
+# Recovery exports and operational snapshots contain private book data.
+*.private.json
+ops/self_host/private/
 # Prebuilt migration outputs that supabase-cli regenerates.
 db/supabase/.temp/
 db/.supabase-cache/

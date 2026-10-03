@@ -20,6 +20,7 @@ deployed and whether gains lean toward compounding or locking.
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -242,12 +243,29 @@ def _supabase():
 
 
 async def deployed_capital(user_id: str) -> dict[str, float]:
-    """Sum the notional of this user's OPEN positions, grouped by market
-    type — so the Trade Execution agent knows how much budget is left."""
+    """Best-effort exposure for advisory displays and proposals.
+
+    Entry execution must use deployed_capital_strict: a failed read is
+    not evidence that this book has an unused allocation.
+    """
+    result = await deployed_capital_strict(user_id)
+    return result if result is not None else {mt: 0.0 for mt in MARKET_TYPES}
+
+
+async def deployed_capital_strict(user_id: str) -> dict[str, float] | None:
+    """This book's open exposure, or None when it cannot be measured.
+
+    An empty successful response is a flat ledger. Missing, failed or
+    malformed responses must block new exposure rather than invent room.
+    Keep the existing lane/notional calculation; this only makes unknown
+    state distinguishable from a verified zero.
+    """
+    if not user_id:
+        return None
     out = {mt: 0.0 for mt in MARKET_TYPES}
     client = _supabase()
     if not client:
-        return out
+        return None
 
     def _sync():
         return (
@@ -260,13 +278,21 @@ async def deployed_capital(user_id: str) -> dict[str, float]:
 
     try:
         res = await asyncio.to_thread(_sync)
+        if not isinstance(res.data, list):
+            return None
+        for r in res.data:
+            if not isinstance(r, dict):
+                return None
+            quantity = float(r["quantity"])
+            price = float(r["entry_price"])
+            if (not math.isfinite(quantity) or quantity < 0
+                    or not math.isfinite(price) or price <= 0):
+                return None
+            notional = quantity * price
+            mt = market_type_for(r.get("strategy") or "", r.get("asset_type") or "")
+            out[mt] = out.get(mt, 0.0) + notional
+            if not math.isfinite(out[mt]):
+                return None
     except Exception:  # noqa: BLE001
-        return out
-    for r in res.data or []:
-        try:
-            notional = float(r.get("quantity") or 0) * float(r.get("entry_price") or 0)
-        except (TypeError, ValueError):
-            continue
-        mt = market_type_for(r.get("strategy") or "", r.get("asset_type") or "")
-        out[mt] = out.get(mt, 0.0) + notional
+        return None
     return out
