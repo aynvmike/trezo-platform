@@ -41,6 +41,10 @@ from _bootstrap import (load_module, quiet_activity_log, run_tests,  # noqa: E40
 stub_config()  # app.brokers.accounts reads settings at import
 book_scope = load_module("app.runtime.book_scope")
 from app.brokers import accounts as acct  # noqa: E402
+# The unresolved-book diagnostic imports this module lazily. Load it
+# before _fake_world patches accounts: its module-level imported aliases
+# would otherwise retain our fake registry after the context exits.
+route_guard = load_module("app.brokers.route_guard")
 
 
 # --- a fake three-book world ---------------------------------------------
@@ -276,12 +280,16 @@ def test_zz_nothing_is_left_patched_after_this_suite():
         assert getattr(acct, n) is real, f"accounts.{n} is still a fake"
     for n, real in _REAL_SCOPE.items():
         assert getattr(book_scope, n) is real, f"book_scope.{n} is still a fake"
+    for n in ("account_for_user", "load_accounts", "multi_account_active"):
+        assert getattr(route_guard, n) is _REAL_ACCT[n], (
+            f"route_guard.{n} captured a fake during a lazy import")
     assert book_scope._POSITIONS_FETCHER is _REAL_FETCHER, (
         "the fake positions fetcher leaked past this suite")
     assert book_scope.cache_state() == {}, "fake-book cache left behind"
     assert acct._active.get() is None, "an account binding leaked"
     # The real registry (credential-free stub settings) knows no fake book.
     assert acct.account_for_user("book-75k") is None
+    assert route_guard.account_for_user("book-75k") is None
     assert book_scope.resolve("book-25k") is None
 
 

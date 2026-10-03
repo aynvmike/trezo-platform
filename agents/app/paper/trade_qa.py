@@ -444,6 +444,9 @@ _LAST_SWEEP_OK: dict = {}
 _LAST_SWEEP_TRY: dict = {}
 # book -> unix ts of the last shield refresh that actually ran
 _LAST_SHIELD_OK: dict = {}
+# Last failed shield refresh, per book. A positions/fills failure during
+# the full sweep is not evidence that the live orders endpoint failed.
+_LAST_SHIELD_ERROR: dict = {}
 # (book, symbol, code) that currently have an open ticket. Edge-triggered,
 # modelled on ops_watchdog._open_alerts: the row, the alert and the
 # source_payload block are written on TRANSITION only. Without this the
@@ -622,6 +625,7 @@ def reset_state() -> None:
     _LAST_SWEEP_OK.clear()
     _LAST_SWEEP_TRY.clear()
     _LAST_SHIELD_OK.clear()
+    _LAST_SHIELD_ERROR.clear()
     _OPEN_TICKETS.clear()
 
 
@@ -682,26 +686,30 @@ async def refresh_shield_for_book(user_id: str) -> dict:
     """
     uid = str(user_id or "")
     out = {"user_id": uid, "symbols": 0, "skipped_reason": None}
+
+    def failed(reason: str) -> dict:
+        out["skipped_reason"] = reason
+        _LAST_SHIELD_ERROR[uid] = reason
+        _log("qa_shield_refresh_deferred", "-", reason=reason,
+             extra={"user_id": uid})
+        return out
+
     try:
         from app.brokers.accounts import bind_for_user
         from app.brokers.route_guard import check_route
     except Exception as e:  # noqa: BLE001
-        out["skipped_reason"] = f"cannot bind book: {type(e).__name__}"
-        return out
+        return failed(f"cannot bind book: {type(e).__name__}")
     with bind_for_user(uid) as book:
         if book is None:
-            out["skipped_reason"] = f"unresolved book {uid[:8]}"
-            return out
+            return failed(f"unresolved book {uid[:8]}")
         ok, why = check_route(uid)
         if not ok:
-            out["skipped_reason"] = f"route refused: {why}"
-            return out
+            return failed(f"route refused: {why}")
         # status=open, not a 72h status=all window -- see _read_open_orders.
         orders = await _read_open_orders()
         if orders is None:
-            out["skipped_reason"] = (
+            return failed(
                 f"orders read failed: {_last_read_error() or 'reason not captured'}")
-            return out
         entries: dict = {}
         for o in _mark_legs(orders):
             if not _is_entry_working(o):
@@ -725,8 +733,19 @@ async def refresh_shield_for_book(user_id: str) -> dict:
                 slot["oldest"] = ts
         _SHIELD[uid] = {"ts": time.time(), "entries": entries}
         _LAST_SHIELD_OK[uid] = time.time()
+        _LAST_SHIELD_ERROR.pop(uid, None)
+        # A real successful live-orders read is recovery. A successful
+        # positions read or full historical sweep must NOT clear this.
+        _clear_ticket(uid, "-", "qa_shield_stale")
         out["symbols"] = len(entries)
     return out
+
+
+async def report_shield_health(client, user_id: str) -> dict:
+    """Surface sustained refresh failure even when the full sweep is not due."""
+    rep = blank_report(str(user_id or ""))
+    await _maybe_shield_liveness_alert(client, str(user_id or ""), rep)
+    return rep
 
 
 # ---------------------------------------------------------------------------
@@ -1049,10 +1068,12 @@ async def _maybe_shield_liveness_alert(client, uid: str, rep: dict) -> None:
         return
     since = ("since this engine started" if last is None
              else f"for {(time.time() - float(last)) / 60.0:.0f} minutes")
+    reason = str(_LAST_SHIELD_ERROR.get(uid) or "no successful shield refresh recorded")
     f = Finding("qa_shield_stale", "-", severity="urgent",
-                message=(f"Trezo has not been able to read this book's orders "
-                         f"{since}. While that is true the QA shield answers "
-                         f"'cannot check', and BOTH reconcilers skip closing "
+                message=(f"Trezo has no current QA orders snapshot for this book "
+                         f"{since}. Last shield refresh: {reason}. "
+                         f"While that is true the QA shield answers "
+                         f"'cannot check', and the reconcilers skip closing "
                          f"rows based only on absence. This does not verify "
                          f"position protection or stop all exits. Broker-side "
                          f"orders may still fill while reconciliation is "

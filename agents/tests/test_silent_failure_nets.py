@@ -143,6 +143,100 @@ def _age_window(agent, minutes):
     agent._flow["since"] = time.time() - minutes * 60
 
 
+def _book_message(agent, kind, uid=None, **payload):
+    if uid is not None:
+        payload["user_id"] = uid
+    payload.setdefault("ticker", "ETH")
+    _run(agent.on_message(_Msg(kind, payload)))
+
+
+def test_shared_signals_and_verdicts_are_compared_per_book():
+    """16 observations / 48 verdicts means 16 opportunities on EACH book."""
+    a = _agent()
+    with _patched(wd, _registered_books=lambda: {"one", "two", "three"},
+                  _us_market_open=lambda: True):
+        for _ in range(16):
+            _book_message(a, "signal", "one")  # scanner origin is not a pin
+            for uid in ("one", "two", "three"):
+                _book_message(a, "veto", uid, reason="TCS below threshold")
+        _age_window(a, 25)
+        out = _run(a._check_flow())
+    assert len(out) == 3, [m.payload for m in out]
+    assert {m.payload["user_id"] for m in out} == {"one", "two", "three"}
+    assert all(m.payload["signals"] == m.payload["vetoes"] == 16 for m in out)
+
+
+def test_one_books_approval_cannot_hide_a_sibling_with_no_verdict():
+    a = _agent()
+    with _patched(wd, _registered_books=lambda: {"one", "two"},
+                  _us_market_open=lambda: True):
+        for _ in range(16):
+            _book_message(a, "signal")
+        _book_message(a, "approve", "one")
+        _age_window(a, 25)
+        out = _run(a._check_flow())
+    assert len(out) == 1, [m.payload for m in out]
+    assert out[0].payload["user_id"] == "two"
+    assert out[0].payload["unaccounted"] == 16
+
+
+def test_one_books_fill_or_refusal_cannot_hide_siblings_vanished_approvals():
+    a = _agent()
+    with _patched(wd, _registered_books=lambda: {"one", "two"}):
+        for _ in range(3):
+            _book_message(a, "approve", "one")
+            _book_message(a, "approve", "two")
+            _book_message(a, "info", "one", event="book_at_capacity")
+        _book_message(a, "execute", "one")
+        _age_window(a, 25)
+        out = _run(a._check_flow())
+    assert len(out) == 1, [m.payload for m in out]
+    assert out[0].payload["event"] == "execution_starvation"
+    assert out[0].payload["user_id"] == "two"
+    assert out[0].payload["unaccounted"] == 3
+
+
+def test_explicitly_disabled_book_entries_report_policy_not_outage():
+    a = _agent()
+    reason = "stocks allocation is zero or invalid for this book"
+    with _patched(wd, _registered_books=lambda: {"one", "two"},
+                  _us_market_open=lambda: True):
+        for _ in range(16):
+            _book_message(a, "signal", ticker="AAPL")
+            for uid in ("one", "two"):
+                _book_message(a, "veto", uid, ticker="AAPL", reason=reason)
+        _age_window(a, 25)
+        out = _run(a._check_flow())
+    assert len(out) == 2
+    assert all(m.payload["event"] == "entry_policy_block" for m in out)
+    assert all(m.payload["top_veto_reason"] == reason for m in out)
+
+
+def test_disabled_vetoes_do_not_hide_a_missing_verdict_or_failed_settings():
+    for bad_reason in (None, "Book settings unavailable: no entries on guessed settings"):
+        a = _agent()
+        with _patched(wd, _registered_books=lambda: {"one"}):
+            for _ in range(16):
+                _book_message(a, "signal")
+            for _ in range(15):
+                _book_message(a, "veto", "one", reason="crypto is OFF for this book (crypto_enabled)")
+            if bad_reason:
+                _book_message(a, "veto", "one", reason=bad_reason)
+            _age_window(a, 25)
+            out = _run(a._check_flow())
+        assert len(out) == 1 and out[0].payload["event"] == "approval_starvation"
+
+
+def test_a_book_scoped_signal_never_counts_for_a_sibling():
+    a = _agent()
+    with _patched(wd, _registered_books=lambda: {"one", "two"}):
+        for _ in range(16):
+            _book_message(a, "signal", "one", book_scoped=True)
+        _age_window(a, 25)
+        out = _run(a._check_flow())
+    assert len(out) == 1 and out[0].payload["user_id"] == "one"
+
+
 # --- net 2: approval starvation ------------------------------------------
 
 def test_signals_with_no_approvals_raises_the_alarm():

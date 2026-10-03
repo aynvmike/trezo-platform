@@ -673,7 +673,7 @@ def test_fire_block_reason_matches_the_fanouts_verdicts():
     assert scanner._fire_block_reason(states, "R", "wheel_csp") is None, "wheel tightens, never suspends"
     assert scanner._fire_block_reason(states, "R", "bull_put_spread") is None
     assert scanner._fire_block_reason(states, "C", "option_day") is None
-    assert scanner._fire_block_reason(states, "nobody", "option_day") is None
+    assert "missing" in scanner._fire_block_reason(states, "nobody", "option_day")
 
 
 # --- KS-6, driven: a recovering book's suspended lane does not fire ------
@@ -754,6 +754,17 @@ def test_an_unreadable_kill_switch_stands_the_directional_lane_down():
     assert not any(m.kind == "execute" for m in out)
     assert any(a["event"] == "option_long_skip" and "unreadable" in a["reason"]
                for a in activity), activity
+
+
+def test_a_missing_own_risk_state_stops_directional_entry_despite_a_healthy_sibling():
+    states = {"U2": ks.KillSwitch(False, None, None)}
+    stack, binding, activity = _directional_seams(states)
+    with stack, _generals([{"sym": "NVDA", "d3": 4.0}]), _scanner_state(0):
+        out = _run(scanner.OptionsScannerAgent()._run_directional(_Client(_positions())))
+    assert not any(m.kind == "execute" for m in out)
+    assert any(a["event"] == "option_long_skip" and "missing" in a["reason"]
+               and a["user_id"] == "U1" for a in activity), activity
+    assert scanner._fire_block_reason(states, "U2", "option_day") is None
 
 
 def test_a_clean_book_still_reaches_the_live_pick():

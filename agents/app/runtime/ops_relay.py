@@ -392,6 +392,11 @@ def _h_report_status(args: dict) -> str:
         lines.append(f"agent states: error {str(e)[:160]}")
     if args.get("diagnostics"):
         lines.append(_read_diagnostics())
+    try:
+        from app.runtime.persistence import buffer_stats
+        lines.append("telemetry outbox: " + json.dumps(buffer_stats(), sort_keys=True))
+    except Exception:
+        lines.append("telemetry outbox: unavailable")
     return "\n".join(lines)
 
 
