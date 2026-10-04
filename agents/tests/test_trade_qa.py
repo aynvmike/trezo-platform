@@ -1617,5 +1617,183 @@ def test_a_resting_exit_is_not_reported_as_a_stuck_order():
     events = [e for e, _t, _k in said]
     assert "qa_order_stuck" not in events and "qa_stale_working_order" not in events, said
 
+# ---- entry drift must belong to this row's entry order ------------------
+
+def _drift_case(*, uid="test-book-alpha", row_id="test-row-alpha",
+                order_id="test-entry-order", side="long", drift_min=0):
+    from datetime import datetime, timedelta, timezone
+    first = datetime.now(timezone.utc) - timedelta(hours=2)
+    row = {"id": row_id, "user_id": uid, "ticker": "TEST",
+           "asset_type": "crypto", "status": "open", "side": side,
+           "quantity": 2, "entry_price": 10, "stop_price": 0,
+           "broker_order_id": order_id,
+           "entry_at": (first + timedelta(minutes=drift_min)).isoformat()}
+    position = {"symbol": "TEST/USD", "asset_class": "crypto",
+                "qty": "2" if side == "long" else "-2",
+                "avg_entry_price": "10"}
+    fill = {"id": "test-fill", "activity_type": "FILL",
+            "symbol": "TEST/USD", "asset_class": "crypto", "qty": "2",
+            "price": "10", "side": "buy" if side == "long" else "sell",
+            "order_id": "test-entry-order",
+            "transaction_time": first.isoformat()}
+    return row, position, fill
+
+
+def _drift_sweep(row, position, fills, *, client=None):
+    client = client or FakeClient(paper_positions=[row])
+    rep, events, sent = _sweep(client, uid=row["user_id"],
+                               positions=[position], orders=[], fills=fills)
+    assert rep["skipped_reason"] is None, rep
+    assert not _ledger_writes(client), client.writes
+    findings = [f for f in rep["findings"]
+                if f["finding"] == "qa_entry_time_drift"]
+    return findings, events, sent
+
+
+def test_entry_drift_ignores_prior_trade_and_closing_fills_for_same_symbol():
+    from datetime import timedelta
+    qa.reset_state()
+    row, position, fill = _drift_case()
+    earlier = (qa._parse_ts(fill["transaction_time"])
+               - timedelta(hours=12)).isoformat()
+    previous = dict(fill, id="previous-cycle", order_id="previous-entry",
+                    transaction_time=earlier)
+    closing = dict(fill, id="previous-close", side="sell",
+                   transaction_time=earlier)
+    findings, _events, sent = _drift_sweep(row, position, [previous, closing, fill])
+    assert findings == [], findings
+    assert not any("qa_entry_time_drift" in key for key, _severity, _title in sent)
+
+
+def test_entry_drift_reports_matching_order_earliest_opening_partial():
+    from datetime import timedelta
+    for side in ("long", "short"):
+        qa.reset_state()
+        row, position, fill = _drift_case(side=side, drift_min=40)
+        later = dict(fill, id="second-partial", qty="1",
+                     transaction_time=(qa._parse_ts(fill["transaction_time"])
+                                       + timedelta(minutes=20)).isoformat())
+        first = dict(fill, qty="1")
+        findings, _events, _sent = _drift_sweep(row, position, [later, first])
+        assert len(findings) == 1, findings
+        assert "40 minutes" in findings[0]["reason"], findings
+        assert findings[0]["qa_reference_fill_at"] == fill["transaction_time"]
+        assert findings[0]["qa_reference_scope"] == "opening_order_fills_in_lookback"
+        assert "earliest observed opening fill for this order within the lookback" \
+            in findings[0]["reason"]
+
+
+def test_entry_drift_without_row_order_requires_one_reconciled_entry_order():
+    qa.reset_state()
+    row, position, fill = _drift_case(order_id=None, drift_min=40)
+    findings, _events, _sent = _drift_sweep(row, position, [fill])
+    assert len(findings) == 1 and "40 minutes" in findings[0]["reason"], findings
+
+
+def test_entry_drift_defers_ambiguous_missing_or_conflicting_order_evidence():
+    row, position, fill = _drift_case(order_id=None, drift_min=40)
+    ambiguous = [dict(fill, qty="1"),
+                 dict(fill, id="other-fill", qty="1", order_id="other-order")]
+    missing = [dict(fill, order_id=None)]
+    round_trip = [fill, dict(fill, id="closing-fill", side="sell")]
+    wrong_quantity = [dict(fill, qty="1")]
+    for fills in (ambiguous, missing, round_trip, wrong_quantity):
+        qa.reset_state()
+        findings, events, _sent = _drift_sweep(row, position, fills)
+        assert findings == [] and "qa_read_deferred" in events, (findings, events)
+
+
+def test_entry_drift_never_falls_back_when_linked_order_is_absent():
+    qa.reset_state()
+    row, position, fill = _drift_case(drift_min=40)
+    findings, events, _sent = _drift_sweep(
+        row, position, [dict(fill, order_id="another-trade")])
+    assert findings == [] and "qa_read_deferred" in events, (findings, events)
+
+
+def test_entry_drift_clears_only_after_supported_matching_receipt_settles_it():
+    qa.reset_state()
+    row, position, fill = _drift_case(drift_min=40)
+    findings, _events, _sent = _drift_sweep(row, position, [fill])
+    key = (row["user_id"], row["ticker"], "qa_entry_time_drift")
+    assert len(findings) == 1 and key in qa._OPEN_TICKETS
+    # Missing evidence does not mean the discrepancy has been repaired.
+    findings, events, _sent = _drift_sweep(row, position, [])
+    assert findings == [] and "qa_read_deferred" in events
+    assert key in qa._OPEN_TICKETS
+    corrected_row = dict(row, entry_at=fill["transaction_time"])
+    findings, events, _sent = _drift_sweep(corrected_row, position, [fill])
+    assert findings == [] and "qa_cleared" in events
+    assert key not in qa._OPEN_TICKETS
+
+
+def test_entry_drift_defers_incomplete_unzoned_or_out_of_window_fill_clocks():
+    from datetime import datetime, timedelta, timezone
+    row, position, fill = _drift_case(drift_min=40)
+    now = datetime.now(timezone.utc)
+    clocks = [None, "unparseable", now.date().isoformat(),
+              now.replace(tzinfo=None).isoformat(),
+              (now + timedelta(hours=1)).isoformat(),
+              (now - timedelta(days=4)).isoformat()]
+    for clock in clocks:
+        qa.reset_state()
+        bad_partial = dict(fill, id="unusable-partial", transaction_time=clock)
+        findings, events, _sent = _drift_sweep(row, position, [fill, bad_partial])
+        assert findings == [] and "qa_read_deferred" in events, (clock, findings)
+
+
+def test_entry_drift_defers_row_older_than_available_fill_window():
+    from datetime import datetime, timedelta, timezone
+    qa.reset_state()
+    row, position, fill = _drift_case()
+    row["entry_at"] = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+    findings, events, _sent = _drift_sweep(row, position, [fill])
+    assert findings == [] and "qa_read_deferred" in events, (findings, events)
+
+
+def test_entry_drift_keeps_same_symbol_receipts_and_tickets_in_their_book():
+    qa.reset_state()
+    row_a, position_a, fill_a = _drift_case(drift_min=40)
+    row_b, position_b, fill_b = _drift_case(uid="test-book-beta",
+                                         row_id="test-row-beta")
+    client = FakeClient(paper_positions=[row_a, row_b])
+    findings_a, _events, _sent = _drift_sweep(row_a, position_a, [fill_a], client=client)
+    findings_b, _events, _sent = _drift_sweep(row_b, position_b, [fill_b], client=client)
+    assert len(findings_a) == 1 and findings_a[0]["row_id"] == row_a["id"]
+    assert findings_b == [], findings_b
+    assert (row_a["user_id"], "TEST", "qa_entry_time_drift") in qa._OPEN_TICKETS
+    assert (row_b["user_id"], "TEST", "qa_entry_time_drift") not in qa._OPEN_TICKETS
+
+
+def test_entry_drift_healthy_duplicate_never_clears_another_rows_ticket():
+    for healthy_side in ("long", "short"):
+        for healthy_first in (False, True):
+            qa.reset_state()
+            row, position, fill = _drift_case(drift_min=40)
+            healthy = dict(row, id="test-healthy-row", side=healthy_side,
+                           entry_at=fill["transaction_time"])
+            positions, fills = [position], [fill]
+            if healthy_side == "short":
+                healthy["broker_order_id"] = "test-short-order"
+                positions.append(dict(position, qty="-2"))
+                fills.append(dict(fill, id="test-short-fill", side="sell",
+                                  order_id="test-short-order"))
+            rows = [healthy, row] if healthy_first else [row, healthy]
+            client = FakeClient(paper_positions=rows)
+            key = (row["user_id"], "TEST", "qa_entry_time_drift")
+            for sweep in range(2):
+                rep, _events, sent = _sweep(
+                    client, uid=row["user_id"], positions=positions,
+                    orders=[], fills=fills)
+                findings = [f for f in rep["findings"]
+                            if f["finding"] == "qa_entry_time_drift"]
+                drift_alerts = [k for k, _severity, _title in sent
+                                if k.endswith("qa_entry_time_drift")]
+                assert len(findings) == (1 if sweep == 0 else 0), rep
+                assert len(drift_alerts) == (1 if sweep == 0 else 0), sent
+                assert key in qa._OPEN_TICKETS, (healthy_side, healthy_first, rep)
+                assert not _ledger_writes(client), client.writes
+
+
 if __name__ == "__main__":
     sys.exit(run_tests(dict(vars())))
