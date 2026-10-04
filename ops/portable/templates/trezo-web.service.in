@@ -1,0 +1,22 @@
+[Unit]
+Description=Trezo private dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@CHECKOUT@/web
+Environment=HOME=@PRIVATE@/runtime/home
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+ExecStart=@NODE@ @CHECKOUT@/node_modules/next/dist/bin/next start --hostname 127.0.0.1 --port 3000
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

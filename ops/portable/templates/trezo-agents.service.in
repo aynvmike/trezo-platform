@@ -1,0 +1,24 @@
+[Unit]
+Description=Trezo agents (activation requires restored database and sole writer approval)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@CHECKOUT@/agents
+Environment=HOME=@PRIVATE@/runtime/home
+Environment=PYTHONUNBUFFERED=1
+Environment=TREZO_ACTIVITY_LOG_DIR=@PRIVATE@/runtime/logs
+Environment=TREZO_REPO_DIR=@CHECKOUT@
+ExecStart=@FLOCK@ --nonblock --no-fork @PRIVATE@/runtime/engine.lock @CHECKOUT@/agents/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 1
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

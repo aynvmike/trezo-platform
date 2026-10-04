@@ -56,6 +56,15 @@ def test_posix_keeps_plain_npm():
         assert relay._npm_exe() == "/usr/bin/npm"
 
 
+def test_log_root_is_checkout_relative_on_linux_and_unchanged_on_windows():
+    from pathlib import Path
+
+    with _patched(relay, sys=_Posix()):
+        assert relay._repo_root() == Path(relay.__file__).resolve().parents[3]
+    with _patched(relay, sys=_Win()):
+        assert relay._repo_root() == Path(r"C:\Trezo\trezo-platform")
+
+
 def test_the_rebuild_spawns_the_resolved_executable_and_restarts_only_on_exit_zero():
     calls = []
 
@@ -63,7 +72,7 @@ def test_the_rebuild_spawns_the_resolved_executable_and_restarts_only_on_exit_ze
         calls.append(list(cmd))
         return "[exit 0]\nCompiled successfully" if cmd[1] == "--prefix" else "[exit 0]\nrestarted"
 
-    with _patched(relay, _npm_exe=lambda: r"C:\nodejs\npm.cmd", _run=fake_run, _tell=lambda *a, **k: None), \
+    with _patched(relay, sys=_Win(), _npm_exe=lambda: r"C:\nodejs\npm.cmd", _run=fake_run, _tell=lambda *a, **k: None), \
          _patched_dict(relay.os.environ, TREZO_WEB_MODE="prod"):
         out = relay._h_web_rebuild({})
     assert calls[0][0].endswith("npm.cmd"), calls[0]
@@ -80,7 +89,7 @@ def test_a_failed_build_never_restarts_the_site():
         calls.append(list(cmd))
         return "[exit 1]\nType error"
 
-    with _patched(relay, _npm_exe=lambda: "npm.cmd", _run=fake_run, _tell=lambda msg, **k: told.append(msg)), \
+    with _patched(relay, sys=_Win(), _npm_exe=lambda: "npm.cmd", _run=fake_run, _tell=lambda msg, **k: told.append(msg)), \
          _patched_dict(relay.os.environ, TREZO_WEB_MODE="prod"):
         out = relay._h_web_rebuild({})
     assert len(calls) == 1 and "NOT restarted" in out and told
@@ -139,6 +148,80 @@ def _run_loop(coro):
         loop.close()
 
 
+def test_non_windows_never_reads_claims_sweeps_or_executes_restored_jobs():
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    old = (_dt.now(_tz.utc) - _td(minutes=relay.STALE_RUNNING_MIN + 1)).isoformat()
+    for platform in ("linux", "darwin"):
+        store = {"ops_tasks": [
+            {"id": "queued", "kind": "restart_service", "status": "queued",
+             "args": {"service": "TrezoAgents"}, "attempts": 0},
+            {"id": "stranded", "kind": "web_rebuild", "status": "running",
+             "started_at": old},
+        ]}
+        before = deepcopy(store)
+        reads, executions = [], []
+
+        class RecordingClient(_FakeClient):
+            def table(self, name):
+                reads.append(name)
+                return super().table(name)
+
+        handlers = {kind: lambda args: executions.append(args) or "unexpected handler"
+                    for kind in relay.HANDLERS}
+        with _patched(relay, sys=SimpleNamespace(platform=platform),
+                      _TICK_BUSY=False, HANDLERS=handlers), \
+                _patched(_alog, record=lambda *a, **k: None):
+            client = RecordingClient(store)
+            out = _run_loop(relay.drain_once(client))
+            swept = _run_loop(relay.sweep_stranded(client))
+            assert relay._TICK_BUSY is False
+        assert out["status"] == "disabled" and out["platform"] == platform, out
+        assert "queue untouched" in out["reason"]
+        assert reads == [] and executions == [], (reads, executions)
+        assert swept == 0 and store == before, store
+
+
+def test_non_windows_disabled_status_precedes_busy_or_missing_client():
+    with _patched(relay, sys=_Posix(), _TICK_BUSY=True):
+        out = _run_loop(relay.drain_once(None))
+        assert out["status"] == "disabled", out
+        assert relay._TICK_BUSY is True
+
+
+def test_linux_log_upload_remains_enabled_when_operator_jobs_are_disabled():
+    import json
+    import tempfile
+    from pathlib import Path
+
+    inserted = []
+
+    class LogTable:
+        def insert(self, batch):
+            inserted.extend(batch)
+            return self
+
+        def execute(self):
+            return type("R", (), {"data": []})()
+
+    class LogClient:
+        def table(self, name):
+            assert name == "ops_log_tail", name
+            return LogTable()
+
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / "logs").mkdir()
+        row = {"ts": _dt.now(_tz.utc).isoformat(), "event": "offline_log_test"}
+        (root / "logs" / "activity-2026-10-04.jsonl").write_text(
+            json.dumps(row) + "\n", encoding="utf-8")
+        with _patched(relay, sys=_Posix(), REPO=root, _LAST_PUSH=None):
+            count = _run_loop(relay.push_log_tail(LogClient()))
+            assert relay._LAST_PUSH is not None
+    assert count == 1 and inserted[0]["line"] == row, inserted
+
+
 def test_a_web_rebuild_is_handed_to_a_detached_task_and_still_lands_done():
     store = {"ops_tasks": [{"id": "j1", "kind": "web_rebuild", "status": "queued", "args": {}, "attempts": 0}]}
     seen = []
@@ -148,7 +231,7 @@ def test_a_web_rebuild_is_handed_to_a_detached_task_and_still_lands_done():
         return "[exit 0]\nCompiled successfully\n[exit 0]\nTrezoWeb restarted"
 
     async def scenario():
-        with _patched(relay, _TICK_BUSY=False), _patched_dict(relay.HANDLERS, web_rebuild=fake_rebuild):
+        with _patched(relay, sys=_Win(), _TICK_BUSY=False), _patched_dict(relay.HANDLERS, web_rebuild=fake_rebuild):
             first = await relay.drain_once(_FakeClient(store))
             assert first == {"kind": "web_rebuild", "status": "started"}, first
             assert store["ops_tasks"][0]["status"] == "running"
@@ -171,7 +254,7 @@ def test_a_detached_failure_is_recorded_not_lost():
         raise RuntimeError("npm exploded")
 
     async def scenario():
-        with _patched(relay, _TICK_BUSY=False), _patched_dict(relay.HANDLERS, web_rebuild=boom):
+        with _patched(relay, sys=_Win(), _TICK_BUSY=False), _patched_dict(relay.HANDLERS, web_rebuild=boom):
             await relay.drain_once(_FakeClient(store))
             await _aio.gather(*list(relay._DETACHED_TASKS))
         row = store["ops_tasks"][0]
@@ -188,7 +271,8 @@ def test_a_stranded_running_row_is_swept_to_failed_but_a_fresh_one_is_left_alone
         {"id": "s1", "kind": "web_rebuild", "status": "running", "started_at": old},
         {"id": "s2", "kind": "web_rebuild", "status": "running", "started_at": fresh},
     ]}
-    n = _run_loop(relay.sweep_stranded(_FakeClient(store)))
+    with _patched(relay, sys=_Win()):
+        n = _run_loop(relay.sweep_stranded(_FakeClient(store)))
     assert n == 1
     assert store["ops_tasks"][0]["status"] == "failed" and "STRANDED" in store["ops_tasks"][0]["result"]
     assert store["ops_tasks"][1]["status"] == "running"
@@ -198,7 +282,7 @@ def test_inline_kinds_still_release_the_latch_when_they_finish():
     store = {"ops_tasks": [{"id": "j3", "kind": "report_status", "status": "queued", "args": {}, "attempts": 0}]}
 
     async def scenario():
-        with _patched(relay, _TICK_BUSY=False), _patched_dict(relay.HANDLERS, report_status=lambda a: "[exit 0]\nok"):
+        with _patched(relay, sys=_Win(), _TICK_BUSY=False), _patched_dict(relay.HANDLERS, report_status=lambda a: "[exit 0]\nok"):
             out = await relay.drain_once(_FakeClient(store))
         assert out == {"kind": "report_status", "status": "done"}, out
         assert store["ops_tasks"][0]["status"] == "done"
@@ -211,7 +295,7 @@ def test_crypto_audit_report_is_detached_and_persists_the_result():
     store = {"ops_tasks": [{"id": "audit", "kind": "report_status", "status": "queued",
                            "args": {"crypto_audit_since": "2026-07-24"}, "attempts": 0}]}
     async def scenario():
-        with _patched(relay, _TICK_BUSY=False), _patched_dict(relay.HANDLERS, report_status=lambda a: '{"books":[]}'):
+        with _patched(relay, sys=_Win(), _TICK_BUSY=False), _patched_dict(relay.HANDLERS, report_status=lambda a: '{"books":[]}'):
             out = await relay.drain_once(_FakeClient(store))
             assert out["status"] == "started"
             await _aio.gather(*list(relay._DETACHED_TASKS))
@@ -238,7 +322,7 @@ def test_a_dev_mode_web_service_is_restarted_not_built():
             return "[exit 0]\nC:\\Trezo\\trezo-platform\\web run dev"
         return "[exit 0]\nrestarted"
 
-    with _patched(relay, _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
+    with _patched(relay, sys=_Win(), _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
          _patched_dict(relay.os.environ, TREZO_WEB_MODE=""):
         out = relay._h_web_rebuild({})
     assert not any("--prefix" in c for c in calls), f"next build must not run in dev mode: {calls}"
@@ -257,7 +341,7 @@ def test_a_prod_mode_web_service_still_builds_then_restarts():
             return "[exit 0]\nCompiled successfully"
         return "[exit 0]\nrestarted"
 
-    with _patched(relay, _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
+    with _patched(relay, sys=_Win(), _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
          _patched_dict(relay.os.environ, TREZO_WEB_MODE=""):
         relay._h_web_rebuild({})
     assert any("--prefix" in c for c in calls), calls
@@ -271,7 +355,7 @@ def test_the_mode_override_wins_over_nssm():
         calls.append(list(cmd))
         return "[exit 0]\nok"
 
-    with _patched(relay, _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
+    with _patched(relay, sys=_Win(), _run=fake_run, _npm_exe=lambda: "npm.cmd", _tell=lambda *a, **k: None), \
          _patched_dict(relay.os.environ, TREZO_WEB_MODE="dev"):
         relay._h_web_rebuild({})
     assert not any(c[:2] == [relay.NSSM, "get"] for c in calls)

@@ -105,6 +105,8 @@ agents/scratch/
 # Recovery exports and operational snapshots contain private book data.
 *.private.json
 ops/self_host/private/
+ops/portable/private/
+*.age
 # Prebuilt migration outputs that supabase-cli regenerates.
 db/supabase/.temp/
 db/.supabase-cache/

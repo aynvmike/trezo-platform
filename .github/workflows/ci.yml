@@ -19,6 +19,32 @@ on:
     branches: [main, develop]
 
 jobs:
+  portable:
+    name: Portable migration tools
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test private backup, isolated restore and disabled installation
+        run: python -m unittest discover -s ops/portable -p 'test_*.py'
+      - name: Install age for a real encryption round trip
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y age
+      - name: Exercise real age encryption
+        if: runner.os == 'Linux'
+        run: python -m unittest discover -s ops/portable -p 'test_backup.py'
+      - name: Validate the pinned Supabase ports without starting containers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sh ops/self_host/prepare_official.sh 564eab8ad7840b13324f68b1bfac074ef8d51c21 "$RUNNER_TEMP/trezo-supabase"
+          cp "$RUNNER_TEMP/trezo-supabase/stack/.env.example" "$RUNNER_TEMP/trezo-supabase/stack/.env"
+          python ops/portable/verify_compose.py --stack "$RUNNER_TEMP/trezo-supabase/stack"
   recovery:
     name: Recovery tools (Windows PowerShell)
     runs-on: windows-latest
