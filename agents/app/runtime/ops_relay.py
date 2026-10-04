@@ -34,7 +34,17 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 NSSM = r"C:\ProgramData\chocolatey\bin\nssm.exe"
-REPO = Path(r"C:\Trezo\trezo-platform")
+
+
+def _repo_root() -> Path:
+    # Windows handlers retain their deployed location. On other hosts
+    # only log upload is enabled, and its logs belong to this checkout.
+    if sys.platform.startswith("win"):
+        return Path(r"C:\Trezo\trezo-platform")
+    return Path(__file__).resolve().parents[3]
+
+
+REPO = _repo_root()
 VENV_PIP = REPO / "agents" / ".venv" / "Scripts" / "pip.exe"
 SERVICES = {"TrezoAgents", "TrezoApi", "TrezoWeb"}
 PKG_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,48}(==[0-9][0-9A-Za-z.]{0,15})?$")
@@ -479,7 +489,9 @@ async def sweep_stranded(client) -> int:
     """Mark long-abandoned "running" rows failed so the queue tells the
     truth (and `relay.py check` stops showing a phantom pending job).
     Returns the number of rows swept. Never raises."""
-    if client is None:
+    # Restored jobs still belong to the Windows deployment. A Linux
+    # engine must not rewrite their status, even through a direct sweep.
+    if not sys.platform.startswith("win") or client is None:
         return 0
     try:
         def _q():
@@ -554,8 +566,16 @@ _DETACHED_TASKS: set = set()
 
 
 async def drain_once(client) -> dict | None:
-    """Claim and run ONE queued job. Returns a summary or None."""
+    """Claim one Windows operator job, or report that this relay is disabled.
+
+    The handlers use NSSM and Task Scheduler. A restored queue must stay
+    untouched on other hosts; deployment there is managed independently.
+    Log upload below remains available on every platform.
+    """
     global _TICK_BUSY
+    if not sys.platform.startswith("win"):
+        return {"status": "disabled", "platform": sys.platform,
+                "reason": "operator jobs require the Windows relay; queue untouched"}
     if _TICK_BUSY or client is None:
         return None
     _TICK_BUSY = True

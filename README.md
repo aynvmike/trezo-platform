@@ -4,6 +4,8 @@
 
 This is the build directory for the Trezo platform — a multi-layer automated wealth-building platform. Specifications live in `../TREZO_PROJECT/01_handoff_specs/`.
 
+For moving an existing installation off AWS, use the [portable migration runbook](ops/portable/README.md). It covers encrypted private backups, a fresh Linux installation, database recovery, and verification before activation. GitHub contains code and recovery tools; account data and credentials must be transferred separately.
+
 ## Monorepo Layout
 
 ```

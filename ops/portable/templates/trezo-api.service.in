@@ -1,0 +1,23 @@
+[Unit]
+Description=Trezo API
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@CHECKOUT@/api
+Environment=HOME=@PRIVATE@/runtime/home
+Environment=NODE_ENV=production
+Environment=API_BIND_HOST=127.0.0.1
+Environment=PORT=8000
+ExecStart=@NODE@ @CHECKOUT@/api/dist/index.js
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
