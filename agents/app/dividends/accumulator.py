@@ -31,14 +31,15 @@ ACCUMULATE/INCOME mode switch, and the ex-div-aware kill-switch are
 separate builds (spec 4.1, 5, 7). Until the kill-switch learns ex-div
 mechanics, tranche sizes here stay small by design.
 
-Fails open everywhere; every decision is activity-logged
-income_accumulate. Nothing raises into the agent loop.
+Unavailable settings or exposure refuse new buys. Decisions are
+activity-logged as income_accumulate; a failed book does not block siblings.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import math
 from datetime import date
 from typing import Optional
 
@@ -192,13 +193,19 @@ async def accumulate_for_book(client, user_id: str) -> Optional[dict]:
     from app.brokers.accounts import (
         account_for_user, bind_for_user, multi_account_active)
     from app.brokers.route_guard import check_route
-    from app.runtime.settings import get_bot_settings
+    from app.runtime.settings import get_bot_settings, is_fallback_settings
     from app.paper.allocation import build_allocation, effective_equity
 
+    bs = get_bot_settings(user_id)
+    if is_fallback_settings(bs):
+        _rec("SLEEVE", "skipped: book settings unavailable; no buy on guessed settings", user_id)
+        return None
+    if not bs.auto_trade_enabled or not bs.dividend_lt_enabled:
+        _rec("SLEEVE", "skipped: automatic dividend entries are disabled for this book", user_id)
+        return None
     eq = await effective_equity(user_id)
     if eq <= 0:
         return None
-    bs = get_bot_settings(user_id)
     plan = build_allocation(eq, posture_setting=bs.account_posture,
                             overrides=bs.allocation_overrides)
     d = dataclasses.asdict(plan) if dataclasses.is_dataclass(plan) else vars(plan)
@@ -211,23 +218,36 @@ async def accumulate_for_book(client, user_id: str) -> Optional[dict]:
         return (client.table("user_positions")
                 .select("ticker, shares, avg_cost")
                 .eq("user_id", user_id).execute())
-    held_rows = (await asyncio.to_thread(_held)).data or []
-    held_cost: dict[str, float] = {}
-    for r in held_rows:
-        tk = str(r["ticker"]).upper()
-        held_cost[tk] = (held_cost.get(tk, 0.0)
-                         + float(r.get("shares") or 0)
-                         * float(r.get("avg_cost") or 0))
+    try:
+        held_rows = (await asyncio.to_thread(_held)).data
+        if not isinstance(held_rows, list):
+            raise ValueError("unreadable holdings response")
+        held_cost: dict[str, float] = {}
+        for r in held_rows:
+            tk = str(r["ticker"]).upper()
+            shares, price = float(r["shares"]), float(r["avg_cost"])
+            if (not tk or not math.isfinite(shares) or shares < 0
+                    or not math.isfinite(price) or price < 0
+                    or (shares > 0 and price == 0)):
+                raise ValueError("invalid holding")
+            held_cost[tk] = held_cost.get(tk, 0.0) + shares * price
+            if not math.isfinite(held_cost[tk]):
+                raise ValueError("invalid holding cost")
+    except Exception:  # noqa: BLE001
+        _rec("SLEEVE", "skipped: this book's income holdings are unreadable", user_id)
+        return None
 
     # Wheel collateral shares the pocket (spec 3: the Wheel is this
     # sleeve's acquisition engine, not a competitor).
-    deployed_income = 0.0
     try:
-        from app.paper.allocation import deployed_capital
-        deployed_income = float(
-            (await deployed_capital(user_id)).get("income") or 0)
+        from app.paper.allocation import deployed_capital_strict
+        exposure = await deployed_capital_strict(user_id)
+        if exposure is None:
+            raise ValueError("exposure unavailable")
+        deployed_income = float(exposure["income"])
     except Exception:  # noqa: BLE001
-        pass
+        _rec("SLEEVE", "skipped: this book's deployed income exposure is unreadable", user_id)
+        return None
     sleeve_used = sum(v for k, v in held_cost.items() if tier_of(k))
     # INITIAL DEPLOYMENT target (Mike 2026-08-11): the sleeve spends up
     # to this milestone, then stops tranche buys -- while the pocket

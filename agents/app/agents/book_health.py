@@ -188,7 +188,10 @@ class BookHealthAgent(Agent):
         try:
             from app.paper import trade_qa
             if trade_qa.shield_due(uid):
-                await trade_qa.refresh_shield_for_book(uid)
+                shield = await trade_qa.refresh_shield_for_book(uid)
+                if shield.get("skipped_reason"):
+                    rep = await trade_qa.report_shield_health(client, uid)
+                    findings.extend(rep.get("findings") or [])
             if trade_qa.due(uid):
                 rep = await trade_qa.qa_sweep_for_book(client, uid)
                 findings.extend(rep.get("findings") or [])

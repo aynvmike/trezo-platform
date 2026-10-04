@@ -1,5 +1,13 @@
 # Rebuilding the engine from nothing
 
+> Recovery update, 2026-10-03: this historical rebuild procedure assumes the
+> hosted database is readable. A cloud database failure also disables the
+> Supabase operations relay. Use [the self-host recovery runbook](ops/self_host/README.md)
+> and `ops/host_preflight.ps1` to establish host capacity and a separate maintenance
+> path first. The hourly application archive is a partial log/state snapshot,
+> not a complete database/Auth/settings backup. A full verified export or backup
+> is required before a database migration.
+
 **The point of this document is that you never need a backup of the
 server.** If the instance is deleted, corrupted, or you simply want a
 cheaper one somewhere else, you do not restore it — you build a new one

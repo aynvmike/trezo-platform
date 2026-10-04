@@ -433,7 +433,7 @@ def _fire_block_reason(states, user_id: str, strategy: str):
         return "kill-switch unreadable -- not firing on an unknown state"
     st = states.get(str(user_id or ""))
     if st is None:
-        return None
+        return "this book's kill-switch state is missing -- not firing on an unknown state"
     if getattr(st, "halted", False) and getattr(st, "mode", None) != "recovery":
         return f"book halted [{st.scope}]: {st.reason}"
     if getattr(st, "mode", None) == "recovery":

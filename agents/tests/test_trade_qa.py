@@ -1617,5 +1617,73 @@ def test_a_resting_exit_is_not_reported_as_a_stuck_order():
     events = [e for e, _t, _k in said]
     assert "qa_order_stuck" not in events and "qa_stale_working_order" not in events, said
 
+def test_successful_shield_refresh_clears_only_its_own_stale_ticket():
+    qa.reset_state()
+    own = (ACCT3, "-", "qa_shield_stale")
+    sibling = (ACCT2, "-", "qa_shield_stale")
+    qa._OPEN_TICKETS.update({own, sibling})
+    qa._LAST_SHIELD_ERROR[ACCT3] = "orders read failed: HTTP 429"
+    with _bound(), _reads(open_orders=[]), quiet_activity_log() as said:
+        out = _run(qa.refresh_shield_for_book(ACCT3))
+    assert out["skipped_reason"] is None
+    assert own not in qa._OPEN_TICKETS and sibling in qa._OPEN_TICKETS
+    assert ACCT3 not in qa._LAST_SHIELD_ERROR
+    assert qa.has_working_order(ACCT3, NOBL) is False  # successful empty read
+    assert "qa_cleared" in [e for e, _t, _kw in said]
+
+
+def test_failed_shield_refresh_preserves_ticket_and_records_actual_failure():
+    qa.reset_state()
+    ticket = (ACCT3, "-", "qa_shield_stale")
+    qa._OPEN_TICKETS.add(ticket)
+    with _bound(), _reads(open_orders=None), quiet_activity_log(), \
+            _patched(qa, _last_read_error=lambda: "HTTP 429: rate_limited"):
+        out = _run(qa.refresh_shield_for_book(ACCT3))
+    assert ticket in qa._OPEN_TICKETS
+    assert out["skipped_reason"] == "orders read failed: HTTP 429: rate_limited"
+    assert qa._LAST_SHIELD_ERROR[ACCT3] == out["skipped_reason"]
+    assert qa.has_working_order(ACCT3, NOBL) is None
+
+
+def test_a_successful_full_sweep_does_not_clear_an_unrefreshed_shield():
+    qa.reset_state()
+    ticket = (ACCT3, "-", "qa_shield_stale")
+    qa._OPEN_TICKETS.add(ticket)
+    rep, _, _ = _sweep(FakeClient(paper_positions=[]),
+                        positions=[], orders=[], fills=[], open_orders=[])
+    assert rep["skipped_reason"] is None
+    assert ticket in qa._OPEN_TICKETS
+    assert qa.has_working_order(ACCT3, NOBL) is None
+
+
+def test_shield_liveness_uses_refresh_error_not_other_broker_reads():
+    qa.reset_state()
+    client = FakeClient(paper_positions=[])
+    with _bound(), _reads(open_orders=None), quiet_activity_log(), \
+            _quiet_alerts(), _patched(qa, _last_read_error=lambda: "orders timeout"):
+        _run(qa.refresh_shield_for_book(ACCT3))
+    with _quiet_alerts(), quiet_activity_log(), \
+            _patched(qa, _last_read_error=lambda: "positions HTTP 503"):
+        rep = _run(qa.report_shield_health(client, ACCT3))
+    reason = rep["findings"][0]["reason"]
+    assert "orders timeout" in reason and "positions HTTP 503" not in reason
+    assert "no current QA orders snapshot" in reason
+
+
+def test_a_recovered_shield_can_raise_a_new_stale_incident():
+    qa.reset_state()
+    client = FakeClient(paper_positions=[])
+    with _quiet_alerts() as sent, quiet_activity_log():
+        first = _run(qa.report_shield_health(client, ACCT3))
+        with _bound(), _reads(open_orders=[]):
+            _run(qa.refresh_shield_for_book(ACCT3))
+        fresh = _run(qa.report_shield_health(client, ACCT3))
+        qa._LAST_SHIELD_OK[ACCT3] -= qa.shield_ttl_s() * 3
+        qa._SHIELD[ACCT3]["ts"] -= qa.shield_ttl_s() * 3
+        again = _run(qa.report_shield_health(client, ACCT3))
+    assert first["findings"] and again["findings"] and not fresh["findings"]
+    assert len(sent) == 2, sent
+
+
 if __name__ == "__main__":
     sys.exit(run_tests(dict(vars())))

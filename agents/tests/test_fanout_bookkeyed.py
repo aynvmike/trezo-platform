@@ -176,6 +176,13 @@ def _recovering():
                          reason="weekly loss limit", mode="recovery")
 
 
+def _healthy_states(overrides=None):
+    states = {uid: ks.KillSwitch(halted=False, scope=None, reason=None)
+              for uid in (BOOK_A, BOOK_B)}
+    states.update(overrides or {})
+    return states
+
+
 _UNSET = object()
 _RAISE = object()
 
@@ -191,7 +198,8 @@ class Harness:
     def __init__(self, books, *, states=_UNSET, dollar_over=frozenset(),
                  accounts_by_book=None):
         self.books = books
-        self.states = {} if states is _UNSET else states
+        self.states = ({uid: ks.KillSwitch(halted=False, scope=None, reason=None)
+                        for uid in books} if states is _UNSET else states)
         self.dollar_over = dollar_over
         self.accounts_by_book = accounts_by_book or {}
         self.executed: dict[str, dict] = {}
@@ -380,10 +388,11 @@ def test_a_book_over_its_daily_dollar_limit_is_skipped():
         == [BOOK_B]
 
 
-def test_an_unreadable_dollar_limit_is_unknown_not_a_brake():
+def test_an_unreadable_dollar_limit_refuses_entries_and_names_each_book():
     h = Harness(_books(), dollar_over=None)
-    h.run(_payload())
-    assert set(h.executed) == {BOOK_A, BOOK_B}
+    out = h.run(_payload())
+    assert h.executed == {}
+    assert {m.payload["user_id"] for m in _events(out, "daily_dollar_limit_unknown")} == {BOOK_A, BOOK_B}
 
 
 # --- (4) KS-11: unreadable kill-switch state fails CLOSED -------------------
@@ -400,10 +409,25 @@ def test_unreadable_killswitch_state_executes_nothing_and_says_so():
         assert "fail closed" in (p.get("reason") or "")
 
 
-def test_an_empty_state_map_is_a_real_answer_and_trades():
+def test_an_empty_state_map_cannot_authorize_a_registered_book():
     h = Harness(_books(), states={})
-    h.run(_payload())
-    assert set(h.executed) == {BOOK_A, BOOK_B}
+    out = h.run(_payload())
+    assert h.executed == {}
+    assert {m.payload["user_id"] for m in _events(out, "book_risk_state_unavailable")} == {BOOK_A, BOOK_B}
+
+
+def test_a_missing_risk_state_blocks_only_its_own_book():
+    h = Harness(_books(), states={BOOK_B: _healthy_states()[BOOK_B]})
+    out = h.run(_payload())
+    assert set(h.executed) == {BOOK_B}
+    assert len(_events(out, "book_risk_state_unavailable", BOOK_A)) == 1
+
+
+def test_a_pinned_book_with_unknown_daily_limit_does_not_execute():
+    h = Harness(_books(), dollar_over=None)
+    out = h.run(_pinned(), via_on_message=True)
+    assert h.executed == {}
+    assert [m.payload["user_id"] for m in _events(out, "daily_dollar_limit_unknown")] == [BOOK_B]
 
 
 # --- (5) TE-07: 'long' is a long; anything unknown is refused ---------------
@@ -432,7 +456,7 @@ def test_an_unknown_direction_is_refused_not_shorted():
 # --- (6) KS-5: a recovering book faces floor + RECOVERY_TCS_BUMP -----------
 
 def test_a_recovering_book_faces_its_floor_plus_the_recovery_bump():
-    h = Harness(_books(), states={BOOK_B: _recovering()})
+    h = Harness(_books(), states=_healthy_states({BOOK_B: _recovering()}))
     out = h.run(_payload(tcs=75))          # clears 70, not 70 + 10
     assert BOOK_A in h.executed and BOOK_B not in h.executed
     declined = _events(out, "book_declined", BOOK_B)
@@ -442,7 +466,7 @@ def test_a_recovering_book_faces_its_floor_plus_the_recovery_bump():
 
 
 def test_a_recovering_book_with_the_conviction_trades_tightened():
-    h = Harness(_books(), states={BOOK_B: _recovering()})
+    h = Harness(_books(), states=_healthy_states({BOOK_B: _recovering()}))
     h.run(_payload(tcs=70 + ks.RECOVERY_TCS_BUMP))
     p = h.executed[BOOK_B]
     assert p.get("_recovery_mode") is True
@@ -596,7 +620,7 @@ def test_pinned_approval_fails_closed_when_the_kill_switch_state_is_unreadable()
 
 
 def test_pinned_approval_on_a_halted_book_is_skipped():
-    h = Harness(_books(), states={BOOK_B: _halted()})
+    h = Harness(_books(), states=_healthy_states({BOOK_B: _halted()}))
     out = h.run(_pinned(), via_on_message=True)
     assert h.executed == {}, h.executed
     skips = _events(out, "book_halted_skip", BOOK_B)
@@ -606,7 +630,7 @@ def test_pinned_approval_on_a_halted_book_is_skipped():
 def test_pinned_approval_on_a_healthy_book_executes_there_only():
     """A halted NEIGHBOUR changes nothing for the pinned book -- and the
     pin holds: nothing fans out to the neighbour either."""
-    h = Harness(_books(), states={BOOK_A: _halted()})
+    h = Harness(_books(), states=_healthy_states({BOOK_A: _halted()}))
     h.run(_pinned(), via_on_message=True)
     assert set(h.executed) == {BOOK_B}, h.executed
 
@@ -638,13 +662,13 @@ def test_pinned_approval_is_reharmonized_to_its_own_books_floor():
 
 
 def test_pinned_approval_on_a_recovering_book_faces_the_bump_and_tightens():
-    h = Harness(_books(), states={BOOK_B: _recovering()})
+    h = Harness(_books(), states=_healthy_states({BOOK_B: _recovering()}))
     out = h.run(_pinned(tcs=75), via_on_message=True)   # clears 70, not 80
     assert h.executed == {}
     declined = _events(out, "book_declined", BOOK_B)
     assert len(declined) == 1
     assert f"floor of {70 + ks.RECOVERY_TCS_BUMP}" in declined[0].payload["note"]
-    h2 = Harness(_books(), states={BOOK_B: _recovering()})
+    h2 = Harness(_books(), states=_healthy_states({BOOK_B: _recovering()}))
     h2.run(_pinned(tcs=70 + ks.RECOVERY_TCS_BUMP), via_on_message=True)
     p = h2.executed[BOOK_B]
     assert p.get("_recovery_mode") is True
@@ -652,7 +676,7 @@ def test_pinned_approval_on_a_recovering_book_faces_the_bump_and_tightens():
 
 
 def test_pinned_approval_on_a_recovering_book_suspends_speculative_lanes():
-    h = Harness(_books(), states={BOOK_B: _recovering()})
+    h = Harness(_books(), states=_healthy_states({BOOK_B: _recovering()}))
     out = h.run(_pinned(strategy="orb", tcs=95), via_on_message=True)
     assert h.executed == {}
     assert len(_events(out, "recovery_suspend_skip", BOOK_B)) == 1
