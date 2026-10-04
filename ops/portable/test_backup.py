@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import ast
+from contextlib import closing
 import importlib.util
 import io
 import json
@@ -139,7 +140,7 @@ class BackupTests(unittest.TestCase):
         self.assertFalse(any(name.endswith(("-wal", "-shm")) for name in manifest["files"]))
         destination = self.work / "sqlite-restored"
         backup.restore_archive(archive, destination)
-        with sqlite3.connect(destination / "host/agents/local_state/research.sqlite3") as restored:
+        with closing(sqlite3.connect(destination / "host/agents/local_state/research.sqlite3")) as restored:
             self.assertEqual(restored.execute("SELECT value FROM examples").fetchall(), [("committed in WAL",)])
 
     def test_custom_state_path_is_flagged_by_name_without_exposing_value(self):
@@ -233,7 +234,7 @@ class BackupTests(unittest.TestCase):
             self.assertEqual((destination / "host" / relative / "private-state.txt").read_text(),
                              "state from " + relative)
         for relative in stores:
-            with sqlite3.connect(destination / "host" / relative) as connection:
+            with closing(sqlite3.connect(destination / "host" / relative)) as connection:
                 self.assertEqual(connection.execute("SELECT source FROM examples").fetchall(), [(relative,)])
         self.assertFalse(any(name.endswith(("-wal", "-shm")) for name in manifest["files"]))
 
@@ -373,9 +374,10 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(public.returncode, 0, "public recipient extraction failed")
         database = self.repo / "agents/local_state/research.sqlite3"
         database.parent.mkdir()
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db:
             db.execute("CREATE TABLE sample (value INTEGER)")
             db.execute("INSERT INTO sample VALUES (42)")
+            db.commit()
         output = self.work / "real-encrypted.age"
         receipt = backup.export_bundle(self.repo, output, self.work, None, public.stdout.strip(), False, True)
         self.assertEqual(receipt["status"], "HOST_ONLY")
@@ -386,7 +388,7 @@ class BackupTests(unittest.TestCase):
             destination = self.work / "real-restore"
             backup.restore_archive(archive, destination)
         self.assertEqual((destination / "host/agents/.env").read_bytes(), (self.repo / "agents/.env").read_bytes())
-        with sqlite3.connect(destination / "host/agents/local_state/research.sqlite3") as db:
+        with closing(sqlite3.connect(destination / "host/agents/local_state/research.sqlite3")) as db:
             self.assertEqual(db.execute("SELECT value FROM sample").fetchall(), [(42,)])
         changed = bytearray(encrypted)
         changed[-20] ^= 1

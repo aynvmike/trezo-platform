@@ -174,7 +174,7 @@ class DatabaseTests(unittest.TestCase):
         with patch.object(db, "validate_bundle"):
             source, expected, files = db.source_inputs(self.bundle, self.books)
             self.assertEqual(source["expected_books"], expected)
-            self.assertEqual(files["roles.sql"], self.files["roles.sql"])
+            self.assertEqual(files["roles.sql"], self.files["roles.sql"].resolve())
             for invalid in ({}, {**self.source, "writers_stopped": False}):
                 self.write(self.folder / "source-inventory.private.json", json.dumps(invalid))
                 with self.assertRaises(db.DatabaseError):
